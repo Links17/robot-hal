@@ -18,6 +18,7 @@ subtle = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 uuid = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 seeed-hal-testkit = { path = "../seeed-hal-testkit" }

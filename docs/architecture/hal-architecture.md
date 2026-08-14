@@ -230,6 +230,23 @@ Camera control uses normal broker IPC. Frame payloads use a bounded shared-memor
 - Tokens are never logged.
 - Renderer processes do not receive broker credentials.
 
+When the executable receives a startup token by file path, it performs the blocking trust checks on
+a dedicated blocking worker and removes the file only after reading exactly 32 bytes. On Unix, the
+parent must be a real `0700` directory; the token must be a non-symlink regular file that is
+owner-readable, inaccessible to group/other, owned by the same owner as its parent, and have exactly
+one hard link. The executable opens with `O_NOFOLLOW`, retains the descriptor, and revalidates the
+parent and pathname device/inode/owner identities before deletion. On Windows, the parent and token
+must be non-reparse directory/file objects owned by the current process user. Their DACLs may grant
+effective access only to that user, LocalSystem, built-in administrators, or the Windows Owner Rights
+principal. The executable retains exclusive parent/file handles and revalidates handle security and
+path metadata before deletion. A failed length, type, ownership, ACL, or identity check leaves the
+path in place.
+
+Owned startup-token buffers in the executable, broker handshake, and Rust client are zeroized on
+drop; temporary client protobuf and encoded handshake buffers are also explicitly zeroized before
+the feasible socket handoff boundary. Copies held by the operating-system kernel, socket transport,
+or third-party codec internals cannot be guaranteed to be zeroized.
+
 ## 10. Observability
 
 The library emits structured tracing spans and metrics but never installs a subscriber. Required dimensions include adapter, transport kind, operation, normalized result, duration, queue depth, and retry count. Resource serial numbers and raw payloads are excluded from logs by default.

@@ -13,6 +13,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::RemoteSerialHandle;
 
@@ -25,7 +26,7 @@ const TASK_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_mil
 /// printable and this type does not implement `Debug`.
 pub struct ConnectionOptions {
     endpoint: PathBuf,
-    startup_token: [u8; 32],
+    startup_token: SecretToken,
     max_frame_bytes: usize,
     max_read_bytes: usize,
     max_write_bytes: usize,
@@ -34,11 +35,24 @@ pub struct ConnectionOptions {
     event_capacity: usize,
 }
 
+#[derive(Zeroize, ZeroizeOnDrop)]
+struct SecretToken([u8; 32]);
+
+impl SecretToken {
+    fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    fn expose(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
 impl ConnectionOptions {
     pub fn new(endpoint: impl Into<PathBuf>, startup_token: [u8; 32]) -> Self {
         Self {
             endpoint: endpoint.into(),
-            startup_token,
+            startup_token: SecretToken::new(startup_token),
             max_frame_bytes: MAX_FRAME_BYTES,
             max_read_bytes: DEFAULT_TRANSFER_BYTES,
             max_write_bytes: DEFAULT_TRANSFER_BYTES,
@@ -128,10 +142,9 @@ impl EventSubscription {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum ExpectedResponse {
-    Handshake,
     EnumerateSerial,
     OpenSerial,
-    SerialRead,
+    SerialRead { max_bytes: usize },
     SerialWrite,
     SerialFlush,
     SetControlLines,
@@ -150,6 +163,23 @@ struct RequestState {
     completed: HashSet<u64>,
     completed_order: VecDeque<u64>,
     terminal: Option<HalError>,
+}
+
+impl RequestState {
+    fn take_request_id(&mut self) -> HalResult<u64> {
+        let request_id = self.next_request_id;
+        if request_id == 0 {
+            return Err(client_error(
+                "runtime.protocol.request_id_exhausted",
+                ErrorCategory::Internal,
+                "runtime.client.request",
+                false,
+                "request ID space is exhausted",
+            ));
+        }
+        self.next_request_id = request_id.checked_add(1).unwrap_or(0);
+        Ok(request_id)
+    }
 }
 
 struct Outbound {
@@ -229,25 +259,28 @@ impl HalClient {
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let framed = Framed::new(io, frame_codec());
+        let requested = Limits {
+            frame: options.max_frame_bytes,
+            read: options.max_read_bytes,
+            write: options.max_write_bytes,
+        };
+        let mut framed = Framed::new(io, frame_codec(requested.frame));
+        let negotiated = perform_handshake(&mut framed, &options, requested).await?;
+        framed.codec_mut().set_max_frame_length(negotiated.frame);
         let (sink, stream) = framed.split();
         let (writer_tx, writer_rx) = mpsc::channel(options.writer_capacity);
         let (event_tx, _) = broadcast::channel(options.event_capacity);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let shared = Arc::new(Shared {
             requests: Mutex::new(RequestState {
-                next_request_id: 1,
+                next_request_id: 2,
                 pending: HashMap::with_capacity(options.pending_capacity),
                 cancelled: HashSet::with_capacity(options.pending_capacity),
-                completed: HashSet::with_capacity(options.pending_capacity),
-                completed_order: VecDeque::with_capacity(options.pending_capacity),
+                completed: HashSet::from([1]),
+                completed_order: VecDeque::from([1]),
                 terminal: None,
             }),
-            limits: Mutex::new(Limits {
-                frame: options.max_frame_bytes,
-                read: options.max_read_bytes,
-                write: options.max_write_bytes,
-            }),
+            limits: Mutex::new(negotiated),
             pending_capacity: options.pending_capacity,
             tombstone_capacity: options.pending_capacity,
             writer: writer_tx,
@@ -263,47 +296,12 @@ impl HalClient {
         ));
         let reader_shared = shared.clone();
         let reader = tokio::spawn(reader_task(stream, shutdown_rx, reader_shared));
-        let client = Self {
+        Ok(Self {
             inner: Arc::new(ClientInner {
                 shared,
                 tasks: Mutex::new(Some(ClientTasks { writer, reader })),
             }),
-        };
-
-        let requested = Limits {
-            frame: options.max_frame_bytes,
-            read: options.max_read_bytes,
-            write: options.max_write_bytes,
-        };
-        let response = client
-            .request(
-                envelope::Payload::HandshakeRequest(v1::HandshakeRequest {
-                    startup_token: options.startup_token.to_vec(),
-                    protocol_major: PROTOCOL_MAJOR,
-                    protocol_minor: PROTOCOL_MINOR,
-                    required_capabilities: vec![SERIAL_CAPABILITY.to_owned()],
-                    max_frame_bytes: requested.frame as u32,
-                    max_read_bytes: requested.read as u32,
-                    max_write_bytes: requested.write as u32,
-                }),
-                ExpectedResponse::Handshake,
-            )
-            .await?;
-        let envelope::Payload::HandshakeResponse(response) = response else {
-            unreachable!()
-        };
-        validate_handshake_response(&response, requested)?;
-        *client
-            .inner
-            .shared
-            .limits
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = Limits {
-            frame: response.max_frame_bytes as usize,
-            read: response.max_read_bytes as usize,
-            write: response.max_write_bytes as usize,
-        };
-        Ok(client)
+        })
     }
 
     pub async fn enumerate_serial(&self) -> HalResult<Vec<ResourceDescriptor>> {
@@ -419,17 +417,7 @@ impl HalClient {
                     "client pending request storage is full",
                 ));
             }
-            let request_id = state.next_request_id;
-            if request_id == 0 {
-                return Err(client_error(
-                    "runtime.protocol.request_id_exhausted",
-                    ErrorCategory::Internal,
-                    "runtime.client.request",
-                    false,
-                    "request ID space is exhausted",
-                ));
-            }
-            state.next_request_id = request_id.checked_add(1).unwrap_or(0);
+            let request_id = state.take_request_id()?;
             state.pending.insert(
                 request_id,
                 PendingRequest {
@@ -534,7 +522,7 @@ async fn writer_task<S>(
     S: futures_util::Sink<Bytes, Error = std::io::Error> + Unpin,
 {
     loop {
-        let outbound = tokio::select! {
+        let mut outbound = tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() { break; }
                 continue;
@@ -551,6 +539,7 @@ async fn writer_task<S>(
         }
         let mut encoded = BytesMut::with_capacity(encoded_len);
         if let Err(error) = outbound.envelope.encode(&mut encoded) {
+            zeroize_handshake(&mut outbound.envelope);
             terminate(
                 &shared,
                 client_error(
@@ -563,7 +552,12 @@ async fn writer_task<S>(
             );
             break;
         }
-        let send = sink.send(encoded.freeze());
+        let contains_secret = zeroize_handshake(&mut outbound.envelope);
+        let wire = Bytes::copy_from_slice(&encoded);
+        if contains_secret {
+            encoded.as_mut().zeroize();
+        }
+        let send = sink.send(wire);
         tokio::pin!(send);
         tokio::select! {
             changed = shutdown.changed() => {
@@ -579,6 +573,114 @@ async fn writer_task<S>(
                 }
             }
         }
+    }
+}
+
+fn zeroize_handshake(envelope: &mut v1::Envelope) -> bool {
+    if let Some(envelope::Payload::HandshakeRequest(request)) = envelope.payload.as_mut() {
+        request.startup_token.zeroize();
+        true
+    } else {
+        false
+    }
+}
+
+async fn perform_handshake<T>(
+    framed: &mut Framed<T, LengthDelimitedCodec>,
+    options: &ConnectionOptions,
+    requested: Limits,
+) -> HalResult<Limits>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut envelope = v1::Envelope {
+        request_id: 1,
+        payload: Some(envelope::Payload::HandshakeRequest(v1::HandshakeRequest {
+            startup_token: options.startup_token.expose().to_vec(),
+            protocol_major: PROTOCOL_MAJOR,
+            protocol_minor: PROTOCOL_MINOR,
+            required_capabilities: vec![SERIAL_CAPABILITY.to_owned()],
+            max_frame_bytes: requested.frame as u32,
+            max_read_bytes: requested.read as u32,
+            max_write_bytes: requested.write as u32,
+        })),
+    };
+    let encoded_len = envelope.encoded_len();
+    if encoded_len > requested.frame || encoded_len > MAX_FRAME_BYTES {
+        zeroize_handshake(&mut envelope);
+        return Err(frame_too_large(
+            "handshake envelope exceeds the offered frame limit",
+        ));
+    }
+    let mut encoded = BytesMut::with_capacity(encoded_len);
+    if let Err(error) = envelope.encode(&mut encoded) {
+        zeroize_handshake(&mut envelope);
+        return Err(client_error(
+            "runtime.protocol.encode_failed",
+            ErrorCategory::Internal,
+            "runtime.protocol.handshake",
+            false,
+            error.to_string(),
+        ));
+    }
+    zeroize_handshake(&mut envelope);
+    let wire = Bytes::copy_from_slice(&encoded);
+    encoded.as_mut().zeroize();
+    framed
+        .send(wire)
+        .await
+        .map_err(|error| disconnected_error("runtime.protocol.handshake", error.to_string()))?;
+
+    let frame = framed
+        .next()
+        .await
+        .ok_or_else(|| {
+            disconnected_error(
+                "runtime.protocol.handshake",
+                "broker closed before handshake response",
+            )
+        })?
+        .map_err(|error| frame_read_error("runtime.protocol.handshake", error))?;
+    if frame.len() > requested.frame || frame.len() > MAX_FRAME_BYTES {
+        return Err(frame_too_large(
+            "handshake response exceeds the offered frame limit",
+        ));
+    }
+    let response = v1::Envelope::decode(frame).map_err(|error| {
+        client_error(
+            "runtime.protocol.invalid_message",
+            ErrorCategory::InvalidArgument,
+            "runtime.protocol.handshake",
+            false,
+            error.to_string(),
+        )
+    })?;
+    if response.request_id != 1 {
+        return Err(client_error(
+            "runtime.protocol.unknown_response",
+            ErrorCategory::Conflict,
+            "runtime.protocol.handshake",
+            false,
+            "handshake response has an unknown request ID",
+        ));
+    }
+    match response.payload {
+        Some(envelope::Payload::HandshakeResponse(response)) => {
+            validate_handshake_response(&response, requested)?;
+            Ok(Limits {
+                frame: response.max_frame_bytes as usize,
+                read: response.max_read_bytes as usize,
+                write: response.max_write_bytes as usize,
+            })
+        }
+        Some(envelope::Payload::Error(error)) => Err(decode_error(error)?),
+        _ => Err(client_error(
+            "runtime.protocol.unexpected_response",
+            ErrorCategory::InvalidArgument,
+            "runtime.protocol.handshake",
+            false,
+            "broker returned a non-handshake response during negotiation",
+        )),
     }
 }
 
@@ -604,10 +706,7 @@ where
         let frame = match frame {
             Ok(frame) => frame,
             Err(error) => {
-                terminate(
-                    &shared,
-                    disconnected_error("runtime.protocol.read", error.to_string()),
-                );
+                terminate(&shared, frame_read_error("runtime.protocol.read", error));
                 return;
             }
         };
@@ -621,6 +720,10 @@ where
                 &shared,
                 frame_too_large("inbound frame exceeds the active frame limit"),
             );
+            return;
+        }
+        if let Err(error) = preflight_inbound(&frame, &shared) {
+            terminate(&shared, error);
             return;
         }
         let envelope = match v1::Envelope::decode(frame) {
@@ -758,20 +861,137 @@ where
     }
 }
 
+fn preflight_inbound(frame: &[u8], shared: &Shared) -> HalResult<()> {
+    let mut request_id = 0_u64;
+    visit_fields(frame, |field, wire| {
+        if let (1, WireValue::Varint(value)) = (field, wire) {
+            request_id = value;
+        }
+        Ok(())
+    })?;
+
+    let negotiated_read = shared
+        .limits
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .read;
+    let requested_read = shared
+        .requests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .pending
+        .get(&request_id)
+        .and_then(|pending| match pending.expected {
+            ExpectedResponse::SerialRead { max_bytes } => Some(max_bytes),
+            _ => None,
+        });
+    visit_fields(frame, |field, wire| {
+        if let (25, WireValue::Bytes(read_response)) = (field, wire) {
+            visit_fields(read_response, |field, wire| {
+                if let (1, WireValue::Bytes(data)) = (field, wire) {
+                    if data.len() > negotiated_read
+                        || requested_read.is_some_and(|max| data.len() > max)
+                    {
+                        return Err(frame_too_large(
+                            "serial read response exceeds the negotiated or requested byte limit",
+                        ));
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    })
+}
+
+#[derive(Clone, Copy)]
+enum WireValue<'a> {
+    Varint(u64),
+    Bytes(&'a [u8]),
+    Fixed,
+}
+
+fn visit_fields<'a>(
+    mut input: &'a [u8],
+    mut visitor: impl FnMut(u32, WireValue<'a>) -> HalResult<()>,
+) -> HalResult<()> {
+    while !input.is_empty() {
+        let (key, key_len) = read_varint(input)?;
+        input = &input[key_len..];
+        let field = u32::try_from(key >> 3).unwrap_or(u32::MAX);
+        if field == 0 {
+            return Err(invalid_wire("protobuf field number zero is invalid"));
+        }
+        match key & 0x07 {
+            0 => {
+                let (value, len) = read_varint(input)?;
+                input = &input[len..];
+                visitor(field, WireValue::Varint(value))?;
+            }
+            1 => {
+                input = input
+                    .get(8..)
+                    .ok_or_else(|| invalid_wire("truncated fixed64 protobuf field"))?;
+                visitor(field, WireValue::Fixed)?;
+            }
+            2 => {
+                let (len, prefix_len) = read_varint(input)?;
+                input = &input[prefix_len..];
+                let len = usize::try_from(len)
+                    .map_err(|_| invalid_wire("protobuf byte field length overflows usize"))?;
+                let bytes = input
+                    .get(..len)
+                    .ok_or_else(|| invalid_wire("truncated length-delimited protobuf field"))?;
+                input = &input[len..];
+                visitor(field, WireValue::Bytes(bytes))?;
+            }
+            5 => {
+                input = input
+                    .get(4..)
+                    .ok_or_else(|| invalid_wire("truncated fixed32 protobuf field"))?;
+                visitor(field, WireValue::Fixed)?;
+            }
+            _ => return Err(invalid_wire("unsupported protobuf wire type")),
+        }
+    }
+    Ok(())
+}
+
+fn read_varint(input: &[u8]) -> HalResult<(u64, usize)> {
+    let mut value = 0_u64;
+    for (index, byte) in input.iter().copied().take(10).enumerate() {
+        if index == 9 && byte > 1 {
+            return Err(invalid_wire("protobuf varint overflows u64"));
+        }
+        value |= u64::from(byte & 0x7f) << (index * 7);
+        if byte & 0x80 == 0 {
+            return Ok((value, index + 1));
+        }
+    }
+    Err(invalid_wire("truncated protobuf varint"))
+}
+
+fn invalid_wire(message: &'static str) -> HalError {
+    client_error(
+        "runtime.protocol.invalid_message",
+        ErrorCategory::InvalidArgument,
+        "runtime.protocol.decode",
+        false,
+        message,
+    )
+}
+
 fn response_matches(expected: ExpectedResponse, payload: &envelope::Payload) -> bool {
     matches!(
         (expected, payload),
         (
-            ExpectedResponse::Handshake,
-            envelope::Payload::HandshakeResponse(_)
-        ) | (
             ExpectedResponse::EnumerateSerial,
             envelope::Payload::EnumerateSerialResponse(_)
         ) | (
             ExpectedResponse::OpenSerial,
             envelope::Payload::OpenSerialResponse(_)
         ) | (
-            ExpectedResponse::SerialRead,
+            ExpectedResponse::SerialRead { .. },
             envelope::Payload::SerialReadResponse(_)
         ) | (
             ExpectedResponse::SerialWrite,
@@ -921,10 +1141,18 @@ fn decode_error(error: v1::Error) -> HalResult<HalError> {
     })
 }
 
-fn frame_codec() -> LengthDelimitedCodec {
+fn frame_codec(max_frame_bytes: usize) -> LengthDelimitedCodec {
     LengthDelimitedCodec::builder()
-        .max_frame_length(MAX_FRAME_BYTES)
+        .max_frame_length(max_frame_bytes.min(MAX_FRAME_BYTES))
         .new_codec()
+}
+
+fn frame_read_error(operation: &'static str, error: std::io::Error) -> HalError {
+    if error.kind() == std::io::ErrorKind::InvalidData {
+        frame_too_large("inbound frame length prefix exceeds the active limit")
+    } else {
+        disconnected_error(operation, error.to_string())
+    }
 }
 
 fn client_error(
@@ -966,4 +1194,38 @@ fn frame_too_large(message: &'static str) -> HalError {
         false,
         message,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    use zeroize::Zeroize;
+
+    use super::{RequestState, SecretToken};
+
+    #[test]
+    fn client_secret_zeroize_clears_owned_bytes() {
+        let mut token = SecretToken::new([0x5a; 32]);
+        token.zeroize();
+        assert_eq!(token.expose(), &[0; 32]);
+    }
+
+    #[test]
+    fn request_id_exhaustion_uses_last_nonzero_id_then_fails_closed() {
+        let mut state = RequestState {
+            next_request_id: u64::MAX,
+            pending: HashMap::new(),
+            cancelled: HashSet::new(),
+            completed: HashSet::new(),
+            completed_order: VecDeque::new(),
+            terminal: None,
+        };
+
+        assert_eq!(state.take_request_id().unwrap(), u64::MAX);
+        assert_eq!(
+            state.take_request_id().unwrap_err().name().as_str(),
+            "runtime.protocol.request_id_exhausted"
+        );
+    }
 }

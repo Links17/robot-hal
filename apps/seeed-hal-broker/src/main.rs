@@ -1,19 +1,24 @@
 #![forbid(unsafe_code)]
 
 mod manifest;
+mod token;
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, ValueEnum};
 use seeed_hal_adapter_serialport::SerialPortAdapter;
-use seeed_hal_broker::{Broker, StartupToken};
+use seeed_hal_broker::Broker;
 use seeed_hal_runtime::HalRuntime;
 use serde::Serialize;
-use tokio::io::AsyncReadExt;
 use tokio::task::JoinSet;
 
 const MAX_CONNECTIONS: usize = 64;
+
+#[derive(Default)]
+struct ServeMetrics {
+    max_retained_tasks: usize,
+}
 
 #[derive(Parser)]
 #[command(version, about = "Local hardware access broker")]
@@ -54,10 +59,8 @@ async fn main() -> std::process::ExitCode {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     if args.manifest {
-        println!(
-            "{}",
-            serde_json::to_string(&manifest::BrokerManifest::current())?
-        );
+        let manifest = tokio::task::spawn_blocking(manifest::BrokerManifest::current).await??;
+        println!("{}", serde_json::to_string(&manifest)?);
         return Ok(());
     }
 
@@ -66,11 +69,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let token_path = args
         .auth_token_file
         .expect("clap requires --auth-token-file");
-    let token = read_and_remove_token(&token_path).await?;
+    let token = token::read_and_remove_token(token_path).await?;
     let runtime = HalRuntime::builder()
         .serial_adapter(SerialPortAdapter::new())
         .build();
-    let broker = Broker::with_startup_token(runtime, StartupToken::from_bytes(token));
+    let broker = Broker::with_startup_token(runtime, token);
     serve(endpoint, broker).await?;
     Ok(())
 }
@@ -93,22 +96,6 @@ fn install_tracing(format: LogFormat) -> io::Result<()> {
     result.map_err(io::Error::other)
 }
 
-async fn read_and_remove_token(path: &Path) -> io::Result<[u8; 32]> {
-    let mut file = tokio::fs::OpenOptions::new().read(true).open(path).await?;
-    let mut token = [0_u8; 32];
-    file.read_exact(&mut token).await?;
-    let mut extra = [0_u8; 1];
-    if file.read(&mut extra).await? != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "authentication token file must contain exactly 32 bytes",
-        ));
-    }
-    drop(file);
-    tokio::fs::remove_file(path).await?;
-    Ok(token)
-}
-
 fn print_readiness(endpoint: &Path) -> Result<(), serde_json::Error> {
     let endpoint = endpoint.to_string_lossy();
     println!(
@@ -123,6 +110,26 @@ fn print_readiness(endpoint: &Path) -> Result<(), serde_json::Error> {
 
 #[cfg(unix)]
 async fn serve(endpoint: PathBuf, broker: Broker) -> Result<(), Box<dyn std::error::Error>> {
+    serve_unix_until(
+        endpoint,
+        broker,
+        async { tokio::signal::ctrl_c().await },
+        MAX_CONNECTIONS,
+    )
+    .await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn serve_unix_until<F>(
+    endpoint: PathBuf,
+    broker: Broker,
+    shutdown: F,
+    max_connections: usize,
+) -> Result<ServeMetrics, Box<dyn std::error::Error>>
+where
+    F: std::future::Future<Output = io::Result<()>>,
+{
     use std::os::unix::fs::PermissionsExt;
 
     let parent = endpoint.parent().ok_or_else(|| {
@@ -144,40 +151,71 @@ async fn serve(endpoint: PathBuf, broker: Broker) -> Result<(), Box<dyn std::err
     let cleanup = UnixSocketCleanup(endpoint.clone());
     print_readiness(&endpoint)?;
 
+    let (connection_shutdown, _) = tokio::sync::watch::channel(false);
     let mut connections = JoinSet::new();
-    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
-    loop {
+    let mut metrics = ServeMetrics::default();
+    tokio::pin!(shutdown);
+    let serve_result = loop {
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal?;
-                break;
+            signal = &mut shutdown => {
+                break signal;
             }
             accepted = listener.accept() => {
-                let (stream, _) = accepted?;
-                match permits.clone().try_acquire_owned() {
-                    Ok(permit) => {
-                        let broker = broker.clone();
-                        connections.spawn(async move {
-                            let outcome = broker.serve_connection(stream).await;
-                            drop(permit);
-                            outcome
-                        });
-                    }
-                    Err(_) => tracing::warn!("broker connection capacity reached"),
+                let (stream, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => break Err(error),
+                };
+                reap_finished(&mut connections);
+                if connections.len() >= max_connections {
+                    tracing::warn!("broker connection capacity reached");
+                    continue;
                 }
+                let broker = broker.clone();
+                let mut shutdown = connection_shutdown.subscribe();
+                connections.spawn(async move {
+                    broker
+                        .serve_connection_until(stream, async move {
+                            wait_for_shutdown(&mut shutdown).await;
+                        })
+                        .await
+                });
+                metrics.max_retained_tasks = metrics.max_retained_tasks.max(connections.len());
             }
             Some(joined) = connections.join_next(), if !connections.is_empty() => {
-                if let Err(error) = joined {
-                    tracing::warn!(%error, "broker connection task failed");
-                }
+                log_connection_result(joined);
             }
         }
-    }
+    };
     drop(listener);
-    connections.abort_all();
-    while connections.join_next().await.is_some() {}
+    connection_shutdown.send_replace(true);
+    while let Some(joined) = connections.join_next().await {
+        log_connection_result(joined);
+    }
     drop(cleanup);
-    Ok(())
+    serve_result?;
+    Ok(metrics)
+}
+
+async fn wait_for_shutdown(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+fn reap_finished(connections: &mut JoinSet<seeed_hal_broker::ConnectionOutcome>) {
+    while let Some(joined) = connections.try_join_next() {
+        log_connection_result(joined);
+    }
+}
+
+fn log_connection_result(
+    result: Result<seeed_hal_broker::ConnectionOutcome, tokio::task::JoinError>,
+) {
+    if let Err(error) = result {
+        tracing::warn!(%error, "broker connection task failed");
+    }
 }
 
 #[cfg(unix)]
@@ -192,6 +230,26 @@ impl Drop for UnixSocketCleanup {
 
 #[cfg(windows)]
 async fn serve(endpoint: PathBuf, broker: Broker) -> Result<(), Box<dyn std::error::Error>> {
+    serve_windows_until(
+        endpoint,
+        broker,
+        async { tokio::signal::ctrl_c().await },
+        MAX_CONNECTIONS,
+    )
+    .await?;
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn serve_windows_until<F>(
+    endpoint: PathBuf,
+    broker: Broker,
+    shutdown: F,
+    max_connections: usize,
+) -> Result<ServeMetrics, Box<dyn std::error::Error>>
+where
+    F: std::future::Future<Output = io::Result<()>>,
+{
     let endpoint = endpoint.to_str().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -200,40 +258,51 @@ async fn serve(endpoint: PathBuf, broker: Broker) -> Result<(), Box<dyn std::err
     })?;
     let mut server = named_pipe_server(endpoint, true)?;
     print_readiness(Path::new(endpoint))?;
+    let (connection_shutdown, _) = tokio::sync::watch::channel(false);
     let mut connections = JoinSet::new();
-    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
-    loop {
+    let mut metrics = ServeMetrics::default();
+    tokio::pin!(shutdown);
+    let serve_result = loop {
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal?;
-                break;
+            signal = &mut shutdown => {
+                break signal;
             }
             connected = server.connect() => {
-                connected?;
-                let next = named_pipe_server(endpoint, false)?;
-                let stream = std::mem::replace(&mut server, next);
-                match permits.clone().try_acquire_owned() {
-                    Ok(permit) => {
-                        let broker = broker.clone();
-                        connections.spawn(async move {
-                            let outcome = broker.serve_connection(stream).await;
-                            drop(permit);
-                            outcome
-                        });
-                    }
-                    Err(_) => tracing::warn!("broker connection capacity reached"),
+                if let Err(error) = connected {
+                    break Err(error);
                 }
+                let next = match named_pipe_server(endpoint, false) {
+                    Ok(next) => next,
+                    Err(error) => break Err(error),
+                };
+                let stream = std::mem::replace(&mut server, next);
+                reap_finished(&mut connections);
+                if connections.len() >= max_connections {
+                    tracing::warn!("broker connection capacity reached");
+                    continue;
+                }
+                let broker = broker.clone();
+                let mut shutdown = connection_shutdown.subscribe();
+                connections.spawn(async move {
+                    broker
+                        .serve_connection_until(stream, async move {
+                            wait_for_shutdown(&mut shutdown).await;
+                        })
+                        .await
+                });
+                metrics.max_retained_tasks = metrics.max_retained_tasks.max(connections.len());
             }
             Some(joined) = connections.join_next(), if !connections.is_empty() => {
-                if let Err(error) = joined {
-                    tracing::warn!(%error, "broker connection task failed");
-                }
+                log_connection_result(joined);
             }
         }
+    };
+    connection_shutdown.send_replace(true);
+    while let Some(joined) = connections.join_next().await {
+        log_connection_result(joined);
     }
-    connections.abort_all();
-    while connections.join_next().await.is_some() {}
-    Ok(())
+    serve_result?;
+    Ok(metrics)
 }
 
 #[cfg(windows)]
@@ -247,31 +316,348 @@ fn named_pipe_server(
     options.create(endpoint)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::token::read_and_remove_token;
+    use seeed_hal_broker::StartupToken;
 
-    #[tokio::test]
-    async fn exact_token_is_read_then_only_that_file_is_removed() {
-        let path =
-            std::env::temp_dir().join(format!("seeed-hal-broker-token-{}", std::process::id()));
-        tokio::fs::write(&path, [0x33_u8; 32]).await.unwrap();
+    #[cfg(unix)]
+    fn private_token_path(label: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
 
-        assert_eq!(read_and_remove_token(&path).await.unwrap(), [0x33_u8; 32]);
-        assert!(!path.exists());
-    }
-
-    #[tokio::test]
-    async fn invalid_token_length_is_rejected_without_deleting_the_file() {
-        let path = std::env::temp_dir().join(format!(
-            "seeed-hal-broker-invalid-token-{}",
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "seeed-hal-token-{label}-{}-{nonce}",
             std::process::id()
         ));
-        tokio::fs::write(&path, [0x44_u8; 33]).await.unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("token");
+        (directory, path)
+    }
 
-        let error = read_and_remove_token(&path).await.unwrap_err();
+    #[cfg(unix)]
+    async fn write_private_token(path: &Path, bytes: &[u8]) {
+        use std::os::unix::fs::PermissionsExt;
+
+        tokio::fs::write(path, bytes).await.unwrap();
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_token_is_read_then_only_that_file_is_removed() {
+        let (directory, path) = private_token_path("exact");
+        write_private_token(&path, &[0x33_u8; 32]).await;
+
+        assert_eq!(
+            read_and_remove_token(path.clone())
+                .await
+                .unwrap()
+                .expose_bytes(),
+            &[0x33_u8; 32]
+        );
+        assert!(!path.exists());
+        tokio::fs::remove_dir(directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invalid_token_length_is_rejected_without_deleting_the_file() {
+        let (directory, path) = private_token_path("invalid-length");
+        write_private_token(&path, &[0x44_u8; 33]).await;
+
+        let error = read_and_remove_token(path.clone())
+            .await
+            .err()
+            .expect("invalid token length must fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(path.exists());
         tokio::fs::remove_file(path).await.unwrap();
+        tokio::fs::remove_dir(directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn token_symlink_is_rejected_without_deleting_target() {
+        use std::os::unix::fs::symlink;
+
+        let (directory, path) = private_token_path("symlink");
+        let target = directory.join("target");
+        write_private_token(&target, &[0x55_u8; 32]).await;
+        symlink(&target, &path).unwrap();
+
+        assert_eq!(
+            read_and_remove_token(path.clone())
+                .await
+                .err()
+                .expect("symlink token must fail")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(path.is_symlink());
+        assert!(target.exists());
+        tokio::fs::remove_file(path).await.unwrap();
+        tokio::fs::remove_file(target).await.unwrap();
+        tokio::fs::remove_dir(directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publicly_readable_token_file_is_rejected_without_deletion() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (directory, path) = private_token_path("public-file");
+        tokio::fs::write(&path, [0x66_u8; 32]).await.unwrap();
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read_and_remove_token(path.clone())
+                .await
+                .err()
+                .expect("public token mode must fail")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(path.exists());
+        tokio::fs::remove_file(path).await.unwrap();
+        tokio::fs::remove_dir(directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn token_in_public_parent_directory_is_rejected_without_deletion() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (directory, path) = private_token_path("public-parent");
+        write_private_token(&path, &[0x77_u8; 32]).await;
+        tokio::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read_and_remove_token(path.clone())
+                .await
+                .err()
+                .expect("public token parent must fail")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(path.exists());
+        tokio::fs::remove_file(path).await.unwrap();
+        tokio::fs::remove_dir(directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_shutdown_revokes_open_owner_before_returning() {
+        use seeed_hal_client::{ConnectionOptions, HalClient};
+        use seeed_hal_core::OwnerId;
+        use seeed_hal_runtime::RuntimeEventKind;
+        use seeed_hal_serial::SerialConfig;
+        use seeed_hal_testkit::VirtualSerialAdapter;
+        use std::os::unix::fs::PermissionsExt;
+
+        const TOKEN: [u8; 32] = [0x91; 32];
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = PathBuf::from(format!("/tmp/shapp-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let endpoint = directory.join("broker.sock");
+        let runtime = HalRuntime::builder()
+            .serial_adapter(VirtualSerialAdapter::loopback("serial:virtual:shutdown"))
+            .build();
+        let mut events = runtime.subscribe();
+        let broker = Broker::with_startup_token(runtime.clone(), StartupToken::from_bytes(TOKEN));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_endpoint = endpoint.clone();
+        let server = tokio::spawn(async move {
+            serve_unix_until(
+                server_endpoint,
+                broker,
+                async move {
+                    shutdown_rx.await.map_err(io::Error::other)?;
+                    Ok(())
+                },
+                2,
+            )
+            .await
+            .unwrap()
+        });
+        while !endpoint.exists() {
+            tokio::task::yield_now().await;
+        }
+
+        let client = HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN))
+            .await
+            .unwrap();
+        let descriptor = client.enumerate_serial().await.unwrap().remove(0);
+        let _serial = client
+            .open_serial(descriptor.selector(), SerialConfig::default())
+            .await
+            .unwrap();
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .expect("cooperative shutdown must complete")
+            .unwrap();
+
+        let mut saw_close = false;
+        for _ in 0..2 {
+            let event = events.recv().await.unwrap();
+            if event.kind() == RuntimeEventKind::SessionClosed {
+                saw_close = true;
+            }
+        }
+        assert!(saw_close, "shutdown must publish session closure");
+        runtime
+            .open_serial(
+                OwnerId::parse("app-test:reuse-after-shutdown").unwrap(),
+                descriptor.selector(),
+                SerialConfig::default(),
+            )
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+        client.close().await.unwrap();
+        tokio::fs::remove_dir(directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_shutdown_error_still_revokes_open_owner_before_returning() {
+        use seeed_hal_client::{ConnectionOptions, HalClient};
+        use seeed_hal_core::OwnerId;
+        use seeed_hal_serial::SerialConfig;
+        use seeed_hal_testkit::VirtualSerialAdapter;
+        use std::os::unix::fs::PermissionsExt;
+
+        const TOKEN: [u8; 32] = [0x93; 32];
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = PathBuf::from(format!("/tmp/sherr-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let endpoint = directory.join("broker.sock");
+        let runtime = HalRuntime::builder()
+            .serial_adapter(VirtualSerialAdapter::loopback(
+                "serial:virtual:shutdown-error",
+            ))
+            .build();
+        let broker = Broker::with_startup_token(runtime.clone(), StartupToken::from_bytes(TOKEN));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_endpoint = endpoint.clone();
+        let server = tokio::spawn(async move {
+            serve_unix_until(
+                server_endpoint,
+                broker,
+                async move {
+                    shutdown_rx.await.map_err(io::Error::other)?;
+                    Err(io::Error::other("test shutdown failure"))
+                },
+                2,
+            )
+            .await
+            .is_err()
+        });
+        while !endpoint.exists() {
+            tokio::task::yield_now().await;
+        }
+
+        let client = HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN))
+            .await
+            .unwrap();
+        let descriptor = client.enumerate_serial().await.unwrap().remove(0);
+        let _serial = client
+            .open_serial(descriptor.selector(), SerialConfig::default())
+            .await
+            .unwrap();
+        shutdown_tx.send(()).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .expect("failed shutdown must still complete cleanup")
+            .unwrap();
+        assert!(result);
+
+        runtime
+            .open_serial(
+                OwnerId::parse("app-test:reuse-after-shutdown-error").unwrap(),
+                descriptor.selector(),
+                SerialConfig::default(),
+            )
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+        client.close().await.unwrap();
+        tokio::fs::remove_dir(directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_connection_churn_keeps_retained_tasks_bounded() {
+        use seeed_hal_testkit::VirtualSerialAdapter;
+        use std::os::unix::fs::PermissionsExt;
+
+        const TOKEN: [u8; 32] = [0x92; 32];
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = PathBuf::from(format!("/tmp/shchurn-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let endpoint = directory.join("broker.sock");
+        let runtime = HalRuntime::builder()
+            .serial_adapter(VirtualSerialAdapter::loopback("serial:virtual:churn"))
+            .build();
+        let broker = Broker::with_startup_token(runtime, StartupToken::from_bytes(TOKEN));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_endpoint = endpoint.clone();
+        let server = tokio::spawn(async move {
+            serve_unix_until(
+                server_endpoint,
+                broker,
+                async move {
+                    shutdown_rx.await.map_err(io::Error::other)?;
+                    Ok(())
+                },
+                2,
+            )
+            .await
+            .unwrap()
+        });
+        while !endpoint.exists() {
+            tokio::task::yield_now().await;
+        }
+
+        for _ in 0..20 {
+            let stream = tokio::net::UnixStream::connect(&endpoint).await.unwrap();
+            drop(stream);
+            tokio::task::yield_now().await;
+        }
+        shutdown_tx.send(()).unwrap();
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .expect("bounded churn shutdown must complete")
+            .unwrap();
+        assert!(metrics.max_retained_tasks <= 2);
+        tokio::fs::remove_dir(directory).await.unwrap();
     }
 }

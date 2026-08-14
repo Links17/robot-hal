@@ -42,3 +42,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 windows-sys = "0.61"
+windows-permissions = "0.2.4"
+zeroize = { version = "1", features = ["derive"] }

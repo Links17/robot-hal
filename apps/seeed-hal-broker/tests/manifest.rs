@@ -1,5 +1,7 @@
 use std::process::Command;
 
+use sha2::{Digest, Sha256};
+
 #[test]
 fn manifest_is_deterministic_business_independent_and_hardware_free() {
     let token_path = std::env::temp_dir().join(format!(
@@ -33,10 +35,22 @@ fn manifest_is_deterministic_business_independent_and_hardware_free() {
     assert_eq!(manifest["wire"]["major"], 1);
     assert_eq!(manifest["wire"]["minimum_minor"], 0);
     assert_eq!(manifest["wire"]["maximum_minor"], 0);
-    assert_eq!(manifest["target"], env!("SEEED_HAL_TARGET"));
+    assert_eq!(manifest["target"]["triple"], env!("SEEED_HAL_TARGET"));
+    assert_eq!(manifest["target"]["os"], std::env::consts::OS);
+    assert_eq!(manifest["target"]["arch"], std::env::consts::ARCH);
     assert_eq!(
-        manifest["enabled_adapters"],
+        manifest["enabled"]["adapters"],
         serde_json::json!(["serialport"])
+    );
+    assert_eq!(manifest["enabled"]["features"], serde_json::json!([]));
+    assert_eq!(manifest["msrv"], "1.85");
+    assert_eq!(manifest["artifact_checksum"]["algorithm"], "sha256");
+    let executable = std::fs::read(env!("CARGO_BIN_EXE_seeed-hal-broker")).unwrap();
+    let expected_checksum = format!("{:x}", Sha256::digest(executable));
+    assert_eq!(manifest["artifact_checksum"]["value"], expected_checksum);
+    assert_eq!(
+        manifest["required_vendor_runtime_libraries"],
+        serde_json::json!([])
     );
 
     let lower = stdout.to_ascii_lowercase();

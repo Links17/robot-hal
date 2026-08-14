@@ -47,7 +47,7 @@ impl RemoteSerialHandle {
                     lease: Some((&self.lease).into()),
                     max_bytes: max_bytes as u32,
                 }),
-                ExpectedResponse::SerialRead,
+                ExpectedResponse::SerialRead { max_bytes },
             )
             .await?;
         let envelope::Payload::SerialReadResponse(response) = payload else {

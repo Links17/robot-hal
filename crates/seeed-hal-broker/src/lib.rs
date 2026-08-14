@@ -4,11 +4,12 @@ mod connection;
 pub mod listener;
 
 use std::io;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub use connection::{BrokerConfig, ConnectionOutcome};
 use seeed_hal_runtime::HalRuntime;
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, Zeroize, ZeroizeOnDrop)]
 pub struct StartupToken([u8; 32]);
 
 impl StartupToken {
@@ -63,5 +64,19 @@ impl Broker {
 
     pub fn startup_token(&self) -> &StartupToken {
         &self.startup_token
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use zeroize::Zeroize;
+
+    use super::StartupToken;
+
+    #[test]
+    fn startup_token_zeroize_clears_owned_bytes() {
+        let mut token = StartupToken::from_bytes([0xa5; 32]);
+        token.zeroize();
+        assert_eq!(token.expose_bytes(), &[0; 32]);
     }
 }

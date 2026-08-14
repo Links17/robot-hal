@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,6 +20,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{Broker, StartupToken};
 
@@ -105,6 +107,18 @@ impl Broker {
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        self.serve_connection_until(io, std::future::pending())
+            .await
+    }
+
+    /// Serves one connection until the peer disconnects or `shutdown`
+    /// completes. Cooperative shutdown always reaches owner revocation before
+    /// this future returns.
+    pub async fn serve_connection_until<T, F>(&self, io: T, shutdown: F) -> ConnectionOutcome
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        F: Future<Output = ()>,
+    {
         let owner = OwnerId::parse(format!("broker:connection:{}", Uuid::new_v4()))
             .expect("generated broker owner identifier is valid");
         let framed = Framed::new(io, frame_codec());
@@ -132,7 +146,7 @@ impl Broker {
             result
         });
 
-        let dispatch_error = dispatch_requests(
+        let mut dispatch = Box::pin(dispatch_requests(
             self.runtime.clone(),
             self.startup_token.clone(),
             self.config.clone(),
@@ -142,8 +156,13 @@ impl Broker {
             active,
             frame_limit_tx,
             cancel_rx,
-        )
-        .await;
+        ));
+        let mut shutdown = Box::pin(shutdown);
+        let dispatch_error = tokio::select! {
+            result = dispatch.as_mut() => result,
+            () = shutdown.as_mut() => None,
+        };
+        drop(dispatch);
 
         let cleanup_error = self.runtime.revoke_owner(&owner).await.err();
         let _ = cancel_tx.send(true);
@@ -188,7 +207,7 @@ where
         let Some(frame) = frame else {
             return Ok(());
         };
-        let frame = frame.map_err(|error| {
+        let mut frame = frame.map_err(|error| {
             protocol_error(
                 "runtime.protocol.frame_invalid",
                 "runtime.protocol.read",
@@ -203,7 +222,7 @@ where
                 "inbound frame exceeds the active connection maximum",
             ));
         }
-        let request = v1::Envelope::decode(frame).map_err(|error| {
+        let request = v1::Envelope::decode(frame.as_ref()).map_err(|error| {
             protocol_error(
                 "runtime.protocol.invalid_message",
                 "runtime.protocol.decode",
@@ -212,6 +231,13 @@ where
                 error.to_string(),
             )
         })?;
+        let is_handshake = matches!(
+            request.payload,
+            Some(envelope::Payload::HandshakeRequest(_))
+        );
+        if is_handshake {
+            frame.as_mut().zeroize();
+        }
         let request_id = request.request_id;
         if request_id == 0 {
             send_response(
@@ -246,10 +272,6 @@ where
             return Ok(());
         }
 
-        let is_handshake = matches!(
-            request.payload,
-            Some(envelope::Payload::HandshakeRequest(_))
-        );
         match request_tx.try_send(InboundRequest {
             envelope: request,
             encoded_len,
@@ -539,12 +561,12 @@ fn event_is_visible_to_owner(event: &RuntimeEvent, owner: &OwnerId) -> bool {
 
 fn validate_handshake(
     expected_token: &StartupToken,
-    request: v1::HandshakeRequest,
+    mut request: v1::HandshakeRequest,
 ) -> HalResult<(v1::HandshakeResponse, NegotiatedLimits)> {
-    let token_matches = request.startup_token.len() == expected_token.expose_bytes().len()
+    let presented_token = Zeroizing::new(std::mem::take(&mut request.startup_token));
+    let token_matches = presented_token.len() == expected_token.expose_bytes().len()
         && bool::from(
-            request
-                .startup_token
+            presented_token
                 .as_slice()
                 .ct_eq(expected_token.expose_bytes().as_slice()),
         );
