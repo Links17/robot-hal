@@ -33,3 +33,6 @@ tokio-util = { version = "0.7", features = ["codec"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+
+[workspace.dependencies.libc]
+version = "0.2"

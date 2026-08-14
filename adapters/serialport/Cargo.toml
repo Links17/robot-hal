@@ -18,5 +18,8 @@ serialport = { workspace = true }
 tokio = { workspace = true }
 tokio-serial = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 seeed-hal-testkit = { path = "../../crates/seeed-hal-testkit" }

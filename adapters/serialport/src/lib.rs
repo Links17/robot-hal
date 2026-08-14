@@ -11,6 +11,7 @@ use seeed_hal_core::{
 use seeed_hal_serial::{SerialAdapter, SerialConfig, SerialSession};
 use serialport::{SerialPortInfo, SerialPortType};
 use std::collections::BTreeMap;
+use std::io;
 
 use crate::identity::{SerialIdentity, UsbPortMetadata, identity_from_endpoint};
 use crate::session::NativeSerialSession;
@@ -173,6 +174,93 @@ pub(crate) fn map_serialport_error(operation: &'static str, error: serialport::E
     )
 }
 
+pub(crate) fn map_serialport_open_error(
+    operation: &'static str,
+    endpoint: &str,
+    error: serialport::Error,
+    native_error: Option<io::Error>,
+) -> HalError {
+    let description = error.to_string();
+    let native_raw_os_error = native_error.as_ref().and_then(|error| error.raw_os_error());
+    let inferred_raw_os_error = raw_os_error_from_serialport_no_device(&description);
+    let raw_os_error = native_raw_os_error
+        .or(inferred_raw_os_error)
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "none".to_owned());
+
+    let (name, category, retryable) = match error.kind() {
+        serialport::ErrorKind::NoDevice => no_device_decision(operation, &description),
+        serialport::ErrorKind::InvalidInput => (
+            "runtime.transport.unsupported_configuration",
+            ErrorCategory::InvalidArgument,
+            false,
+        ),
+        serialport::ErrorKind::Io(kind) => native_error
+            .as_ref()
+            .map(|error| io_error_decision(error.kind()))
+            .unwrap_or_else(|| io_error_decision(kind)),
+        serialport::ErrorKind::Unknown => (
+            "runtime.transport.disconnected",
+            ErrorCategory::Unavailable,
+            true,
+        ),
+    };
+
+    let native_probe = native_error
+        .as_ref()
+        .map(|error| format!("native_open_error kind={:?}: {}", error.kind(), error))
+        .unwrap_or_else(|| "native_open_error=none".to_owned());
+
+    hal_error(
+        name,
+        category,
+        operation,
+        retryable,
+        format!(
+            "endpoint={endpoint}; serialport error kind={:?}: {}; {native_probe}; raw_os_error={raw_os_error}",
+            error.kind(),
+            description
+        ),
+    )
+}
+
+pub(crate) fn capture_native_open_error(endpoint: &str) -> Option<io::Error> {
+    native_open_probe(endpoint).err()
+}
+
+#[cfg(unix)]
+fn native_open_probe(endpoint: &str) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(endpoint)
+}
+
+#[cfg(windows)]
+fn native_open_probe(endpoint: &str) -> io::Result<std::fs::File> {
+    let path = if endpoint.starts_with(r"\\") {
+        endpoint.to_owned()
+    } else {
+        format!(r"\\.\{endpoint}")
+    };
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn native_open_probe(endpoint: &str) -> io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(endpoint)
+}
+
 pub(crate) fn map_io_error(operation: &'static str, error: std::io::Error) -> HalError {
     let (name, category, retryable) = io_error_decision(error.kind());
     let raw_os_error = error
@@ -191,6 +279,35 @@ pub(crate) fn map_io_error(operation: &'static str, error: std::io::Error) -> Ha
             error
         ),
     )
+}
+
+fn raw_os_error_from_serialport_no_device(description: &str) -> Option<i32> {
+    let normalized = description.to_ascii_lowercase();
+
+    if normalized.contains("busy") || normalized.contains("lock") {
+        return platform_busy_code();
+    }
+
+    if normalized.contains("access is denied") {
+        return Some(5);
+    }
+
+    None
+}
+
+#[cfg(unix)]
+fn platform_busy_code() -> Option<i32> {
+    Some(libc::EBUSY)
+}
+
+#[cfg(windows)]
+fn platform_busy_code() -> Option<i32> {
+    Some(170)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn platform_busy_code() -> Option<i32> {
+    None
 }
 
 fn no_device_decision(
@@ -385,5 +502,42 @@ mod tests {
         let error = map_io_error("serial.open", io_error);
 
         assert!(error.debug_message().contains("raw_os_error=13"));
+    }
+
+    #[test]
+    fn open_error_diagnostics_include_native_probe_raw_os_error_code() {
+        let serialport_error =
+            serialport::Error::new(serialport::ErrorKind::NoDevice, "No such file or directory");
+        let native_error = io::Error::from_raw_os_error(2);
+
+        let error = map_serialport_open_error(
+            "serial.open",
+            "/dev/definitely-missing",
+            serialport_error,
+            Some(native_error),
+        );
+
+        assert_eq!(error.name().as_str(), "runtime.resource.not_found");
+        assert!(error.debug_message().contains("raw_os_error=2"));
+        assert!(!error.debug_message().contains("raw_os_error=unavailable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_busy_error_without_probe_has_platform_busy_code() {
+        let serialport_error = serialport::Error::new(
+            serialport::ErrorKind::NoDevice,
+            "Unable to acquire exclusive lock on serial port",
+        );
+
+        let error =
+            map_serialport_open_error("serial.open", "/dev/ttyUSB0", serialport_error, None);
+
+        assert_eq!(error.name().as_str(), "runtime.transport.busy");
+        assert!(
+            error
+                .debug_message()
+                .contains(&format!("raw_os_error={}", libc::EBUSY))
+        );
     }
 }

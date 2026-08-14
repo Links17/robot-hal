@@ -100,3 +100,43 @@ Output summary: metadata tests passed `5/5`; adapter unit tests passed `7/7`; pa
 - Serial `flush()` and `close()` avoid Tokio `poll_flush`/`shutdown`; they move the stream through an explicitly owned `spawn_blocking` drain worker so Unix `tcdrain()` cannot block a Tokio executor worker.
 - `read(0)` now returns `runtime.session.closed` after close.
 - Hardware loopback read retries timeout results until the overall deadline.
+
+## Fix Round 2
+
+### Files changed
+
+- `Cargo.toml`
+- `Cargo.lock`
+- `adapters/serialport/Cargo.toml`
+- `adapters/serialport/src/lib.rs`
+- `adapters/serialport/src/session.rs`
+- `.superpowers/sdd/2026-08-14-v0.1-core-serial/task-5-report.md`
+
+### RED evidence
+
+```bash
+cargo test -p seeed-hal-adapter-serialport --lib
+```
+
+Output summary: failed as expected before implementation. The focused tests referenced missing round-2 seams and behavior: `SessionState`, `DrainTask`, `DrainStrategy`, `map_serialport_open_error`, and the Unix `libc` raw OS error dependency were not yet present.
+
+### GREEN evidence
+
+```bash
+cargo test -p seeed-hal-adapter-serialport --lib
+cargo test -p seeed-hal-adapter-serialport --test metadata
+cargo test -p seeed-hal-adapter-serialport
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+```
+
+Output summary: adapter unit tests passed `12/12`; metadata tests passed; package tests passed with the physical loopback test ignored; fmt passed; clippy passed with `-D warnings`; workspace tests passed with the physical loopback test ignored.
+
+### Fixes
+
+- Serial session ownership now uses explicit `Ready`, `Draining`, `Closing`, and `Closed` states instead of dropping the stream while a drain/close future is cancellable.
+- `flush()` and `close()` move the stream into a tracked blocking drain task before awaiting it; if the future is dropped, a later operation awaits the same task and either restores readiness or reaches a terminal closed state.
+- Drain worker join failures now close the session deterministically and report `runtime.internal`.
+- `serial.open` error mapping now preserves native open diagnostics when available, including `raw_os_error=<code>`.
+- Serialport `NoDevice` messages that discard platform details now infer stable raw busy/access-denied codes where possible (`EBUSY` on Unix, Windows `5`/`170`).
