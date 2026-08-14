@@ -161,6 +161,7 @@ dependencies = [
 name = "seeed-hal-runtime"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "seeed-hal-core",
  "seeed-hal-serial",

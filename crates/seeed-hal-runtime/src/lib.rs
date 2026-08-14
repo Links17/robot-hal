@@ -6,6 +6,7 @@ mod registry;
 mod serial_actor;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 pub use events::{EventSubscription, RuntimeEvent, RuntimeEventKind};
@@ -19,9 +20,18 @@ use serial_actor::{ActorMetadata, SerialCommand, spawn_serial_actor};
 use tokio::sync::{Mutex, oneshot, watch};
 use uuid::Uuid;
 
-#[derive(Default)]
 pub struct HalRuntimeBuilder {
     serial_adapter: Option<Arc<dyn SerialAdapter>>,
+    serial_close_timeout: Duration,
+}
+
+impl Default for HalRuntimeBuilder {
+    fn default() -> Self {
+        Self {
+            serial_adapter: None,
+            serial_close_timeout: Duration::from_secs(2),
+        }
+    }
 }
 
 impl HalRuntimeBuilder {
@@ -33,12 +43,23 @@ impl HalRuntimeBuilder {
         self
     }
 
+    /// Sets the deadline for adapter-level Serial cleanup.
+    ///
+    /// The default is two seconds. If an adapter does not finish `close()` by
+    /// the deadline, the runtime drops the actor-owned session, releases its
+    /// lease, and reports `runtime.session.close_timeout`.
+    pub fn serial_close_timeout(mut self, timeout: Duration) -> Self {
+        self.serial_close_timeout = timeout;
+        self
+    }
+
     pub fn build(self) -> HalRuntime {
         HalRuntime {
             inner: Arc::new(RuntimeInner {
                 serial_adapter: self.serial_adapter,
                 registry: Arc::new(Mutex::new(Registry::default())),
                 events: events::EventPublisher::new(),
+                serial_close_timeout: self.serial_close_timeout,
             }),
         }
     }
@@ -48,6 +69,7 @@ struct RuntimeInner {
     serial_adapter: Option<Arc<dyn SerialAdapter>>,
     registry: Arc<Mutex<Registry>>,
     events: events::EventPublisher,
+    serial_close_timeout: Duration,
 }
 
 #[derive(Clone)]
@@ -73,22 +95,36 @@ impl HalRuntime {
         let adapter = self.serial_adapter("serial.open")?;
         let session_id = SessionId::parse(Uuid::new_v4().to_string())?;
         let resource_id = selector.id().clone();
-        let lease = self.inner.registry.lock().await.reserve_open(
+        let reservation = self.inner.registry.lock().await.reserve_open(
             resource_id.clone(),
             session_id.clone(),
             owner.clone(),
         )?;
+        let lease = reservation.lease;
+        let mut pending_open = PendingOpen::new(self.inner.registry.clone(), session_id.clone());
 
-        let session = match adapter.open(&selector, config).await {
+        let session_result = tokio::select! {
+            result = adapter.open(&selector, config) => result,
+            _ = wait_until_cancelled(reservation.cancellation) => Err(runtime_error(
+                "runtime.session.closed",
+                ErrorCategory::Conflict,
+                "serial.open",
+                false,
+                "the owner was revoked while the serial resource was opening",
+            )),
+        };
+        let session = match session_result {
             Ok(session) => session,
             Err(error) => {
                 self.inner.registry.lock().await.cancel_open(&session_id);
+                pending_open.disarm();
                 return Err(error);
             }
         };
 
         let metadata = ActorMetadata {
             session_id: session_id.clone(),
+            close_timeout: self.inner.serial_close_timeout,
         };
         let actor = spawn_serial_actor(
             session,
@@ -101,6 +137,7 @@ impl HalRuntime {
             actor.clone(),
             &self.inner.events,
         );
+        pending_open.disarm();
         if !accepted {
             actor.request_close();
             let _ = actor.wait_closed().await;
@@ -164,6 +201,13 @@ impl HalRuntime {
         .await
     }
 
+    /// Closes a Serial session after authenticating its session ID and lease.
+    ///
+    /// Close replay is idempotent for the 256 most recently closed sessions
+    /// in this runtime, provided the caller supplies the exact original
+    /// session ID and lease token. Closing a 257th newer session evicts the
+    /// oldest replay entry; a later replay for that entry returns
+    /// `runtime.session.not_found`.
     pub async fn close_serial(&self, session_id: SessionId, lease: &LeaseToken) -> HalResult<()> {
         let action = {
             let mut registry = self.inner.registry.lock().await;
@@ -249,6 +293,45 @@ impl HalRuntime {
     }
 }
 
+struct PendingOpen {
+    registry: Arc<Mutex<Registry>>,
+    session_id: SessionId,
+    armed: bool,
+}
+
+impl PendingOpen {
+    fn new(registry: Arc<Mutex<Registry>>, session_id: SessionId) -> Self {
+        Self {
+            registry,
+            session_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingOpen {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut registry) = self.registry.try_lock() {
+            registry.cancel_open(&self.session_id);
+            return;
+        }
+        let registry = self.registry.clone();
+        let session_id = self.session_id.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                registry.lock().await.cancel_open(&session_id);
+            });
+        }
+    }
+}
+
 pub struct SerialHandle {
     runtime: HalRuntime,
     session_id: SessionId,
@@ -330,6 +413,17 @@ async fn wait_until_done(mut done: watch::Receiver<bool>) -> HalResult<()> {
                 false,
                 "an opening serial session disappeared before cleanup completed",
             ));
+        }
+    }
+}
+
+async fn wait_until_cancelled(mut cancellation: watch::Receiver<bool>) {
+    loop {
+        if *cancellation.borrow() {
+            return;
+        }
+        if cancellation.changed().await.is_err() {
+            return;
         }
     }
 }

@@ -187,7 +187,12 @@ Camera control uses normal broker IPC. Frame payloads use a bounded shared-memor
 - Blocking vendor calls never execute on Tokio executor workers.
 - Operation queues are bounded and preserve documented ordering.
 - Cancellation has a deadline; adapters that cannot cancel synchronously are isolated in a disposable worker.
-- Close is idempotent from the caller's perspective.
+- Adapter-level Serial close has a configurable deadline and defaults to two seconds. On timeout,
+  the runtime drops the resource actor, releases its lease, completes close waiters with
+  `runtime.session.close_timeout`, and does not continue using that session.
+- Authenticated close replay is idempotent for the 256 most recently closed sessions in a runtime.
+  The replay key is the exact `SessionId` and `LeaseToken`; closing a 257th newer session evicts the
+  oldest entry, whose next replay returns `runtime.session.not_found`.
 - Client disconnect revokes its leases, rejects new operations, cancels queued work, and closes transport resources.
 - An unrelated external process can still bypass HAL; adapters use OS exclusivity where available and report limitations otherwise.
 

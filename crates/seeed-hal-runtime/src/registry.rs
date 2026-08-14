@@ -24,6 +24,7 @@ struct SessionEntry {
     state: SessionState,
     actor: Option<ActorHandle>,
     done: watch::Sender<bool>,
+    open_cancel: watch::Sender<bool>,
 }
 
 struct ClosedSession {
@@ -33,6 +34,11 @@ struct ClosedSession {
 pub(crate) struct RevokeTarget {
     pub(crate) actor: Option<ActorHandle>,
     pub(crate) done: watch::Receiver<bool>,
+}
+
+pub(crate) struct OpenReservation {
+    pub(crate) lease: LeaseToken,
+    pub(crate) cancellation: watch::Receiver<bool>,
 }
 
 pub(crate) enum CloseAction {
@@ -54,13 +60,14 @@ impl Registry {
         resource_id: ResourceId,
         session_id: SessionId,
         owner_id: OwnerId,
-    ) -> HalResult<LeaseToken> {
+    ) -> HalResult<OpenReservation> {
         let lease = self.leases.reserve_control(
             resource_id.clone(),
             session_id.clone(),
             owner_id.clone(),
         )?;
         let (done, _) = watch::channel(false);
+        let (open_cancel, cancellation) = watch::channel(false);
         self.sessions.insert(
             session_id,
             SessionEntry {
@@ -70,9 +77,13 @@ impl Registry {
                 state: SessionState::Opening,
                 actor: None,
                 done,
+                open_cancel,
             },
         );
-        Ok(lease)
+        Ok(OpenReservation {
+            lease,
+            cancellation,
+        })
     }
 
     pub(crate) fn finish_open(
@@ -173,6 +184,9 @@ impl Registry {
             .filter(|entry| &entry.owner_id == owner_id)
             .map(|entry| {
                 entry.state = SessionState::Closing;
+                if entry.actor.is_none() {
+                    entry.open_cancel.send_replace(true);
+                }
                 RevokeTarget {
                     actor: entry.actor.clone(),
                     done: entry.done.subscribe(),

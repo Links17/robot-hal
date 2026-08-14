@@ -1,4 +1,5 @@
 use std::sync::Weak;
+use std::time::Duration;
 
 use bytes::Bytes;
 use seeed_hal_core::{ErrorCategory, HalResult, SessionId};
@@ -101,6 +102,7 @@ impl ActorHandle {
 #[derive(Clone)]
 pub(crate) struct ActorMetadata {
     pub(crate) session_id: SessionId,
+    pub(crate) close_timeout: Duration,
 }
 
 pub(crate) fn spawn_serial_actor(
@@ -161,7 +163,20 @@ async fn run_serial_actor(
         }
     }
 
-    let close_result = session.close().await;
+    let close_result = match tokio::time::timeout(metadata.close_timeout, session.close()).await {
+        Ok(result) => result,
+        Err(_) => Err(runtime_error(
+            "runtime.session.close_timeout",
+            ErrorCategory::Unavailable,
+            "serial.close",
+            false,
+            format!(
+                "serial session close exceeded its {:?} deadline",
+                metadata.close_timeout
+            ),
+        )),
+    };
+    drop(session);
     while let Ok(command) = commands.try_recv() {
         command.reject_closed();
     }
