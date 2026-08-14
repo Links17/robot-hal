@@ -30,8 +30,8 @@ struct Target {
 
 #[derive(Serialize)]
 struct Enabled {
-    adapters: [&'static str; 1],
-    features: [&'static str; 0],
+    adapters: &'static [&'static str],
+    features: &'static [&'static str],
 }
 
 #[derive(Serialize)]
@@ -66,8 +66,8 @@ impl BrokerManifest {
                 arch: std::env::consts::ARCH,
             },
             enabled: Enabled {
-                adapters: ["serialport"],
-                features: [],
+                adapters: enabled_adapters(),
+                features: enabled_features(),
             },
             msrv: env!("CARGO_PKG_RUST_VERSION"),
             artifact_checksum: ArtifactChecksum {
@@ -77,4 +77,24 @@ impl BrokerManifest {
             required_vendor_runtime_libraries: [],
         })
     }
+}
+
+#[cfg(feature = "virtual-adapter")]
+fn enabled_adapters() -> &'static [&'static str] {
+    &["virtual-serial"]
+}
+
+#[cfg(not(feature = "virtual-adapter"))]
+fn enabled_adapters() -> &'static [&'static str] {
+    &["serialport"]
+}
+
+#[cfg(feature = "virtual-adapter")]
+fn enabled_features() -> &'static [&'static str] {
+    &["virtual-adapter"]
+}
+
+#[cfg(not(feature = "virtual-adapter"))]
+fn enabled_features() -> &'static [&'static str] {
+    &[]
 }

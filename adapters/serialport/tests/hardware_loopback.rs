@@ -3,7 +3,7 @@
 async fn physical_loopback_round_trip_preserves_byte_order() {
     #[cfg(not(feature = "hardware-loopback"))]
     {
-        panic!("enable the hardware-loopback feature and set SEEED_HAL_SERIAL_LOOPBACK");
+        panic!("enable the hardware-tests feature and set SEEED_HAL_SERIAL_LOOPBACK");
     }
 
     #[cfg(feature = "hardware-loopback")]

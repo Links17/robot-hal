@@ -34,6 +34,19 @@ jobs:
       - name: Run Rust tests
         if: ${{ steps.workspace.outputs.has-packages == 'true' }}
         run: cargo test --workspace --all-features
+      - name: Build broker conformance executable
+        if: ${{ steps.workspace.outputs.has-packages == 'true' }}
+        run: cargo build -p seeed-hal-broker-app --features virtual-adapter
+      - name: Run broker black-box conformance
+        if: ${{ steps.workspace.outputs.has-packages == 'true' }}
+        shell: bash
+        run: |
+          broker_path="target/debug/seeed-hal-broker"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            broker_path="${broker_path}.exe"
+          fi
+          uv run --project bindings/python --frozen pytest -q tests/conformance/test_runner_contract.py
+          uv run --project bindings/python --frozen python tests/conformance/run-broker-conformance.py --broker "$broker_path"
       - name: Run Python binding tests
         if: ${{ hashFiles('bindings/python/tests/**') != '' }}
         working-directory: bindings/python

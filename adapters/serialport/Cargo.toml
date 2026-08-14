@@ -7,6 +7,7 @@ license.workspace = true
 
 [features]
 hardware-loopback = []
+hardware-tests = ["hardware-loopback"]
 
 [dependencies]
 async-trait = { workspace = true }

@@ -1,6 +1,6 @@
 # Seeed HAL Architecture
 
-**Status:** Approved design  
+**Status:** v0.1 core and Serial implemented; later hardware classes planned
 **Date:** 2026-08-14  
 **Scope:** Team-reusable Rust HAL; `lerobot-easy` is the first consumer, not the domain model.
 
@@ -276,6 +276,21 @@ The library emits structured tracing spans and metrics but never installs a subs
 5. **v1.0:** stabilized interfaces, compatibility guarantees, and cross-platform conformance qualification.
 
 Each version is a working vertical slice. Later modules may refine core only through backward-compatible additions or an explicit contract revision.
+
+Implementation status is intentionally separate from cross-platform release qualification:
+
+- Implemented in v0.1: core identity/capability/lease/error/event types, runtime ownership and
+  fencing, the versioned local broker, Rust and Python clients, the virtual Serial conformance
+  adapter, and the native `serialport` adapter.
+- Qualified locally: hardware-free macOS execution and the cross-target compile checks recorded in
+  [v0.1.0 acceptance](../releases/v0.1.0-acceptance.md).
+- Pending external acceptance: native Linux and Windows CI execution and physical Serial loopback.
+- Planned: CAN/CAN FD, USB, GPIO, Camera, Node bindings, shared-memory frame transport, device
+  protocols, and consuming-application migration.
+
+These modules retain the responsibility boundary defined in
+[HAL responsibility](../contracts/hal-responsibility.md); implementation status does not move
+device protocols or product behavior into the HAL.
 
 ## 12. Decisions
 

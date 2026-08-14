@@ -7,11 +7,15 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, ValueEnum};
+#[cfg(not(feature = "virtual-adapter"))]
 use seeed_hal_adapter_serialport::SerialPortAdapter;
 use seeed_hal_broker::Broker;
 use seeed_hal_runtime::HalRuntime;
 use serde::Serialize;
 use tokio::task::JoinSet;
+
+#[cfg(feature = "virtual-adapter")]
+use seeed_hal_testkit::VirtualSerialAdapter;
 
 const MAX_CONNECTIONS: usize = 64;
 
@@ -70,8 +74,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .auth_token_file
         .expect("clap requires --auth-token-file");
     let token = token::read_and_remove_token(token_path).await?;
+    #[cfg(not(feature = "virtual-adapter"))]
     let runtime = HalRuntime::builder()
         .serial_adapter(SerialPortAdapter::new())
+        .build();
+    #[cfg(feature = "virtual-adapter")]
+    let runtime = HalRuntime::builder()
+        .serial_adapter(VirtualSerialAdapter::loopback("serial:virtual:broker-app"))
         .build();
     let broker = Broker::with_startup_token(runtime, token);
     serve(endpoint, broker).await?;

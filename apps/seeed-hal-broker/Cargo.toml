@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 build = "build.rs"
 
+[features]
+virtual-adapter = ["dep:seeed-hal-testkit"]
+
 [[bin]]
 name = "seeed-hal-broker"
 path = "src/main.rs"
@@ -16,6 +19,7 @@ seeed-hal-adapter-serialport = { path = "../../adapters/serialport" }
 seeed-hal-broker = { path = "../../crates/seeed-hal-broker" }
 seeed-hal-protocol = { path = "../../crates/seeed-hal-protocol" }
 seeed-hal-runtime = { path = "../../crates/seeed-hal-runtime" }
+seeed-hal-testkit = { path = "../../crates/seeed-hal-testkit", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

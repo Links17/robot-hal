@@ -20,16 +20,24 @@ The implementation is library-first. Rust applications link the library directly
 - [Responsibility contract](docs/contracts/hal-responsibility.md)
 - [Versioning contract](docs/contracts/versioning.md)
 - [v0.1 implementation plan](docs/superpowers/plans/2026-08-14-v0.1-core-serial.md)
+- [v0.1.0 acceptance evidence](docs/releases/v0.1.0-acceptance.md)
+- [Physical Serial loopback runbook](docs/runbooks/serial-loopback.md)
 
 ## Status
 
-Architecture and implementation planning only. No production implementation exists yet.
+The v0.1 core and Serial vertical slice is implemented: platform-neutral identity, capabilities,
+leases, structured errors and events; the library-first runtime; virtual and native Serial adapters;
+the local broker; and Rust and Python clients. The implementation remains independent of robot,
+device-protocol, workflow, and product behavior.
+
+Linux, macOS, and Windows are target platforms. Local macOS and cross-compile evidence is recorded in
+the v0.1 acceptance document; native Linux/Windows CI, physical Serial loopback, and release
+qualification remain pending external gates. CAN/CAN FD, USB, GPIO, Camera, Node bindings, and the
+camera frame data plane remain planned.
 
 ## Verification
 
-The workspace uses Rust 1.85 and Rust 2024. The initial workspace is intentionally empty, so
-`cargo metadata --no-deps --format-version 1` is the baseline check and must report an empty
-`packages` array. The full Rust gate becomes active automatically once a workspace crate exists:
+The workspace uses Rust 1.85 and Rust 2024. Run the full Rust gate with:
 
 ```bash
 cargo fmt --all --check
@@ -37,8 +45,11 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
-When Python bindings are present, run their tests with:
+Run the frozen Python 3.11 binding suite with:
 
 ```bash
-uv run pytest bindings/python/tests
+cd bindings/python && uv run --frozen pytest -q
 ```
+
+The hardware-free executable conformance command is documented in
+[`tests/conformance/README.md`](tests/conformance/README.md).
