@@ -350,6 +350,16 @@ mod tests {
             .unwrap();
     }
 
+    async fn wait_for_endpoint(endpoint: &Path) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !endpoint.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("broker endpoint must become ready before the test deadline");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn exact_token_is_read_then_only_that_file_is_removed() {
@@ -495,9 +505,7 @@ mod tests {
             .await
             .unwrap()
         });
-        while !endpoint.exists() {
-            tokio::task::yield_now().await;
-        }
+        wait_for_endpoint(&endpoint).await;
 
         let client = HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN))
             .await
@@ -575,9 +583,7 @@ mod tests {
             .await
             .is_err()
         });
-        while !endpoint.exists() {
-            tokio::task::yield_now().await;
-        }
+        wait_for_endpoint(&endpoint).await;
 
         let client = HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN))
             .await
@@ -643,9 +649,7 @@ mod tests {
             .await
             .unwrap()
         });
-        while !endpoint.exists() {
-            tokio::task::yield_now().await;
-        }
+        wait_for_endpoint(&endpoint).await;
 
         for _ in 0..20 {
             let stream = tokio::net::UnixStream::connect(&endpoint).await.unwrap();

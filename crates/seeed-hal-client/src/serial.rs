@@ -12,6 +12,7 @@ use crate::connection::ExpectedResponse;
 /// sends a close request. Dropping this value never creates a runtime or
 /// spawns a task; the broker remains authoritative and revokes the session
 /// when the owning client connection closes.
+#[must_use = "a remote serial handle owns a broker session until it is explicitly closed or its client disconnects"]
 pub struct RemoteSerialHandle {
     client: HalClient,
     session_id: SessionId,

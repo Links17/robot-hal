@@ -21,5 +21,6 @@ uuid = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 seeed-hal-testkit = { path = "../seeed-hal-testkit" }
 tokio = { workspace = true, features = ["test-util"] }

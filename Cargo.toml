@@ -28,6 +28,7 @@ percent-encoding = "2"
 prost = "0.14"
 prost-build = "0.14"
 protoc-bin-vendored = "3"
+rustix = { version = "1", features = ["fs", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serial2 = "0.2"
@@ -43,4 +44,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 uuid = { version = "1", features = ["serde", "v4"] }
 windows-sys = "0.61"
 windows-permissions = "0.2.4"
+winapi-util = "0.1.11"
 zeroize = { version = "1", features = ["derive"] }

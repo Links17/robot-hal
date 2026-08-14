@@ -233,19 +233,20 @@ Camera control uses normal broker IPC. Frame payloads use a bounded shared-memor
 When the executable receives a startup token by file path, it performs the blocking trust checks on
 a dedicated blocking worker and removes the file only after reading exactly 32 bytes. On Unix, the
 parent must be a real `0700` directory; the token must be a non-symlink regular file that is
-owner-readable, inaccessible to group/other, owned by the same owner as its parent, and have exactly
-one hard link. The executable opens with `O_NOFOLLOW`, retains the descriptor, and revalidates the
-parent and pathname device/inode/owner identities before deletion. On Windows, the parent and token
-must be non-reparse directory/file objects owned by the current process user. Their DACLs may grant
-effective access only to that user, LocalSystem, built-in administrators, or the Windows Owner Rights
-principal. The executable retains exclusive parent/file handles and revalidates handle security and
-path metadata before deletion. A failed length, type, ownership, ACL, or identity check leaves the
-path in place.
+owner-readable, inaccessible to group/other, owned by the broker's effective user, and have exactly
+one hard link. The executable retains a no-follow parent directory descriptor, opens and revalidates
+the token relative to that descriptor, and deletes it with descriptor-relative `unlinkat` only after
+the device/inode/owner identities still match. On Windows, the parent and token must be non-reparse
+directory/file objects owned by the current process user. Their DACLs may grant effective access only
+to that user, LocalSystem, built-in administrators, or the Windows Owner Rights principal. The
+executable retains the parent handle and file handles that deny write/delete sharing, requires one
+hard link, and revalidates handle security plus volume/file identity before deletion. A failed length,
+type, ownership, ACL, link-count, or identity check leaves the path in place.
 
-Owned startup-token buffers in the executable, broker handshake, and Rust client are zeroized on
-drop; temporary client protobuf and encoded handshake buffers are also explicitly zeroized before
-the feasible socket handoff boundary. Copies held by the operating-system kernel, socket transport,
-or third-party codec internals cannot be guaranteed to be zeroized.
+The zeroization guarantee is limited to specific mutable startup-token buffers explicitly owned by
+this code: the executable and client token arrays, decoded broker/client protobuf token vectors,
+broker input frame, and client encode scratch buffer. This code zeroizes those buffers on drop or
+before releasing them. Any buffer outside that list is outside this guarantee.
 
 ## 10. Observability
 

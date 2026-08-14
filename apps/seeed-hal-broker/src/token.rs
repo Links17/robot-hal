@@ -17,15 +17,17 @@ fn policy_error(message: &'static str) -> io::Error {
 
 #[cfg(unix)]
 mod platform {
-    use std::fs::{File, OpenOptions};
+    use std::ffi::OsString;
+    use std::fs::File;
     use std::io::{self, Read};
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
     use zeroize::Zeroizing;
 
     use super::policy_error;
 
-    #[derive(Clone, Copy, Eq, PartialEq)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct Identity {
         device: u64,
         inode: u64,
@@ -33,54 +35,64 @@ mod platform {
     }
 
     impl Identity {
-        fn from(metadata: &std::fs::Metadata) -> Self {
+        fn from(metadata: &Stat) -> Self {
             Self {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-                owner: metadata.uid(),
+                device: metadata.st_dev as u64,
+                inode: metadata.st_ino,
+                owner: metadata.st_uid,
             }
         }
     }
 
     pub(super) struct TrustedTokenFile {
-        path: PathBuf,
+        name: OsString,
         file: File,
         file_identity: Identity,
-        parent: PathBuf,
+        parent_file: File,
         parent_identity: Identity,
+        effective_uid: u32,
     }
 
     impl TrustedTokenFile {
         pub(super) fn open(path: PathBuf) -> io::Result<Self> {
-            let parent = path
-                .parent()
-                .ok_or_else(|| policy_error("token file must have a private parent directory"))?
-                .to_owned();
-            let parent_metadata = std::fs::symlink_metadata(&parent)?;
-            validate_parent(&parent_metadata)?;
+            let (parent, name) = parent_and_name(&path)?;
+            let effective_uid = rustix::process::geteuid().as_raw();
+            let parent_file = File::from(
+                rustix::fs::open(
+                    &parent,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(normalize_open_error)?,
+            );
+            let parent_metadata = rustix::fs::fstat(&parent_file).map_err(io::Error::from)?;
+            validate_parent(&parent_metadata, effective_uid)?;
             let parent_identity = Identity::from(&parent_metadata);
 
-            let path_metadata = std::fs::symlink_metadata(&path)?;
-            if path_metadata.file_type().is_symlink() {
-                return Err(policy_error("token file must not be a symbolic link"));
-            }
-            let file = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(&path)
-                .map_err(normalize_open_error)?;
-            let metadata = file.metadata()?;
-            validate_file(&metadata, parent_identity.owner)?;
+            let path_metadata = rustix::fs::statat(&parent_file, &name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(io::Error::from)?;
+            let file = File::from(
+                rustix::fs::openat(
+                    &parent_file,
+                    &name,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(normalize_open_error)?,
+            );
+            let metadata = rustix::fs::fstat(&file).map_err(io::Error::from)?;
+            validate_file(&metadata, effective_uid)?;
             let file_identity = Identity::from(&metadata);
             if file_identity != Identity::from(&path_metadata) {
                 return Err(policy_error("token path changed while it was being opened"));
             }
             Ok(Self {
-                path,
+                name,
                 file,
                 file_identity,
-                parent,
+                parent_file,
                 parent_identity,
+                effective_uid,
             })
         }
 
@@ -95,59 +107,85 @@ mod platform {
                 ));
             }
 
-            let parent_metadata = std::fs::symlink_metadata(&self.parent)?;
-            validate_parent(&parent_metadata)?;
+            let parent_metadata = rustix::fs::fstat(&self.parent_file).map_err(io::Error::from)?;
+            validate_parent(&parent_metadata, self.effective_uid)?;
             if Identity::from(&parent_metadata) != self.parent_identity {
                 return Err(policy_error(
                     "token parent directory changed before deletion",
                 ));
             }
-            let path_metadata = std::fs::symlink_metadata(&self.path)?;
-            validate_file(&path_metadata, self.parent_identity.owner)?;
+            let metadata = rustix::fs::fstat(&self.file).map_err(io::Error::from)?;
+            validate_file(&metadata, self.effective_uid)?;
+            let path_metadata =
+                rustix::fs::statat(&self.parent_file, &self.name, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(io::Error::from)?;
+            validate_file(&path_metadata, self.effective_uid)?;
             if Identity::from(&path_metadata) != self.file_identity {
                 return Err(policy_error("token path changed before deletion"));
             }
-            std::fs::remove_file(&self.path)?;
+            rustix::fs::unlinkat(&self.parent_file, &self.name, AtFlags::empty())
+                .map_err(io::Error::from)?;
             Ok(token)
         }
     }
 
-    fn validate_parent(metadata: &std::fs::Metadata) -> io::Result<()> {
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    fn parent_and_name(path: &Path) -> io::Result<(PathBuf, OsString)> {
+        let name = path
+            .file_name()
+            .ok_or_else(|| policy_error("token path must name a file"))?
+            .to_owned();
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        Ok((parent.to_owned(), name))
+    }
+
+    fn validate_parent(metadata: &Stat, effective_uid: u32) -> io::Result<()> {
+        if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory {
             return Err(policy_error("token parent must be a real directory"));
         }
-        if metadata.permissions().mode() & 0o777 != 0o700 {
+        if Mode::from_raw_mode(metadata.st_mode) & (Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            != Mode::RWXU
+        {
             return Err(policy_error("token parent directory must have mode 0700"));
+        }
+        if metadata.st_uid != effective_uid {
+            return Err(policy_error(
+                "token parent directory must be owned by the effective user",
+            ));
         }
         Ok(())
     }
 
-    fn validate_file(metadata: &std::fs::Metadata, parent_owner: u32) -> io::Result<()> {
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
+    fn validate_file(metadata: &Stat, effective_uid: u32) -> io::Result<()> {
+        if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile {
             return Err(policy_error("token path must name a regular file"));
         }
-        if metadata.permissions().mode() & 0o077 != 0 || metadata.permissions().mode() & 0o400 == 0
-        {
+        let mode = Mode::from_raw_mode(metadata.st_mode);
+        if !(mode.contains(Mode::RUSR)) || mode.intersects(Mode::RWXG | Mode::RWXO) {
             return Err(policy_error(
                 "token file must be owner-readable and inaccessible to group/other",
             ));
         }
-        if metadata.uid() != parent_owner {
+        if metadata.st_uid != effective_uid {
             return Err(policy_error(
-                "token file and private parent must have the same owner",
+                "token file must be owned by the effective user",
             ));
         }
-        if metadata.nlink() != 1 {
+        if metadata.st_nlink != 1 {
             return Err(policy_error("token file must have exactly one hard link"));
         }
         Ok(())
     }
 
-    fn normalize_open_error(error: io::Error) -> io::Error {
-        if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::EMLINK)) {
+    fn normalize_open_error(error: rustix::io::Errno) -> io::Error {
+        if matches!(error, rustix::io::Errno::LOOP | rustix::io::Errno::MLINK) {
             policy_error("token file must not be a symbolic link")
         } else {
-            error
+            error.into()
         }
     }
 }
@@ -155,30 +193,93 @@ mod platform {
 #[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
 
     use super::platform::TrustedTokenFile;
 
-    #[test]
-    fn pathname_replacement_is_rejected_without_deleting_replacement() {
+    fn private_directory(label: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let directory = std::env::temp_dir().join(format!(
-            "seeed-hal-token-replace-{}-{nonce}",
+            "seeed-hal-token-{label}-{}-{nonce}",
             std::process::id()
         ));
         std::fs::create_dir(&directory).unwrap();
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        directory
+    }
+
+    fn write_token(path: &std::path::Path, byte: u8) {
+        std::fs::write(path, [byte; 32]).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn bare_relative_token_uses_current_directory_as_parent() {
+        let directory = private_directory("bare-relative");
+        let path = directory.join("token");
+        write_token(&path, 0x33);
+        let original_directory = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&directory).unwrap();
+        let result = TrustedTokenFile::open(PathBuf::from("token")).and_then(|file| file.consume());
+        std::env::set_current_dir(original_directory).unwrap();
+
+        assert_eq!(*result.unwrap(), [0x33; 32]);
+        assert!(!path.exists());
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn hard_linked_token_is_rejected_without_deleting_either_link() {
+        let directory = private_directory("hard-link");
+        let path = directory.join("token");
+        let link = directory.join("token-link");
+        write_token(&path, 0x44);
+        std::fs::hard_link(&path, &link).unwrap();
+
+        assert_eq!(
+            TrustedTokenFile::open(path.clone()).err().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(path.exists());
+        assert!(link.exists());
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(link).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn token_parent_and_file_must_be_owned_by_effective_user() {
+        if !rustix::process::geteuid().is_root() {
+            return;
+        }
+        let directory = private_directory("wrong-owner");
+        let path = directory.join("token");
+        write_token(&path, 0x55);
+        let other = rustix::process::Uid::from_raw(1);
+        rustix::fs::chown(&path, Some(other), None).unwrap();
+        rustix::fs::chown(&directory, Some(other), None).unwrap();
+
+        assert_eq!(
+            TrustedTokenFile::open(path.clone()).err().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn pathname_replacement_is_rejected_without_deleting_replacement() {
+        let directory = private_directory("replace");
         let path = directory.join("token");
         let original = directory.join("original");
-        std::fs::write(&path, [0x11_u8; 32]).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        write_token(&path, 0x11);
         let trusted = TrustedTokenFile::open(path.clone()).unwrap();
 
         std::fs::rename(&path, &original).unwrap();
-        std::fs::write(&path, [0x22_u8; 32]).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        write_token(&path, 0x22);
 
         assert_eq!(
             trusted.consume().unwrap_err().kind(),
@@ -204,6 +305,7 @@ mod platform {
 
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ,
     };
 
     use super::policy_error;
@@ -218,22 +320,19 @@ mod platform {
         user: LocalBox<Sid>,
     }
 
-    #[derive(Clone, Copy, Eq, PartialEq)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct Identity {
-        attributes: u32,
-        created: u64,
-        modified: u64,
-        size: u64,
+        volume_serial_number: u64,
+        file_index: u64,
     }
 
     impl Identity {
-        fn from(metadata: &std::fs::Metadata) -> Self {
-            Self {
-                attributes: metadata.file_attributes(),
-                created: metadata.creation_time(),
-                modified: metadata.last_write_time(),
-                size: metadata.file_size(),
-            }
+        fn from(file: &File) -> io::Result<Self> {
+            let information = winapi_util::file::information(file)?;
+            Ok(Self {
+                volume_serial_number: information.volume_serial_number(),
+                file_index: information.file_index(),
+            })
         }
     }
 
@@ -252,28 +351,20 @@ mod platform {
                 .open(&parent)?;
             let parent_metadata = parent_file.metadata()?;
             validate_real_directory(&parent_metadata)?;
-            let parent_identity = Identity::from(&parent_metadata);
-            if parent_identity != Identity::from(&parent_path_metadata) {
-                return Err(policy_error(
-                    "token parent path changed while it was being opened",
-                ));
-            }
+            let parent_identity = Identity::from(&parent_file)?;
             let user = current_process_sid()?;
             validate_handle_security(&parent_file, &user)?;
 
             let path_metadata = std::fs::symlink_metadata(&path)?;
-            validate_real_file(&path_metadata)?;
+            validate_real_file_path(&path_metadata)?;
             let file = OpenOptions::new()
                 .read(true)
-                .share_mode(0)
+                .share_mode(FILE_SHARE_READ)
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(&path)?;
             let metadata = file.metadata()?;
-            validate_real_file(&metadata)?;
-            let identity = Identity::from(&metadata);
-            if identity != Identity::from(&path_metadata) {
-                return Err(policy_error("token path changed while it was being opened"));
-            }
+            validate_real_file(&metadata, &file)?;
+            let identity = Identity::from(&file)?;
             validate_handle_security(&file, &user)?;
             Ok(Self {
                 path,
@@ -302,22 +393,29 @@ mod platform {
             validate_handle_security(&self.parent_file, &self.user)?;
             let parent_path_metadata = std::fs::symlink_metadata(&self.parent)?;
             validate_real_directory(&parent_path_metadata)?;
-            if Identity::from(&parent_metadata) != self.parent_identity
-                || Identity::from(&parent_path_metadata) != self.parent_identity
-            {
+            if Identity::from(&self.parent_file)? != self.parent_identity {
                 return Err(policy_error("token parent changed before deletion"));
             }
 
             let metadata = self.file.metadata()?;
-            validate_real_file(&metadata)?;
+            validate_real_file(&metadata, &self.file)?;
             validate_handle_security(&self.file, &self.user)?;
             let path_metadata = std::fs::symlink_metadata(&self.path)?;
-            validate_real_file(&path_metadata)?;
-            if Identity::from(&metadata) != self.identity
-                || Identity::from(&path_metadata) != self.identity
+            validate_real_file_path(&path_metadata)?;
+            let path_file = OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&self.path)?;
+            let path_file_metadata = path_file.metadata()?;
+            validate_real_file(&path_file_metadata, &path_file)?;
+            validate_handle_security(&path_file, &self.user)?;
+            if Identity::from(&self.file)? != self.identity
+                || Identity::from(&path_file)? != self.identity
             {
                 return Err(policy_error("token path changed before deletion"));
             }
+            drop(path_file);
             drop(self.file);
             std::fs::remove_file(&self.path)?;
             Ok(token)
@@ -333,11 +431,19 @@ mod platform {
         Ok(())
     }
 
-    fn validate_real_file(metadata: &std::fs::Metadata) -> io::Result<()> {
+    fn validate_real_file_path(metadata: &std::fs::Metadata) -> io::Result<()> {
         if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(policy_error(
                 "token path must name a regular non-reparse file",
             ));
+        }
+        Ok(())
+    }
+
+    fn validate_real_file(metadata: &std::fs::Metadata, file: &File) -> io::Result<()> {
+        validate_real_file_path(metadata)?;
+        if winapi_util::file::information(file)?.number_of_links() != 1 {
+            return Err(policy_error("token file must have exactly one hard link"));
         }
         Ok(())
     }
@@ -404,14 +510,49 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use std::io;
+        use std::os::windows::fs::OpenOptionsExt;
 
         use windows_permissions::utilities::current_process_sid;
         use windows_permissions::{LocalBox, SecurityDescriptor};
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
-        use super::validate_private_security_descriptor;
+        use super::{Identity, validate_private_security_descriptor, validate_real_file};
 
         fn descriptor(sddl: &str) -> LocalBox<SecurityDescriptor> {
             sddl.parse().expect("test SDDL must be valid")
+        }
+
+        #[test]
+        fn file_identity_is_handle_stable_and_hard_links_are_rejected() {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "seeed-hal-windows-token-{}-{nonce}",
+                std::process::id()
+            ));
+            let link = path.with_extension("link");
+            std::fs::write(&path, [0x66_u8; 32]).unwrap();
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(&path)
+                .unwrap();
+            assert_eq!(
+                Identity::from(&file).unwrap(),
+                Identity::from(&file).unwrap()
+            );
+            std::fs::hard_link(&path, &link).unwrap();
+            assert_eq!(
+                validate_real_file(&file.metadata().unwrap(), &file)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            drop(file);
+            std::fs::remove_file(path).unwrap();
+            std::fs::remove_file(link).unwrap();
         }
 
         #[test]

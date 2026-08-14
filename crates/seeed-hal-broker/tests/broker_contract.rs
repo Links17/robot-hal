@@ -1,19 +1,20 @@
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use seeed_hal_broker::{Broker, BrokerConfig, StartupToken};
-use seeed_hal_core::{OwnerId, ResourceSelector};
+use seeed_hal_core::{HalResult, OwnerId, ResourceDescriptor, ResourceSelector};
 use seeed_hal_protocol::v1::{self, envelope};
 use seeed_hal_runtime::{HalRuntime, RuntimeEventKind};
-use seeed_hal_serial::SerialConfig;
+use seeed_hal_serial::{ControlLines, SerialAdapter, SerialConfig, SerialSession};
 use seeed_hal_testkit::VirtualSerialAdapter;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, oneshot};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 const TOKEN: [u8; 32] = [0xa5; 32];
@@ -34,6 +35,134 @@ struct GatedIo<T> {
     inner: T,
     gate: BlockingWriteGate,
     target_request_id: u64,
+}
+
+#[derive(Clone)]
+struct SecondEnumerateGateAdapter {
+    inner: VirtualSerialAdapter,
+    enumerate_calls: Arc<AtomicUsize>,
+    enumerate_started: Arc<Notify>,
+    enumerate_release: Arc<(Mutex<bool>, Condvar)>,
+    operation_dropped: Arc<AtomicBool>,
+    close_after_operation_drop: Arc<AtomicBool>,
+    close_started: Arc<Notify>,
+}
+
+impl SecondEnumerateGateAdapter {
+    fn new(resource_id: &str) -> Self {
+        Self {
+            inner: VirtualSerialAdapter::loopback(resource_id),
+            enumerate_calls: Arc::new(AtomicUsize::new(0)),
+            enumerate_started: Arc::new(Notify::new()),
+            enumerate_release: Arc::new((Mutex::new(false), Condvar::new())),
+            operation_dropped: Arc::new(AtomicBool::new(false)),
+            close_after_operation_drop: Arc::new(AtomicBool::new(false)),
+            close_started: Arc::new(Notify::new()),
+        }
+    }
+
+    async fn wait_until_second_enumerate_started(&self) {
+        self.enumerate_started.notified().await;
+    }
+
+    fn release_second_enumerate(&self) {
+        let (released, condvar) = &*self.enumerate_release;
+        *released.lock().unwrap() = true;
+        condvar.notify_one();
+    }
+
+    async fn wait_until_close_started(&self) {
+        self.close_started.notified().await;
+    }
+}
+
+struct OperationDropGuard {
+    dropped: Arc<AtomicBool>,
+}
+
+impl Drop for OperationDropGuard {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::Release);
+    }
+}
+
+#[async_trait::async_trait]
+impl SerialAdapter for SecondEnumerateGateAdapter {
+    fn adapter_name(&self) -> &'static str {
+        "virtual.serial.second-enumerate-gate"
+    }
+
+    async fn enumerate(&self) -> HalResult<Vec<ResourceDescriptor>> {
+        if self.enumerate_calls.fetch_add(1, Ordering::AcqRel) == 1 {
+            let _drop_guard = OperationDropGuard {
+                dropped: self.operation_dropped.clone(),
+            };
+            self.enumerate_started.notify_one();
+            {
+                let (released, condvar) = &*self.enumerate_release;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = condvar.wait(released).unwrap();
+                }
+            }
+            self.inner.enumerate().await
+        } else {
+            self.inner.enumerate().await
+        }
+    }
+
+    async fn open(
+        &self,
+        selector: &ResourceSelector,
+        config: SerialConfig,
+    ) -> HalResult<Box<dyn SerialSession>> {
+        let inner = self.inner.open(selector, config).await?;
+        Ok(Box::new(CloseOrderSession {
+            inner,
+            operation_dropped: self.operation_dropped.clone(),
+            close_after_operation_drop: self.close_after_operation_drop.clone(),
+            close_started: self.close_started.clone(),
+        }))
+    }
+}
+
+struct CloseOrderSession {
+    inner: Box<dyn SerialSession>,
+    operation_dropped: Arc<AtomicBool>,
+    close_after_operation_drop: Arc<AtomicBool>,
+    close_started: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl SerialSession for CloseOrderSession {
+    fn descriptor(&self) -> &ResourceDescriptor {
+        self.inner.descriptor()
+    }
+
+    async fn read(&mut self, max_bytes: usize) -> HalResult<Bytes> {
+        self.inner.read(max_bytes).await
+    }
+
+    async fn write_all(&mut self, bytes: &[u8]) -> HalResult<()> {
+        self.inner.write_all(bytes).await
+    }
+
+    async fn flush(&mut self) -> HalResult<()> {
+        self.inner.flush().await
+    }
+
+    async fn set_control_lines(&mut self, lines: ControlLines) -> HalResult<()> {
+        self.inner.set_control_lines(lines).await
+    }
+
+    async fn close(&mut self) -> HalResult<()> {
+        self.close_started.notify_one();
+        self.close_after_operation_drop.store(
+            self.operation_dropped.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        self.inner.close().await
+    }
 }
 
 impl BlockingWriteGate {
@@ -915,6 +1044,86 @@ async fn disconnect_revokes_owned_sessions() {
     runtime
         .open_serial(
             OwnerId::parse("broker-contract:next-owner").unwrap(),
+            descriptor.selector(),
+            SerialConfig::default(),
+        )
+        .await
+        .unwrap()
+        .close()
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_joins_in_flight_operations_before_revoking_owner() {
+    let adapter = SecondEnumerateGateAdapter::new("serial:virtual:shutdown-order");
+    let runtime = HalRuntime::builder()
+        .serial_adapter(adapter.clone())
+        .build();
+    let mut events = runtime.subscribe();
+    let broker = Broker::with_startup_token(runtime.clone(), StartupToken::from_bytes(TOKEN));
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        broker
+            .serve_connection_until(server_io, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+    let mut client = Client::new(client_io);
+    client.handshake().await;
+    let session = open_virtual_serial(&mut client, 1_000).await;
+    client
+        .send(
+            900,
+            envelope::Payload::EnumerateSerialRequest(v1::EnumerateSerialRequest {}),
+        )
+        .await;
+    adapter.wait_until_second_enumerate_started().await;
+
+    shutdown_tx.send(()).unwrap();
+    let close_started_before_release = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        adapter.wait_until_close_started(),
+    )
+    .await
+    .is_ok();
+    adapter.release_second_enumerate();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), server)
+        .await
+        .expect("shutdown must join operations and finish connection tasks")
+        .unwrap();
+
+    assert!(outcome.cleanup_error().is_none());
+    assert!(
+        !close_started_before_release,
+        "owner revoke must wait for the in-flight operation task to join"
+    );
+    assert!(
+        adapter.operation_dropped.load(Ordering::Acquire),
+        "the in-flight operation future must terminate"
+    );
+    assert!(
+        adapter.close_after_operation_drop.load(Ordering::Acquire),
+        "owner revoke must close sessions only after operation futures terminate"
+    );
+
+    let mut saw_closed = false;
+    for _ in 0..2 {
+        let event = events.recv().await.unwrap();
+        if event.kind() == RuntimeEventKind::SessionClosed
+            && event.session_id().as_str() == session.session_id
+        {
+            saw_closed = true;
+        }
+    }
+    assert!(saw_closed, "owner revoke must publish session closure");
+
+    let descriptor = runtime.enumerate_serial().await.unwrap().remove(0);
+    runtime
+        .open_serial(
+            OwnerId::parse("broker-contract:shutdown-order-reuse").unwrap(),
             descriptor.selector(),
             SerialConfig::default(),
         )

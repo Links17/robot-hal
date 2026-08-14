@@ -159,7 +159,7 @@ struct PendingRequest {
 struct RequestState {
     next_request_id: u64,
     pending: HashMap<u64, PendingRequest>,
-    cancelled: HashSet<u64>,
+    cancelled: HashMap<u64, ExpectedResponse>,
     completed: HashSet<u64>,
     completed_order: VecDeque<u64>,
     terminal: Option<HalError>,
@@ -275,7 +275,7 @@ impl HalClient {
             requests: Mutex::new(RequestState {
                 next_request_id: 2,
                 pending: HashMap::with_capacity(options.pending_capacity),
-                cancelled: HashSet::with_capacity(options.pending_capacity),
+                cancelled: HashMap::with_capacity(options.pending_capacity),
                 completed: HashSet::from([1]),
                 completed_order: VecDeque::from([1]),
                 terminal: None,
@@ -493,7 +493,7 @@ impl Drop for CancellationGuard {
             .requests
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        if state.pending.remove(&self.request_id).is_some() {
+        if let Some(pending) = state.pending.remove(&self.request_id) {
             if state.cancelled.len() >= self.shared.tombstone_capacity {
                 drop(state);
                 terminate(
@@ -507,7 +507,7 @@ impl Drop for CancellationGuard {
                     ),
                 );
             } else {
-                state.cancelled.insert(self.request_id);
+                state.cancelled.insert(self.request_id, pending.expected);
             }
         }
     }
@@ -803,7 +803,7 @@ where
             if let Some(pending) = state.pending.remove(&envelope.request_id) {
                 remember_completed(&mut state, envelope.request_id, shared.tombstone_capacity);
                 Some(pending)
-            } else if state.cancelled.remove(&envelope.request_id) {
+            } else if state.cancelled.remove(&envelope.request_id).is_some() {
                 None
             } else {
                 let duplicate = state.completed.contains(&envelope.request_id);
@@ -875,16 +875,21 @@ fn preflight_inbound(frame: &[u8], shared: &Shared) -> HalResult<()> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .read;
-    let requested_read = shared
-        .requests
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .pending
-        .get(&request_id)
-        .and_then(|pending| match pending.expected {
-            ExpectedResponse::SerialRead { max_bytes } => Some(max_bytes),
-            _ => None,
-        });
+    let requested_read = {
+        let state = shared
+            .requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state
+            .pending
+            .get(&request_id)
+            .map(|pending| pending.expected)
+            .or_else(|| state.cancelled.get(&request_id).copied())
+            .and_then(|expected| match expected {
+                ExpectedResponse::SerialRead { max_bytes } => Some(max_bytes),
+                _ => None,
+            })
+    };
     visit_fields(frame, |field, wire| {
         if let (25, WireValue::Bytes(read_response)) = (field, wire) {
             visit_fields(read_response, |field, wire| {
@@ -945,6 +950,8 @@ fn visit_fields<'a>(
                 input = &input[len..];
                 visitor(field, WireValue::Bytes(bytes))?;
             }
+            3 => input = skip_group(input, field, 1)?,
+            4 => return Err(invalid_wire("unexpected protobuf end-group field")),
             5 => {
                 input = input
                     .get(4..)
@@ -955,6 +962,56 @@ fn visit_fields<'a>(
         }
     }
     Ok(())
+}
+
+const MAX_PROTOBUF_GROUP_DEPTH: usize = 64;
+
+fn skip_group(mut input: &[u8], expected_field: u32, depth: usize) -> HalResult<&[u8]> {
+    if depth > MAX_PROTOBUF_GROUP_DEPTH {
+        return Err(invalid_wire("protobuf group nesting is too deep"));
+    }
+    while !input.is_empty() {
+        let (key, key_len) = read_varint(input)?;
+        input = &input[key_len..];
+        let field = u32::try_from(key >> 3).unwrap_or(u32::MAX);
+        if field == 0 {
+            return Err(invalid_wire("protobuf field number zero is invalid"));
+        }
+        match key & 0x07 {
+            0 => {
+                let (_, len) = read_varint(input)?;
+                input = &input[len..];
+            }
+            1 => {
+                input = input
+                    .get(8..)
+                    .ok_or_else(|| invalid_wire("truncated fixed64 protobuf field"))?;
+            }
+            2 => {
+                let (len, prefix_len) = read_varint(input)?;
+                input = &input[prefix_len..];
+                let len = usize::try_from(len)
+                    .map_err(|_| invalid_wire("protobuf byte field length overflows usize"))?;
+                input = input
+                    .get(len..)
+                    .ok_or_else(|| invalid_wire("truncated length-delimited protobuf field"))?;
+            }
+            3 => input = skip_group(input, field, depth + 1)?,
+            4 if field == expected_field => return Ok(input),
+            4 => {
+                return Err(invalid_wire(
+                    "protobuf end-group field does not match start-group",
+                ));
+            }
+            5 => {
+                input = input
+                    .get(4..)
+                    .ok_or_else(|| invalid_wire("truncated fixed32 protobuf field"))?;
+            }
+            _ => return Err(invalid_wire("unsupported protobuf wire type")),
+        }
+    }
+    Err(invalid_wire("unterminated protobuf group"))
 }
 
 fn read_varint(input: &[u8]) -> HalResult<(u64, usize)> {
@@ -1202,7 +1259,7 @@ mod tests {
 
     use zeroize::Zeroize;
 
-    use super::{RequestState, SecretToken};
+    use super::{RequestState, SecretToken, WireValue, visit_fields};
 
     #[test]
     fn client_secret_zeroize_clears_owned_bytes() {
@@ -1216,7 +1273,7 @@ mod tests {
         let mut state = RequestState {
             next_request_id: u64::MAX,
             pending: HashMap::new(),
-            cancelled: HashSet::new(),
+            cancelled: HashMap::new(),
             completed: HashSet::new(),
             completed_order: VecDeque::new(),
             terminal: None,
@@ -1226,6 +1283,53 @@ mod tests {
         assert_eq!(
             state.take_request_id().unwrap_err().name().as_str(),
             "runtime.protocol.request_id_exhausted"
+        );
+    }
+
+    #[test]
+    fn protobuf_scanner_skips_nested_unknown_groups_without_visiting_contents() {
+        let frame = [
+            0x1b, // field 3, start group
+            0x08, 0x07, // grouped field 1
+            0x23, // field 4, nested start group
+            0xca, 0x01, 0x02, 0x0a, 0x00, // grouped field 25 bytes
+            0x24, // field 4, end group
+            0x1c, // field 3, end group
+            0x08, 0x2a, // top-level field 1
+        ];
+        let mut visited = Vec::new();
+
+        visit_fields(&frame, |field, wire| {
+            if let WireValue::Varint(value) = wire {
+                visited.push((field, value));
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(visited, vec![(1, 42)]);
+    }
+
+    #[test]
+    fn protobuf_scanner_rejects_invalid_group_structure_and_excessive_depth() {
+        for malformed in [&[0x1c][..], &[0x1b][..], &[0x1b, 0x24][..]] {
+            assert_eq!(
+                visit_fields(malformed, |_, _| Ok(()))
+                    .unwrap_err()
+                    .name()
+                    .as_str(),
+                "runtime.protocol.invalid_message"
+            );
+        }
+
+        let mut too_deep = vec![0x1b; 65];
+        too_deep.extend(std::iter::repeat_n(0x1c, 65));
+        assert_eq!(
+            visit_fields(&too_deep, |_, _| Ok(()))
+                .unwrap_err()
+                .name()
+                .as_str(),
+            "runtime.protocol.invalid_message"
         );
     }
 }

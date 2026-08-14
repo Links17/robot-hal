@@ -613,6 +613,68 @@ async fn oversized_read_field_is_rejected_before_decode_and_fans_out() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn cancelled_read_keeps_its_requested_limit_until_response_is_discarded() {
+    use seeed_hal_protocol::v1::{self, envelope};
+    use tokio::sync::oneshot;
+
+    let endpoint = fake::endpoint("cancelled-read-limit");
+    let listener = fake::bind(&endpoint);
+    let (read_received_tx, read_received_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut wire = fake::accept_and_handshake(listener).await;
+        fake::respond_enumerate_and_open(&mut wire, "serial:fake:cancelled-read-limit").await;
+        let cancelled_read = fake::recv(&mut wire).await;
+        assert!(matches!(
+            cancelled_read.payload,
+            Some(envelope::Payload::SerialReadRequest(_))
+        ));
+        read_received_tx.send(()).unwrap();
+        let enumerate = fake::recv(&mut wire).await;
+        assert!(matches!(
+            enumerate.payload,
+            Some(envelope::Payload::EnumerateSerialRequest(_))
+        ));
+        fake::send(
+            &mut wire,
+            v1::Envelope {
+                request_id: cancelled_read.request_id,
+                payload: Some(envelope::Payload::SerialReadResponse(
+                    v1::SerialReadResponse {
+                        data: vec![0x77; 12],
+                    },
+                )),
+            },
+        )
+        .await;
+        fake::send(
+            &mut wire,
+            fake::enumerate_response(enumerate.request_id, "serial:fake:next"),
+        )
+        .await;
+    });
+    let client =
+        HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN).with_byte_limits(512, 16, 16))
+            .await
+            .unwrap();
+    let descriptor = client.enumerate_serial().await.unwrap().remove(0);
+    let serial = client
+        .open_serial(descriptor.selector(), SerialConfig::default())
+        .await
+        .unwrap();
+    let read = tokio::spawn(async move { serial.read(8).await });
+    read_received_rx.await.unwrap();
+    read.abort();
+    assert!(read.await.unwrap_err().is_cancelled());
+
+    let error = client.enumerate_serial().await.unwrap_err();
+    assert_eq!(error.name().as_str(), "runtime.protocol.frame_too_large");
+    client.close().await.unwrap();
+    server.await.unwrap();
+    std::fs::remove_file(endpoint).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn concurrent_requests_use_unique_nonzero_ids() {
     let endpoint = fake::endpoint("unique-ids");
     let listener = fake::bind(&endpoint);
@@ -649,12 +711,16 @@ async fn concurrent_requests_use_unique_nonzero_ids() {
 #[cfg(unix)]
 #[tokio::test]
 async fn writer_queue_overflow_returns_structured_backpressure() {
+    use futures_util::StreamExt;
+    use tokio::sync::oneshot;
+
     let endpoint = fake::endpoint("writer-overflow");
     let listener = fake::bind(&endpoint);
+    let (release_tx, release_rx) = oneshot::channel();
     let server = tokio::spawn(async move {
         let mut wire = fake::accept_and_handshake(listener).await;
         fake::respond_enumerate_and_open(&mut wire, "serial:fake:writer-overflow").await;
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        release_rx.await.unwrap();
     });
     let client = HalClient::connect(
         ConnectionOptions::new(&endpoint, TOKEN)
@@ -669,14 +735,22 @@ async fn writer_queue_overflow_returns_structured_backpressure() {
         .await
         .unwrap();
     let payload = Bytes::from(vec![0x44; 64 * 1024]);
-    let results =
-        futures_util::future::join_all((0..64).map(|_| serial.write(payload.clone()))).await;
-    assert!(results.into_iter().any(|result| {
-        result.is_err_and(|error| {
+    let mut requests = (0..64)
+        .map(|_| serial.write(payload.clone()))
+        .collect::<futures_util::stream::FuturesUnordered<_>>();
+    let mut saw_backpressure = false;
+    while let Some(result) = requests.next().await {
+        if result.is_err_and(|error| {
             error.name().as_str() == "runtime.queue.full"
                 && error.operation().as_str() == "runtime.protocol.write"
-        })
-    }));
+        }) {
+            saw_backpressure = true;
+            break;
+        }
+    }
+    assert!(saw_backpressure);
+    drop(requests);
+    release_tx.send(()).unwrap();
     client.close().await.unwrap();
     server.await.unwrap();
     std::fs::remove_file(endpoint).unwrap();
@@ -685,13 +759,19 @@ async fn writer_queue_overflow_returns_structured_backpressure() {
 #[cfg(unix)]
 #[tokio::test]
 async fn cancellation_tombstone_overflow_fails_connection_closed() {
+    use tokio::sync::{mpsc, oneshot};
+
     let endpoint = fake::endpoint("cancel-overflow");
     let listener = fake::bind(&endpoint);
+    let (received_tx, mut received_rx) = mpsc::channel(2);
+    let (release_tx, release_rx) = oneshot::channel();
     let server = tokio::spawn(async move {
         let mut wire = fake::accept_and_handshake(listener).await;
-        let _first = fake::recv(&mut wire).await;
-        let _second = fake::recv(&mut wire).await;
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        for _ in 0..2 {
+            let request = fake::recv(&mut wire).await;
+            received_tx.send(request.request_id).await.unwrap();
+        }
+        release_rx.await.unwrap();
     });
     let client =
         HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN).with_queue_capacities(1, 4, 4))
@@ -700,7 +780,7 @@ async fn cancellation_tombstone_overflow_fails_connection_closed() {
     for _ in 0..2 {
         let request_client = client.clone();
         let request = tokio::spawn(async move { request_client.enumerate_serial().await });
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert_ne!(received_rx.recv().await.unwrap(), 0);
         request.abort();
         assert!(request.await.unwrap_err().is_cancelled());
     }
@@ -708,6 +788,7 @@ async fn cancellation_tombstone_overflow_fails_connection_closed() {
         client.enumerate_serial().await.unwrap_err().name().as_str(),
         "runtime.queue.cancelled_full"
     );
+    release_tx.send(()).unwrap();
     client.close().await.unwrap();
     server.await.unwrap();
     std::fs::remove_file(endpoint).unwrap();
@@ -827,13 +908,19 @@ async fn disconnect_fans_out_to_multiple_pending_requests() {
 #[cfg(unix)]
 #[tokio::test]
 async fn client_close_fans_out_to_multiple_pending_requests() {
+    use tokio::sync::{mpsc, oneshot};
+
     let endpoint = fake::endpoint("close-fanout");
     let listener = fake::bind(&endpoint);
+    let (received_tx, mut received_rx) = mpsc::channel(2);
+    let (release_tx, release_rx) = oneshot::channel();
     let server = tokio::spawn(async move {
         let mut wire = fake::accept_and_handshake(listener).await;
-        let _first = fake::recv(&mut wire).await;
-        let _second = fake::recv(&mut wire).await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for _ in 0..2 {
+            let request = fake::recv(&mut wire).await;
+            received_tx.send(request.request_id).await.unwrap();
+        }
+        release_rx.await.unwrap();
     });
     let client = HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN))
         .await
@@ -842,11 +929,13 @@ async fn client_close_fans_out_to_multiple_pending_requests() {
     let second_client = client.clone();
     let first = tokio::spawn(async move { first_client.enumerate_serial().await });
     let second = tokio::spawn(async move { second_client.enumerate_serial().await });
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert_ne!(received_rx.recv().await.unwrap(), 0);
+    assert_ne!(received_rx.recv().await.unwrap(), 0);
     client.close().await.unwrap();
     for result in [first.await.unwrap(), second.await.unwrap()] {
         assert_eq!(result.unwrap_err().name().as_str(), "runtime.client.closed");
     }
+    release_tx.send(()).unwrap();
     server.await.unwrap();
     std::fs::remove_file(endpoint).unwrap();
 }

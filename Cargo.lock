@@ -773,6 +773,7 @@ dependencies = [
 name = "seeed-hal-broker"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "futures-util",
  "getrandom 0.3.4",
@@ -794,7 +795,7 @@ name = "seeed-hal-broker-app"
 version = "0.1.0"
 dependencies = [
  "clap",
- "libc",
+ "rustix",
  "seeed-hal-adapter-serialport",
  "seeed-hal-broker",
  "seeed-hal-client",
@@ -809,6 +810,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "winapi-util",
  "windows-permissions",
  "windows-sys 0.61.2",
  "zeroize",
@@ -1328,6 +1330,15 @@ name = "winapi-i686-pc-windows-gnu"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
+
+[[package]]
+name = "winapi-util"
+version = "0.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
+dependencies = [
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "winapi-x86_64-pc-windows-gnu"

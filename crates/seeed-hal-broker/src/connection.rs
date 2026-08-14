@@ -93,8 +93,50 @@ struct NegotiatedLimits {
 }
 
 struct InboundRequest {
-    envelope: v1::Envelope,
+    envelope: SensitiveEnvelope,
     encoded_len: usize,
+}
+
+struct SensitiveEnvelope {
+    envelope: v1::Envelope,
+    #[cfg(test)]
+    drop_observer: Option<Arc<Mutex<Option<Vec<u8>>>>>,
+}
+
+impl SensitiveEnvelope {
+    fn new(envelope: v1::Envelope) -> Self {
+        Self {
+            envelope,
+            #[cfg(test)]
+            drop_observer: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_drop_observer(
+        envelope: v1::Envelope,
+        drop_observer: Arc<Mutex<Option<Vec<u8>>>>,
+    ) -> Self {
+        Self {
+            envelope,
+            drop_observer: Some(drop_observer),
+        }
+    }
+}
+
+impl Drop for SensitiveEnvelope {
+    fn drop(&mut self) {
+        if let Some(envelope::Payload::HandshakeRequest(request)) = self.envelope.payload.as_mut() {
+            request.startup_token.as_mut_slice().zeroize();
+            #[cfg(test)]
+            if let Some(observer) = &self.drop_observer {
+                *observer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(request.startup_token.clone());
+            }
+        }
+    }
 }
 
 struct OutboundEnvelope {
@@ -160,9 +202,11 @@ impl Broker {
         let mut shutdown = Box::pin(shutdown);
         let dispatch_error = tokio::select! {
             result = dispatch.as_mut() => result,
-            () = shutdown.as_mut() => None,
+            () = shutdown.as_mut() => {
+                let _ = cancel_tx.send(true);
+                dispatch.as_mut().await
+            },
         };
-        drop(dispatch);
 
         let cleanup_error = self.runtime.revoke_owner(&owner).await.err();
         let _ = cancel_tx.send(true);
@@ -222,23 +266,24 @@ where
                 "inbound frame exceeds the active connection maximum",
             ));
         }
-        let request = v1::Envelope::decode(frame.as_ref()).map_err(|error| {
-            protocol_error(
-                "runtime.protocol.invalid_message",
-                "runtime.protocol.decode",
-                ErrorCategory::InvalidArgument,
-                false,
-                error.to_string(),
-            )
-        })?;
+        let request =
+            SensitiveEnvelope::new(v1::Envelope::decode(frame.as_ref()).map_err(|error| {
+                protocol_error(
+                    "runtime.protocol.invalid_message",
+                    "runtime.protocol.decode",
+                    ErrorCategory::InvalidArgument,
+                    false,
+                    error.to_string(),
+                )
+            })?);
         let is_handshake = matches!(
-            request.payload,
+            request.envelope.payload,
             Some(envelope::Payload::HandshakeRequest(_))
         );
         if is_handshake {
             frame.as_mut().zeroize();
         }
-        let request_id = request.request_id;
+        let request_id = request.envelope.request_id;
         if request_id == 0 {
             send_response(
                 &response_tx,
@@ -286,7 +331,7 @@ where
                 send_response(
                     &response_tx,
                     error_envelope(
-                        request.envelope.request_id,
+                        request.envelope.envelope.request_id,
                         queue_full("broker request queue is full"),
                     ),
                     reader_frame_limit(&frame_limit),
@@ -442,18 +487,17 @@ async fn dispatch_requests(
                             .expect("successful handshake sets negotiated limits")
                             .max_frame_bytes
                 {
-                    remove_active(&active, request.envelope.request_id);
+                    remove_active(&active, request.envelope.envelope.request_id);
                     failure = Some(frame_too_large(
                         "inbound frame exceeds the negotiated maximum",
                     ));
                     break;
                 }
-                let request = request.envelope;
-                let request_id = request.request_id;
-                let payload = request.payload;
+                let mut request = request.envelope;
+                let request_id = request.envelope.request_id;
 
                 if !handshaken {
-                    match payload {
+                    match request.envelope.payload.as_mut() {
                         Some(envelope::Payload::HandshakeRequest(handshake)) => {
                             match validate_handshake(&startup_token, handshake) {
                                 Ok((response, negotiated)) => {
@@ -508,7 +552,10 @@ async fn dispatch_requests(
                     continue;
                 }
 
-                if matches!(payload, Some(envelope::Payload::HandshakeRequest(_))) {
+                if matches!(
+                    request.envelope.payload.as_ref(),
+                    Some(envelope::Payload::HandshakeRequest(_))
+                ) {
                     remove_active(&active, request_id);
                     let error = invalid_message("handshake may only be sent once per connection");
                     if let Err(error) = send_response(
@@ -538,6 +585,7 @@ async fn dispatch_requests(
                 let runtime = runtime.clone();
                 let owner = owner.clone();
                 let limits = limits.expect("successful handshake sets negotiated limits");
+                let payload = request.envelope.payload.take();
                 tasks.spawn(async move {
                     let response = dispatch_operation(runtime, owner, request_id, payload, limits).await;
                     (request_id, response)
@@ -561,7 +609,7 @@ fn event_is_visible_to_owner(event: &RuntimeEvent, owner: &OwnerId) -> bool {
 
 fn validate_handshake(
     expected_token: &StartupToken,
-    mut request: v1::HandshakeRequest,
+    request: &mut v1::HandshakeRequest,
 ) -> HalResult<(v1::HandshakeResponse, NegotiatedLimits)> {
     let presented_token = Zeroizing::new(std::mem::take(&mut request.startup_token));
     let token_matches = presented_token.len() == expected_token.expose_bytes().len()
@@ -903,5 +951,35 @@ async fn finish_connection_task(
             false,
             error.to_string(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use seeed_hal_protocol::v1::{self, envelope};
+
+    use super::SensitiveEnvelope;
+
+    #[test]
+    fn sensitive_envelope_zeroizes_decoded_handshake_on_early_drop() {
+        for request_id in [0, 7] {
+            let observed = Arc::new(Mutex::new(None));
+            let request = SensitiveEnvelope::with_drop_observer(
+                v1::Envelope {
+                    request_id,
+                    payload: Some(envelope::Payload::HandshakeRequest(v1::HandshakeRequest {
+                        startup_token: vec![0x5a; 32],
+                        ..Default::default()
+                    })),
+                },
+                observed.clone(),
+            );
+
+            drop(request);
+
+            assert_eq!(*observed.lock().unwrap(), Some(vec![0; 32]));
+        }
     }
 }
