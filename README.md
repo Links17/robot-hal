@@ -24,3 +24,19 @@ The implementation is library-first. Rust applications link the library directly
 ## Status
 
 Architecture and implementation planning only. No production implementation exists yet.
+
+## Verification
+
+The workspace uses Rust 1.85 and Rust 2024. Run the canonical checks from the repository root:
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+```
+
+When Python bindings are present, run their tests with:
+
+```bash
+uv run pytest bindings/python/tests
+```
