@@ -37,12 +37,17 @@ class UnixFramedTransport:
         self._frame_limit = min(frame_limit, HARD_FRAME_BYTES)
 
     async def send(self, payload: bytes | bytearray | memoryview) -> None:
-        size = len(payload)
+        view = memoryview(payload)
+        if not view.c_contiguous:
+            view = memoryview(view.tobytes())
+        elif view.format != "B" or view.ndim != 1:
+            view = view.cast("B")
+        size = view.nbytes
         if size > self._frame_limit or size > HARD_FRAME_BYTES:
             raise frame_too_large("outbound frame exceeds the active frame limit")
         try:
             self._writer.write(struct.pack(">I", size))
-            self._writer.write(payload)
+            self._writer.write(view)
             await self._writer.drain()
         except (ConnectionError, OSError, RuntimeError) as error:
             raise disconnected_error("runtime.protocol.write", str(error)) from error

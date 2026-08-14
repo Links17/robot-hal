@@ -41,22 +41,37 @@ class WindowsFramedTransport:
         win32file, win32pipe = _load_pywin32()
 
         def blocking_connect() -> Any:
-            handle = win32file.CreateFile(
-                endpoint,
-                win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-                0,
-                None,
-                win32file.OPEN_EXISTING,
-                0,
-                None,
-            )
-            win32pipe.SetNamedPipeHandleState(
-                handle, win32pipe.PIPE_READMODE_BYTE, None, None
-            )
-            return handle
+            handle = None
+            try:
+                handle = win32file.CreateFile(
+                    endpoint,
+                    win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+                    0,
+                    None,
+                    win32file.OPEN_EXISTING,
+                    0,
+                    None,
+                )
+                win32pipe.SetNamedPipeHandleState(
+                    handle, win32pipe.PIPE_READMODE_BYTE, None, None
+                )
+                return handle
+            except BaseException:
+                if handle is not None:
+                    win32file.CloseHandle(handle)
+                raise
 
+        worker = asyncio.create_task(asyncio.to_thread(blocking_connect))
         try:
-            handle = await asyncio.to_thread(blocking_connect)
+            handle = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            try:
+                handle = await worker
+            except Exception:
+                pass
+            else:
+                await asyncio.to_thread(win32file.CloseHandle, handle)
+            raise
         except OSError as error:
             raise disconnected_error("runtime.broker.connect", str(error)) from error
         return cls(handle, win32file, frame_limit)
@@ -93,10 +108,15 @@ class WindowsFramedTransport:
             raise ConnectionError("Named Pipe write was incomplete")
 
     async def send(self, payload: bytes | bytearray | memoryview) -> None:
-        size = len(payload)
+        view = memoryview(payload)
+        if not view.c_contiguous:
+            view = memoryview(view.tobytes())
+        elif view.format != "B" or view.ndim != 1:
+            view = view.cast("B")
+        size = view.nbytes
         if size > self._frame_limit or size > HARD_FRAME_BYTES:
             raise frame_too_large("outbound frame exceeds the active frame limit")
-        framed = struct.pack(">I", size) + bytes(payload)
+        framed = struct.pack(">I", size) + view.tobytes()
         try:
             await asyncio.to_thread(self._write_all, framed)
         except (ConnectionError, OSError) as error:

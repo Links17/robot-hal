@@ -20,6 +20,9 @@ from typing import Protocol
 from google.protobuf.message import DecodeError, Message
 
 from .errors import (
+    _ErrorData,
+    _error_data,
+    _fresh_error,
     ErrorCategory,
     HalError,
     client_error,
@@ -101,9 +104,9 @@ class EventSubscription:
 
     def __init__(self, client: HalClient, capacity: int) -> None:
         self._client = client
-        self._queue: asyncio.Queue[RuntimeEvent | HalError] = asyncio.Queue(capacity)
+        self._queue: asyncio.Queue[RuntimeEvent | _ErrorData] = asyncio.Queue(capacity)
         self._lagged = 0
-        self._terminal: HalError | None = None
+        self._terminal: _ErrorData | None = None
 
     async def receive(self) -> RuntimeEvent:
         if self._lagged:
@@ -117,10 +120,10 @@ class EventSubscription:
                 f"event subscriber fell behind by {skipped} events",
             )
         if self._terminal is not None and self._queue.empty():
-            raise self._terminal
+            raise _fresh_error(self._terminal)
         item = await self._queue.get()
-        if isinstance(item, HalError):
-            raise item
+        if isinstance(item, _ErrorData):
+            raise _fresh_error(item)
         return item
 
     recv = receive
@@ -128,7 +131,7 @@ class EventSubscription:
     def close(self) -> None:
         self._client._remove_subscription(self)
 
-    def _publish(self, item: RuntimeEvent | HalError) -> None:
+    def _publish(self, item: RuntimeEvent | _ErrorData) -> None:
         if self._terminal is not None:
             return
         if self._queue.full():
@@ -137,7 +140,7 @@ class EventSubscription:
         self._queue.put_nowait(item)
 
     def _finish(self) -> None:
-        self._terminal = client_error(
+        self._terminal = _ErrorData(
             "runtime.event.closed",
             ErrorCategory.UNAVAILABLE,
             "runtime.event.receive",
@@ -202,7 +205,7 @@ class HalClient:
         self._cancelled: OrderedDict[int, tuple[str, int | None]] = OrderedDict()
         self._completed: OrderedDict[int, None] = OrderedDict([(1, None)])
         self._next_request_id = 2
-        self._terminal: HalError | None = None
+        self._terminal: _ErrorData | None = None
         self._subscriptions: list[EventSubscription] = []
         self._event_capacity = max(1, event_capacity)
         self._writer_task = asyncio.create_task(
@@ -227,9 +230,12 @@ class HalClient:
         event_capacity: int = DEFAULT_EVENT_CAPACITY,
     ) -> HalClient:
         _validate_limits(max_frame_bytes, max_read_bytes, max_write_bytes)
+        _validate_capacities(pending_capacity, writer_capacity, event_capacity)
+        endpoint_text = _validate_endpoint(endpoint)
         try:
-            owned_token = bytearray(startup_token)
-        except (TypeError, ValueError) as error:
+            token_view = memoryview(startup_token)
+            owned_token = bytearray(token_view)
+        except (TypeError, ValueError, BufferError) as error:
             raise _argument_error(
                 "runtime.broker.connect", "startup token must be bytes-like"
             ) from error
@@ -238,7 +244,6 @@ class HalClient:
             raise _argument_error(
                 "runtime.broker.connect", "startup token must contain exactly 32 bytes"
             )
-        endpoint_text = os.fspath(endpoint)
         transport: FramedTransport
         try:
             if os.name == "nt":
@@ -317,7 +322,7 @@ class HalClient:
             raise _argument_error("serial.open", "selector must be ResourceSelector")
         _validate_serial_config(config)
         selector_proto = hal_pb2.ResourceSelector(
-            resource_id=_valid_identifier(selector.resource_id, "resource.id"),
+            resource_id=_outbound_identifier(selector.resource_id, "resource.id"),
             minimum_identity_quality=_identity_to_proto(selector.minimum_identity_quality),
             transport=_transport_to_proto(selector.transport),
         )
@@ -335,21 +340,23 @@ class HalClient:
             "open_serial_response",
         )
         assert isinstance(response, hal_pb2.OpenSerialResponse)
-        if (
-            not response.session_id
-            or not response.HasField("lease")
-            or not response.lease.lease_id
-            or response.lease.generation == 0
-            or response.lease.mode
-            not in (hal_pb2.LEASE_MODE_OBSERVE, hal_pb2.LEASE_MODE_CONTROL)
-        ):
-            error = _invalid_message("broker returned invalid session metadata")
+        try:
+            session_id = _valid_identifier(response.session_id, "session.id")
+            if not response.HasField("lease"):
+                raise _invalid_message("broker returned invalid session metadata")
+            lease_id = _valid_identifier(response.lease.lease_id, "lease.id")
+            if response.lease.generation == 0 or response.lease.mode not in (
+                hal_pb2.LEASE_MODE_OBSERVE,
+                hal_pb2.LEASE_MODE_CONTROL,
+            ):
+                raise _invalid_message("broker returned invalid session metadata")
+        except HalError as error:
             self._terminate(error)
-            raise error
+            raise
         return SerialSession(
             self,
-            response.session_id,
-            response.lease.lease_id,
+            session_id,
+            lease_id,
             response.lease.generation,
             response.lease.mode,
         )
@@ -382,8 +389,15 @@ class HalClient:
                 pass
 
     async def _serial_read(self, session: SerialSession, max_bytes: int) -> bytes:
-        if not _is_plain_int(max_bytes) or max_bytes <= 0 or max_bytes > self._read_limit or max_bytes > MAX_U32:
-            raise _argument_error("serial.read", "read size exceeds the negotiated maximum")
+        if (
+            not _is_plain_int(max_bytes)
+            or max_bytes <= 0
+            or max_bytes > self._read_limit
+            or max_bytes > MAX_U32
+        ):
+            raise _argument_error(
+                "serial.read", "read size exceeds the negotiated maximum"
+            )
         response = await self._request(
             "serial_read_request",
             hal_pb2.SerialReadRequest(
@@ -481,7 +495,7 @@ class HalClient:
         requested_read: int | None = None,
     ) -> Message:
         if self._terminal is not None:
-            raise self._terminal
+            raise _fresh_error(self._terminal)
         if len(self._pending) >= self._pending_capacity:
             raise client_error(
                 "runtime.queue.full",
@@ -509,7 +523,7 @@ class HalClient:
                 "client writer queue is full",
             ) from error
         try:
-            return await future
+            return await asyncio.shield(future)
         except asyncio.CancelledError:
             pending = self._pending.pop(request_id, None)
             if pending is not None:
@@ -547,7 +561,10 @@ class HalClient:
         try:
             while True:
                 request = await self._writer_queue.get()
-                if request.ByteSize() > self._frame_limit or request.ByteSize() > HARD_FRAME_BYTES:
+                if (
+                    request.ByteSize() > self._frame_limit
+                    or request.ByteSize() > HARD_FRAME_BYTES
+                ):
                     raise frame_too_large("writer rejected an oversized envelope")
                 encoded = bytearray(request.SerializeToString())
                 try:
@@ -595,12 +612,16 @@ class HalClient:
                         "broker sent an unknown response ID",
                     )
                 self._remember_completed(request_id)
+                if pending.future.done():
+                    continue
                 field = response.WhichOneof("payload")
                 if field == "error":
                     try:
                         pending.future.set_exception(_decode_error(response.error))
                     except HalError as error:
-                        pending.future.set_exception(error)
+                        pending.future.set_exception(
+                            _fresh_error(_error_data(error))
+                        )
                         raise
                 elif field == pending.expected:
                     pending.future.set_result(getattr(response, field))
@@ -612,7 +633,7 @@ class HalClient:
                         False,
                         "response payload does not match its request",
                     )
-                    pending.future.set_exception(error)
+                    pending.future.set_exception(_fresh_error(_error_data(error)))
                     raise error
         except asyncio.CancelledError:
             return
@@ -641,7 +662,7 @@ class HalClient:
                 subscription._publish(public)
             return
         if field == "error":
-            error = _decode_error(response.error)
+            error = _error_data(_decode_error(response.error))
             for subscription in tuple(self._subscriptions):
                 subscription._publish(error)
             return
@@ -655,12 +676,12 @@ class HalClient:
     def _terminate(self, error: HalError) -> None:
         if self._terminal is not None:
             return
-        self._terminal = error
+        self._terminal = _error_data(error)
         pending = tuple(self._pending.values())
         self._pending.clear()
         for item in pending:
             if not item.future.done():
-                item.future.set_exception(error)
+                item.future.set_exception(_fresh_error(self._terminal))
         for subscription in tuple(self._subscriptions):
             subscription._finish()
         current = asyncio.current_task()
@@ -906,8 +927,44 @@ def _decode_descriptor(value: hal_pb2.ResourceDescriptor) -> ResourceDescriptor:
 
 
 def _valid_identifier(value: str, field: str) -> str:
-    if not value or len(value.encode("utf-8")) > 255 or not value.isascii():
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 255
+        or not value.isascii()
+    ):
         raise _invalid_message(f"{field} is invalid")
+    return value
+
+
+def _outbound_identifier(value: object, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 255
+        or not value.isascii()
+    ):
+        raise _argument_error("serial.open", f"{field} is invalid")
+    return value
+
+
+def _validate_endpoint(endpoint: object) -> str:
+    try:
+        value = os.fspath(endpoint)
+    except Exception as error:
+        raise _argument_error(
+            "runtime.broker.connect", "broker endpoint is invalid"
+        ) from error
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise _argument_error("runtime.broker.connect", "broker endpoint is invalid")
+    try:
+        size = len(value.encode("utf-8"))
+    except UnicodeEncodeError as error:
+        raise _argument_error(
+            "runtime.broker.connect", "broker endpoint is invalid"
+        ) from error
+    if size > 4096:
+        raise _argument_error("runtime.broker.connect", "broker endpoint is invalid")
     return value
 
 
@@ -923,6 +980,16 @@ def _validate_limits(frame: int, read: int, write: int) -> None:
     ):
         raise _argument_error(
             "runtime.broker.connect", "connection byte limits are invalid"
+        )
+
+
+def _validate_capacities(pending: int, writer: int, event: int) -> None:
+    if not all(
+        _is_plain_int(item) and 0 < item <= MAX_U32
+        for item in (pending, writer, event)
+    ):
+        raise _argument_error(
+            "runtime.broker.connect", "connection capacities are invalid"
         )
 
 

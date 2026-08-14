@@ -14,7 +14,7 @@ class ErrorCategory(Enum):
     INTERNAL = "internal"
 
 
-@dataclass(eq=True, slots=True)
+@dataclass(eq=True, frozen=True, slots=True)
 class HalError(Exception):
     name: str
     category: ErrorCategory
@@ -27,6 +27,35 @@ class HalError(Exception):
 
     def __str__(self) -> str:
         return f"{self.name} during {self.operation}: {self.debug_message}"
+
+
+@dataclass(frozen=True, slots=True)
+class _ErrorData:
+    name: str
+    category: ErrorCategory
+    operation: str
+    retryable: bool
+    debug_message: str
+
+
+def _error_data(error: HalError) -> _ErrorData:
+    return _ErrorData(
+        error.name,
+        error.category,
+        error.operation,
+        error.retryable,
+        error.debug_message,
+    )
+
+
+def _fresh_error(data: _ErrorData) -> HalError:
+    return HalError(
+        data.name,
+        data.category,
+        data.operation,
+        data.retryable,
+        data.debug_message,
+    )
 
 
 def client_error(

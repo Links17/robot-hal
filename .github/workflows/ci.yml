@@ -16,12 +16,9 @@ jobs:
         with:
           python-version: "3.11"
       - uses: astral-sh/setup-uv@v5
-      - name: Regenerate Python protocol bindings
-        shell: bash
-        run: ./scripts/generate-protocol.sh
       - name: Check generated Python protocol bindings
         shell: bash
-        run: git diff --exit-code -- bindings/python/seeed_hal/proto
+        run: ./scripts/check-generated-protocol.sh
       - name: Detect workspace packages
         id: workspace
         shell: bash

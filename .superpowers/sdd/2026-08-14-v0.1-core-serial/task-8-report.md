@@ -110,3 +110,71 @@ Final verification commands:
 - Python cannot guarantee erasure of immutable bytes copied internally by protobuf, asyncio, or the
   OS. The binding does not retain or represent the token and wipes every mutable copy it owns.
 - Physical Serial hardware is intentionally not exercised; default tests remain hardware-free.
+
+## Fix Round 1
+
+### Status
+
+Hardened the Python binding at its cancellation, transport-ownership, validation, terminal-error,
+framing, and generated-code boundaries without expanding the v0.1 Serial-only public surface.
+
+### Root causes and fixes
+
+- Directly awaiting a pending response Future allowed caller cancellation to cancel the shared
+  Future while it remained reader-visible. Requests now shield that Future, atomically move a
+  cancelled pending entry to its bounded tombstone set, and discard replies whose waiter has
+  already completed instead of turning `InvalidStateError` into a terminal disconnect.
+- Windows Named Pipe connect did not close a handle when post-open state setup failed, and an
+  unshielded `to_thread` cancellation could orphan a late successful handle. The blocking worker
+  now closes on setup failure; the async owner shields the worker and closes any late handle in a
+  worker thread before propagating cancellation.
+- Python annotations were treated as runtime validation at several public boundaries. Connect now
+  validates string/path endpoints, bytes-like tokens, plain-integer byte limits, and bounded queue
+  capacities before transport I/O. Serial selectors, configurations, control lines, and read sizes
+  now fail locally with `runtime.argument.invalid` rather than leaking Python/protobuf exceptions.
+- Broker session and lease identifiers are now checked as non-empty, bounded ASCII identifiers
+  before a `SerialSession` is exposed. Invalid broker metadata terminates the connection with
+  `runtime.protocol.invalid_message` and fans out to all pending calls.
+- Terminal state and event queues previously retained and re-raised exception instances carrying
+  mutable traceback state. `HalError` is now frozen, internal state stores immutable error data,
+  and each pending caller, subscriber, and repeated terminal call receives a fresh exception.
+- Unix and Windows send paths now normalize buffer views to byte format and frame by
+  `memoryview.nbytes`, so non-byte element views cannot produce a short length prefix.
+- CI's plain `git diff` check ignored untracked stale generator output. The executable
+  `scripts/check-generated-protocol.sh` reruns the frozen generator, rejects unexpected Python
+  outputs, and checks scoped tracked plus untracked status; CI now uses this gate.
+
+### TDD evidence
+
+RED:
+
+- `cd bindings/python && uv run --python 3.11 --frozen pytest tests/test_client_hardening.py -q`
+  - `36 failed, 32 passed`; failures covered the cancellation boundary/stress case, Windows handle
+    cleanup, public and inbound validation, fresh immutable terminal errors, buffer byte length,
+    and missing generated-output checker.
+
+GREEN:
+
+- `cd bindings/python && uv run --python 3.11 --frozen pytest tests/test_client_hardening.py -q`
+  - `68 passed`.
+- `uv run --project bindings/python --python 3.11 --frozen pytest -q`
+  - `83 passed`.
+- `uv run --project bindings/python --python 3.11 --frozen python -m compileall -q bindings/python/seeed_hal bindings/python/tests`
+  - passed.
+- `./scripts/check-generated-protocol.sh` twice
+  - passed twice with Python 3.11.13; the scoped generated tree remained clean.
+- `cargo fmt --all --check`
+  - passed.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  - passed.
+- `cargo test --workspace --all-features`
+  - passed; the physical Serial loopback test remained ignored as intended.
+- `cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-msvc`
+  - passed.
+
+### Concerns and limitations
+
+- Native Windows Python/pywin32 behavior remains covered by deterministic mocks and the Windows CI
+  job rather than a real Named Pipe acceptance run on this macOS host.
+- Physical Serial hardware remains intentionally untested; all defaults and verification stay
+  hardware-free.
