@@ -1,0 +1,26 @@
+[project]
+name = "seeed-hal"
+version = "0.1.0"
+description = "Async Python client for the local Seeed HAL broker"
+requires-python = ">=3.11"
+dependencies = [
+    "protobuf==6.32.1",
+    "pywin32==311; sys_platform == 'win32'",
+]
+
+[dependency-groups]
+dev = [
+    "grpcio-tools==1.75.1",
+    "pytest==8.4.2",
+    "pytest-asyncio==1.2.0",
+]
+
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["seeed_hal"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

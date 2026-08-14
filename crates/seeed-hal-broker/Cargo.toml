@@ -23,4 +23,5 @@ zeroize = { workspace = true }
 [dev-dependencies]
 async-trait = { workspace = true }
 seeed-hal-testkit = { path = "../seeed-hal-testkit" }
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

@@ -16,6 +16,12 @@ jobs:
         with:
           python-version: "3.11"
       - uses: astral-sh/setup-uv@v5
+      - name: Regenerate Python protocol bindings
+        shell: bash
+        run: ./scripts/generate-protocol.sh
+      - name: Check generated Python protocol bindings
+        shell: bash
+        run: git diff --exit-code -- bindings/python/seeed_hal/proto
       - name: Detect workspace packages
         id: workspace
         shell: bash
@@ -33,4 +39,5 @@ jobs:
         run: cargo test --workspace --all-features
       - name: Run Python binding tests
         if: ${{ hashFiles('bindings/python/tests/**') != '' }}
-        run: uv run pytest bindings/python/tests
+        working-directory: bindings/python
+        run: uv run --frozen pytest -q

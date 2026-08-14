@@ -783,6 +783,7 @@ dependencies = [
  "seeed-hal-runtime",
  "seeed-hal-serial",
  "seeed-hal-testkit",
+ "serde_json",
  "subtle",
  "tokio",
  "tokio-util",

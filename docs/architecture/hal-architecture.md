@@ -83,6 +83,20 @@ socket is `0600`; Windows uses a unique per-launch Named Pipe with remote client
 
 For Electron applications, Electron Main owns broker process lifecycle and update activation. Renderer code never connects directly to the broker. The application backend or Electron Main uses a language client according to the application's own architecture.
 
+### 3.4 Python broker client
+
+The Python binding exposes protobuf-independent async `HalClient` and `SerialSession` types. It
+performs authentication and limit negotiation before starting one bounded writer task and one
+reader task. Pending requests, cancellation and completion tombstones, writer admission, and event
+delivery are bounded; request IDs are nonzero and correlated independently of response order.
+
+Unix uses asyncio Unix sockets. Windows uses local-only Named Pipes, with every pywin32
+connect/read/write/close call delegated through `asyncio.to_thread`. Both transports use the
+broker's big-endian 32-bit length prefix, reject the hard 1 MiB limit before reading a frame body,
+and apply negotiated frame/read/write limits. The binding wipes mutable token and encode buffers it
+owns; Python/protobuf/asyncio or kernel-created immutable and transient copies are outside that
+best-effort zeroization boundary.
+
 ## 4. Workspace modules
 
 ```text
