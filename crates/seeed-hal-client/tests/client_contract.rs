@@ -55,6 +55,8 @@ mod fake {
             _ => panic!("expected handshake request"),
         };
         assert_eq!(handshake.startup_token, super::TOKEN);
+        assert_eq!(handshake.protocol_minor_minimum, 0);
+        assert_eq!(handshake.protocol_minor_maximum, 0);
         send(
             &mut wire,
             v1::Envelope {
@@ -67,6 +69,8 @@ mod fake {
                         max_frame_bytes: handshake.max_frame_bytes,
                         max_read_bytes: handshake.max_read_bytes,
                         max_write_bytes: handshake.max_write_bytes,
+                        protocol_minor_minimum: 0,
+                        protocol_minor_maximum: 0,
                     },
                 )),
             },
@@ -104,6 +108,7 @@ mod fake {
                         identity_quality: v1::IdentityQuality::Strong as i32,
                         transport: v1::TransportKind::Serial as i32,
                         properties: Default::default(),
+                        capabilities: vec!["serial.bytes/v1".to_owned()],
                     }],
                 },
             )),
@@ -165,6 +170,7 @@ async fn rust_client_round_trips_serial_through_broker() {
     let server = tokio::spawn(async move { broker.serve_one().await.unwrap() });
 
     let client = HalClient::connect(options).await.unwrap();
+    assert_eq!(client.protocol_minor(), 0);
     let descriptor = client.enumerate_serial().await.unwrap().remove(0);
     let serial = client
         .open_serial(descriptor.selector(), SerialConfig::default())
@@ -415,6 +421,8 @@ async fn duplicate_response_fails_the_connection_closed() {
                         max_frame_bytes: seeed_hal_protocol::MAX_FRAME_BYTES as u32,
                         max_read_bytes: 64 * 1024,
                         max_write_bytes: 64 * 1024,
+                        protocol_minor_minimum: 0,
+                        protocol_minor_maximum: 0,
                     },
                 )),
             },
@@ -523,6 +531,8 @@ async fn pipelined_post_handshake_frame_prefix_uses_negotiated_decoder_limit() {
                     max_frame_bytes: 256,
                     max_read_bytes: 16,
                     max_write_bytes: 16,
+                    protocol_minor_minimum: 0,
+                    protocol_minor_maximum: 0,
                 },
             )),
         }

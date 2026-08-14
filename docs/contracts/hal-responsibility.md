@@ -8,6 +8,8 @@ Seeed HAL is a cross-platform, business-independent hardware access module. It g
 
 - enumerate resources and describe transport-level metadata;
 - separate physical identity from the current platform endpoint;
+- resolve selectors from persisted identity, transport, identity-quality threshold, and required
+  hardware-class capability while failing closed on zero or multiple matches;
 - open, configure, use, cancel, and close hardware sessions;
 - enforce local ownership through sessions, leases, and fencing generations;
 - expose Serial, CAN/CAN FD, USB, GPIO, and Camera interfaces;
@@ -49,3 +51,6 @@ HAL does not guarantee a domain-safe physical state. Consuming device drivers mu
 An in-process library session owns its platform handle. In broker deployment, the broker owns all platform handles and clients operate through opaque session identifiers. A resource with an active exclusive lease cannot be opened by another HAL session.
 
 HAL cannot prevent unrelated external processes from bypassing it and opening the same OS resource; platform adapters should request OS exclusivity where the platform supports it and report the limitation otherwise.
+
+An open reservation is provisional until the session is exposed. Failed or cancelled opens roll
+back only their exact current reservation; generations already exposed to callers are never reused.

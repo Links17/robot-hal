@@ -1307,6 +1307,7 @@ mod tests {
             IdentityQuality::Weak,
             TransportKind::Serial,
             ResourceProperties::default(),
+            seeed_hal_core::CapabilitySet::new(vec![seeed_hal_serial::serial_bytes_capability()]),
         )
     }
 

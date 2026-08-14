@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "adapters/serialport",
     "adapters/windows-file",
+    "adapters/windows-security",
     "apps/seeed-hal-broker",
     "crates/seeed-hal-client",
     "crates/seeed-hal-broker",

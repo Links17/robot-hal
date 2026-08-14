@@ -4,12 +4,13 @@ mod connection;
 pub mod listener;
 
 use std::io;
+use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub use connection::{BrokerConfig, ConnectionOutcome};
 use seeed_hal_runtime::HalRuntime;
 
-#[derive(Clone, Eq, PartialEq, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct StartupToken([u8; 32]);
 
 impl StartupToken {
@@ -27,6 +28,10 @@ impl StartupToken {
 
     pub fn expose_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    pub fn authenticates(&self, presented: &[u8]) -> bool {
+        presented.len() == self.0.len() && bool::from(presented.ct_eq(self.0.as_slice()))
     }
 }
 
@@ -77,6 +82,15 @@ mod tests {
     fn startup_token_zeroize_clears_owned_bytes() {
         let mut token = StartupToken::from_bytes([0xa5; 32]);
         token.zeroize();
-        assert_eq!(token.expose_bytes(), &[0; 32]);
+        assert!(token.expose_bytes().iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn startup_token_authentication_uses_the_explicit_secret_comparison() {
+        let token = StartupToken::from_bytes([0xa5; 32]);
+
+        assert!(token.authenticates(&[0xa5; 32]));
+        assert!(!token.authenticates(&[0xa4; 32]));
+        assert!(!token.authenticates(&[0xa5; 31]));
     }
 }

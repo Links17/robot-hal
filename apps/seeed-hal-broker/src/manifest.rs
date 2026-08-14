@@ -57,8 +57,8 @@ impl BrokerManifest {
             broker_version: env!("CARGO_PKG_VERSION"),
             wire: WireRange {
                 major: seeed_hal_protocol::PROTOCOL_MAJOR,
-                minimum_minor: seeed_hal_protocol::PROTOCOL_MINOR,
-                maximum_minor: seeed_hal_protocol::PROTOCOL_MINOR,
+                minimum_minor: seeed_hal_protocol::PROTOCOL_MINOR_MINIMUM,
+                maximum_minor: seeed_hal_protocol::PROTOCOL_MINOR_MAXIMUM,
             },
             target: Target {
                 triple: env!("SEEED_HAL_TARGET"),

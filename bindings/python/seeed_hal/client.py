@@ -43,7 +43,9 @@ from .transport_unix import HARD_FRAME_BYTES, UnixFramedTransport
 
 
 PROTOCOL_MAJOR = 1
-PROTOCOL_MINOR = 0
+PROTOCOL_MINOR_MINIMUM = 0
+PROTOCOL_MINOR_MAXIMUM = 0
+PROTOCOL_MINOR = PROTOCOL_MINOR_MAXIMUM
 SERIAL_CAPABILITY = "serial.bytes/v1"
 DEFAULT_TRANSFER_BYTES = 64 * 1024
 DEFAULT_CAPACITY = 32
@@ -83,6 +85,7 @@ class ResourceDescriptor:
     identity_quality: IdentityQuality
     transport: TransportKind
     properties: dict[str, str]
+    capabilities: tuple[str, ...]
 
     def selector(self) -> ResourceSelector:
         return ResourceSelector(
@@ -163,6 +166,7 @@ class HalClient:
 
     __slots__ = (
         "_transport",
+        "_protocol_minor",
         "_frame_limit",
         "_read_limit",
         "_write_limit",
@@ -185,6 +189,7 @@ class HalClient:
         self,
         transport: FramedTransport,
         *,
+        protocol_minor: int,
         frame_limit: int,
         read_limit: int,
         write_limit: int,
@@ -193,6 +198,7 @@ class HalClient:
         event_capacity: int,
     ) -> None:
         self._transport = transport
+        self._protocol_minor = protocol_minor
         self._frame_limit = frame_limit
         self._read_limit = read_limit
         self._write_limit = write_limit
@@ -256,7 +262,7 @@ class HalClient:
                 transport = await UnixFramedTransport.connect(
                     endpoint_text, max_frame_bytes
                 )
-            frame, read, write = await _perform_handshake(
+            protocol_minor, frame, read, write = await _perform_handshake(
                 transport,
                 owned_token,
                 max_frame_bytes,
@@ -266,6 +272,7 @@ class HalClient:
             transport.set_frame_limit(frame)
             return cls(
                 transport,
+                protocol_minor=protocol_minor,
                 frame_limit=frame,
                 read_limit=read,
                 write_limit=write,
@@ -283,6 +290,10 @@ class HalClient:
 
     async def __aenter__(self) -> HalClient:
         return self
+
+    @property
+    def protocol_minor(self) -> int:
+        return self._protocol_minor
 
     async def __aexit__(self, *_exc: object) -> None:
         await self.close()
@@ -709,7 +720,7 @@ async def _perform_handshake(
     frame_limit: int,
     read_limit: int,
     write_limit: int,
-) -> tuple[int, int, int]:
+) -> tuple[int, int, int, int]:
     handshake = hal_pb2.HandshakeRequest(
         startup_token=bytes(token),
         protocol_major=PROTOCOL_MAJOR,
@@ -718,6 +729,8 @@ async def _perform_handshake(
         max_frame_bytes=frame_limit,
         max_read_bytes=read_limit,
         max_write_bytes=write_limit,
+        protocol_minor_minimum=PROTOCOL_MINOR_MINIMUM,
+        protocol_minor_maximum=PROTOCOL_MINOR_MAXIMUM,
     )
     request = hal_pb2.Envelope(request_id=1, handshake_request=handshake)
     if request.ByteSize() > frame_limit or request.ByteSize() > HARD_FRAME_BYTES:
@@ -758,9 +771,19 @@ async def _perform_handshake(
             "broker returned a non-handshake response during negotiation",
         )
     accepted = response.handshake_response
+    if accepted.protocol_minor_minimum == 0 and accepted.protocol_minor_maximum == 0:
+        broker_minimum = accepted.protocol_minor
+        broker_maximum = accepted.protocol_minor
+    else:
+        broker_minimum = accepted.protocol_minor_minimum
+        broker_maximum = accepted.protocol_minor_maximum
     if (
         accepted.protocol_major != PROTOCOL_MAJOR
-        or accepted.protocol_minor != PROTOCOL_MINOR
+        or broker_minimum > broker_maximum
+        or accepted.protocol_minor < broker_minimum
+        or accepted.protocol_minor > broker_maximum
+        or accepted.protocol_minor < PROTOCOL_MINOR_MINIMUM
+        or accepted.protocol_minor > PROTOCOL_MINOR_MAXIMUM
         or accepted.max_frame_bytes == 0
         or accepted.max_frame_bytes > frame_limit
         or accepted.max_read_bytes == 0
@@ -777,6 +800,7 @@ async def _perform_handshake(
             "broker returned invalid negotiated settings",
         )
     return (
+        accepted.protocol_minor,
         accepted.max_frame_bytes,
         accepted.max_read_bytes,
         accepted.max_write_bytes,
@@ -929,6 +953,7 @@ def _decode_descriptor(value: hal_pb2.ResourceDescriptor) -> ResourceDescriptor:
         quality,
         TransportKind.SERIAL,
         dict(value.properties),
+        tuple(value.capabilities) if value.capabilities else (SERIAL_CAPABILITY,),
     )
 
 
@@ -1008,7 +1033,7 @@ def _validate_serial_config(config: SerialConfig) -> None:
         or config.baud_rate > MAX_U32
         or not _is_plain_int(config.read_timeout_ms)
         or config.read_timeout_ms > MAX_U64
-        or config.read_timeout_ms < 0
+        or config.read_timeout_ms <= 0
         or not isinstance(config.data_bits, DataBits)
         or not isinstance(config.parity, Parity)
         or not isinstance(config.stop_bits, StopBits)

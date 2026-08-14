@@ -1,7 +1,9 @@
 use std::time::Duration;
 
 use seeed_hal_serial::{
-    ControlLines, DataBits, FlowControl, Parity, SerialAdapter, SerialConfig, StopBits,
+    CapabilityId, CapabilitySet, ControlLines, DataBits, Endpoint, FlowControl, IdentityQuality,
+    Parity, ResourceDescriptor, ResourceId, ResourceProperties, SerialAdapter, SerialConfig,
+    StopBits, TransportKind,
 };
 use seeed_hal_testkit::VirtualSerialAdapter;
 
@@ -156,4 +158,32 @@ async fn receive_queue_is_bounded() {
     let error = session.write_all(b"y").await.unwrap_err();
 
     assert_eq!(error.name().as_str(), "runtime.queue.full");
+}
+
+#[tokio::test]
+async fn ambiguous_virtual_open_fails_closed() {
+    let capability = CapabilitySet::new(vec![CapabilityId::parse("serial.bytes/v1").unwrap()]);
+    let descriptor = |endpoint: &str| {
+        ResourceDescriptor::new(
+            ResourceId::parse("serial:virtual:duplicate").unwrap(),
+            Endpoint::new(endpoint).unwrap(),
+            IdentityQuality::Strong,
+            TransportKind::Serial,
+            ResourceProperties::default(),
+            capability.clone(),
+        )
+    };
+    let adapter = VirtualSerialAdapter::from_descriptors(vec![
+        descriptor("virtual://serial/first"),
+        descriptor("virtual://serial/second"),
+    ])
+    .unwrap();
+    let selector = adapter.enumerate().await.unwrap().remove(0).selector();
+
+    let error = match adapter.open(&selector, SerialConfig::default()).await {
+        Ok(_) => panic!("ambiguous open must fail closed"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.name().as_str(), "runtime.resource.ambiguous");
 }

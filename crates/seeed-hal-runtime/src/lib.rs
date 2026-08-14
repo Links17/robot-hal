@@ -255,6 +255,12 @@ impl HalRuntime {
         self.inner.events.subscribe()
     }
 
+    /// Returns the number of physical resource identities whose last exposed
+    /// lease generation is retained for fencing.
+    pub async fn retained_generation_count(&self) -> usize {
+        self.inner.registry.lock().await.retained_generation_count()
+    }
+
     async fn request_serial<T>(
         &self,
         session_id: SessionId,

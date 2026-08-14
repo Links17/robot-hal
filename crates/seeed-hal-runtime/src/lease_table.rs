@@ -10,6 +10,7 @@ struct ActiveLease {
     session_id: SessionId,
     owner_id: OwnerId,
     token: LeaseToken,
+    committed: bool,
 }
 
 #[derive(Default)]
@@ -55,9 +56,26 @@ impl LeaseTable {
                 session_id,
                 owner_id,
                 token: token.clone(),
+                committed: false,
             },
         );
         Ok(token)
+    }
+
+    pub(crate) fn commit(
+        &mut self,
+        resource_id: &ResourceId,
+        session_id: &SessionId,
+        token: &LeaseToken,
+    ) -> bool {
+        let Some(active) = self.active.get_mut(resource_id) else {
+            return false;
+        };
+        if &active.session_id != session_id || &active.token != token {
+            return false;
+        }
+        active.committed = true;
+        true
     }
 
     pub(crate) fn validate(
@@ -126,13 +144,29 @@ impl LeaseTable {
         Ok(())
     }
 
-    pub(crate) fn release(&mut self, resource_id: &ResourceId, session_id: &SessionId) {
-        if self
+    pub(crate) fn release(&mut self, resource_id: &ResourceId, session_id: &SessionId) -> bool {
+        let Some(active) = self
             .active
             .get(resource_id)
-            .is_some_and(|lease| &lease.session_id == session_id)
-        {
-            self.active.remove(resource_id);
+            .filter(|lease| &lease.session_id == session_id)
+        else {
+            return false;
+        };
+        let committed = active.committed;
+        let generation = active.token.generation();
+        self.active.remove(resource_id);
+
+        if !committed && self.current_generations.get(resource_id).copied() == Some(generation) {
+            if generation == 1 {
+                self.current_generations.remove(resource_id);
+            } else if let Some(current) = self.current_generations.get_mut(resource_id) {
+                *current = generation - 1;
+            }
         }
+        committed
+    }
+
+    pub(crate) fn retained_generation_count(&self) -> usize {
+        self.current_generations.len()
     }
 }

@@ -36,6 +36,11 @@ message HandshakeRequest {
   uint32 max_frame_bytes = 5;
   uint32 max_read_bytes = 6;
   uint32 max_write_bytes = 7;
+  // Inclusive range for range-aware peers. When both values are zero, the
+  // legacy protocol_minor field is an exact-minor offer. Range-aware clients
+  // also set legacy protocol_minor to protocol_minor_maximum.
+  uint32 protocol_minor_minimum = 8;
+  uint32 protocol_minor_maximum = 9;
 }
 
 message HandshakeResponse {
@@ -45,6 +50,10 @@ message HandshakeResponse {
   uint32 max_frame_bytes = 4;
   uint32 max_read_bytes = 5;
   uint32 max_write_bytes = 6;
+  // Broker-supported inclusive range. A legacy response leaves both values
+  // zero and protocol_minor remains the selected exact minor.
+  uint32 protocol_minor_minimum = 7;
+  uint32 protocol_minor_maximum = 8;
 }
 
 message ResourceDescriptor {
@@ -53,6 +62,8 @@ message ResourceDescriptor {
   IdentityQuality identity_quality = 3;
   TransportKind transport = 4;
   map<string, string> properties = 5;
+  // Empty from a legacy v1 peer means the capability implied by transport.
+  repeated string capabilities = 6;
 }
 
 message ResourceSelector {

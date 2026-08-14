@@ -155,9 +155,8 @@ where
         )
         .into());
     }
-    let listener = tokio::net::UnixListener::bind(&endpoint)?;
+    let (listener, cleanup) = bind_unix_socket(endpoint.clone())?;
     tokio::fs::set_permissions(&endpoint, std::fs::Permissions::from_mode(0o600)).await?;
-    let cleanup = UnixSocketCleanup(endpoint.clone());
     print_readiness(&endpoint)?;
 
     let (connection_shutdown, _) = tokio::sync::watch::channel(false);
@@ -222,9 +221,50 @@ fn reap_finished(connections: &mut JoinSet<seeed_hal_broker::ConnectionOutcome>)
 fn log_connection_result(
     result: Result<seeed_hal_broker::ConnectionOutcome, tokio::task::JoinError>,
 ) {
-    if let Err(error) = result {
-        tracing::warn!(%error, "broker connection task failed");
+    match result {
+        Ok(outcome) => {
+            if let Some(error) = outcome.connection_error() {
+                log_structured_error(structured_error_fields("connection", error));
+            }
+            if let Some(error) = outcome.cleanup_error() {
+                log_structured_error(structured_error_fields("cleanup", error));
+            }
+        }
+        Err(error) => tracing::warn!(%error, "broker connection task failed"),
     }
+}
+
+#[derive(Debug)]
+struct StructuredErrorFields<'a> {
+    kind: &'static str,
+    name: &'a str,
+    category: seeed_hal_core::ErrorCategory,
+    operation: &'a str,
+    retryable: bool,
+}
+
+fn structured_error_fields<'a>(
+    kind: &'static str,
+    error: &'a seeed_hal_core::HalError,
+) -> StructuredErrorFields<'a> {
+    StructuredErrorFields {
+        kind,
+        name: error.name().as_str(),
+        category: error.category(),
+        operation: error.operation().as_str(),
+        retryable: error.retryable(),
+    }
+}
+
+fn log_structured_error(fields: StructuredErrorFields<'_>) {
+    tracing::warn!(
+        error.kind = fields.kind,
+        error.name = fields.name,
+        error.category = ?fields.category,
+        error.operation = fields.operation,
+        error.retryable = fields.retryable,
+        "broker connection ended with a structured error",
+    );
 }
 
 #[cfg(any(test, windows))]
@@ -287,6 +327,34 @@ mod shutdown_signal_tests {
     }
 }
 
+#[cfg(test)]
+mod connection_logging_tests {
+    use seeed_hal_core::{ErrorCategory, HalError};
+
+    use super::structured_error_fields;
+
+    #[test]
+    fn structured_connection_logging_excludes_diagnostics_and_secrets() {
+        let error = HalError::new(
+            "runtime.protocol.authentication_failed",
+            ErrorCategory::Conflict,
+            "runtime.protocol.handshake",
+            false,
+            "secret-token-material",
+        )
+        .unwrap();
+
+        let fields = structured_error_fields("connection", &error);
+
+        assert_eq!(fields.kind, "connection");
+        assert_eq!(fields.name, "runtime.protocol.authentication_failed");
+        assert_eq!(fields.operation, "runtime.protocol.handshake");
+        assert_eq!(fields.category, ErrorCategory::Conflict);
+        assert!(!fields.retryable);
+        assert!(!format!("{fields:?}").contains("secret-token-material"));
+    }
+}
+
 #[cfg(unix)]
 struct UnixSocketCleanup(PathBuf);
 
@@ -295,6 +363,15 @@ impl Drop for UnixSocketCleanup {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+#[cfg(unix)]
+fn bind_unix_socket(
+    endpoint: PathBuf,
+) -> io::Result<(tokio::net::UnixListener, UnixSocketCleanup)> {
+    let listener = tokio::net::UnixListener::bind(&endpoint)?;
+    let cleanup = UnixSocketCleanup(endpoint);
+    Ok((listener, cleanup))
 }
 
 #[cfg(windows)]
@@ -382,7 +459,7 @@ fn named_pipe_server(
     let mut options = tokio::net::windows::named_pipe::ServerOptions::new();
     options.reject_remote_clients(true);
     options.first_pipe_instance(first_instance);
-    options.create(endpoint)
+    seeed_hal_windows_security::create_current_user_named_pipe(&options, endpoint)
 }
 
 #[cfg(all(test, unix))]
@@ -398,6 +475,22 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), future)
             .await
             .expect(message)
+    }
+
+    #[tokio::test]
+    async fn unix_socket_cleanup_is_armed_immediately_after_bind() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let endpoint = PathBuf::from(format!("/tmp/shg-{}-{nonce}.sock", std::process::id()));
+
+        let (listener, cleanup) = bind_unix_socket(endpoint.clone()).unwrap();
+
+        assert!(endpoint.exists());
+        drop(listener);
+        drop(cleanup);
+        assert!(!endpoint.exists());
     }
 
     #[cfg(unix)]

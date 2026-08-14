@@ -10,7 +10,7 @@ use crate::{Broker, ConnectionOutcome};
 pub struct UnixBroker {
     broker: Broker,
     listener: UnixListener,
-    socket_path: PathBuf,
+    socket: UnixSocketCleanup,
 }
 
 impl UnixBroker {
@@ -21,20 +21,29 @@ impl UnixBroker {
             .await?;
         let socket_path = private_directory.join(format!("seeed-hal-{}.sock", Uuid::new_v4()));
         let listener = UnixListener::bind(&socket_path)?;
-        tokio::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600)).await?;
+        let socket = UnixSocketCleanup(socket_path);
+        tokio::fs::set_permissions(&socket.0, std::fs::Permissions::from_mode(0o600)).await?;
         Ok(Self {
             broker,
             listener,
-            socket_path,
+            socket,
         })
     }
 
     pub fn socket_path(&self) -> &Path {
-        &self.socket_path
+        &self.socket.0
     }
 
     pub async fn serve_one(&self) -> io::Result<ConnectionOutcome> {
         let (stream, _) = self.listener.accept().await?;
         Ok(self.broker.serve_connection(stream).await)
+    }
+}
+
+struct UnixSocketCleanup(PathBuf);
+
+impl Drop for UnixSocketCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }

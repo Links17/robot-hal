@@ -17,6 +17,7 @@ path = "src/main.rs"
 clap = { workspace = true }
 seeed-hal-adapter-serialport = { path = "../../adapters/serialport" }
 seeed-hal-broker = { path = "../../crates/seeed-hal-broker" }
+seeed-hal-core = { path = "../../crates/seeed-hal-core" }
 seeed-hal-protocol = { path = "../../crates/seeed-hal-protocol" }
 seeed-hal-runtime = { path = "../../crates/seeed-hal-runtime" }
 seeed-hal-testkit = { path = "../../crates/seeed-hal-testkit", optional = true }
@@ -33,13 +34,13 @@ rustix = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 seeed-hal-windows-file = { path = "../../adapters/windows-file" }
+seeed-hal-windows-security = { path = "../../adapters/windows-security" }
 windows-permissions = { workspace = true }
 windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 winapi-util = { workspace = true }
 
 [dev-dependencies]
 seeed-hal-client = { path = "../../crates/seeed-hal-client" }
-seeed-hal-core = { path = "../../crates/seeed-hal-core" }
 seeed-hal-serial = { path = "../../crates/seeed-hal-serial" }
 seeed-hal-testkit = { path = "../../crates/seeed-hal-testkit" }
 serde_json = { workspace = true }

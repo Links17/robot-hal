@@ -9,6 +9,73 @@ mod conversion;
 pub use conversion::{invalid_message, parse_session_lease};
 
 pub const PROTOCOL_MAJOR: u32 = 1;
-pub const PROTOCOL_MINOR: u32 = 0;
+pub const PROTOCOL_MINOR_MINIMUM: u32 = 0;
+pub const PROTOCOL_MINOR_MAXIMUM: u32 = 0;
+/// Legacy exact-minor field value sent to peers that predate range fields.
+pub const PROTOCOL_MINOR: u32 = PROTOCOL_MINOR_MAXIMUM;
 pub const SERIAL_CAPABILITY: &str = "serial.bytes/v1";
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+pub fn handshake_minor_range(request: &v1::HandshakeRequest) -> HalResult<(u32, u32)> {
+    if request.protocol_minor_minimum == 0 && request.protocol_minor_maximum == 0 {
+        return Ok((request.protocol_minor, request.protocol_minor));
+    }
+    if request.protocol_minor_minimum > request.protocol_minor_maximum
+        || request.protocol_minor != request.protocol_minor_maximum
+    {
+        return Err(invalid_message(
+            "protocol minor range is invalid or conflicts with legacy protocol_minor",
+        ));
+    }
+    Ok((
+        request.protocol_minor_minimum,
+        request.protocol_minor_maximum,
+    ))
+}
+
+pub fn handshake_response_minor_range(response: &v1::HandshakeResponse) -> HalResult<(u32, u32)> {
+    if response.protocol_minor_minimum == 0 && response.protocol_minor_maximum == 0 {
+        return Ok((response.protocol_minor, response.protocol_minor));
+    }
+    if response.protocol_minor_minimum > response.protocol_minor_maximum
+        || response.protocol_minor < response.protocol_minor_minimum
+        || response.protocol_minor > response.protocol_minor_maximum
+    {
+        return Err(invalid_message(
+            "broker protocol minor range does not contain the selected minor",
+        ));
+    }
+    Ok((
+        response.protocol_minor_minimum,
+        response.protocol_minor_maximum,
+    ))
+}
+
+pub fn negotiate_protocol_minor(
+    client_major: u32,
+    client_minimum: u32,
+    client_maximum: u32,
+    broker_major: u32,
+    broker_minimum: u32,
+    broker_maximum: u32,
+) -> HalResult<u32> {
+    if client_minimum > client_maximum || broker_minimum > broker_maximum {
+        return Err(invalid_message(
+            "protocol minor range minimum exceeds maximum",
+        ));
+    }
+    let shared_minimum = client_minimum.max(broker_minimum);
+    let shared_maximum = client_maximum.min(broker_maximum);
+    if client_major != broker_major || shared_minimum > shared_maximum {
+        return Err(HalError::new(
+            "runtime.protocol.version_incompatible",
+            ErrorCategory::Conflict,
+            "runtime.protocol.handshake",
+            false,
+            "client and broker protocol version ranges do not overlap",
+        )?);
+    }
+    Ok(shared_maximum)
+}
+
+use seeed_hal_core::{ErrorCategory, HalError, HalResult};

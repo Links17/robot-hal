@@ -100,6 +100,13 @@ impl Registry {
             return false;
         }
 
+        if !self
+            .leases
+            .commit(&entry.resource_id, &metadata.session_id, &entry.lease)
+        {
+            return false;
+        }
+
         entry.state = SessionState::Active;
         events.publish(
             RuntimeEventKind::SessionOpened,
@@ -204,17 +211,24 @@ impl Registry {
         let Some(entry) = self.sessions.remove(&metadata.session_id) else {
             return;
         };
-        self.leases
+        let exposed = self
+            .leases
             .release(&entry.resource_id, &metadata.session_id);
-        self.remember_closed(metadata.session_id.clone(), entry.lease.clone());
-        events.publish(
-            RuntimeEventKind::SessionClosed,
-            entry.resource_id,
-            metadata.session_id.clone(),
-            entry.owner_id,
-            entry.lease.generation(),
-        );
+        if exposed {
+            self.remember_closed(metadata.session_id.clone(), entry.lease.clone());
+            events.publish(
+                RuntimeEventKind::SessionClosed,
+                entry.resource_id,
+                metadata.session_id.clone(),
+                entry.owner_id,
+                entry.lease.generation(),
+            );
+        }
         entry.done.send_replace(Some(close_result.clone()));
+    }
+
+    pub(crate) fn retained_generation_count(&self) -> usize {
+        self.leases.retained_generation_count()
     }
 
     fn remember_closed(&mut self, session_id: SessionId, lease: LeaseToken) {

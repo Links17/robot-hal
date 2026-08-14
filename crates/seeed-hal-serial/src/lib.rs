@@ -1,12 +1,20 @@
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
-use seeed_hal_core::{HalResult, ResourceDescriptor, ResourceSelector};
+use seeed_hal_core::{HalResult, ResourceSelector};
 use std::time::Duration;
 
 pub use seeed_hal_core::{
-    Endpoint, IdentityQuality, ResourceId, ResourceProperties, TransportKind,
+    CapabilityId, CapabilitySet, Endpoint, IdentityQuality, ResourceDescriptor, ResourceId,
+    ResourceProperties, TransportKind,
 };
+
+pub const SERIAL_BYTES_CAPABILITY: &str = "serial.bytes/v1";
+
+pub fn serial_bytes_capability() -> CapabilityId {
+    CapabilityId::parse(SERIAL_BYTES_CAPABILITY)
+        .expect("the static Serial capability identifier is valid")
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DataBits {

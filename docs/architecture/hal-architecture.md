@@ -76,8 +76,11 @@ deadline, so a peer that stops reading cannot retain hardware ownership.
 
 Each launch creates a 256-bit startup token. The handshake compares it in constant time and rejects
 incompatible protocol versions, unsupported required capabilities, and invalid frame/read/write
-limits before exposing resources. Unix endpoints live in a caller-private `0700` directory and the
-socket is `0600`; Windows uses a unique per-launch Named Pipe with remote clients rejected.
+limits before exposing resources. Client and broker advertise inclusive minor ranges within one
+major and select the highest shared minor; peers that omit both additive range fields retain the
+legacy exact-minor behavior. Unix endpoints live in a caller-private `0700` directory and the socket
+is `0600`. Windows uses a unique per-launch Named Pipe with remote clients rejected and a protected
+DACL granting access only to the current user, LocalSystem, and built-in Administrators.
 
 ### 3.3 Desktop integration
 
@@ -90,11 +93,14 @@ performs authentication and limit negotiation before starting one bounded writer
 reader task. Pending requests, cancellation and completion tombstones, writer admission, and event
 delivery are bounded; request IDs are nonzero and correlated independently of response order.
 
-Unix uses asyncio Unix sockets. Windows uses local-only Named Pipes, with every pywin32
-connect/read/write/close call delegated through `asyncio.to_thread`. Both transports use the
-broker's big-endian 32-bit length prefix, reject the hard 1 MiB limit before reading a frame body,
-and apply negotiated frame/read/write limits. The binding wipes mutable token and encode buffers it
-owns; Python/protobuf/asyncio or kernel-created immutable and transient copies are outside that
+Unix uses asyncio Unix sockets. On Windows, one tracked `asyncio.to_thread` call performs connection
+setup, then a bounded per-transport actor thread exclusively owns `ReadFile`, `WriteFile`, and
+`CloseHandle`. The pipe is placed in nonblocking byte mode so that actor can multiplex pending work;
+cancelling an active operation terminally closes the transport and waits for handle ownership to
+return before reporting cancellation. Both transports use the broker's big-endian 32-bit length
+prefix, reject the hard 1 MiB limit before reading a frame body, and apply negotiated
+frame/read/write limits. The binding wipes mutable token and encode buffers it owns;
+Python/protobuf/asyncio or kernel-created immutable and transient copies are outside that
 best-effort zeroization boundary.
 
 ## 4. Workspace modules
@@ -148,6 +154,12 @@ pub struct ResourceDescriptor {
 
 Identity quality is `Strong`, `Medium`, or `Weak`. A caller can reject weak identities when persistent binding requires stronger guarantees.
 
+`ResourceSelector.minimum_identity_quality` is an inclusive threshold with the stable ordering
+`Weak < Medium < Strong`. The canonical resolver matches the persisted resource ID, transport,
+minimum identity quality, and required hardware-class capability. It deliberately ignores the
+transient endpoint, including for disambiguation. Zero matching descriptors return
+`runtime.resource.not_found`; more than one returns `runtime.resource.ambiguous` and fails closed.
+
 ### 5.2 Capabilities
 
 Capabilities describe only transport or standard hardware-class behavior. Identifiers are stable and versioned, such as:
@@ -171,7 +183,12 @@ Lease modes are:
 - `Control`: normal read/write ownership; at most one controlling generation;
 - `Maintenance`: fully exclusive reconfiguration.
 
-Every lease includes an incrementing generation. Requests with a stale generation fail before reaching the adapter. Queues are bounded and each hardware-class interface documents overflow behavior.
+Every exposed lease includes an incrementing generation. Opening first creates a provisional
+reservation; only successful runtime publication commits its fencing generation. A failed,
+cancelled, or otherwise unexposed open compare-checks and rolls back that exact current reservation,
+while any generation already exposed to a caller remains monotonic. Requests with a stale
+generation fail before reaching the adapter. Queues are bounded and each hardware-class interface
+documents overflow behavior.
 
 HAL lease expiry performs transport cleanup only. Domain-safe physical behavior stays above HAL.
 
@@ -226,6 +243,10 @@ Camera control uses normal broker IPC. Frame payloads use a bounded shared-memor
 - Blocking vendor calls never execute on Tokio executor workers.
 - Operation queues are bounded and preserve documented ordering.
 - Cancellation has a deadline; adapters that cannot cancel synchronously are isolated in a disposable worker.
+- The Python Windows transport uses one bounded, per-transport actor thread as the sole steady-state
+  owner of its Named Pipe handle. Its command capacity is four; full or closed admission fails
+  without blocking the event loop. Native Windows execution remains an acceptance gate for
+  pywin32 `PIPE_NOWAIT` behavior.
 - The native Serial adapter serializes port access on one owned blocking actor with a one-command queue and no interrupt clone. Flush polls the platform output-queue count (`TIOCOUTQ` on Unix, `ClearCommError`/`COMSTAT.cbOutQue` on Windows) and succeeds only after it reaches zero; cancellation or the logical deadline stops polling and terminally releases the actor-owned handle. Read and write use finite nonzero native timeout slices of at most 100 ms while the configured Serial timeout remains the authoritative outer deadline.
 - Adapter-level Serial close has a configurable deadline and defaults to two seconds. On timeout,
   the runtime drops the resource actor, releases its lease, completes close waiters with
@@ -251,8 +272,8 @@ owner-readable, inaccessible to group/other, owned by the broker's effective use
 one hard link. The executable retains a no-follow parent directory descriptor, opens and revalidates
 the token relative to that descriptor, and deletes it with descriptor-relative `unlinkat` only after
 the device/inode/owner identities still match. On Windows, the parent and token must be non-reparse
-directory/file objects owned by the current process user. Their DACLs may grant effective access only
-to that user, LocalSystem, built-in administrators, or the Windows Owner Rights principal. The
+directory/file objects owned by the current process user. Their protected DACLs may grant effective
+access only to that user, LocalSystem, or built-in administrators. The
 executable retains the parent handle and file handles that deny write/delete sharing, requires one
 hard link, and revalidates handle security plus volume/file identity before marking the validated
 file handle for deletion. It does not arm delete-on-close until every trust check succeeds. A failed
@@ -265,7 +286,7 @@ before releasing them. Any buffer outside that list is outside this guarantee.
 
 ## 10. Observability
 
-The library emits structured tracing spans and metrics but never installs a subscriber. Required dimensions include adapter, transport kind, operation, normalized result, duration, queue depth, and retry count. Resource serial numbers and raw payloads are excluded from logs by default.
+The library emits structured tracing spans and metrics but never installs a subscriber. Required dimensions include adapter, transport kind, operation, normalized result, duration, queue depth, and retry count. Resource serial numbers and raw payloads are excluded from logs by default. The broker executable records both connection and owner-cleanup outcomes using only the error kind, stable name, category, operation, and retryable flag; diagnostic strings and credentials are excluded.
 
 ## 11. Delivery sequence
 

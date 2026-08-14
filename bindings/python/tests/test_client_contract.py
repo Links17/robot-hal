@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import struct
 import sys
+import threading
 from types import ModuleType
 from unittest.mock import patch
 
@@ -67,7 +68,16 @@ def enumerate_response(request_id: int, resource_id: str) -> hal_pb2.Envelope:
 
 
 @asynccontextmanager
-async def fake_broker(handler, *, frame=HARD_FRAME_BYTES, read=64 * 1024, write=64 * 1024):
+async def fake_broker(
+    handler,
+    *,
+    frame=HARD_FRAME_BYTES,
+    read=64 * 1024,
+    write=64 * 1024,
+    selected_minor=0,
+    minimum_minor=0,
+    maximum_minor=0,
+):
     if os.name == "nt":
         pytest.skip("Unix socket protocol fault injection is covered on Unix CI")
     import tempfile
@@ -80,6 +90,8 @@ async def fake_broker(handler, *, frame=HARD_FRAME_BYTES, read=64 * 1024, write=
                 hello = hal_pb2.Envelope.FromString(await read_frame(reader_stream))
                 assert hello.request_id == 1
                 assert hello.WhichOneof("payload") == "handshake_request"
+                assert hello.handshake_request.protocol_minor_minimum == 0
+                assert hello.handshake_request.protocol_minor_maximum == 0
                 await send_frame(
                     writer_stream,
                     envelope(
@@ -87,11 +99,13 @@ async def fake_broker(handler, *, frame=HARD_FRAME_BYTES, read=64 * 1024, write=
                         "handshake_response",
                         hal_pb2.HandshakeResponse(
                             protocol_major=1,
-                            protocol_minor=0,
+                            protocol_minor=selected_minor,
                             capabilities=["serial.bytes/v1"],
                             max_frame_bytes=frame,
                             max_read_bytes=read,
                             max_write_bytes=write,
+                            protocol_minor_minimum=minimum_minor,
+                            protocol_minor_maximum=maximum_minor,
                         ),
                     ).SerializeToString(),
                 )
@@ -118,6 +132,30 @@ def test_public_api_is_typed_and_does_not_export_protobuf_objects() -> None:
 
 
 @pytest.mark.asyncio
+async def test_python_client_accepts_overlap_selection_and_rejects_no_shared_minor() -> None:
+    release = asyncio.Event()
+
+    async def handler(_reader, _writer):
+        await release.wait()
+
+    async with fake_broker(handler, minimum_minor=0, maximum_minor=3) as endpoint:
+        client = await HalClient.connect(endpoint, TOKEN)
+        assert client.protocol_minor == 0
+        await client.close()
+        release.set()
+
+    async with fake_broker(
+        handler,
+        selected_minor=1,
+        minimum_minor=0,
+        maximum_minor=1,
+    ) as endpoint:
+        with pytest.raises(HalError) as caught:
+            await HalClient.connect(endpoint, TOKEN)
+        assert caught.value.name == "runtime.protocol.invalid_handshake"
+
+
+@pytest.mark.asyncio
 async def test_invalid_python_arguments_use_stable_hal_errors() -> None:
     with pytest.raises(HalError) as invalid_limit:
         await HalClient.connect("not-used", TOKEN, max_frame_bytes=True)
@@ -140,10 +178,12 @@ async def test_invalid_python_arguments_use_stable_hal_errors() -> None:
 @pytest.mark.asyncio
 async def test_python_client_round_trips_complete_serial_contract(broker) -> None:
     client = await HalClient.connect(broker.endpoint, broker.token)
+    assert client.protocol_minor == 0
     events = client.subscribe()
     resources = await client.enumerate_serial()
     assert resources[0].identity_quality is IdentityQuality.STRONG
     assert resources[0].transport is TransportKind.SERIAL
+    assert resources[0].capabilities == ("serial.bytes/v1",)
 
     serial = await client.open_serial(resources[0].selector(), SerialConfig())
     opened = await asyncio.wait_for(events.receive(), 1)
@@ -389,31 +429,34 @@ async def test_request_id_exhaustion_uses_last_nonzero_id() -> None:
 
 
 @pytest.mark.asyncio
-async def test_windows_transport_delegates_every_pywin32_call_to_threads(monkeypatch) -> None:
+async def test_windows_transport_owns_steady_state_pywin32_calls_on_one_thread(
+    monkeypatch,
+) -> None:
     from seeed_hal.transport_windows import WindowsFramedTransport
 
     win32file = ModuleType("win32file")
     win32pipe = ModuleType("win32pipe")
     pywintypes = ModuleType("pywintypes")
     calls = []
+    main_thread = threading.get_ident()
     wire = bytearray(struct.pack(">I", 2) + b"ok")
 
     def create_file(*args):
-        calls.append(("connect", args))
+        calls.append(("connect", threading.get_ident(), args))
         return object()
 
     def read_file(_handle, count):
-        calls.append(("read", count))
+        calls.append(("read", threading.get_ident(), count))
         chunk = bytes(wire[:count])
         del wire[:count]
         return 0, chunk
 
     def write_file(_handle, data):
-        calls.append(("write", bytes(data)))
+        calls.append(("write", threading.get_ident(), bytes(data)))
         return 0, len(data)
 
     def close_handle(_handle):
-        calls.append(("close",))
+        calls.append(("close", threading.get_ident()))
 
     win32file.CreateFile = create_file
     win32file.ReadFile = read_file
@@ -422,8 +465,11 @@ async def test_windows_transport_delegates_every_pywin32_call_to_threads(monkeyp
     win32file.GENERIC_READ = 1
     win32file.GENERIC_WRITE = 2
     win32file.OPEN_EXISTING = 3
-    win32pipe.SetNamedPipeHandleState = lambda *_args: calls.append(("state",))
+    win32pipe.SetNamedPipeHandleState = lambda *_args: calls.append(
+        ("state", threading.get_ident())
+    )
     win32pipe.PIPE_READMODE_BYTE = 0
+    win32pipe.PIPE_NOWAIT = 1
     monkeypatch.setitem(sys.modules, "win32file", win32file)
     monkeypatch.setitem(sys.modules, "win32pipe", win32pipe)
     monkeypatch.setitem(sys.modules, "pywintypes", pywintypes)
@@ -442,7 +488,10 @@ async def test_windows_transport_delegates_every_pywin32_call_to_threads(monkeyp
         await transport.close()
 
     assert [entry[0] for entry in calls] == ["connect", "state", "read", "read", "write", "close"]
-    assert len(delegated) == 5
+    assert len(delegated) == 1
+    actor_threads = {entry[1] for entry in calls if entry[0] in {"read", "write", "close"}}
+    assert len(actor_threads) == 1
+    assert actor_threads != {main_thread}
 
 
 def test_non_windows_import_does_not_require_pywin32() -> None:

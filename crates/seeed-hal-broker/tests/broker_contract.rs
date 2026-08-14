@@ -380,6 +380,8 @@ fn valid_handshake(token: Vec<u8>) -> v1::HandshakeRequest {
         max_frame_bytes: 1024 * 1024,
         max_read_bytes: 64 * 1024,
         max_write_bytes: 64 * 1024,
+        protocol_minor_minimum: 0,
+        protocol_minor_maximum: 0,
     }
 }
 
@@ -518,7 +520,7 @@ async fn handshake_version_capability_and_byte_limits_fail_closed() {
     wrong_version.protocol_major = 2;
     assert_eq!(
         rejected_handshake(wrong_version).await,
-        "runtime.protocol.incompatible_version"
+        "runtime.protocol.version_incompatible"
     );
 
     let mut unsupported_capability = valid_handshake(TOKEN.to_vec());
@@ -543,6 +545,32 @@ async fn handshake_version_capability_and_byte_limits_fail_closed() {
         rejected_handshake(missing_envelope_overhead).await,
         "runtime.protocol.invalid_message"
     );
+}
+
+#[tokio::test]
+async fn broker_selects_highest_shared_minor_and_reports_its_supported_range() {
+    let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+    let broker = broker();
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    let mut handshake = valid_handshake(TOKEN.to_vec());
+    handshake.protocol_minor = 3;
+    handshake.protocol_minor_minimum = 0;
+    handshake.protocol_minor_maximum = 3;
+
+    let response = client
+        .request(envelope::Payload::HandshakeRequest(handshake))
+        .await;
+    let accepted = match response.payload {
+        Some(envelope::Payload::HandshakeResponse(response)) => response,
+        other => panic!("expected handshake response, got {other:?}"),
+    };
+    assert_eq!(accepted.protocol_minor, 0);
+    assert_eq!(accepted.protocol_minor_minimum, 0);
+    assert_eq!(accepted.protocol_minor_maximum, 0);
+
+    drop(client);
+    assert!(server.await.unwrap().cleanup_error().is_none());
 }
 
 #[tokio::test]
@@ -1548,6 +1576,6 @@ async fn unix_listener_uses_a_private_directory_and_socket() {
     );
 
     drop(listener);
-    std::fs::remove_file(socket_path).unwrap();
+    assert!(!socket_path.exists());
     std::fs::remove_dir(directory).unwrap();
 }

@@ -20,6 +20,9 @@ tokio-util = { workspace = true }
 uuid = { workspace = true }
 zeroize = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+seeed-hal-windows-security = { path = "../../adapters/windows-security" }
+
 [dev-dependencies]
 async-trait = { workspace = true }
 seeed-hal-testkit = { path = "../seeed-hal-testkit" }

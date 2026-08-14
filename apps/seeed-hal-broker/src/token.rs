@@ -530,7 +530,6 @@ mod platform {
             .ok_or_else(|| policy_error("token file and parent must have a private DACL"))?;
         let system: LocalBox<Sid> = "SY".parse()?;
         let administrators: LocalBox<Sid> = "BA".parse()?;
-        let owner_rights: LocalBox<Sid> = "OW".parse()?;
 
         for index in 0..dacl.len() {
             let ace = dacl
@@ -549,11 +548,7 @@ mod platform {
             let sid = ace
                 .sid()
                 .ok_or_else(|| policy_error("token DACL contains an invalid access entry"))?;
-            if sid == user
-                || sid == system.as_ref()
-                || sid == administrators.as_ref()
-                || sid == owner_rights.as_ref()
-            {
+            if sid == user || sid == system.as_ref() || sid == administrators.as_ref() {
                 continue;
             }
             let trustee: Trustee<'_> = sid.into();

@@ -26,7 +26,9 @@ from seeed_hal.transport_unix import UnixFramedTransport  # noqa: E402
 
 
 PROTOCOL_MAJOR = 1
-PROTOCOL_MINOR = 0
+PROTOCOL_MINOR_MINIMUM = 0
+PROTOCOL_MINOR_MAXIMUM = 0
+PROTOCOL_MINOR = PROTOCOL_MINOR_MAXIMUM
 SERIAL_CAPABILITY = "serial.bytes/v1"
 TRANSFER_LIMIT = 64 * 1024
 FRAME_LIMIT = 1024 * 1024
@@ -218,11 +220,17 @@ class RawClient:
                 max_frame_bytes=FRAME_LIMIT,
                 max_read_bytes=TRANSFER_LIMIT,
                 max_write_bytes=TRANSFER_LIMIT,
+                protocol_minor_minimum=PROTOCOL_MINOR_MINIMUM,
+                protocol_minor_maximum=PROTOCOL_MINOR_MAXIMUM,
             ),
         )
         _expect_payload(response, "handshake_response")
         handshake = response.handshake_response
         _require(handshake.protocol_major == PROTOCOL_MAJOR, "protocol major mismatch")
+        _require(
+            PROTOCOL_MINOR_MINIMUM <= handshake.protocol_minor <= PROTOCOL_MINOR_MAXIMUM,
+            "selected protocol minor is outside the offered range",
+        )
         _require(SERIAL_CAPABILITY in handshake.capabilities, "Serial capability missing")
         self.transport.set_frame_limit(handshake.max_frame_bytes)
 

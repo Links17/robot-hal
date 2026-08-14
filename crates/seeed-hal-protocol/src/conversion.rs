@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use seeed_hal_core::{
-    Endpoint, ErrorCategory, HalError, HalResult, IdentityQuality, LeaseId, LeaseMode, LeaseToken,
-    ResourceDescriptor, ResourceId, ResourceProperties, ResourceSelector, SessionId, TransportKind,
+    CapabilityId, CapabilitySet, Endpoint, ErrorCategory, HalError, HalResult, IdentityQuality,
+    LeaseId, LeaseMode, LeaseToken, ResourceDescriptor, ResourceId, ResourceProperties,
+    ResourceSelector, SessionId, TransportKind,
 };
 use seeed_hal_runtime::{RuntimeEvent, RuntimeEventKind};
 use seeed_hal_serial::{DataBits, FlowControl, Parity, SerialConfig, StopBits};
@@ -73,12 +74,29 @@ impl TryFrom<v1::ResourceDescriptor> for ResourceDescriptor {
         })?;
         let endpoint = Endpoint::new(value.endpoint)
             .map_err(|_| invalid_message("resource descriptor has an invalid endpoint"))?;
+        let capabilities = if value.capabilities.is_empty() {
+            vec![
+                CapabilityId::parse(crate::SERIAL_CAPABILITY)
+                    .expect("the static Serial capability identifier is valid"),
+            ]
+        } else {
+            value
+                .capabilities
+                .into_iter()
+                .map(|capability| {
+                    CapabilityId::parse(capability).map_err(|_| {
+                        invalid_message("resource descriptor has an invalid capability")
+                    })
+                })
+                .collect::<HalResult<Vec<_>>>()?
+        };
         Ok(Self::new(
             selector.id().clone(),
             endpoint,
             selector.minimum_identity_quality(),
             selector.transport(),
             ResourceProperties::new(value.properties.into_iter().collect::<BTreeMap<_, _>>()),
+            CapabilitySet::new(capabilities),
         ))
     }
 }
@@ -94,6 +112,12 @@ impl From<&ResourceDescriptor> for v1::ResourceDescriptor {
                 .properties()
                 .iter()
                 .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect(),
+            capabilities: value
+                .capabilities()
+                .as_slice()
+                .iter()
+                .map(|capability| capability.as_str().to_owned())
                 .collect(),
         }
     }

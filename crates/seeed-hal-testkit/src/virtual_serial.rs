@@ -1,11 +1,11 @@
 use bytes::Bytes;
 use seeed_hal_core::{
-    ErrorCategory, HalError, HalResult, IdentityQuality, ResourceDescriptor, ResourceId,
-    ResourceProperties, ResourceSelector, TransportKind,
+    CapabilitySet, ErrorCategory, HalError, HalResult, IdentityQuality, ResourceDescriptor,
+    ResourceId, ResourceProperties, ResourceSelector, TransportKind, resolve_resource,
 };
 use seeed_hal_serial::{
     ControlLines, DataBits, FlowControl, Parity, SerialAdapter, SerialConfig, SerialSession,
-    StopBits,
+    StopBits, serial_bytes_capability,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +22,7 @@ const DEFAULT_ENDPOINT_PREFIX: &str = "virtual://serial/";
 /// `runtime.queue.full` rather than waiting for capacity.
 #[derive(Clone, Debug)]
 pub struct VirtualSerialAdapter {
-    descriptor: ResourceDescriptor,
+    descriptors: Vec<ResourceDescriptor>,
 }
 
 impl VirtualSerialAdapter {
@@ -36,13 +36,23 @@ impl VirtualSerialAdapter {
         properties.insert("mode".to_owned(), "loopback".to_owned());
 
         Self {
-            descriptor: resource_descriptor(
+            descriptors: vec![resource_descriptor(
                 resource_id,
                 endpoint,
                 IdentityQuality::Strong,
                 ResourceProperties::new(properties),
-            ),
+            )],
         }
+    }
+
+    pub fn from_descriptors(descriptors: Vec<ResourceDescriptor>) -> HalResult<Self> {
+        if descriptors.is_empty() {
+            return Err(invalid_argument(
+                "serial.adapter.configure",
+                "virtual adapter requires at least one descriptor",
+            ));
+        }
+        Ok(Self { descriptors })
     }
 }
 
@@ -53,7 +63,7 @@ impl SerialAdapter for VirtualSerialAdapter {
     }
 
     async fn enumerate(&self) -> HalResult<Vec<ResourceDescriptor>> {
-        Ok(vec![self.descriptor.clone()])
+        Ok(self.descriptors.clone())
     }
 
     async fn open(
@@ -61,21 +71,19 @@ impl SerialAdapter for VirtualSerialAdapter {
         selector: &ResourceSelector,
         config: SerialConfig,
     ) -> HalResult<Box<dyn SerialSession>> {
-        if selector != &self.descriptor.selector() {
-            return Err(not_found(
-                "serial.open",
-                "selector did not match the loopback descriptor",
-            ));
-        }
+        let descriptor = resolve_resource(
+            &self.descriptors,
+            selector,
+            &serial_bytes_capability(),
+            "serial.open",
+        )?
+        .clone();
 
         validate_config(&config)?;
 
         let (tx, rx) = mpsc::channel(QUEUE_CAPACITY);
         Ok(Box::new(VirtualSerialSession::new(
-            self.descriptor.clone(),
-            config,
-            tx,
-            rx,
+            descriptor, config, tx, rx,
         )))
     }
 }
@@ -276,17 +284,6 @@ fn invalid_argument(operation: &'static str, debug_message: impl Into<String>) -
     .expect("static invalid argument error metadata must be valid")
 }
 
-fn not_found(operation: &'static str, debug_message: impl Into<String>) -> HalError {
-    HalError::new(
-        "runtime.resource.not_found",
-        ErrorCategory::NotFound,
-        operation,
-        false,
-        debug_message,
-    )
-    .expect("static not found error metadata must be valid")
-}
-
 fn unsupported_configuration(
     operation: &'static str,
     debug_message: impl Into<String>,
@@ -346,5 +343,6 @@ fn resource_descriptor(
         identity_quality,
         TransportKind::Serial,
         properties,
+        CapabilitySet::new(vec![serial_bytes_capability()]),
     )
 }

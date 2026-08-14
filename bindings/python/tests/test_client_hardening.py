@@ -62,6 +62,7 @@ def direct_client(
 ) -> HalClient:
     return HalClient(
         transport,
+        protocol_minor=0,
         frame_limit=HARD_FRAME_BYTES,
         read_limit=64 * 1024,
         write_limit=64 * 1024,
@@ -171,10 +172,142 @@ def install_win32_modules(monkeypatch, win32file: ModuleType, win32pipe: ModuleT
     win32file.GENERIC_READ = 1
     win32file.GENERIC_WRITE = 2
     win32file.OPEN_EXISTING = 3
+    win32file.FILE_FLAG_OVERLAPPED = 4
     win32pipe.PIPE_READMODE_BYTE = 0
+    win32pipe.PIPE_NOWAIT = 1
     monkeypatch.setitem(sys.modules, "win32file", win32file)
     monkeypatch.setitem(sys.modules, "win32pipe", win32pipe)
     monkeypatch.setitem(sys.modules, "pywintypes", pywintypes)
+
+
+@pytest.mark.asyncio
+async def test_windows_blocked_read_cancellation_transfers_close_to_owned_worker(
+    monkeypatch,
+) -> None:
+    from seeed_hal.transport_windows import WindowsFramedTransport
+
+    handle = object()
+    read_started = threading.Event()
+    read_release = threading.Event()
+    active = 0
+    active_lock = threading.Lock()
+    close_calls: list[int] = []
+    win32file = ModuleType("win32file")
+    win32pipe = ModuleType("win32pipe")
+
+    win32file.CreateFile = lambda *_args: handle
+    win32pipe.SetNamedPipeHandleState = lambda *_args: None
+
+    def read_file(value, _count):
+        nonlocal active
+        assert value is handle
+        with active_lock:
+            active += 1
+        read_started.set()
+        assert read_release.wait(2)
+        with active_lock:
+            active -= 1
+        return 0, b"\0\0\0\0"
+
+    def close_handle(value):
+        assert value is handle
+        with active_lock:
+            assert active == 0, "handle close raced an active read"
+        close_calls.append(threading.get_ident())
+
+    win32file.ReadFile = read_file
+    win32file.WriteFile = lambda _handle, data: (0, len(data))
+    win32file.CloseHandle = close_handle
+    install_win32_modules(monkeypatch, win32file, win32pipe)
+    transport = await WindowsFramedTransport.connect(r"\\.\pipe\seeed-hal-blocked-read")
+    receiving = asyncio.create_task(transport.receive())
+    assert await asyncio.to_thread(read_started.wait, 1)
+
+    receiving.cancel()
+    closing = asyncio.create_task(transport.close())
+    await asyncio.sleep(0)
+    closing.cancel()
+    await asyncio.sleep(0)
+    closing.cancel()
+    try:
+        assert not receiving.done()
+        assert not closing.done()
+        assert close_calls == []
+    finally:
+        read_release.set()
+        results = await asyncio.gather(receiving, closing, return_exceptions=True)
+
+    assert all(isinstance(result, asyncio.CancelledError) for result in results)
+    assert len(close_calls) == 1
+    assert not any(
+        thread.name.startswith("seeed-hal-pipe-io") and thread.is_alive()
+        for thread in threading.enumerate()
+    )
+
+
+@pytest.mark.asyncio
+async def test_windows_blocked_write_cancellation_transfers_close_to_owned_worker(
+    monkeypatch,
+) -> None:
+    from seeed_hal.transport_windows import WindowsFramedTransport
+
+    handle = object()
+    write_started = threading.Event()
+    write_release = threading.Event()
+    active = 0
+    active_lock = threading.Lock()
+    close_calls: list[int] = []
+    win32file = ModuleType("win32file")
+    win32pipe = ModuleType("win32pipe")
+
+    win32file.CreateFile = lambda *_args: handle
+    win32pipe.SetNamedPipeHandleState = lambda *_args: None
+    win32file.ReadFile = lambda _handle, count: (0, b"\0" * count)
+
+    def write_file(value, data):
+        nonlocal active
+        assert value is handle
+        with active_lock:
+            active += 1
+        write_started.set()
+        assert write_release.wait(2)
+        with active_lock:
+            active -= 1
+        return 0, len(data)
+
+    def close_handle(value):
+        assert value is handle
+        with active_lock:
+            assert active == 0, "handle close raced an active write"
+        close_calls.append(threading.get_ident())
+
+    win32file.WriteFile = write_file
+    win32file.CloseHandle = close_handle
+    install_win32_modules(monkeypatch, win32file, win32pipe)
+    transport = await WindowsFramedTransport.connect(r"\\.\pipe\seeed-hal-blocked-write")
+    sending = asyncio.create_task(transport.send(b"blocked"))
+    assert await asyncio.to_thread(write_started.wait, 1)
+
+    sending.cancel()
+    closing = asyncio.create_task(transport.close())
+    await asyncio.sleep(0)
+    closing.cancel()
+    await asyncio.sleep(0)
+    closing.cancel()
+    try:
+        assert not sending.done()
+        assert not closing.done()
+        assert close_calls == []
+    finally:
+        write_release.set()
+        results = await asyncio.gather(sending, closing, return_exceptions=True)
+
+    assert all(isinstance(result, asyncio.CancelledError) for result in results)
+    assert len(close_calls) == 1
+    assert not any(
+        thread.name.startswith("seeed-hal-pipe-io") and thread.is_alive()
+        for thread in threading.enumerate()
+    )
 
 
 @pytest.mark.asyncio
@@ -537,6 +670,7 @@ async def test_invalid_resource_selectors_are_structured_arguments(selector) -> 
         SerialConfig(read_timeout_ms=True),
         SerialConfig(read_timeout_ms="100"),
         SerialConfig(read_timeout_ms=-1),
+        SerialConfig(read_timeout_ms=0),
         SerialConfig(read_timeout_ms=MAX_U64 + 1),
     ],
 )

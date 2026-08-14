@@ -5,10 +5,10 @@ mod session;
 
 use async_trait::async_trait;
 use seeed_hal_core::{
-    Endpoint, ErrorCategory, HalError, HalResult, ResourceDescriptor, ResourceProperties,
-    ResourceSelector, TransportKind,
+    CapabilitySet, Endpoint, ErrorCategory, HalError, HalResult, ResourceDescriptor,
+    ResourceProperties, ResourceSelector, TransportKind, resolve_resource,
 };
-use seeed_hal_serial::{SerialAdapter, SerialConfig, SerialSession};
+use seeed_hal_serial::{SerialAdapter, SerialConfig, SerialSession, serial_bytes_capability};
 use serialport::{SerialPortInfo, SerialPortType};
 use std::collections::BTreeMap;
 
@@ -56,12 +56,14 @@ impl SerialAdapter for SerialPortAdapter {
             ));
         }
 
-        let descriptor = self
-            .enumerate()
-            .await?
-            .into_iter()
-            .find(|descriptor| descriptor.selector() == *selector)
-            .ok_or_else(|| not_found("serial.open", "selector did not match an enumerated port"))?;
+        let descriptors = self.enumerate().await?;
+        let descriptor = resolve_resource(
+            &descriptors,
+            selector,
+            &serial_bytes_capability(),
+            "serial.open",
+        )?
+        .clone();
 
         Ok(Box::new(
             NativeSerialSession::open(descriptor, config).await?,
@@ -80,6 +82,7 @@ fn descriptor_from_port(port: SerialPortInfo) -> HalResult<ResourceDescriptor> {
         identity.quality,
         TransportKind::Serial,
         properties,
+        CapabilitySet::new(vec![serial_bytes_capability()]),
     ))
 }
 
@@ -269,16 +272,6 @@ pub(crate) fn invalid_argument(
     hal_error(
         "runtime.argument.invalid",
         ErrorCategory::InvalidArgument,
-        operation,
-        false,
-        debug_message,
-    )
-}
-
-pub(crate) fn not_found(operation: &'static str, debug_message: impl Into<String>) -> HalError {
-    hal_error(
-        "runtime.resource.not_found",
-        ErrorCategory::NotFound,
         operation,
         false,
         debug_message,

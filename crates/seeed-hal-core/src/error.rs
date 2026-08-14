@@ -109,7 +109,7 @@ impl<'de> Deserialize<'de> for OperationName {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HalError(ErrorName, ErrorCategory, OperationName, bool, String);
 
 impl HalError {
@@ -194,6 +194,30 @@ impl Serialize for HalError {
         S: serde::Serializer,
     {
         self.decision_fields().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for HalError {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct SerializedDecision {
+            name: ErrorName,
+            category: ErrorCategory,
+            operation: OperationName,
+            retryable: bool,
+        }
+
+        let decision = SerializedDecision::deserialize(deserializer)?;
+        Ok(Self(
+            decision.name,
+            decision.category,
+            decision.operation,
+            decision.retryable,
+            String::new(),
+        ))
     }
 }
 

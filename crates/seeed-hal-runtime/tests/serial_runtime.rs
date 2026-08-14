@@ -1,11 +1,11 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
 use seeed_hal_core::{
-    HalResult, LeaseId, LeaseMode, LeaseToken, OwnerId, ResourceDescriptor, ResourceSelector,
-    SessionId,
+    ErrorCategory, HalError, HalResult, IdentityQuality, LeaseId, LeaseMode, LeaseToken, OwnerId,
+    ResourceDescriptor, ResourceId, ResourceSelector, SessionId, TransportKind,
 };
 use seeed_hal_runtime::HalRuntime;
 use seeed_hal_serial::{ControlLines, SerialAdapter, SerialConfig, SerialSession};
@@ -166,6 +166,53 @@ struct FirstReadBlocksSession {
     inner: Box<dyn SerialSession>,
     read_started: Arc<Notify>,
     release_read: Arc<Notify>,
+}
+
+#[derive(Clone)]
+struct FailNextOpenAdapter {
+    inner: VirtualSerialAdapter,
+    fail_next: Arc<AtomicBool>,
+}
+
+impl FailNextOpenAdapter {
+    fn new(resource_id: &str) -> Self {
+        Self {
+            inner: VirtualSerialAdapter::loopback(resource_id),
+            fail_next: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn fail_next(&self) {
+        self.fail_next.store(true, Ordering::Release);
+    }
+}
+
+#[async_trait::async_trait]
+impl SerialAdapter for FailNextOpenAdapter {
+    fn adapter_name(&self) -> &'static str {
+        "virtual.serial.fail-next-open"
+    }
+
+    async fn enumerate(&self) -> HalResult<Vec<ResourceDescriptor>> {
+        self.inner.enumerate().await
+    }
+
+    async fn open(
+        &self,
+        selector: &ResourceSelector,
+        config: SerialConfig,
+    ) -> HalResult<Box<dyn SerialSession>> {
+        if self.fail_next.swap(false, Ordering::AcqRel) {
+            return Err(HalError::new(
+                "runtime.transport.unavailable",
+                ErrorCategory::Unavailable,
+                "serial.open",
+                true,
+                "injected open failure",
+            )?);
+        }
+        self.inner.open(selector, config).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -378,7 +425,79 @@ async fn cancelling_an_in_progress_open_releases_its_reservation() {
     .await
     .expect("cancelled open cleanup must not hang")
     .unwrap();
+    assert_eq!(replacement.lease_token().generation(), 1);
+    assert_eq!(runtime.retained_generation_count().await, 1);
     replacement.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn thousands_of_unique_failed_opens_do_not_retain_generation_entries() {
+    let runtime = HalRuntime::builder()
+        .serial_adapter(VirtualSerialAdapter::loopback("serial:virtual:present"))
+        .build();
+
+    for index in 0..4_096 {
+        let selector = ResourceSelector::exact(
+            ResourceId::parse(format!("serial:missing:{index}")).unwrap(),
+            IdentityQuality::Weak,
+            TransportKind::Serial,
+        );
+        let error = match runtime
+            .open_serial(owner("client-a"), selector, SerialConfig::default())
+            .await
+        {
+            Ok(_) => panic!("missing selector must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.name().as_str(), "runtime.resource.not_found");
+    }
+
+    assert_eq!(runtime.retained_generation_count().await, 0);
+}
+
+#[tokio::test]
+async fn failed_reopen_after_exposure_does_not_erase_or_skip_the_last_generation() {
+    let adapter = FailNextOpenAdapter::new("serial:virtual:reopen-failure");
+    let runtime = HalRuntime::builder()
+        .serial_adapter(adapter.clone())
+        .build();
+    let descriptor = runtime.enumerate_serial().await.unwrap().remove(0);
+    let first = runtime
+        .open_serial(
+            owner("client-a"),
+            descriptor.selector(),
+            SerialConfig::default(),
+        )
+        .await
+        .unwrap();
+    let first_generation = first.lease_token().generation();
+    first.close().await.unwrap();
+
+    adapter.fail_next();
+    let error = match runtime
+        .open_serial(
+            owner("client-b"),
+            descriptor.selector(),
+            SerialConfig::default(),
+        )
+        .await
+    {
+        Ok(_) => panic!("injected open failure must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.name().as_str(), "runtime.transport.unavailable");
+    assert_eq!(runtime.retained_generation_count().await, 1);
+
+    let reopened = runtime
+        .open_serial(
+            owner("client-c"),
+            descriptor.selector(),
+            SerialConfig::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reopened.lease_token().generation(), first_generation + 1);
+    reopened.close().await.unwrap();
 }
 
 #[tokio::test]

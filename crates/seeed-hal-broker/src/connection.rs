@@ -9,12 +9,12 @@ use prost::Message;
 use seeed_hal_core::{ErrorCategory, HalError, HalResult, OwnerId};
 use seeed_hal_protocol::v1::{self, envelope};
 use seeed_hal_protocol::{
-    MAX_FRAME_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR, SERIAL_CAPABILITY, invalid_message,
+    MAX_FRAME_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR_MAXIMUM, PROTOCOL_MINOR_MINIMUM,
+    SERIAL_CAPABILITY, handshake_minor_range, invalid_message, negotiate_protocol_minor,
     parse_session_lease,
 };
 use seeed_hal_runtime::{HalRuntime, RuntimeEvent, RuntimeEventKind};
 use seeed_hal_serial::ControlLines;
-use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
@@ -612,12 +612,7 @@ fn validate_handshake(
     request: &mut v1::HandshakeRequest,
 ) -> HalResult<(v1::HandshakeResponse, NegotiatedLimits)> {
     let presented_token = Zeroizing::new(std::mem::take(&mut request.startup_token));
-    let token_matches = presented_token.len() == expected_token.expose_bytes().len()
-        && bool::from(
-            presented_token
-                .as_slice()
-                .ct_eq(expected_token.expose_bytes().as_slice()),
-        );
+    let token_matches = expected_token.authenticates(presented_token.as_slice());
     if !token_matches {
         return Err(protocol_error(
             "runtime.protocol.authentication_failed",
@@ -627,15 +622,15 @@ fn validate_handshake(
             "startup token did not authenticate the connection",
         ));
     }
-    if request.protocol_major != PROTOCOL_MAJOR || request.protocol_minor != PROTOCOL_MINOR {
-        return Err(protocol_error(
-            "runtime.protocol.incompatible_version",
-            "runtime.protocol.handshake",
-            ErrorCategory::Conflict,
-            false,
-            "the requested protocol version is not supported",
-        ));
-    }
+    let (client_minimum, client_maximum) = handshake_minor_range(request)?;
+    let selected_minor = negotiate_protocol_minor(
+        request.protocol_major,
+        client_minimum,
+        client_maximum,
+        PROTOCOL_MAJOR,
+        PROTOCOL_MINOR_MINIMUM,
+        PROTOCOL_MINOR_MAXIMUM,
+    )?;
     for capability in &request.required_capabilities {
         if capability != SERIAL_CAPABILITY {
             return Err(protocol_error(
@@ -664,11 +659,13 @@ fn validate_handshake(
 
     let response = v1::HandshakeResponse {
         protocol_major: PROTOCOL_MAJOR,
-        protocol_minor: PROTOCOL_MINOR,
+        protocol_minor: selected_minor,
         capabilities: vec![SERIAL_CAPABILITY.to_owned()],
         max_frame_bytes: request.max_frame_bytes,
         max_read_bytes: request.max_read_bytes,
         max_write_bytes: request.max_write_bytes,
+        protocol_minor_minimum: PROTOCOL_MINOR_MINIMUM,
+        protocol_minor_maximum: PROTOCOL_MINOR_MAXIMUM,
     };
     let response_envelope = v1::Envelope {
         request_id: u64::MAX,

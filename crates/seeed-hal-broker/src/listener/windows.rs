@@ -15,7 +15,7 @@ pub struct WindowsBroker {
 impl WindowsBroker {
     pub fn bind(broker: Broker) -> io::Result<Self> {
         let pipe_name = format!(r"\\.\pipe\seeed-hal-{}", Uuid::new_v4());
-        let server = options(true).create(&pipe_name)?;
+        let server = create_server(&pipe_name, true)?;
         Ok(Self {
             broker,
             pipe_name,
@@ -30,7 +30,7 @@ impl WindowsBroker {
     pub async fn serve_one(&self) -> io::Result<ConnectionOutcome> {
         let mut server = self.server.lock().await;
         server.connect().await?;
-        let next = options(false).create(&self.pipe_name)?;
+        let next = create_server(&self.pipe_name, false)?;
         let connected = std::mem::replace(&mut *server, next);
         drop(server);
         Ok(self.broker.serve_connection(connected).await)
@@ -42,4 +42,8 @@ fn options(first_instance: bool) -> ServerOptions {
     options.reject_remote_clients(true);
     options.first_pipe_instance(first_instance);
     options
+}
+
+fn create_server(pipe_name: &str, first_instance: bool) -> io::Result<NamedPipeServer> {
+    seeed_hal_windows_security::create_current_user_named_pipe(&options(first_instance), pipe_name)
 }

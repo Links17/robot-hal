@@ -106,6 +106,10 @@ impl CapabilitySet {
     pub fn as_slice(&self) -> &[CapabilityId] {
         &self.0
     }
+
+    pub fn contains(&self, capability: &CapabilityId) -> bool {
+        self.0.contains(capability)
+    }
 }
 
 pub(crate) fn validate_identifier(field: &'static str, value: &str) -> HalResult<()> {

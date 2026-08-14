@@ -8,6 +8,9 @@ use prost::Message;
 use seeed_hal_core::{ErrorCategory, HalError, HalResult, ResourceDescriptor, ResourceSelector};
 use seeed_hal_protocol::v1::{self, envelope};
 use seeed_hal_protocol::{MAX_FRAME_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR, SERIAL_CAPABILITY};
+use seeed_hal_protocol::{
+    PROTOCOL_MINOR_MAXIMUM, PROTOCOL_MINOR_MINIMUM, handshake_response_minor_range,
+};
 use seeed_hal_serial::SerialConfig;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -189,6 +192,7 @@ struct Outbound {
 
 #[derive(Clone, Copy)]
 struct Limits {
+    protocol_minor: u32,
     frame: usize,
     read: usize,
     write: usize,
@@ -301,11 +305,21 @@ impl HalClient {
         Self::from_io(io, options).await
     }
 
+    pub fn protocol_minor(&self) -> u32 {
+        self.inner
+            .shared
+            .limits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .protocol_minor
+    }
+
     async fn from_io<T>(io: T, options: ConnectionOptions) -> HalResult<Self>
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let requested = Limits {
+            protocol_minor: PROTOCOL_MINOR_MAXIMUM,
             frame: options.max_frame_bytes,
             read: options.max_read_bytes,
             write: options.max_write_bytes,
@@ -653,6 +667,8 @@ where
             max_frame_bytes: requested.frame as u32,
             max_read_bytes: requested.read as u32,
             max_write_bytes: requested.write as u32,
+            protocol_minor_minimum: PROTOCOL_MINOR_MINIMUM,
+            protocol_minor_maximum: PROTOCOL_MINOR_MAXIMUM,
         })),
     };
     let encoded_len = envelope.encoded_len();
@@ -718,6 +734,7 @@ where
         Some(envelope::Payload::HandshakeResponse(response)) => {
             validate_handshake_response(&response, requested)?;
             Ok(Limits {
+                protocol_minor: response.protocol_minor,
                 frame: response.max_frame_bytes as usize,
                 read: response.max_read_bytes as usize,
                 write: response.max_write_bytes as usize,
@@ -1256,8 +1273,18 @@ fn validate_handshake_response(
     response: &v1::HandshakeResponse,
     requested: Limits,
 ) -> HalResult<()> {
+    let broker_range = handshake_response_minor_range(response).map_err(|_| {
+        client_error(
+            "runtime.protocol.invalid_handshake",
+            ErrorCategory::Conflict,
+            "runtime.protocol.handshake",
+            false,
+            "broker returned an invalid supported protocol minor range",
+        )
+    })?;
     if response.protocol_major != PROTOCOL_MAJOR
-        || response.protocol_minor != PROTOCOL_MINOR
+        || !(PROTOCOL_MINOR_MINIMUM..=PROTOCOL_MINOR_MAXIMUM).contains(&response.protocol_minor)
+        || !(broker_range.0..=broker_range.1).contains(&response.protocol_minor)
         || response.max_frame_bytes == 0
         || response.max_frame_bytes as usize > requested.frame
         || response.max_read_bytes == 0
@@ -1392,6 +1419,7 @@ mod tests {
         begin_termination, client_error, frame_codec, reader_task, visit_fields,
     };
     use seeed_hal_core::ErrorCategory;
+    use seeed_hal_protocol::PROTOCOL_MINOR_MAXIMUM;
     use seeed_hal_protocol::v1::{self, envelope};
 
     #[derive(Clone, Default)]
@@ -1601,6 +1629,8 @@ mod tests {
                             max_frame_bytes: request.max_frame_bytes,
                             max_read_bytes: request.max_read_bytes,
                             max_write_bytes: request.max_write_bytes,
+                            protocol_minor_minimum: 0,
+                            protocol_minor_maximum: 0,
                         },
                     )),
                 }
@@ -1723,6 +1753,7 @@ mod tests {
                     terminal: None,
                 }),
                 limits: std::sync::Mutex::new(Limits {
+                    protocol_minor: PROTOCOL_MINOR_MAXIMUM,
                     frame: 512,
                     read: 16,
                     write: 16,
