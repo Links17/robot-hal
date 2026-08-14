@@ -140,7 +140,7 @@ impl HalRuntime {
         pending_open.disarm();
         if !accepted {
             actor.request_close();
-            let _ = actor.wait_closed().await;
+            actor.wait_closed().await?;
             return Err(runtime_error(
                 "runtime.session.closed",
                 ErrorCategory::Conflict,
@@ -400,10 +400,10 @@ impl Drop for SerialHandle {
     }
 }
 
-async fn wait_until_done(mut done: watch::Receiver<bool>) -> HalResult<()> {
+async fn wait_until_done(mut done: watch::Receiver<Option<HalResult<()>>>) -> HalResult<()> {
     loop {
-        if *done.borrow() {
-            return Ok(());
+        if let Some(result) = done.borrow().clone() {
+            return result;
         }
         if done.changed().await.is_err() {
             return Err(runtime_error(
@@ -437,4 +437,118 @@ pub(crate) fn runtime_error(
 ) -> HalError {
     HalError::new(name, category, operation, retryable, debug_message)
         .expect("static runtime error metadata must be valid")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use seeed_hal_core::{HalResult, OwnerId, ResourceDescriptor, SessionId};
+    use seeed_hal_serial::{ControlLines, SerialAdapter, SerialConfig, SerialSession};
+    use seeed_hal_testkit::VirtualSerialAdapter;
+    use tokio::sync::Notify;
+
+    use super::{ActorMetadata, HalRuntime, spawn_serial_actor, wait_until_cancelled};
+
+    struct PendingCloseSession {
+        inner: Box<dyn SerialSession>,
+        close_started: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl SerialSession for PendingCloseSession {
+        fn descriptor(&self) -> &ResourceDescriptor {
+            self.inner.descriptor()
+        }
+
+        async fn read(&mut self, max_bytes: usize) -> HalResult<Bytes> {
+            self.inner.read(max_bytes).await
+        }
+
+        async fn write_all(&mut self, bytes: &[u8]) -> HalResult<()> {
+            self.inner.write_all(bytes).await
+        }
+
+        async fn flush(&mut self) -> HalResult<()> {
+            self.inner.flush().await
+        }
+
+        async fn set_control_lines(&mut self, lines: ControlLines) -> HalResult<()> {
+            self.inner.set_control_lines(lines).await
+        }
+
+        async fn close(&mut self) -> HalResult<()> {
+            self.close_started.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_open_revoke_propagates_actor_close_timeout() {
+        let adapter = VirtualSerialAdapter::loopback("serial:virtual:pending-open-revoke");
+        let runtime = HalRuntime::builder()
+            .serial_adapter(adapter.clone())
+            .serial_close_timeout(Duration::from_millis(25))
+            .build();
+        let descriptor = adapter.enumerate().await.unwrap().remove(0);
+        let owner = OwnerId::parse("client-a").unwrap();
+        let session_id = SessionId::parse("pending-open-revoke").unwrap();
+        let reservation = runtime.inner.registry.lock().await.reserve_open(
+            descriptor.id().clone(),
+            session_id.clone(),
+            owner.clone(),
+        );
+        let reservation = reservation.unwrap();
+
+        let revoking_runtime = runtime.clone();
+        let revoking_owner = owner.clone();
+        let revoke =
+            tokio::spawn(async move { revoking_runtime.revoke_owner(&revoking_owner).await });
+        wait_until_cancelled(reservation.cancellation).await;
+
+        let inner = adapter
+            .open(&descriptor.selector(), SerialConfig::default())
+            .await
+            .unwrap();
+        let close_started = Arc::new(Notify::new());
+        let metadata = ActorMetadata {
+            session_id,
+            close_timeout: Duration::from_millis(25),
+        };
+        let actor = spawn_serial_actor(
+            Box::new(PendingCloseSession {
+                inner,
+                close_started: close_started.clone(),
+            }),
+            Arc::downgrade(&runtime.inner.registry),
+            runtime.inner.events.clone(),
+            metadata.clone(),
+        );
+        let accepted = runtime.inner.registry.lock().await.finish_open(
+            &metadata,
+            actor.clone(),
+            &runtime.inner.events,
+        );
+        assert!(!accepted);
+
+        actor.request_close();
+        close_started.notified().await;
+        tokio::time::advance(Duration::from_millis(25)).await;
+        let error = revoke.await.unwrap().unwrap_err();
+        assert_eq!(error.name().as_str(), "runtime.session.close_timeout");
+
+        runtime
+            .open_serial(
+                OwnerId::parse("client-b").unwrap(),
+                descriptor.selector(),
+                SerialConfig::default(),
+            )
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+    }
 }

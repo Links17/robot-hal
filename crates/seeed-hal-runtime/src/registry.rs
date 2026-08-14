@@ -23,7 +23,7 @@ struct SessionEntry {
     lease: LeaseToken,
     state: SessionState,
     actor: Option<ActorHandle>,
-    done: watch::Sender<bool>,
+    done: watch::Sender<Option<HalResult<()>>>,
     open_cancel: watch::Sender<bool>,
 }
 
@@ -33,7 +33,7 @@ struct ClosedSession {
 
 pub(crate) struct RevokeTarget {
     pub(crate) actor: Option<ActorHandle>,
-    pub(crate) done: watch::Receiver<bool>,
+    pub(crate) done: watch::Receiver<Option<HalResult<()>>>,
 }
 
 pub(crate) struct OpenReservation {
@@ -66,7 +66,7 @@ impl Registry {
             session_id.clone(),
             owner_id.clone(),
         )?;
-        let (done, _) = watch::channel(false);
+        let (done, _) = watch::channel(None);
         let (open_cancel, cancellation) = watch::channel(false);
         self.sessions.insert(
             session_id,
@@ -114,7 +114,7 @@ impl Registry {
     pub(crate) fn cancel_open(&mut self, session_id: &SessionId) {
         if let Some(entry) = self.sessions.remove(session_id) {
             self.leases.release(&entry.resource_id, session_id);
-            entry.done.send_replace(true);
+            entry.done.send_replace(Some(Ok(())));
         }
     }
 
@@ -195,7 +195,12 @@ impl Registry {
             .collect()
     }
 
-    pub(crate) fn finish_close(&mut self, metadata: &ActorMetadata, events: &EventPublisher) {
+    pub(crate) fn finish_close(
+        &mut self,
+        metadata: &ActorMetadata,
+        events: &EventPublisher,
+        close_result: &HalResult<()>,
+    ) {
         let Some(entry) = self.sessions.remove(&metadata.session_id) else {
             return;
         };
@@ -209,7 +214,7 @@ impl Registry {
             entry.owner_id,
             entry.lease.generation(),
         );
-        entry.done.send_replace(true);
+        entry.done.send_replace(Some(close_result.clone()));
     }
 
     fn remember_closed(&mut self, session_id: SessionId, lease: LeaseToken) {

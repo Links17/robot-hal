@@ -182,7 +182,10 @@ async fn run_serial_actor(
     }
 
     if let Some(registry) = registry.upgrade() {
-        registry.lock().await.finish_close(&metadata, &events);
+        registry
+            .lock()
+            .await
+            .finish_close(&metadata, &events, &close_result);
     }
     let _ = completion.send(Some(close_result));
 }
