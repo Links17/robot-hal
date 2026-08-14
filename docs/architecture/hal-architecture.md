@@ -54,6 +54,18 @@ The broker constructs the same runtime and exposes it through versioned local IP
 
 The broker is a deployment adapter, not a separate implementation. Platform handles never cross IPC.
 
+The v0.1 broker accepts frames up to exactly 1 MiB. Each connection has a 32-request admission
+queue, at most 32 executing requests, and a 64-response queue; runtime event subscriptions retain
+64 events. Request or execution admission overflow returns `runtime.queue.full`. Response overflow
+closes the connection and is recorded in its cleanup outcome because no further response can be
+safely admitted; event lag reports `runtime.event.lagged`. These defaults are configurable downward
+or upward for embedding, but all queues remain bounded.
+
+Each launch creates a 256-bit startup token. The handshake compares it in constant time and rejects
+incompatible protocol versions, unsupported required capabilities, and invalid frame/read/write
+limits before exposing resources. Unix endpoints live in a caller-private `0700` directory and the
+socket is `0600`; Windows uses a unique per-launch Named Pipe with remote clients rejected.
+
 ### 3.3 Desktop integration
 
 For Electron applications, Electron Main owns broker process lifecycle and update activation. Renderer code never connects directly to the broker. The application backend or Electron Main uses a language client according to the application's own architecture.

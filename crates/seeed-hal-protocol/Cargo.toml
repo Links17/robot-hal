@@ -1,0 +1,17 @@
+[package]
+name = "seeed-hal-protocol"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+prost = { workspace = true }
+seeed-hal-core = { path = "../seeed-hal-core" }
+seeed-hal-runtime = { path = "../seeed-hal-runtime" }
+seeed-hal-serial = { path = "../seeed-hal-serial" }
+
+[build-dependencies]
+prost-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }

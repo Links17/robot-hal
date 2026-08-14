@@ -141,6 +141,12 @@ impl ResourceProperties {
     pub fn get(&self, key: &str) -> Option<&str> {
         self.0.get(key).map(String::as_str)
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]

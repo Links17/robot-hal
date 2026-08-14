@@ -348,6 +348,16 @@ impl SerialHandle {
         &self.lease
     }
 
+    /// Transfers an opened session to a caller that will use the runtime's
+    /// session-ID and fenced lease-token operations directly.
+    ///
+    /// This is the broker handoff seam: it suppresses the handle's RAII close
+    /// while retaining all ownership and fencing state in [`HalRuntime`].
+    pub fn into_parts(mut self) -> (SessionId, LeaseToken) {
+        self.closed = true;
+        (self.session_id.clone(), self.lease.clone())
+    }
+
     pub async fn read(&self, max_bytes: usize) -> HalResult<Bytes> {
         self.runtime
             .read_serial(self.session_id(), &self.lease, max_bytes)

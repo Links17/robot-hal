@@ -1,0 +1,24 @@
+[package]
+name = "seeed-hal-broker"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+futures-util = { workspace = true }
+getrandom = { workspace = true }
+prost = { workspace = true }
+seeed-hal-core = { path = "../seeed-hal-core" }
+seeed-hal-protocol = { path = "../seeed-hal-protocol" }
+seeed-hal-runtime = { path = "../seeed-hal-runtime" }
+seeed-hal-serial = { path = "../seeed-hal-serial" }
+subtle = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+seeed-hal-testkit = { path = "../seeed-hal-testkit" }
+tokio = { workspace = true, features = ["test-util"] }

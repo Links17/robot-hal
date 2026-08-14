@@ -1,0 +1,569 @@
+use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
+use prost::Message;
+use seeed_hal_broker::{Broker, BrokerConfig, StartupToken};
+use seeed_hal_core::{OwnerId, ResourceSelector};
+use seeed_hal_protocol::v1::{self, envelope};
+use seeed_hal_runtime::{HalRuntime, RuntimeEventKind};
+use seeed_hal_serial::SerialConfig;
+use seeed_hal_testkit::VirtualSerialAdapter;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+const TOKEN: [u8; 32] = [0xa5; 32];
+
+struct Client<T> {
+    framed: Framed<T, LengthDelimitedCodec>,
+    next_request_id: u64,
+}
+
+impl<T> Client<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    fn new(io: T) -> Self {
+        Self {
+            framed: Framed::new(io, codec()),
+            next_request_id: 1,
+        }
+    }
+
+    async fn request(&mut self, payload: envelope::Payload) -> v1::Envelope {
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+        self.send(request_id, payload).await;
+        loop {
+            let response = self.recv().await;
+            if response.request_id == request_id {
+                return response;
+            }
+            assert_eq!(
+                response.request_id, 0,
+                "only runtime events are unsolicited"
+            );
+        }
+    }
+
+    async fn send(&mut self, request_id: u64, payload: envelope::Payload) {
+        let encoded = v1::Envelope {
+            request_id,
+            payload: Some(payload),
+        }
+        .encode_to_vec();
+        self.framed.send(Bytes::from(encoded)).await.unwrap();
+    }
+
+    async fn recv(&mut self) -> v1::Envelope {
+        let frame = self.framed.next().await.unwrap().unwrap();
+        v1::Envelope::decode(frame).unwrap()
+    }
+
+    async fn handshake(&mut self) {
+        let response = self
+            .request(envelope::Payload::HandshakeRequest(valid_handshake(
+                TOKEN.to_vec(),
+            )))
+            .await;
+        assert!(matches!(
+            response.payload,
+            Some(envelope::Payload::HandshakeResponse(_))
+        ));
+    }
+}
+
+fn codec() -> LengthDelimitedCodec {
+    LengthDelimitedCodec::builder()
+        .max_frame_length(seeed_hal_protocol::MAX_FRAME_BYTES)
+        .new_codec()
+}
+
+fn valid_handshake(token: Vec<u8>) -> v1::HandshakeRequest {
+    v1::HandshakeRequest {
+        startup_token: token,
+        protocol_major: 1,
+        protocol_minor: 0,
+        required_capabilities: vec!["serial.bytes/v1".to_owned()],
+        max_frame_bytes: 1024 * 1024,
+        max_read_bytes: 64 * 1024,
+        max_write_bytes: 64 * 1024,
+    }
+}
+
+fn broker() -> Broker {
+    let runtime = HalRuntime::builder()
+        .serial_adapter(VirtualSerialAdapter::loopback("serial:virtual:broker"))
+        .build();
+    Broker::with_startup_token(runtime, StartupToken::from_bytes(TOKEN))
+}
+
+fn runtime() -> HalRuntime {
+    HalRuntime::builder()
+        .serial_adapter(VirtualSerialAdapter::loopback("serial:virtual:broker"))
+        .build()
+}
+
+fn serial_config(read_timeout_ms: u64) -> v1::SerialConfig {
+    v1::SerialConfig {
+        baud_rate: 115_200,
+        data_bits: v1::DataBits::Eight as i32,
+        parity: v1::Parity::None as i32,
+        stop_bits: v1::StopBits::One as i32,
+        flow_control: v1::FlowControl::None as i32,
+        read_timeout_ms,
+    }
+}
+
+async fn open_virtual_serial<T>(
+    client: &mut Client<T>,
+    read_timeout_ms: u64,
+) -> v1::OpenSerialResponse
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let enumerate = client
+        .request(envelope::Payload::EnumerateSerialRequest(
+            v1::EnumerateSerialRequest {},
+        ))
+        .await;
+    let descriptor = match enumerate.payload.unwrap() {
+        envelope::Payload::EnumerateSerialResponse(response) => {
+            response.resources.into_iter().next().unwrap()
+        }
+        _ => panic!("expected enumerate response"),
+    };
+    let response = client
+        .request(envelope::Payload::OpenSerialRequest(
+            v1::OpenSerialRequest {
+                selector: Some(v1::ResourceSelector {
+                    resource_id: descriptor.resource_id,
+                    minimum_identity_quality: descriptor.identity_quality,
+                    transport: descriptor.transport,
+                }),
+                config: Some(serial_config(read_timeout_ms)),
+            },
+        ))
+        .await;
+    match response.payload.unwrap() {
+        envelope::Payload::OpenSerialResponse(response) => response,
+        payload => panic!("expected open response, got {payload:?}"),
+    }
+}
+
+fn error_name(envelope: &v1::Envelope) -> &str {
+    match envelope.payload.as_ref() {
+        Some(envelope::Payload::Error(error)) => &error.name,
+        _ => panic!("expected an error envelope"),
+    }
+}
+
+async fn rejected_handshake(request: v1::HandshakeRequest) -> String {
+    let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+    let broker = broker();
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    let response = client
+        .request(envelope::Payload::HandshakeRequest(request))
+        .await;
+    let name = error_name(&response).to_owned();
+    drop(client);
+    assert!(server.await.unwrap().cleanup_error().is_none());
+    name
+}
+
+#[tokio::test]
+async fn broker_rejects_operations_before_handshake() {
+    let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+    let broker = broker();
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+
+    let response = client
+        .request(envelope::Payload::EnumerateSerialRequest(
+            v1::EnumerateSerialRequest {},
+        ))
+        .await;
+    assert_eq!(error_name(&response), "runtime.protocol.handshake_required");
+
+    drop(client);
+    assert!(server.await.unwrap().cleanup_error().is_none());
+}
+
+#[tokio::test]
+async fn invalid_startup_token_fails_closed() {
+    let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+    let broker = broker();
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+
+    let response = client
+        .request(envelope::Payload::HandshakeRequest(valid_handshake(vec![
+            0;
+            32
+        ])))
+        .await;
+    assert_eq!(
+        error_name(&response),
+        "runtime.protocol.authentication_failed"
+    );
+
+    drop(client);
+    assert!(server.await.unwrap().cleanup_error().is_none());
+}
+
+#[tokio::test]
+async fn handshake_version_capability_and_byte_limits_fail_closed() {
+    let mut wrong_version = valid_handshake(TOKEN.to_vec());
+    wrong_version.protocol_major = 2;
+    assert_eq!(
+        rejected_handshake(wrong_version).await,
+        "runtime.protocol.incompatible_version"
+    );
+
+    let mut unsupported_capability = valid_handshake(TOKEN.to_vec());
+    unsupported_capability.required_capabilities = vec!["can.fd/v1".to_owned()];
+    assert_eq!(
+        rejected_handshake(unsupported_capability).await,
+        "runtime.protocol.unsupported_capability"
+    );
+
+    let mut oversized_frame = valid_handshake(TOKEN.to_vec());
+    oversized_frame.max_frame_bytes = (seeed_hal_protocol::MAX_FRAME_BYTES + 1) as u32;
+    assert_eq!(
+        rejected_handshake(oversized_frame).await,
+        "runtime.protocol.invalid_message"
+    );
+}
+
+#[tokio::test]
+async fn virtual_serial_supports_the_complete_v1_operation_set() {
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let broker = broker();
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    client.handshake().await;
+    let session = open_virtual_serial(&mut client, 1_000).await;
+    let lease = session.lease.clone();
+
+    let write = client
+        .request(envelope::Payload::SerialWriteRequest(
+            v1::SerialWriteRequest {
+                session_id: session.session_id.clone(),
+                lease: lease.clone(),
+                data: b"loopback".to_vec(),
+            },
+        ))
+        .await;
+    assert!(matches!(
+        write.payload,
+        Some(envelope::Payload::SerialWriteResponse(_))
+    ));
+
+    let flush = client
+        .request(envelope::Payload::SerialFlushRequest(
+            v1::SerialFlushRequest {
+                session_id: session.session_id.clone(),
+                lease: lease.clone(),
+            },
+        ))
+        .await;
+    assert!(matches!(
+        flush.payload,
+        Some(envelope::Payload::SerialFlushResponse(_))
+    ));
+
+    let control = client
+        .request(envelope::Payload::SetSerialControlLinesRequest(
+            v1::SetSerialControlLinesRequest {
+                session_id: session.session_id.clone(),
+                lease: lease.clone(),
+                data_terminal_ready: true,
+                request_to_send: true,
+            },
+        ))
+        .await;
+    assert!(matches!(
+        control.payload,
+        Some(envelope::Payload::SetSerialControlLinesResponse(_))
+    ));
+
+    let read = client
+        .request(envelope::Payload::SerialReadRequest(
+            v1::SerialReadRequest {
+                session_id: session.session_id.clone(),
+                lease: lease.clone(),
+                max_bytes: 64,
+            },
+        ))
+        .await;
+    match read.payload.unwrap() {
+        envelope::Payload::SerialReadResponse(response) => {
+            assert_eq!(response.data, b"loopback")
+        }
+        _ => panic!("expected read response"),
+    }
+
+    let close = client
+        .request(envelope::Payload::CloseSessionRequest(
+            v1::CloseSessionRequest {
+                session_id: session.session_id,
+                lease,
+            },
+        ))
+        .await;
+    assert!(matches!(
+        close.payload,
+        Some(envelope::Payload::CloseSessionResponse(_))
+    ));
+
+    drop(client);
+    assert!(server.await.unwrap().cleanup_error().is_none());
+}
+
+#[tokio::test]
+async fn runtime_events_are_forwarded_as_unsolicited_envelopes() {
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let broker = broker();
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    client.handshake().await;
+    let enumerate = client
+        .request(envelope::Payload::EnumerateSerialRequest(
+            v1::EnumerateSerialRequest {},
+        ))
+        .await;
+    let descriptor = match enumerate.payload.unwrap() {
+        envelope::Payload::EnumerateSerialResponse(response) => {
+            response.resources.into_iter().next().unwrap()
+        }
+        _ => panic!("expected enumerate response"),
+    };
+    client
+        .send(
+            50,
+            envelope::Payload::OpenSerialRequest(v1::OpenSerialRequest {
+                selector: Some(v1::ResourceSelector {
+                    resource_id: descriptor.resource_id,
+                    minimum_identity_quality: descriptor.identity_quality,
+                    transport: descriptor.transport,
+                }),
+                config: Some(serial_config(1_000)),
+            }),
+        )
+        .await;
+
+    let mut saw_response = false;
+    let mut saw_event = false;
+    while !saw_response || !saw_event {
+        let envelope = client.recv().await;
+        match envelope.payload.unwrap() {
+            envelope::Payload::OpenSerialResponse(_) => {
+                assert_eq!(envelope.request_id, 50);
+                saw_response = true;
+            }
+            envelope::Payload::RuntimeEvent(event) => {
+                assert_eq!(envelope.request_id, 0);
+                assert_eq!(event.name, "session.opened");
+                saw_event = true;
+            }
+            _ => panic!("unexpected payload while opening serial"),
+        }
+    }
+
+    drop(client);
+    assert!(server.await.unwrap().cleanup_error().is_none());
+}
+
+#[tokio::test]
+async fn disconnect_revokes_owned_sessions() {
+    let runtime = runtime();
+    let mut events = runtime.subscribe();
+    let broker = Broker::with_startup_token(runtime.clone(), StartupToken::from_bytes(TOKEN));
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    client.handshake().await;
+    let session = open_virtual_serial(&mut client, 1_000).await;
+    let expected_session_id = session.session_id;
+    drop(client);
+
+    let outcome = server.await.unwrap();
+    assert!(outcome.cleanup_error().is_none());
+    let mut closed = false;
+    for _ in 0..2 {
+        let event = events.recv().await.unwrap();
+        if event.kind() == RuntimeEventKind::SessionClosed
+            && event.session_id().as_str() == expected_session_id
+        {
+            closed = true;
+        }
+    }
+    assert!(
+        closed,
+        "disconnect must publish closure for the owned session"
+    );
+
+    let descriptor = runtime.enumerate_serial().await.unwrap().remove(0);
+    runtime
+        .open_serial(
+            OwnerId::parse("broker-contract:next-owner").unwrap(),
+            descriptor.selector(),
+            SerialConfig::default(),
+        )
+        .await
+        .unwrap()
+        .close()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn task_queue_overflow_is_deterministic_and_structured() {
+    let runtime = runtime();
+    let broker = Broker::with_config(
+        runtime,
+        StartupToken::from_bytes(TOKEN),
+        BrokerConfig::default().with_max_in_flight_requests(1),
+    );
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    client.handshake().await;
+    let session = open_virtual_serial(&mut client, 5_000).await;
+    let request = v1::SerialReadRequest {
+        session_id: session.session_id,
+        lease: session.lease,
+        max_bytes: 1,
+    };
+
+    client
+        .send(100, envelope::Payload::SerialReadRequest(request.clone()))
+        .await;
+    client
+        .send(101, envelope::Payload::SerialReadRequest(request))
+        .await;
+
+    loop {
+        let response = client.recv().await;
+        if response.request_id == 101 {
+            assert_eq!(error_name(&response), "runtime.queue.full");
+            break;
+        }
+    }
+    drop(client);
+    assert!(server.await.unwrap().cleanup_error().is_none());
+}
+
+#[tokio::test]
+async fn duplicate_in_flight_request_ids_fail_closed() {
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let broker = broker();
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    client.handshake().await;
+    let session = open_virtual_serial(&mut client, 5_000).await;
+    let request = v1::SerialReadRequest {
+        session_id: session.session_id,
+        lease: session.lease,
+        max_bytes: 1,
+    };
+
+    client
+        .send(200, envelope::Payload::SerialReadRequest(request.clone()))
+        .await;
+    client
+        .send(200, envelope::Payload::SerialReadRequest(request))
+        .await;
+    loop {
+        let response = client.recv().await;
+        if response.request_id == 200
+            && matches!(response.payload, Some(envelope::Payload::Error(_)))
+        {
+            assert_eq!(
+                error_name(&response),
+                "runtime.protocol.duplicate_request_id"
+            );
+            break;
+        }
+    }
+    drop(client);
+    assert!(server.await.unwrap().cleanup_error().is_none());
+}
+
+#[tokio::test]
+async fn malformed_operation_returns_a_structured_protocol_error() {
+    let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+    let broker = broker();
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    client.handshake().await;
+
+    let response = client
+        .request(envelope::Payload::SerialFlushRequest(
+            v1::SerialFlushRequest {
+                session_id: "not a valid id".to_owned(),
+                lease: None,
+            },
+        ))
+        .await;
+    let error = match response.payload.unwrap() {
+        envelope::Payload::Error(error) => error,
+        _ => panic!("expected structured error"),
+    };
+    assert_eq!(error.name, "runtime.protocol.invalid_message");
+    assert_eq!(error.category, v1::ErrorCategory::InvalidArgument as i32);
+    assert!(!error.operation.is_empty());
+
+    drop(client);
+    assert!(server.await.unwrap().cleanup_error().is_none());
+}
+
+#[test]
+fn resource_descriptor_selector_conversion_is_canonical() {
+    let runtime = runtime();
+    let descriptor = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(runtime.enumerate_serial())
+        .unwrap()
+        .remove(0);
+    let wire = v1::ResourceDescriptor::from(&descriptor);
+    let selector = ResourceSelector::try_from(v1::ResourceSelector {
+        resource_id: wire.resource_id,
+        minimum_identity_quality: wire.identity_quality,
+        transport: wire.transport,
+    })
+    .unwrap();
+    assert_eq!(selector, descriptor.selector());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unix_listener_uses_a_private_directory_and_socket() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use seeed_hal_broker::listener::UnixBroker;
+
+    let directory =
+        std::path::Path::new("/tmp").join(format!("shb-contract-{}", std::process::id()));
+    if directory.exists() {
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    let listener = UnixBroker::bind(broker(), &directory).await.unwrap();
+    let socket_path = listener.socket_path().to_owned();
+
+    assert_eq!(
+        std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&socket_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    drop(listener);
+    std::fs::remove_file(socket_path).unwrap();
+    std::fs::remove_dir(directory).unwrap();
+}

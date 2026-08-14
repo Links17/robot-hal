@@ -1,0 +1,205 @@
+syntax = "proto3";
+
+package seeed.hal.v1;
+
+message Envelope {
+  uint64 request_id = 1;
+  oneof payload {
+    HandshakeRequest handshake_request = 10;
+    HandshakeResponse handshake_response = 11;
+    EnumerateSerialRequest enumerate_serial_request = 20;
+    EnumerateSerialResponse enumerate_serial_response = 21;
+    OpenSerialRequest open_serial_request = 22;
+    OpenSerialResponse open_serial_response = 23;
+    SerialReadRequest serial_read_request = 24;
+    SerialReadResponse serial_read_response = 25;
+    SerialWriteRequest serial_write_request = 26;
+    Empty serial_write_response = 27;
+    SerialFlushRequest serial_flush_request = 28;
+    Empty serial_flush_response = 29;
+    SetSerialControlLinesRequest set_serial_control_lines_request = 30;
+    Empty set_serial_control_lines_response = 31;
+    CloseSessionRequest close_session_request = 32;
+    Empty close_session_response = 33;
+    RuntimeEvent runtime_event = 40;
+    Error error = 100;
+  }
+}
+
+message Empty {}
+
+message HandshakeRequest {
+  bytes startup_token = 1;
+  uint32 protocol_major = 2;
+  uint32 protocol_minor = 3;
+  repeated string required_capabilities = 4;
+  uint32 max_frame_bytes = 5;
+  uint32 max_read_bytes = 6;
+  uint32 max_write_bytes = 7;
+}
+
+message HandshakeResponse {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  repeated string capabilities = 3;
+  uint32 max_frame_bytes = 4;
+  uint32 max_read_bytes = 5;
+  uint32 max_write_bytes = 6;
+}
+
+message ResourceDescriptor {
+  string resource_id = 1;
+  string endpoint = 2;
+  IdentityQuality identity_quality = 3;
+  TransportKind transport = 4;
+  map<string, string> properties = 5;
+}
+
+message ResourceSelector {
+  string resource_id = 1;
+  IdentityQuality minimum_identity_quality = 2;
+  TransportKind transport = 3;
+}
+
+enum IdentityQuality {
+  IDENTITY_QUALITY_UNSPECIFIED = 0;
+  IDENTITY_QUALITY_WEAK = 1;
+  IDENTITY_QUALITY_MEDIUM = 2;
+  IDENTITY_QUALITY_STRONG = 3;
+}
+
+enum TransportKind {
+  TRANSPORT_KIND_UNSPECIFIED = 0;
+  TRANSPORT_KIND_SERIAL = 1;
+}
+
+message SerialConfig {
+  uint32 baud_rate = 1;
+  DataBits data_bits = 2;
+  Parity parity = 3;
+  StopBits stop_bits = 4;
+  FlowControl flow_control = 5;
+  uint64 read_timeout_ms = 6;
+}
+
+enum DataBits {
+  DATA_BITS_UNSPECIFIED = 0;
+  DATA_BITS_FIVE = 1;
+  DATA_BITS_SIX = 2;
+  DATA_BITS_SEVEN = 3;
+  DATA_BITS_EIGHT = 4;
+}
+
+enum Parity {
+  PARITY_UNSPECIFIED = 0;
+  PARITY_NONE = 1;
+  PARITY_ODD = 2;
+  PARITY_EVEN = 3;
+}
+
+enum StopBits {
+  STOP_BITS_UNSPECIFIED = 0;
+  STOP_BITS_ONE = 1;
+  STOP_BITS_TWO = 2;
+}
+
+enum FlowControl {
+  FLOW_CONTROL_UNSPECIFIED = 0;
+  FLOW_CONTROL_NONE = 1;
+  FLOW_CONTROL_SOFTWARE = 2;
+  FLOW_CONTROL_HARDWARE = 3;
+}
+
+message LeaseToken {
+  string lease_id = 1;
+  uint64 generation = 2;
+  LeaseMode mode = 3;
+}
+
+enum LeaseMode {
+  LEASE_MODE_UNSPECIFIED = 0;
+  LEASE_MODE_OBSERVE = 1;
+  LEASE_MODE_CONTROL = 2;
+}
+
+message EnumerateSerialRequest {}
+
+message EnumerateSerialResponse {
+  repeated ResourceDescriptor resources = 1;
+}
+
+message OpenSerialRequest {
+  ResourceSelector selector = 1;
+  SerialConfig config = 2;
+}
+
+message OpenSerialResponse {
+  string session_id = 1;
+  LeaseToken lease = 2;
+}
+
+message SerialReadRequest {
+  string session_id = 1;
+  LeaseToken lease = 2;
+  uint32 max_bytes = 3;
+}
+
+message SerialReadResponse {
+  bytes data = 1;
+}
+
+message SerialWriteRequest {
+  string session_id = 1;
+  LeaseToken lease = 2;
+  bytes data = 3;
+}
+
+message SerialFlushRequest {
+  string session_id = 1;
+  LeaseToken lease = 2;
+}
+
+message SetSerialControlLinesRequest {
+  string session_id = 1;
+  LeaseToken lease = 2;
+  bool data_terminal_ready = 3;
+  bool request_to_send = 4;
+}
+
+message CloseSessionRequest {
+  string session_id = 1;
+  LeaseToken lease = 2;
+}
+
+message RuntimeEvent {
+  uint64 sequence = 1;
+  RuntimeEventKind kind = 2;
+  string name = 3;
+  string resource_id = 4;
+  string session_id = 5;
+  string owner_id = 6;
+  uint64 lease_generation = 7;
+}
+
+enum RuntimeEventKind {
+  RUNTIME_EVENT_KIND_UNSPECIFIED = 0;
+  RUNTIME_EVENT_KIND_SESSION_OPENED = 1;
+  RUNTIME_EVENT_KIND_SESSION_CLOSED = 2;
+}
+
+message Error {
+  string name = 1;
+  ErrorCategory category = 2;
+  string operation = 3;
+  bool retryable = 4;
+  string debug_message = 5;
+}
+
+enum ErrorCategory {
+  ERROR_CATEGORY_UNSPECIFIED = 0;
+  ERROR_CATEGORY_INVALID_ARGUMENT = 1;
+  ERROR_CATEGORY_NOT_FOUND = 2;
+  ERROR_CATEGORY_CONFLICT = 3;
+  ERROR_CATEGORY_UNAVAILABLE = 4;
+  ERROR_CATEGORY_INTERNAL = 5;
+}
