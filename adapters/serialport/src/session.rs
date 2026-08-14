@@ -1,71 +1,315 @@
+use std::io;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
+
 use async_trait::async_trait;
 use bytes::Bytes;
-use seeed_hal_core::{HalError, HalResult, ResourceDescriptor};
+use seeed_hal_core::{ErrorCategory, HalError, HalResult, ResourceDescriptor};
 use seeed_hal_serial::{
     ControlLines, DataBits, FlowControl, Parity, SerialConfig, SerialSession, StopBits,
 };
-use tokio::task::JoinHandle;
+use tokio::sync::{oneshot, watch};
 
 use crate::{internal, invalid_argument, map_io_error, session_closed, timeout};
 
+const COMMAND_QUEUE_CAPACITY: usize = 1;
+const IDLE_CLOSE_POLL: Duration = Duration::from_millis(5);
+const LIFECYCLE_OPEN: u8 = 0;
+const LIFECYCLE_CLOSING: u8 = 1;
+const LIFECYCLE_CLOSED: u8 = 2;
+
 type SerialStream = serial2::SerialPort;
-type DrainWorkerResult = HalResult<(SerialStream, HalResult<()>)>;
-type CloseWorkerResult = HalResult<HalResult<()>>;
 
-struct DrainTask {
-    operation: &'static str,
-    join: JoinHandle<DrainWorkerResult>,
+trait SerialIo: Send {
+    fn try_clone_box(&self) -> io::Result<Box<dyn SerialIo>>;
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize>;
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize>;
+    fn flush(&mut self) -> io::Result<()>;
+    fn set_write_timeout(&mut self, timeout: Duration) -> io::Result<()>;
+    fn set_control_lines(&mut self, lines: ControlLines) -> io::Result<()>;
+    fn discard_buffers(&mut self) -> io::Result<()>;
 }
 
-struct CloseTask {
-    operation: &'static str,
-    join: JoinHandle<CloseWorkerResult>,
-}
-
-trait DrainStrategy: Send + Sync {
-    fn spawn_flush(&self, operation: &'static str, stream: SerialStream) -> DrainTask;
-    fn spawn_close(&self, operation: &'static str, stream: SerialStream) -> CloseTask;
-}
-
-struct BlockingDrainStrategy;
-
-impl DrainStrategy for BlockingDrainStrategy {
-    fn spawn_flush(&self, operation: &'static str, stream: SerialStream) -> DrainTask {
-        let join = tokio::task::spawn_blocking(move || {
-            let result = stream
-                .flush()
-                .map_err(|error| map_io_error(operation, error));
-            Ok((stream, result))
-        });
-
-        DrainTask { operation, join }
+impl SerialIo for SerialStream {
+    fn try_clone_box(&self) -> io::Result<Box<dyn SerialIo>> {
+        self.try_clone()
+            .map(|stream| Box::new(stream) as Box<dyn SerialIo>)
     }
 
-    fn spawn_close(&self, operation: &'static str, stream: SerialStream) -> CloseTask {
-        let join = tokio::task::spawn_blocking(move || {
-            let result = stream
-                .flush()
-                .map_err(|error| map_io_error(operation, error));
-            drop(stream);
-            Ok(result)
-        });
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        SerialStream::read(self, buffer)
+    }
 
-        CloseTask { operation, join }
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        SerialStream::write(self, bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        SerialStream::flush(self)
+    }
+
+    fn set_write_timeout(&mut self, timeout: Duration) -> io::Result<()> {
+        SerialStream::set_write_timeout(self, timeout)
+    }
+
+    fn set_control_lines(&mut self, lines: ControlLines) -> io::Result<()> {
+        self.set_dtr(lines.data_terminal_ready)?;
+        self.set_rts(lines.request_to_send)
+    }
+
+    fn discard_buffers(&mut self) -> io::Result<()> {
+        SerialStream::discard_buffers(self)
     }
 }
 
-enum SessionState {
-    Ready(SerialStream),
-    Draining(DrainTask),
-    Closing(CloseTask),
-    Closed,
+enum WorkerCommand {
+    Read {
+        max_bytes: usize,
+        reply: oneshot::Sender<HalResult<Bytes>>,
+    },
+    Write {
+        bytes: Bytes,
+        reply: oneshot::Sender<HalResult<()>>,
+    },
+    Flush {
+        reply: oneshot::Sender<HalResult<()>>,
+    },
+    SetControlLines {
+        lines: ControlLines,
+        reply: oneshot::Sender<HalResult<()>>,
+    },
+}
+
+impl WorkerCommand {
+    fn reject_closed(self) {
+        match self {
+            Self::Read { reply, .. } => {
+                let _ = reply.send(Err(session_closed(
+                    "serial.read",
+                    "serial session is closing",
+                )));
+            }
+            Self::Write { reply, .. } => {
+                let _ = reply.send(Err(session_closed(
+                    "serial.write",
+                    "serial session is closing",
+                )));
+            }
+            Self::Flush { reply } => {
+                let _ = reply.send(Err(session_closed(
+                    "serial.flush",
+                    "serial session is closing",
+                )));
+            }
+            Self::SetControlLines { reply, .. } => {
+                let _ = reply.send(Err(session_closed(
+                    "serial.set_control_lines",
+                    "serial session is closing",
+                )));
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum WatchdogState {
+    Idle,
+    Flush { id: u64, deadline: Instant },
+    Close { interrupt_flush: bool },
+}
+
+struct CompletionState {
+    actor_result: Option<HalResult<()>>,
+    watchdog_result: Option<HalResult<()>>,
+    published: bool,
+}
+
+struct WorkerControlInner {
+    lifecycle: AtomicU8,
+    next_flush_id: AtomicU64,
+    timed_out_flush: AtomicU64,
+    watchdog: Mutex<WatchdogState>,
+    watchdog_changed: Condvar,
+    terminal_error: Mutex<Option<HalError>>,
+    completion: Mutex<CompletionState>,
+    completion_tx: watch::Sender<Option<HalResult<()>>>,
+}
+
+#[derive(Clone)]
+struct WorkerControl {
+    inner: Arc<WorkerControlInner>,
+}
+
+impl WorkerControl {
+    fn new() -> (Self, watch::Receiver<Option<HalResult<()>>>) {
+        let (completion_tx, completion_rx) = watch::channel(None);
+        (
+            Self {
+                inner: Arc::new(WorkerControlInner {
+                    lifecycle: AtomicU8::new(LIFECYCLE_OPEN),
+                    next_flush_id: AtomicU64::new(1),
+                    timed_out_flush: AtomicU64::new(0),
+                    watchdog: Mutex::new(WatchdogState::Idle),
+                    watchdog_changed: Condvar::new(),
+                    terminal_error: Mutex::new(None),
+                    completion: Mutex::new(CompletionState {
+                        actor_result: None,
+                        watchdog_result: None,
+                        published: false,
+                    }),
+                    completion_tx,
+                }),
+            },
+            completion_rx,
+        )
+    }
+
+    fn is_open(&self) -> bool {
+        self.inner.lifecycle.load(Ordering::Acquire) == LIFECYCLE_OPEN
+    }
+
+    fn request_close(&self) {
+        if self
+            .inner
+            .lifecycle
+            .compare_exchange(
+                LIFECYCLE_OPEN,
+                LIFECYCLE_CLOSING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            let mut watchdog = lock_unpoisoned(&self.inner.watchdog);
+            let interrupt_flush = matches!(*watchdog, WatchdogState::Flush { .. });
+            *watchdog = WatchdogState::Close { interrupt_flush };
+            self.inner.watchdog_changed.notify_all();
+        }
+    }
+
+    fn arm_flush(&self, deadline: Instant) -> Option<u64> {
+        let mut watchdog = lock_unpoisoned(&self.inner.watchdog);
+        if !self.is_open() {
+            return None;
+        }
+
+        let id = self.inner.next_flush_id.fetch_add(1, Ordering::AcqRel);
+        *watchdog = WatchdogState::Flush { id, deadline };
+        self.inner.watchdog_changed.notify_all();
+        Some(id)
+    }
+
+    fn finish_flush(&self, id: u64) -> bool {
+        let mut watchdog = lock_unpoisoned(&self.inner.watchdog);
+        if matches!(*watchdog, WatchdogState::Flush { id: active, .. } if active == id) {
+            *watchdog = WatchdogState::Idle;
+            self.inner.watchdog_changed.notify_all();
+        }
+
+        self.inner.timed_out_flush.load(Ordering::Acquire) == id
+    }
+
+    fn mark_flush_timed_out(&self, id: u64) {
+        self.inner.timed_out_flush.store(id, Ordering::Release);
+        self.inner
+            .lifecycle
+            .store(LIFECYCLE_CLOSING, Ordering::Release);
+    }
+
+    fn record_terminal_error<T>(&self, result: &HalResult<T>) {
+        if self.is_open() {
+            return;
+        }
+        let Err(error) = result else {
+            return;
+        };
+        if matches!(
+            error.name().as_str(),
+            "runtime.session.closed" | "runtime.transport.disconnected"
+        ) {
+            return;
+        }
+
+        let mut terminal_error = lock_unpoisoned(&self.inner.terminal_error);
+        if terminal_error.is_none() {
+            *terminal_error = Some(error.clone());
+        }
+    }
+
+    fn take_terminal_error(&self) -> Option<HalError> {
+        lock_unpoisoned(&self.inner.terminal_error).take()
+    }
+
+    fn finish_actor(&self, result: HalResult<()>) {
+        self.inner
+            .lifecycle
+            .store(LIFECYCLE_CLOSED, Ordering::Release);
+        let mut completion = lock_unpoisoned(&self.inner.completion);
+        completion.actor_result = Some(result);
+        self.publish_completion(&mut completion);
+    }
+
+    fn finish_watchdog(&self, result: HalResult<()>) {
+        let mut completion = lock_unpoisoned(&self.inner.completion);
+        completion.watchdog_result = Some(result);
+        self.publish_completion(&mut completion);
+    }
+
+    fn publish_completion(&self, completion: &mut CompletionState) {
+        if completion.published {
+            return;
+        }
+
+        let (Some(actor_result), Some(watchdog_result)) = (
+            completion.actor_result.as_ref(),
+            completion.watchdog_result.as_ref(),
+        ) else {
+            return;
+        };
+
+        let result = match (actor_result, watchdog_result) {
+            (Err(error), _) => Err(error.clone()),
+            (Ok(()), Err(error)) => Err(error.clone()),
+            (Ok(()), Ok(())) => Ok(()),
+        };
+        completion.published = true;
+        let _ = self.inner.completion_tx.send(Some(result));
+    }
+}
+
+struct OperationGuard {
+    control: WorkerControl,
+    completed: bool,
+}
+
+impl OperationGuard {
+    fn new(control: WorkerControl) -> Self {
+        Self {
+            control,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for OperationGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.control.request_close();
+        }
+    }
 }
 
 pub(crate) struct NativeSerialSession {
     descriptor: ResourceDescriptor,
-    config: SerialConfig,
-    state: SessionState,
-    drain_strategy: std::sync::Arc<dyn DrainStrategy>,
+    command_tx: mpsc::SyncSender<WorkerCommand>,
+    control: WorkerControl,
+    completion_rx: watch::Receiver<Option<HalResult<()>>>,
 }
 
 impl NativeSerialSession {
@@ -74,134 +318,68 @@ impl NativeSerialSession {
         config: SerialConfig,
     ) -> HalResult<Self> {
         validate_config(&config)?;
+        let endpoint = descriptor.endpoint().as_str().to_owned();
 
-        let stream = open_serial_stream(descriptor.endpoint().as_str(), &config)?;
-
-        Ok(Self {
-            descriptor,
-            config,
-            state: SessionState::Ready(stream),
-            drain_strategy: std::sync::Arc::new(BlockingDrainStrategy),
+        run_blocking_open(move || {
+            let stream = open_serial_stream(&endpoint, &config)?;
+            spawn_session_worker(descriptor, config, Box::new(stream))
         })
+        .await
     }
 
-    async fn ensure_ready(&mut self, operation: &'static str) -> HalResult<()> {
-        loop {
-            match self.state {
-                SessionState::Ready(_) => return Ok(()),
-                SessionState::Closed => {
-                    return Err(session_closed(
-                        operation,
-                        "serial session is already closed",
-                    ));
-                }
-                SessionState::Draining(_) => {
-                    self.finish_tracked_drain().await??;
-                }
-                SessionState::Closing(_) => {
-                    let result = self.finish_tracked_close().await?;
-                    if let Err(error) = result {
-                        if error.name().as_str() != "runtime.transport.disconnected" {
-                            return Err(error);
-                        }
-                    }
-                    return Err(session_closed(operation, "serial session is closing"));
-                }
-            }
-        }
-    }
-
-    fn ready_stream_mut(&mut self, operation: &'static str) -> HalResult<&mut SerialStream> {
-        match &mut self.state {
-            SessionState::Ready(stream) => Ok(stream),
-            SessionState::Closed => Err(session_closed(
+    fn ensure_open(&self, operation: &'static str) -> HalResult<()> {
+        if self.control.is_open() {
+            Ok(())
+        } else {
+            Err(session_closed(
                 operation,
-                "serial session is already closed",
-            )),
-            SessionState::Draining(_) => Err(session_closed(
-                operation,
-                "serial session drain is still in progress",
-            )),
-            SessionState::Closing(_) => Err(session_closed(operation, "serial session is closing")),
+                "serial session is closing or already closed",
+            ))
         }
     }
 
-    fn take_ready_stream(&mut self, operation: &'static str) -> HalResult<SerialStream> {
-        match std::mem::replace(&mut self.state, SessionState::Closed) {
-            SessionState::Ready(stream) => Ok(stream),
-            state => {
-                self.state = state;
-                Err(session_closed(operation, "serial session is not ready"))
-            }
-        }
-    }
-
-    fn begin_tracked_drain(&mut self, operation: &'static str) -> HalResult<()> {
-        let stream = self.take_ready_stream(operation)?;
-        self.state = SessionState::Draining(self.drain_strategy.spawn_flush(operation, stream));
-        Ok(())
-    }
-
-    fn begin_tracked_close(&mut self) -> HalResult<()> {
-        let stream = self.take_ready_stream("serial.close")?;
-        self.state = SessionState::Closing(self.drain_strategy.spawn_close("serial.close", stream));
-        Ok(())
-    }
-
-    async fn finish_tracked_drain(&mut self) -> HalResult<HalResult<()>> {
-        let (operation, join_result) = match &mut self.state {
-            SessionState::Draining(task) => (task.operation, (&mut task.join).await),
-            SessionState::Ready(_) => return Ok(Ok(())),
-            SessionState::Closing(_) => {
-                return Err(session_closed("serial.drain", "serial session is closing"));
-            }
-            SessionState::Closed => {
-                return Err(session_closed(
-                    "serial.drain",
-                    "serial session is already closed",
-                ));
-            }
-        };
-
-        match join_result {
-            Ok(Ok((stream, drain_result))) => {
-                self.state = SessionState::Ready(stream);
-                Ok(drain_result)
-            }
-            Ok(Err(error)) => {
-                self.state = SessionState::Closed;
-                Err(error)
-            }
-            Err(error) => {
-                self.state = SessionState::Closed;
-                Err(internal(
+    fn enqueue(&self, command: WorkerCommand, operation: &'static str) -> HalResult<()> {
+        self.command_tx
+            .try_send(command)
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => queue_full(
                     operation,
-                    format!("serial drain blocking worker failed: {error}"),
-                ))
+                    "the serial adapter worker queue has reached its one-command capacity",
+                ),
+                mpsc::TrySendError::Disconnected(_) => session_closed(
+                    operation,
+                    "the serial adapter worker is no longer available",
+                ),
+            })
+    }
+
+    async fn wait_closed(&mut self) -> HalResult<()> {
+        loop {
+            if let Some(result) = self.completion_rx.borrow().clone() {
+                return result;
+            }
+            if self.completion_rx.changed().await.is_err() {
+                return Err(internal(
+                    "serial.close",
+                    "serial worker exited without publishing terminal cleanup",
+                ));
             }
         }
     }
 
-    async fn finish_tracked_close(&mut self) -> HalResult<HalResult<()>> {
-        let (operation, join_result) = match &mut self.state {
-            SessionState::Closing(task) => (task.operation, (&mut task.join).await),
-            SessionState::Closed => return Ok(Ok(())),
-            SessionState::Ready(_) | SessionState::Draining(_) => {
-                return Err(session_closed(
-                    "serial.close",
-                    "serial session is not closing",
-                ));
-            }
-        };
+    #[cfg(test)]
+    fn from_io_for_test(
+        descriptor: ResourceDescriptor,
+        config: SerialConfig,
+        io: Box<dyn SerialIo>,
+    ) -> HalResult<Self> {
+        spawn_session_worker(descriptor, config, io)
+    }
+}
 
-        self.state = SessionState::Closed;
-        match join_result {
-            Ok(result) => result,
-            Err(error) => Err(internal(
-                operation,
-                format!("serial close blocking worker failed: {error}"),
-            )),
-        }
+impl Drop for NativeSerialSession {
+    fn drop(&mut self) {
+        self.control.request_close();
     }
 }
 
@@ -212,8 +390,7 @@ impl SerialSession for NativeSerialSession {
     }
 
     async fn read(&mut self, max_bytes: usize) -> HalResult<Bytes> {
-        self.ensure_ready("serial.read").await?;
-
+        self.ensure_open("serial.read")?;
         if max_bytes == 0 {
             return Err(invalid_argument(
                 "serial.read",
@@ -221,125 +398,354 @@ impl SerialSession for NativeSerialSession {
             ));
         }
 
-        let read_timeout = self.config.read_timeout;
-        let stream = self
-            .ready_stream_mut("serial.read")?
-            .try_clone()
-            .map_err(|error| map_io_error("serial.read", error))?;
-        let mut buffer = vec![0_u8; max_bytes];
-
-        let (read, mut buffer) = tokio::time::timeout(
-            read_timeout,
-            tokio::task::spawn_blocking(move || {
-                stream
-                    .read(&mut buffer)
-                    .map(|read| (read, buffer))
-                    .map_err(|error| map_io_error("serial.read", error))
-            }),
-        )
-        .await
-        .map_err(|_| {
-            timeout(
-                "serial.read",
-                format!("read timed out after {read_timeout:?}"),
-            )
-        })?
-        .map_err(|error| {
+        let (reply, response) = oneshot::channel();
+        self.enqueue(WorkerCommand::Read { max_bytes, reply }, "serial.read")?;
+        let mut guard = OperationGuard::new(self.control.clone());
+        let result = response.await.map_err(|_| {
             internal(
                 "serial.read",
-                format!("serial read blocking worker failed: {error}"),
+                "serial adapter worker dropped the read response",
             )
-        })??;
-
-        if read == 0 {
-            return Err(disconnected(
-                "serial.read",
-                "serial port returned end of stream",
-            ));
+        });
+        if result.is_ok() {
+            guard.complete();
         }
-
-        buffer.truncate(read);
-        Ok(Bytes::from(buffer))
+        result?
     }
 
     async fn write_all(&mut self, bytes: &[u8]) -> HalResult<()> {
-        self.ensure_ready("serial.write").await?;
-
+        self.ensure_open("serial.write")?;
         if bytes.is_empty() {
             return Ok(());
         }
 
-        let stream = self
-            .ready_stream_mut("serial.write")?
-            .try_clone()
-            .map_err(|error| map_io_error("serial.write", error))?;
-        let bytes = bytes.to_vec();
-
-        tokio::task::spawn_blocking(move || {
-            stream
-                .write_all(&bytes)
-                .map_err(|error| map_io_error("serial.write", error))
-        })
-        .await
-        .map_err(|error| {
+        let (reply, response) = oneshot::channel();
+        self.enqueue(
+            WorkerCommand::Write {
+                bytes: Bytes::copy_from_slice(bytes),
+                reply,
+            },
+            "serial.write",
+        )?;
+        let mut guard = OperationGuard::new(self.control.clone());
+        let result = response.await.map_err(|_| {
             internal(
                 "serial.write",
-                format!("serial write blocking worker failed: {error}"),
+                "serial adapter worker dropped the write response",
             )
-        })?
+        });
+        if result.is_ok() {
+            guard.complete();
+        }
+        result?
     }
 
     async fn flush(&mut self) -> HalResult<()> {
-        self.ensure_ready("serial.flush").await?;
-        self.begin_tracked_drain("serial.flush")?;
-        self.finish_tracked_drain().await?
+        self.ensure_open("serial.flush")?;
+        let (reply, response) = oneshot::channel();
+        self.enqueue(WorkerCommand::Flush { reply }, "serial.flush")?;
+        let mut guard = OperationGuard::new(self.control.clone());
+        let result = response.await.map_err(|_| {
+            internal(
+                "serial.flush",
+                "serial adapter worker dropped the flush response",
+            )
+        });
+        if result.is_ok() {
+            guard.complete();
+        }
+        result?
     }
 
     async fn set_control_lines(&mut self, lines: ControlLines) -> HalResult<()> {
-        self.ensure_ready("serial.set_control_lines").await?;
-        let stream = self.ready_stream_mut("serial.set_control_lines")?;
-        stream
-            .set_dtr(lines.data_terminal_ready)
-            .map_err(|error| map_io_error("serial.set_control_lines", error))?;
-        stream
-            .set_rts(lines.request_to_send)
-            .map_err(|error| map_io_error("serial.set_control_lines", error))
+        self.ensure_open("serial.set_control_lines")?;
+        let (reply, response) = oneshot::channel();
+        self.enqueue(
+            WorkerCommand::SetControlLines { lines, reply },
+            "serial.set_control_lines",
+        )?;
+        let mut guard = OperationGuard::new(self.control.clone());
+        let result = response.await.map_err(|_| {
+            internal(
+                "serial.set_control_lines",
+                "serial adapter worker dropped the control-line response",
+            )
+        });
+        if result.is_ok() {
+            guard.complete();
+        }
+        result?
     }
 
     async fn close(&mut self) -> HalResult<()> {
-        let mut pending_flush_error = None;
+        self.control.request_close();
+        self.wait_closed().await
+    }
+}
 
-        loop {
-            match self.state {
-                SessionState::Ready(_) => self.begin_tracked_close()?,
-                SessionState::Draining(_) => {
-                    let drain_result = self.finish_tracked_drain().await?;
-                    match drain_result {
-                        Ok(()) => {}
-                        Err(error) if error.name().as_str() == "runtime.transport.disconnected" => {
-                        }
-                        Err(error) => {
-                            if pending_flush_error.is_none() {
-                                pending_flush_error = Some(error);
-                            }
-                        }
-                    }
-                }
-                SessionState::Closing(_) => {
-                    let close_result = self.finish_tracked_close().await?;
-                    match close_result {
-                        Ok(()) => {}
-                        Err(error) if error.name().as_str() == "runtime.transport.disconnected" => {
-                        }
-                        Err(error) => return Err(error),
-                    }
+fn spawn_session_worker(
+    descriptor: ResourceDescriptor,
+    config: SerialConfig,
+    io: Box<dyn SerialIo>,
+) -> HalResult<NativeSerialSession> {
+    let interrupt_io = io
+        .try_clone_box()
+        .map_err(|error| map_io_error("serial.open", error))?;
+    let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_QUEUE_CAPACITY);
+    let (control, completion_rx) = WorkerControl::new();
 
-                    return pending_flush_error.map_or(Ok(()), Err);
-                }
-                SessionState::Closed => return pending_flush_error.map_or(Ok(()), Err),
+    let watchdog_control = control.clone();
+    thread::Builder::new()
+        .name("seeed-hal-serial-watchdog".to_owned())
+        .spawn(move || run_watchdog(interrupt_io, watchdog_control))
+        .map_err(|error| {
+            internal(
+                "serial.open",
+                format!("failed to start serial cancellation watchdog: {error}"),
+            )
+        })?;
+
+    let actor_control = control.clone();
+    if let Err(error) = thread::Builder::new()
+        .name("seeed-hal-serial-worker".to_owned())
+        .spawn(move || run_actor_guarded(io, command_rx, actor_control, config.read_timeout))
+    {
+        control.request_close();
+        return Err(internal(
+            "serial.open",
+            format!("failed to start serial worker: {error}"),
+        ));
+    }
+
+    Ok(NativeSerialSession {
+        descriptor,
+        command_tx,
+        control,
+        completion_rx,
+    })
+}
+
+fn run_actor_guarded(
+    io: Box<dyn SerialIo>,
+    commands: mpsc::Receiver<WorkerCommand>,
+    control: WorkerControl,
+    operation_timeout: Duration,
+) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_actor(io, commands, &control, operation_timeout)
+    }));
+    let result = match result {
+        Ok(()) => control.take_terminal_error().map_or(Ok(()), Err),
+        Err(_) => Err(internal("serial.close", "serial worker panicked")),
+    };
+    control.request_close();
+    control.finish_actor(result);
+}
+
+fn run_actor(
+    mut io: Box<dyn SerialIo>,
+    commands: mpsc::Receiver<WorkerCommand>,
+    control: &WorkerControl,
+    operation_timeout: Duration,
+) {
+    while control.is_open() {
+        let command = match commands.recv_timeout(IDLE_CLOSE_POLL) {
+            Ok(command) => command,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                control.request_close();
+                break;
             }
+        };
+
+        if !control.is_open() {
+            command.reject_closed();
+            break;
+        }
+        execute_command(io.as_mut(), command, control, operation_timeout);
+    }
+
+    while let Ok(command) = commands.try_recv() {
+        command.reject_closed();
+    }
+    drop(io);
+}
+
+fn execute_command(
+    io: &mut dyn SerialIo,
+    command: WorkerCommand,
+    control: &WorkerControl,
+    operation_timeout: Duration,
+) {
+    match command {
+        WorkerCommand::Read { max_bytes, reply } => {
+            let mut buffer = vec![0_u8; max_bytes];
+            let result = io
+                .read(&mut buffer)
+                .map_err(|error| map_io_error("serial.read", error))
+                .and_then(|read| {
+                    if read == 0 {
+                        Err(disconnected(
+                            "serial.read",
+                            "serial port returned end of stream",
+                        ))
+                    } else {
+                        buffer.truncate(read);
+                        Ok(Bytes::from(buffer))
+                    }
+                });
+            control.record_terminal_error(&result);
+            let _ = reply.send(result);
+        }
+        WorkerCommand::Write { bytes, reply } => {
+            let deadline = operation_deadline(operation_timeout);
+            let result = write_all_bounded(io, &bytes, deadline, &control.inner.lifecycle);
+            control.record_terminal_error(&result);
+            let _ = reply.send(result);
+        }
+        WorkerCommand::Flush { reply } => {
+            let deadline = operation_deadline(operation_timeout);
+            let result = match control.arm_flush(deadline) {
+                Some(id) => {
+                    let flush_result = io
+                        .flush()
+                        .map_err(|error| map_io_error("serial.flush", error));
+                    if control.finish_flush(id) {
+                        Err(timeout(
+                            "serial.flush",
+                            format!("flush timed out after {operation_timeout:?}"),
+                        ))
+                    } else {
+                        flush_result
+                    }
+                }
+                None => Err(session_closed("serial.flush", "serial session is closing")),
+            };
+            control.record_terminal_error(&result);
+            let _ = reply.send(result);
+        }
+        WorkerCommand::SetControlLines { lines, reply } => {
+            let result = io
+                .set_control_lines(lines)
+                .map_err(|error| map_io_error("serial.set_control_lines", error));
+            control.record_terminal_error(&result);
+            let _ = reply.send(result);
         }
     }
+}
+
+fn run_watchdog(mut io: Box<dyn SerialIo>, control: WorkerControl) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        loop {
+            let mut state = lock_unpoisoned(&control.inner.watchdog);
+            match *state {
+                WatchdogState::Idle => {
+                    state = wait_unpoisoned(&control.inner.watchdog_changed, state);
+                    drop(state);
+                }
+                WatchdogState::Close { interrupt_flush } => {
+                    break if interrupt_flush {
+                        io.discard_buffers()
+                            .map_err(|error| map_io_error("serial.close", error))
+                    } else {
+                        Ok(())
+                    };
+                }
+                WatchdogState::Flush { id, deadline } => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        control.mark_flush_timed_out(id);
+                        *state = WatchdogState::Close {
+                            interrupt_flush: true,
+                        };
+                        drop(state);
+                        break io
+                            .discard_buffers()
+                            .map_err(|error| map_io_error("serial.flush", error));
+                    }
+
+                    let (next_state, _) = wait_timeout_unpoisoned(
+                        &control.inner.watchdog_changed,
+                        state,
+                        deadline.saturating_duration_since(now),
+                    );
+                    drop(next_state);
+                }
+            }
+        }
+    }));
+
+    let result = match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(internal("serial.close", "serial watchdog panicked")),
+    };
+    drop(io);
+    control.finish_watchdog(result);
+}
+
+fn write_all_bounded(
+    io: &mut dyn SerialIo,
+    bytes: &[u8],
+    deadline: Instant,
+    lifecycle: &AtomicU8,
+) -> HalResult<()> {
+    write_all_bounded_with_clock(io, bytes, deadline, lifecycle, Instant::now)
+}
+
+fn write_all_bounded_with_clock(
+    io: &mut dyn SerialIo,
+    mut bytes: &[u8],
+    deadline: Instant,
+    lifecycle: &AtomicU8,
+    mut now: impl FnMut() -> Instant,
+) -> HalResult<()> {
+    while !bytes.is_empty() {
+        if lifecycle.load(Ordering::Acquire) != LIFECYCLE_OPEN {
+            return Err(session_closed("serial.write", "serial session is closing"));
+        }
+
+        let Some(remaining) = deadline.checked_duration_since(now()) else {
+            return Err(timeout(
+                "serial.write",
+                "write exceeded its configured operation deadline",
+            ));
+        };
+        if remaining.is_zero() {
+            return Err(timeout(
+                "serial.write",
+                "write exceeded its configured operation deadline",
+            ));
+        }
+
+        io.set_write_timeout(remaining)
+            .map_err(|error| map_io_error("serial.write", error))?;
+        match io.write(bytes) {
+            Ok(0) => {
+                return Err(disconnected(
+                    "serial.write",
+                    "serial port made no progress while writing",
+                ));
+            }
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(map_io_error("serial.write", error)),
+        }
+    }
+    Ok(())
+}
+
+async fn run_blocking_open<T, F>(open: F) -> HalResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> HalResult<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(open).await.map_err(|error| {
+        internal(
+            "serial.open",
+            format!("serial open blocking worker failed: {error}"),
+        )
+    })?
 }
 
 fn open_serial_stream(endpoint: &str, config: &SerialConfig) -> HalResult<SerialStream> {
@@ -364,59 +770,10 @@ fn open_serial_stream(endpoint: &str, config: &SerialConfig) -> HalResult<Serial
     Ok(stream)
 }
 
-#[cfg(test)]
-async fn run_blocking_drain<T, F>(drain: F) -> HalResult<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> HalResult<T> + Send + 'static,
-{
-    tokio::task::spawn_blocking(drain).await.map_err(|error| {
-        internal(
-            "serial.drain",
-            format!("serial drain blocking worker failed: {error}"),
-        )
-    })?
-}
-
-#[cfg(test)]
-fn close_join_failure(operation: &'static str) -> CloseTask {
-    let join = tokio::task::spawn_blocking(|| -> CloseWorkerResult {
-        panic!("intentional serial drain worker panic for test")
-    });
-
-    CloseTask { operation, join }
-}
-
-impl NativeSerialSession {
-    #[cfg(test)]
-    fn has_tracked_drain_for_test(&self) -> bool {
-        matches!(self.state, SessionState::Draining(_))
-    }
-
-    #[cfg(test)]
-    fn has_tracked_close_for_test(&self) -> bool {
-        matches!(self.state, SessionState::Closing(_))
-    }
-
-    #[cfg(test)]
-    fn is_ready_for_test(&self) -> bool {
-        matches!(self.state, SessionState::Ready(_))
-    }
-
-    #[cfg(test)]
-    fn is_closed_for_test(&self) -> bool {
-        matches!(self.state, SessionState::Closed)
-    }
-
-    #[cfg(test)]
-    async fn finish_tracked_close_for_test(&mut self) -> HalResult<HalResult<()>> {
-        self.finish_tracked_close().await
-    }
-
-    #[cfg(test)]
-    fn set_join_failure_for_test(&mut self, operation: &'static str) {
-        self.state = SessionState::Closing(close_join_failure(operation));
-    }
+fn operation_deadline(timeout: Duration) -> Instant {
+    Instant::now()
+        .checked_add(timeout)
+        .expect("validated serial operation timeout must fit in Instant")
 }
 
 fn validate_config(config: &SerialConfig) -> HalResult<()> {
@@ -431,6 +788,13 @@ fn validate_config(config: &SerialConfig) -> HalResult<()> {
         return Err(invalid_argument(
             "serial.open",
             "read_timeout must be greater than zero",
+        ));
+    }
+
+    if Instant::now().checked_add(config.read_timeout).is_none() {
+        return Err(invalid_argument(
+            "serial.open",
+            "read_timeout is too large for the platform clock",
         ));
     }
 
@@ -469,10 +833,10 @@ fn map_flow_control(flow_control: FlowControl) -> serial2::FlowControl {
     }
 }
 
-fn disconnected(operation: &'static str, debug_message: impl Into<String>) -> HalError {
+fn queue_full(operation: &'static str, debug_message: impl Into<String>) -> HalError {
     HalError::new(
-        "runtime.transport.disconnected",
-        seeed_hal_core::ErrorCategory::Unavailable,
+        "runtime.queue.full",
+        ErrorCategory::Unavailable,
         operation,
         true,
         debug_message,
@@ -480,164 +844,236 @@ fn disconnected(operation: &'static str, debug_message: impl Into<String>) -> Ha
     .expect("static serialport adapter error metadata must be valid")
 }
 
+fn disconnected(operation: &'static str, debug_message: impl Into<String>) -> HalError {
+    HalError::new(
+        "runtime.transport.disconnected",
+        ErrorCategory::Unavailable,
+        operation,
+        true,
+        debug_message,
+    )
+    .expect("static serialport adapter error metadata must be valid")
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn wait_unpoisoned<'a, T>(
+    condvar: &Condvar,
+    guard: std::sync::MutexGuard<'a, T>,
+) -> std::sync::MutexGuard<'a, T> {
+    condvar
+        .wait(guard)
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn wait_timeout_unpoisoned<'a, T>(
+    condvar: &Condvar,
+    guard: std::sync::MutexGuard<'a, T>,
+    timeout: Duration,
+) -> (std::sync::MutexGuard<'a, T>, std::sync::WaitTimeoutResult) {
+    condvar
+        .wait_timeout(guard, timeout)
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::thread;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     use seeed_hal_core::{
-        Endpoint, IdentityQuality, ResourceDescriptor, ResourceId, ResourceProperties,
-        TransportKind,
+        Endpoint, IdentityQuality, ResourceId, ResourceProperties, TransportKind,
     };
 
     use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn blocking_drain_runs_outside_tokio_worker() {
-        let caller_thread = thread::current().id();
-
-        let drain_thread = run_blocking_drain(|| Ok(thread::current().id()))
+    async fn open_and_configure_run_outside_tokio_worker() {
+        let caller = thread::current().id();
+        let opened_on = run_blocking_open(move || Ok(thread::current().id()))
             .await
             .unwrap();
 
-        assert_ne!(drain_thread, caller_thread);
+        assert_ne!(opened_on, caller);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_open_future_drops_late_opened_port() {
+        let gate = Arc::new(Gate::default());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let open_gate = Arc::clone(&gate);
+        let open_dropped = Arc::clone(&dropped);
+        let mut open = Box::pin(run_blocking_open(move || {
+            open_gate.enter_and_wait();
+            Ok(DropProbe(open_dropped))
+        }));
+
+        tokio::select! {
+            result = &mut open => panic!("open should remain blocked, got {result:?}"),
+            () = gate.wait_until_entered() => {}
+        }
+        drop(open);
+        gate.release();
+
+        wait_until(
+            || dropped.load(Ordering::Acquire),
+            "late opened port was not dropped",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_read_closes_worker_before_next_access() {
+        let probe = Arc::new(IoProbe::new(BlockedOperation::Read));
+        let mut session = test_actor_session(Arc::clone(&probe));
+        let mut read = Box::pin(session.read(8));
+
+        tokio::select! {
+            result = &mut read => panic!("read should remain blocked, got {result:?}"),
+            () = probe.wait_until_operation_entered() => {}
+        }
+        drop(read);
+        probe.release_operation();
+        probe.wait_until_all_handles_dropped().await;
+
+        let error = session.write_all(b"later").await.unwrap_err();
+        assert_eq!(error.name().as_str(), "runtime.session.closed");
+        assert_eq!(probe.write_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_write_all_closes_worker_before_next_access() {
+        let probe = Arc::new(IoProbe::new(BlockedOperation::Write));
+        let mut session = test_actor_session(Arc::clone(&probe));
+        let mut write = Box::pin(session.write_all(b"blocked"));
+
+        tokio::select! {
+            result = &mut write => panic!("write should remain blocked, got {result:?}"),
+            () = probe.wait_until_operation_entered() => {}
+        }
+        drop(write);
+        probe.release_operation();
+        probe.wait_until_all_handles_dropped().await;
+
+        let error = session.read(1).await.unwrap_err();
+        assert_eq!(error.name().as_str(), "runtime.session.closed");
+        assert_eq!(probe.max_active.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_close_while_flush_is_in_flight_releases_port_autonomously() {
+        let probe = Arc::new(IoProbe::new(BlockedOperation::Flush));
+        let mut session = test_actor_session(Arc::clone(&probe));
+        let mut flush = Box::pin(session.flush());
+
+        tokio::select! {
+            result = &mut flush => panic!("flush should remain blocked, got {result:?}"),
+            () = probe.wait_until_operation_entered() => {}
+        }
+        drop(flush);
+        probe.wait_until_interrupt_entered().await;
+
+        let mut close = Box::pin(session.close());
+        tokio::select! {
+            result = &mut close => panic!("close should remain blocked, got {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        drop(close);
+        probe.release_interrupt();
+
+        probe.wait_until_all_handles_dropped().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_reports_cancelled_flush_error_after_terminal_release() {
+        let probe = Arc::new(IoProbe::new_with_flush_error());
+        let mut session = test_actor_session(Arc::clone(&probe));
+        let mut flush = Box::pin(session.flush());
+
+        tokio::select! {
+            result = &mut flush => panic!("flush should remain blocked, got {result:?}"),
+            () = probe.wait_until_operation_entered() => {}
+        }
+        drop(flush);
+        probe.wait_until_interrupt_entered().await;
+        probe.release_interrupt();
+
+        let error = session.close().await.unwrap_err();
+
+        assert_eq!(error.name().as_str(), "runtime.transport.permission_denied");
+        probe.wait_until_all_handles_dropped().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn normal_commands_are_serialized_on_one_owned_worker() {
+        let probe = Arc::new(IoProbe::new(BlockedOperation::None));
+        let mut session = test_actor_session(Arc::clone(&probe));
+
+        session.write_all(b"abc").await.unwrap();
+        session.flush().await.unwrap();
+        session
+            .set_control_lines(ControlLines::default())
+            .await
+            .unwrap();
+        session.close().await.unwrap();
+
+        assert_eq!(probe.max_active.load(Ordering::Acquire), 1);
+        assert_eq!(probe.worker_threads.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn write_all_stops_at_operation_deadline() {
+        let probe = Arc::new(IoProbe::new(BlockedOperation::None));
+        let mut io = TestIo::new(Arc::clone(&probe));
+        let lifecycle = AtomicU8::new(LIFECYCLE_OPEN);
+
+        let error =
+            write_all_bounded(&mut io, b"never admitted", Instant::now(), &lifecycle).unwrap_err();
+
+        assert_eq!(error.name().as_str(), "runtime.transport.timeout");
+        assert_eq!(probe.write_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn write_all_deadline_terminates_repeated_partial_writes() {
+        let probe = Arc::new(IoProbe::new(BlockedOperation::None));
+        let mut io = TestIo::new(Arc::clone(&probe));
+        let lifecycle = AtomicU8::new(LIFECYCLE_OPEN);
+        let started = Instant::now();
+        let mut ticks = [
+            started,
+            started + Duration::from_millis(1),
+            started + Duration::from_millis(2),
+            started + Duration::from_millis(11),
+        ]
+        .into_iter();
+
+        let error = write_all_bounded_with_clock(
+            &mut io,
+            b"more than three bytes",
+            started + Duration::from_millis(10),
+            &lifecycle,
+            || ticks.next().unwrap(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.name().as_str(), "runtime.transport.timeout");
+        assert_eq!(probe.write_calls.load(Ordering::Acquire), 3);
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn closed_state_takes_precedence_over_invalid_read_size() {
-        let (_master, slave) = test_pair();
-        let mut session = test_session(slave, Arc::new(BlockingDrainStrategy));
+        let probe = Arc::new(IoProbe::new(BlockedOperation::None));
+        let mut session = test_actor_session(probe);
 
         session.close().await.unwrap();
         let error = session.read(0).await.unwrap_err();
 
         assert_eq!(error.name().as_str(), "runtime.session.closed");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dropping_flush_future_leaves_tracked_drain_and_recovers_session() {
-        let (_master, slave) = test_pair();
-        let gate = Arc::new(DrainGate::new());
-        let mut session = test_session(
-            slave,
-            Arc::new(GatedDrainStrategy {
-                gate: Arc::clone(&gate),
-                flush_error: false,
-            }),
-        );
-
-        let mut flush = Box::pin(session.flush());
-        tokio::select! {
-            result = &mut flush => panic!("flush should remain blocked, got {result:?}"),
-            () = gate.wait_until_entered() => {}
-        }
-        drop(flush);
-
-        assert!(session.has_tracked_drain_for_test());
-
-        gate.release();
-        let error = session.read(0).await.unwrap_err();
-
-        assert_eq!(error.name().as_str(), "runtime.argument.invalid");
-        assert!(session.is_ready_for_test());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dropping_close_future_leaves_tracked_close_and_terminal_state() {
-        let (_master, slave) = test_pair();
-        let gate = Arc::new(DrainGate::new());
-        let mut session = test_session(
-            slave,
-            Arc::new(GatedDrainStrategy {
-                gate: Arc::clone(&gate),
-                flush_error: false,
-            }),
-        );
-
-        let mut close = Box::pin(session.close());
-        tokio::select! {
-            result = &mut close => panic!("close should remain blocked, got {result:?}"),
-            () = gate.wait_until_entered() => {}
-        }
-        drop(close);
-
-        assert!(session.has_tracked_close_for_test());
-
-        gate.release();
-        session.close().await.unwrap();
-
-        assert!(session.is_closed_for_test());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dropping_close_future_releases_stream_without_later_session_poll() {
-        let (_master, slave) = test_pair();
-        let gate = Arc::new(DrainGate::new());
-        let mut session = test_session(
-            slave,
-            Arc::new(GatedDrainStrategy {
-                gate: Arc::clone(&gate),
-                flush_error: false,
-            }),
-        );
-
-        let mut close = Box::pin(session.close());
-        tokio::select! {
-            result = &mut close => panic!("close should remain blocked, got {result:?}"),
-            () = gate.wait_until_entered() => {}
-        }
-        drop(close);
-
-        gate.release();
-        gate.wait_until_stream_released().await;
-
-        assert!(gate.stream_released());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn close_attempts_terminal_close_after_cancelled_flush_error() {
-        let (_master, slave) = test_pair();
-        let gate = Arc::new(DrainGate::new());
-        let mut session = test_session(
-            slave,
-            Arc::new(GatedDrainStrategy {
-                gate: Arc::clone(&gate),
-                flush_error: true,
-            }),
-        );
-
-        let mut flush = Box::pin(session.flush());
-        tokio::select! {
-            result = &mut flush => panic!("flush should remain blocked, got {result:?}"),
-            () = gate.wait_until_entered() => {}
-        }
-        drop(flush);
-
-        gate.release();
-        let error = session.close().await.unwrap_err();
-
-        assert_eq!(error.name().as_str(), "runtime.transport.permission_denied");
-        assert!(gate.close_completed());
-        assert!(session.is_closed_for_test());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn drain_join_failure_closes_session_deterministically() {
-        let (_master, slave) = test_pair();
-        let mut session = test_session(slave, Arc::new(BlockingDrainStrategy));
-        session.set_join_failure_for_test("serial.close");
-
-        let error = session.finish_tracked_close_for_test().await.unwrap_err();
-
-        assert_eq!(error.name().as_str(), "runtime.internal");
-        assert!(session.is_closed_for_test());
     }
 
     #[test]
@@ -692,152 +1128,218 @@ mod tests {
         assert!(!error.debug_message().contains("native_open_error"));
     }
 
-    fn test_session(
-        stream: SerialStream,
-        drain_strategy: Arc<dyn DrainStrategy>,
-    ) -> NativeSerialSession {
-        NativeSerialSession {
-            descriptor: descriptor(),
-            config: SerialConfig::default(),
-            state: SessionState::Ready(stream),
-            drain_strategy,
-        }
-    }
-
-    #[cfg(unix)]
-    fn test_pair() -> ((), SerialStream) {
-        use std::os::fd::OwnedFd;
-
-        let path = std::env::temp_dir().join(format!(
-            "seeed-hal-serial-session-test-{}-{:?}",
-            std::process::id(),
-            thread::current().id()
-        ));
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .unwrap();
-        std::fs::remove_file(&path).unwrap();
-
-        let owned: OwnedFd = file.into();
-        ((), serial2::SerialPort::from(owned))
+    fn test_actor_session(probe: Arc<IoProbe>) -> NativeSerialSession {
+        NativeSerialSession::from_io_for_test(
+            descriptor(),
+            SerialConfig {
+                read_timeout: Duration::from_secs(5),
+                ..SerialConfig::default()
+            },
+            Box::new(TestIo::new(probe)),
+        )
+        .unwrap()
     }
 
     fn descriptor() -> ResourceDescriptor {
         ResourceDescriptor::new(
-            ResourceId::parse("serial:test:loopback").unwrap(),
-            Endpoint::new("test://loopback").unwrap(),
+            ResourceId::parse("serial:test:actor").unwrap(),
+            Endpoint::new("test://actor").unwrap(),
             IdentityQuality::Weak,
             TransportKind::Serial,
             ResourceProperties::default(),
         )
     }
 
-    struct DrainGate {
-        entered: AtomicBool,
-        released: AtomicBool,
-        stream_released: AtomicBool,
-        close_completed: AtomicBool,
+    async fn wait_until(mut predicate: impl FnMut() -> bool, message: &str) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !predicate() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect(message);
     }
 
-    impl DrainGate {
-        fn new() -> Self {
-            Self {
-                entered: AtomicBool::new(false),
-                released: AtomicBool::new(false),
-                stream_released: AtomicBool::new(false),
-                close_completed: AtomicBool::new(false),
+    #[derive(Default)]
+    struct Gate {
+        state: Mutex<(bool, bool)>,
+        changed: Condvar,
+    }
+
+    impl Gate {
+        fn enter_and_wait(&self) {
+            let mut state = lock_unpoisoned(&self.state);
+            state.0 = true;
+            self.changed.notify_all();
+            while !state.1 {
+                state = wait_unpoisoned(&self.changed, state);
             }
         }
 
         async fn wait_until_entered(&self) {
-            tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                while !self.entered.load(Ordering::Acquire) {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("drain worker should start");
+            wait_until(
+                || lock_unpoisoned(&self.state).0,
+                "blocking operation did not start",
+            )
+            .await;
         }
 
         fn release(&self) {
-            self.released.store(true, Ordering::Release);
+            let mut state = lock_unpoisoned(&self.state);
+            state.1 = true;
+            self.changed.notify_all();
         }
+    }
 
-        fn wait_for_release(&self) {
-            while !self.released.load(Ordering::Acquire) {
-                thread::yield_now();
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl std::fmt::Debug for DropProbe {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.debug_struct("DropProbe").finish()
+        }
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum BlockedOperation {
+        None,
+        Read,
+        Write,
+        Flush,
+    }
+
+    struct IoProbe {
+        blocked: BlockedOperation,
+        operation_gate: Gate,
+        interrupt_gate: Gate,
+        handles: AtomicUsize,
+        max_active: AtomicUsize,
+        active: AtomicUsize,
+        write_calls: AtomicUsize,
+        flush_error: bool,
+        worker_threads: Mutex<std::collections::HashSet<thread::ThreadId>>,
+    }
+
+    impl IoProbe {
+        fn new(blocked: BlockedOperation) -> Self {
+            Self {
+                blocked,
+                operation_gate: Gate::default(),
+                interrupt_gate: Gate::default(),
+                handles: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
+                active: AtomicUsize::new(0),
+                write_calls: AtomicUsize::new(0),
+                flush_error: false,
+                worker_threads: Mutex::new(std::collections::HashSet::new()),
             }
         }
 
-        async fn wait_until_stream_released(&self) {
-            tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                while !self.stream_released() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("close worker should release the stream without another session poll");
+        fn new_with_flush_error() -> Self {
+            Self {
+                flush_error: true,
+                ..Self::new(BlockedOperation::Flush)
+            }
         }
 
-        fn stream_released(&self) -> bool {
-            self.stream_released.load(Ordering::Acquire)
+        fn enter(&self, operation: BlockedOperation) {
+            lock_unpoisoned(&self.worker_threads).insert(thread::current().id());
+            let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+            self.max_active.fetch_max(active, Ordering::AcqRel);
+            if self.blocked != BlockedOperation::None && self.blocked == operation {
+                self.operation_gate.enter_and_wait();
+            }
+            self.active.fetch_sub(1, Ordering::AcqRel);
         }
 
-        fn mark_stream_released(&self) {
-            self.stream_released.store(true, Ordering::Release);
+        async fn wait_until_operation_entered(&self) {
+            self.operation_gate.wait_until_entered().await;
         }
 
-        fn close_completed(&self) -> bool {
-            self.close_completed.load(Ordering::Acquire)
+        async fn wait_until_interrupt_entered(&self) {
+            self.interrupt_gate.wait_until_entered().await;
         }
 
-        fn mark_close_completed(&self) {
-            self.close_completed.store(true, Ordering::Release);
+        fn release_interrupt(&self) {
+            self.interrupt_gate.release();
+            self.operation_gate.release();
+        }
+
+        fn release_operation(&self) {
+            self.operation_gate.release();
+        }
+
+        async fn wait_until_all_handles_dropped(&self) {
+            wait_until(
+                || self.handles.load(Ordering::Acquire) == 0,
+                "worker retained a serial handle",
+            )
+            .await;
         }
     }
 
-    struct GatedDrainStrategy {
-        gate: Arc<DrainGate>,
-        flush_error: bool,
+    struct TestIo {
+        probe: Arc<IoProbe>,
     }
 
-    impl DrainStrategy for GatedDrainStrategy {
-        fn spawn_flush(&self, operation: &'static str, stream: SerialStream) -> DrainTask {
-            let gate = Arc::clone(&self.gate);
-            let flush_error = self.flush_error;
-            let join = tokio::task::spawn_blocking(move || {
-                gate.entered.store(true, Ordering::Release);
-                gate.wait_for_release();
-                let result = if flush_error {
-                    Err(map_io_error(
-                        operation,
-                        std::io::Error::from_raw_os_error(13),
-                    ))
-                } else {
-                    Ok(())
-                };
-                Ok((stream, result))
-            });
+    impl TestIo {
+        fn new(probe: Arc<IoProbe>) -> Self {
+            probe.handles.fetch_add(1, Ordering::AcqRel);
+            Self { probe }
+        }
+    }
 
-            DrainTask { operation, join }
+    impl Drop for TestIo {
+        fn drop(&mut self) {
+            self.probe.handles.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    impl SerialIo for TestIo {
+        fn try_clone_box(&self) -> io::Result<Box<dyn SerialIo>> {
+            Ok(Box::new(Self::new(Arc::clone(&self.probe))))
         }
 
-        fn spawn_close(&self, operation: &'static str, stream: SerialStream) -> CloseTask {
-            let gate = Arc::clone(&self.gate);
-            let join = tokio::task::spawn_blocking(move || {
-                gate.entered.store(true, Ordering::Release);
-                gate.wait_for_release();
-                let result = Ok(());
-                drop(stream);
-                gate.mark_stream_released();
-                gate.mark_close_completed();
-                Ok(result)
-            });
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.probe.enter(BlockedOperation::Read);
+            buffer[0] = b'x';
+            Ok(1)
+        }
 
-            CloseTask { operation, join }
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.probe.write_calls.fetch_add(1, Ordering::AcqRel);
+            self.probe.enter(BlockedOperation::Write);
+            Ok(bytes.len().min(1))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.probe.enter(BlockedOperation::Flush);
+            if self.probe.flush_error {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn set_write_timeout(&mut self, _timeout: Duration) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn set_control_lines(&mut self, _lines: ControlLines) -> io::Result<()> {
+            self.probe.enter(BlockedOperation::None);
+            Ok(())
+        }
+
+        fn discard_buffers(&mut self) -> io::Result<()> {
+            if self.probe.blocked != BlockedOperation::None {
+                self.probe.interrupt_gate.enter_and_wait();
+            }
+            Ok(())
         }
     }
 }

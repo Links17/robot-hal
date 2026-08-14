@@ -187,6 +187,7 @@ Camera control uses normal broker IPC. Frame payloads use a bounded shared-memor
 - Blocking vendor calls never execute on Tokio executor workers.
 - Operation queues are bounded and preserve documented ordering.
 - Cancellation has a deadline; adapters that cannot cancel synchronously are isolated in a disposable worker.
+- The native Serial adapter serializes normal port access on one owned blocking actor with a one-command queue. A cancellation watchdog holds the only interrupt clone; dropping an admitted operation fails the adapter session closed, and an active flush is purged before both handles are released. The configured Serial read timeout also bounds each write operation and flush drain.
 - Adapter-level Serial close has a configurable deadline and defaults to two seconds. On timeout,
   the runtime drops the resource actor, releases its lease, completes close waiters with
   `runtime.session.close_timeout`, and does not continue using that session.
