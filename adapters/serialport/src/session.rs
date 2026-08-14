@@ -4,44 +4,60 @@ use seeed_hal_core::{HalError, HalResult, ResourceDescriptor};
 use seeed_hal_serial::{
     ControlLines, DataBits, FlowControl, Parity, SerialConfig, SerialSession, StopBits,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
-use tokio_serial::SerialPortBuilderExt;
 
-use crate::{
-    capture_native_open_error, internal, invalid_argument, map_io_error, map_serialport_error,
-    map_serialport_open_error, session_closed, timeout,
-};
+use crate::{internal, invalid_argument, map_io_error, session_closed, timeout};
 
-type DrainWorkerResult = HalResult<(tokio_serial::SerialStream, HalResult<()>)>;
+type SerialStream = serial2::SerialPort;
+type DrainWorkerResult = HalResult<(SerialStream, HalResult<()>)>;
+type CloseWorkerResult = HalResult<HalResult<()>>;
 
 struct DrainTask {
     operation: &'static str,
     join: JoinHandle<DrainWorkerResult>,
 }
 
+struct CloseTask {
+    operation: &'static str,
+    join: JoinHandle<CloseWorkerResult>,
+}
+
 trait DrainStrategy: Send + Sync {
-    fn spawn(&self, operation: &'static str, stream: tokio_serial::SerialStream) -> DrainTask;
+    fn spawn_flush(&self, operation: &'static str, stream: SerialStream) -> DrainTask;
+    fn spawn_close(&self, operation: &'static str, stream: SerialStream) -> CloseTask;
 }
 
 struct BlockingDrainStrategy;
 
 impl DrainStrategy for BlockingDrainStrategy {
-    fn spawn(&self, operation: &'static str, mut stream: tokio_serial::SerialStream) -> DrainTask {
+    fn spawn_flush(&self, operation: &'static str, stream: SerialStream) -> DrainTask {
         let join = tokio::task::spawn_blocking(move || {
-            let result =
-                std::io::Write::flush(&mut stream).map_err(|error| map_io_error(operation, error));
+            let result = stream
+                .flush()
+                .map_err(|error| map_io_error(operation, error));
             Ok((stream, result))
         });
 
         DrainTask { operation, join }
     }
+
+    fn spawn_close(&self, operation: &'static str, stream: SerialStream) -> CloseTask {
+        let join = tokio::task::spawn_blocking(move || {
+            let result = stream
+                .flush()
+                .map_err(|error| map_io_error(operation, error));
+            drop(stream);
+            Ok(result)
+        });
+
+        CloseTask { operation, join }
+    }
 }
 
 enum SessionState {
-    Ready(tokio_serial::SerialStream),
+    Ready(SerialStream),
     Draining(DrainTask),
-    Closing(DrainTask),
+    Closing(CloseTask),
     Closed,
 }
 
@@ -83,7 +99,7 @@ impl NativeSerialSession {
                     self.finish_tracked_drain().await??;
                 }
                 SessionState::Closing(_) => {
-                    let result = self.finish_tracked_drain().await?;
+                    let result = self.finish_tracked_close().await?;
                     if let Err(error) = result {
                         if error.name().as_str() != "runtime.transport.disconnected" {
                             return Err(error);
@@ -95,10 +111,7 @@ impl NativeSerialSession {
         }
     }
 
-    fn ready_stream_mut(
-        &mut self,
-        operation: &'static str,
-    ) -> HalResult<&mut tokio_serial::SerialStream> {
+    fn ready_stream_mut(&mut self, operation: &'static str) -> HalResult<&mut SerialStream> {
         match &mut self.state {
             SessionState::Ready(stream) => Ok(stream),
             SessionState::Closed => Err(session_closed(
@@ -113,10 +126,7 @@ impl NativeSerialSession {
         }
     }
 
-    fn take_ready_stream(
-        &mut self,
-        operation: &'static str,
-    ) -> HalResult<tokio_serial::SerialStream> {
+    fn take_ready_stream(&mut self, operation: &'static str) -> HalResult<SerialStream> {
         match std::mem::replace(&mut self.state, SessionState::Closed) {
             SessionState::Ready(stream) => Ok(stream),
             state => {
@@ -128,21 +138,23 @@ impl NativeSerialSession {
 
     fn begin_tracked_drain(&mut self, operation: &'static str) -> HalResult<()> {
         let stream = self.take_ready_stream(operation)?;
-        self.state = SessionState::Draining(self.drain_strategy.spawn(operation, stream));
+        self.state = SessionState::Draining(self.drain_strategy.spawn_flush(operation, stream));
         Ok(())
     }
 
     fn begin_tracked_close(&mut self) -> HalResult<()> {
         let stream = self.take_ready_stream("serial.close")?;
-        self.state = SessionState::Closing(self.drain_strategy.spawn("serial.close", stream));
+        self.state = SessionState::Closing(self.drain_strategy.spawn_close("serial.close", stream));
         Ok(())
     }
 
     async fn finish_tracked_drain(&mut self) -> HalResult<HalResult<()>> {
-        let (was_closing, operation, join_result) = match &mut self.state {
-            SessionState::Draining(task) => (false, task.operation, (&mut task.join).await),
-            SessionState::Closing(task) => (true, task.operation, (&mut task.join).await),
+        let (operation, join_result) = match &mut self.state {
+            SessionState::Draining(task) => (task.operation, (&mut task.join).await),
             SessionState::Ready(_) => return Ok(Ok(())),
+            SessionState::Closing(_) => {
+                return Err(session_closed("serial.drain", "serial session is closing"));
+            }
             SessionState::Closed => {
                 return Err(session_closed(
                     "serial.drain",
@@ -153,11 +165,7 @@ impl NativeSerialSession {
 
         match join_result {
             Ok(Ok((stream, drain_result))) => {
-                self.state = if was_closing {
-                    SessionState::Closed
-                } else {
-                    SessionState::Ready(stream)
-                };
+                self.state = SessionState::Ready(stream);
                 Ok(drain_result)
             }
             Ok(Err(error)) => {
@@ -171,6 +179,28 @@ impl NativeSerialSession {
                     format!("serial drain blocking worker failed: {error}"),
                 ))
             }
+        }
+    }
+
+    async fn finish_tracked_close(&mut self) -> HalResult<HalResult<()>> {
+        let (operation, join_result) = match &mut self.state {
+            SessionState::Closing(task) => (task.operation, (&mut task.join).await),
+            SessionState::Closed => return Ok(Ok(())),
+            SessionState::Ready(_) | SessionState::Draining(_) => {
+                return Err(session_closed(
+                    "serial.close",
+                    "serial session is not closing",
+                ));
+            }
+        };
+
+        self.state = SessionState::Closed;
+        match join_result {
+            Ok(result) => result,
+            Err(error) => Err(internal(
+                operation,
+                format!("serial close blocking worker failed: {error}"),
+            )),
         }
     }
 }
@@ -192,18 +222,34 @@ impl SerialSession for NativeSerialSession {
         }
 
         let read_timeout = self.config.read_timeout;
-        let stream = self.ready_stream_mut("serial.read")?;
+        let stream = self
+            .ready_stream_mut("serial.read")?
+            .try_clone()
+            .map_err(|error| map_io_error("serial.read", error))?;
         let mut buffer = vec![0_u8; max_bytes];
 
-        let read = tokio::time::timeout(read_timeout, stream.read(&mut buffer))
-            .await
-            .map_err(|_| {
-                timeout(
-                    "serial.read",
-                    format!("read timed out after {read_timeout:?}"),
-                )
-            })?
-            .map_err(|error| map_io_error("serial.read", error))?;
+        let (read, mut buffer) = tokio::time::timeout(
+            read_timeout,
+            tokio::task::spawn_blocking(move || {
+                stream
+                    .read(&mut buffer)
+                    .map(|read| (read, buffer))
+                    .map_err(|error| map_io_error("serial.read", error))
+            }),
+        )
+        .await
+        .map_err(|_| {
+            timeout(
+                "serial.read",
+                format!("read timed out after {read_timeout:?}"),
+            )
+        })?
+        .map_err(|error| {
+            internal(
+                "serial.read",
+                format!("serial read blocking worker failed: {error}"),
+            )
+        })??;
 
         if read == 0 {
             return Err(disconnected(
@@ -223,10 +269,24 @@ impl SerialSession for NativeSerialSession {
             return Ok(());
         }
 
-        self.ready_stream_mut("serial.write")?
-            .write_all(bytes)
-            .await
-            .map_err(|error| map_io_error("serial.write", error))
+        let stream = self
+            .ready_stream_mut("serial.write")?
+            .try_clone()
+            .map_err(|error| map_io_error("serial.write", error))?;
+        let bytes = bytes.to_vec();
+
+        tokio::task::spawn_blocking(move || {
+            stream
+                .write_all(&bytes)
+                .map_err(|error| map_io_error("serial.write", error))
+        })
+        .await
+        .map_err(|error| {
+            internal(
+                "serial.write",
+                format!("serial write blocking worker failed: {error}"),
+            )
+        })?
     }
 
     async fn flush(&mut self) -> HalResult<()> {
@@ -238,50 +298,70 @@ impl SerialSession for NativeSerialSession {
     async fn set_control_lines(&mut self, lines: ControlLines) -> HalResult<()> {
         self.ensure_ready("serial.set_control_lines").await?;
         let stream = self.ready_stream_mut("serial.set_control_lines")?;
-        tokio_serial::SerialPort::write_data_terminal_ready(stream, lines.data_terminal_ready)
-            .map_err(|error| map_serialport_error("serial.set_control_lines", error))?;
-        tokio_serial::SerialPort::write_request_to_send(stream, lines.request_to_send)
-            .map_err(|error| map_serialport_error("serial.set_control_lines", error))
+        stream
+            .set_dtr(lines.data_terminal_ready)
+            .map_err(|error| map_io_error("serial.set_control_lines", error))?;
+        stream
+            .set_rts(lines.request_to_send)
+            .map_err(|error| map_io_error("serial.set_control_lines", error))
     }
 
     async fn close(&mut self) -> HalResult<()> {
+        let mut pending_flush_error = None;
+
         loop {
             match self.state {
                 SessionState::Ready(_) => self.begin_tracked_close()?,
-                SessionState::Draining(_) | SessionState::Closing(_) => {
+                SessionState::Draining(_) => {
                     let drain_result = self.finish_tracked_drain().await?;
                     match drain_result {
                         Ok(()) => {}
                         Err(error) if error.name().as_str() == "runtime.transport.disconnected" => {
                         }
-                        Err(error) => return Err(error),
+                        Err(error) => {
+                            if pending_flush_error.is_none() {
+                                pending_flush_error = Some(error);
+                            }
+                        }
                     }
                 }
-                SessionState::Closed => return Ok(()),
+                SessionState::Closing(_) => {
+                    let close_result = self.finish_tracked_close().await?;
+                    match close_result {
+                        Ok(()) => {}
+                        Err(error) if error.name().as_str() == "runtime.transport.disconnected" => {
+                        }
+                        Err(error) => return Err(error),
+                    }
+
+                    return pending_flush_error.map_or(Ok(()), Err);
+                }
+                SessionState::Closed => return pending_flush_error.map_or(Ok(()), Err),
             }
         }
     }
 }
 
-fn open_serial_stream(
-    endpoint: &str,
-    config: &SerialConfig,
-) -> HalResult<tokio_serial::SerialStream> {
-    tokio_serial::new(endpoint, config.baud_rate)
-        .data_bits(map_data_bits(config.data_bits))
-        .parity(map_parity(config.parity))
-        .stop_bits(map_stop_bits(config.stop_bits))
-        .flow_control(map_flow_control(config.flow_control))
-        .timeout(config.read_timeout)
-        .open_native_async()
-        .map_err(|error| {
-            map_serialport_open_error(
-                "serial.open",
-                endpoint,
-                error,
-                capture_native_open_error(endpoint),
-            )
-        })
+fn open_serial_stream(endpoint: &str, config: &SerialConfig) -> HalResult<SerialStream> {
+    let mut stream = serial2::SerialPort::open(endpoint, |mut settings: serial2::Settings| {
+        settings.set_raw();
+        settings.set_baud_rate(config.baud_rate)?;
+        settings.set_char_size(map_data_bits(config.data_bits));
+        settings.set_parity(map_parity(config.parity));
+        settings.set_stop_bits(map_stop_bits(config.stop_bits));
+        settings.set_flow_control(map_flow_control(config.flow_control));
+        Ok(settings)
+    })
+    .map_err(|error| map_io_error("serial.open", error))?;
+
+    stream
+        .set_read_timeout(config.read_timeout)
+        .map_err(|error| map_io_error("serial.open", error))?;
+    stream
+        .set_write_timeout(config.read_timeout)
+        .map_err(|error| map_io_error("serial.open", error))?;
+
+    Ok(stream)
 }
 
 #[cfg(test)]
@@ -299,12 +379,12 @@ where
 }
 
 #[cfg(test)]
-fn drain_join_failure(operation: &'static str) -> DrainTask {
-    let join = tokio::task::spawn_blocking(|| -> DrainWorkerResult {
+fn close_join_failure(operation: &'static str) -> CloseTask {
+    let join = tokio::task::spawn_blocking(|| -> CloseWorkerResult {
         panic!("intentional serial drain worker panic for test")
     });
 
-    DrainTask { operation, join }
+    CloseTask { operation, join }
 }
 
 impl NativeSerialSession {
@@ -329,13 +409,13 @@ impl NativeSerialSession {
     }
 
     #[cfg(test)]
-    async fn finish_tracked_drain_for_test(&mut self) -> HalResult<HalResult<()>> {
-        self.finish_tracked_drain().await
+    async fn finish_tracked_close_for_test(&mut self) -> HalResult<HalResult<()>> {
+        self.finish_tracked_close().await
     }
 
     #[cfg(test)]
     fn set_join_failure_for_test(&mut self, operation: &'static str) {
-        self.state = SessionState::Closing(drain_join_failure(operation));
+        self.state = SessionState::Closing(close_join_failure(operation));
     }
 }
 
@@ -357,35 +437,35 @@ fn validate_config(config: &SerialConfig) -> HalResult<()> {
     Ok(())
 }
 
-fn map_data_bits(data_bits: DataBits) -> tokio_serial::DataBits {
+fn map_data_bits(data_bits: DataBits) -> serial2::CharSize {
     match data_bits {
-        DataBits::Five => tokio_serial::DataBits::Five,
-        DataBits::Six => tokio_serial::DataBits::Six,
-        DataBits::Seven => tokio_serial::DataBits::Seven,
-        DataBits::Eight => tokio_serial::DataBits::Eight,
+        DataBits::Five => serial2::CharSize::Bits5,
+        DataBits::Six => serial2::CharSize::Bits6,
+        DataBits::Seven => serial2::CharSize::Bits7,
+        DataBits::Eight => serial2::CharSize::Bits8,
     }
 }
 
-fn map_parity(parity: Parity) -> tokio_serial::Parity {
+fn map_parity(parity: Parity) -> serial2::Parity {
     match parity {
-        Parity::None => tokio_serial::Parity::None,
-        Parity::Odd => tokio_serial::Parity::Odd,
-        Parity::Even => tokio_serial::Parity::Even,
+        Parity::None => serial2::Parity::None,
+        Parity::Odd => serial2::Parity::Odd,
+        Parity::Even => serial2::Parity::Even,
     }
 }
 
-fn map_stop_bits(stop_bits: StopBits) -> tokio_serial::StopBits {
+fn map_stop_bits(stop_bits: StopBits) -> serial2::StopBits {
     match stop_bits {
-        StopBits::One => tokio_serial::StopBits::One,
-        StopBits::Two => tokio_serial::StopBits::Two,
+        StopBits::One => serial2::StopBits::One,
+        StopBits::Two => serial2::StopBits::Two,
     }
 }
 
-fn map_flow_control(flow_control: FlowControl) -> tokio_serial::FlowControl {
+fn map_flow_control(flow_control: FlowControl) -> serial2::FlowControl {
     match flow_control {
-        FlowControl::None => tokio_serial::FlowControl::None,
-        FlowControl::Software => tokio_serial::FlowControl::Software,
-        FlowControl::Hardware => tokio_serial::FlowControl::Hardware,
+        FlowControl::None => serial2::FlowControl::None,
+        FlowControl::Software => serial2::FlowControl::XonXoff,
+        FlowControl::Hardware => serial2::FlowControl::RtsCts,
     }
 }
 
@@ -427,7 +507,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn closed_state_takes_precedence_over_invalid_read_size() {
-        let (_master, slave) = tokio_serial::SerialStream::pair().unwrap();
+        let (_master, slave) = test_pair();
         let mut session = test_session(slave, Arc::new(BlockingDrainStrategy));
 
         session.close().await.unwrap();
@@ -439,12 +519,13 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropping_flush_future_leaves_tracked_drain_and_recovers_session() {
-        let (_master, slave) = tokio_serial::SerialStream::pair().unwrap();
+        let (_master, slave) = test_pair();
         let gate = Arc::new(DrainGate::new());
         let mut session = test_session(
             slave,
             Arc::new(GatedDrainStrategy {
                 gate: Arc::clone(&gate),
+                flush_error: false,
             }),
         );
 
@@ -467,12 +548,13 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropping_close_future_leaves_tracked_close_and_terminal_state() {
-        let (_master, slave) = tokio_serial::SerialStream::pair().unwrap();
+        let (_master, slave) = test_pair();
         let gate = Arc::new(DrainGate::new());
         let mut session = test_session(
             slave,
             Arc::new(GatedDrainStrategy {
                 gate: Arc::clone(&gate),
+                flush_error: false,
             }),
         );
 
@@ -492,51 +574,126 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_close_future_releases_stream_without_later_session_poll() {
+        let (_master, slave) = test_pair();
+        let gate = Arc::new(DrainGate::new());
+        let mut session = test_session(
+            slave,
+            Arc::new(GatedDrainStrategy {
+                gate: Arc::clone(&gate),
+                flush_error: false,
+            }),
+        );
+
+        let mut close = Box::pin(session.close());
+        tokio::select! {
+            result = &mut close => panic!("close should remain blocked, got {result:?}"),
+            () = gate.wait_until_entered() => {}
+        }
+        drop(close);
+
+        gate.release();
+        gate.wait_until_stream_released().await;
+
+        assert!(gate.stream_released());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_attempts_terminal_close_after_cancelled_flush_error() {
+        let (_master, slave) = test_pair();
+        let gate = Arc::new(DrainGate::new());
+        let mut session = test_session(
+            slave,
+            Arc::new(GatedDrainStrategy {
+                gate: Arc::clone(&gate),
+                flush_error: true,
+            }),
+        );
+
+        let mut flush = Box::pin(session.flush());
+        tokio::select! {
+            result = &mut flush => panic!("flush should remain blocked, got {result:?}"),
+            () = gate.wait_until_entered() => {}
+        }
+        drop(flush);
+
+        gate.release();
+        let error = session.close().await.unwrap_err();
+
+        assert_eq!(error.name().as_str(), "runtime.transport.permission_denied");
+        assert!(gate.close_completed());
+        assert!(session.is_closed_for_test());
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn drain_join_failure_closes_session_deterministically() {
-        let (_master, slave) = tokio_serial::SerialStream::pair().unwrap();
+        let (_master, slave) = test_pair();
         let mut session = test_session(slave, Arc::new(BlockingDrainStrategy));
         session.set_join_failure_for_test("serial.close");
 
-        let error = session.finish_tracked_drain_for_test().await.unwrap_err();
+        let error = session.finish_tracked_close_for_test().await.unwrap_err();
 
         assert_eq!(error.name().as_str(), "runtime.internal");
         assert!(session.is_closed_for_test());
     }
 
     #[test]
-    fn maps_serial_config_to_tokio_serial_types() {
-        assert_eq!(map_data_bits(DataBits::Five), tokio_serial::DataBits::Five);
-        assert_eq!(map_data_bits(DataBits::Six), tokio_serial::DataBits::Six);
-        assert_eq!(
-            map_data_bits(DataBits::Seven),
-            tokio_serial::DataBits::Seven
-        );
-        assert_eq!(
-            map_data_bits(DataBits::Eight),
-            tokio_serial::DataBits::Eight
-        );
-        assert_eq!(map_parity(Parity::None), tokio_serial::Parity::None);
-        assert_eq!(map_parity(Parity::Odd), tokio_serial::Parity::Odd);
-        assert_eq!(map_parity(Parity::Even), tokio_serial::Parity::Even);
-        assert_eq!(map_stop_bits(StopBits::One), tokio_serial::StopBits::One);
-        assert_eq!(map_stop_bits(StopBits::Two), tokio_serial::StopBits::Two);
+    fn maps_serial_config_to_serial2_types() {
+        assert_eq!(map_data_bits(DataBits::Five), serial2::CharSize::Bits5);
+        assert_eq!(map_data_bits(DataBits::Six), serial2::CharSize::Bits6);
+        assert_eq!(map_data_bits(DataBits::Seven), serial2::CharSize::Bits7);
+        assert_eq!(map_data_bits(DataBits::Eight), serial2::CharSize::Bits8);
+        assert_eq!(map_parity(Parity::None), serial2::Parity::None);
+        assert_eq!(map_parity(Parity::Odd), serial2::Parity::Odd);
+        assert_eq!(map_parity(Parity::Even), serial2::Parity::Even);
+        assert_eq!(map_stop_bits(StopBits::One), serial2::StopBits::One);
+        assert_eq!(map_stop_bits(StopBits::Two), serial2::StopBits::Two);
         assert_eq!(
             map_flow_control(FlowControl::None),
-            tokio_serial::FlowControl::None
+            serial2::FlowControl::None
         );
         assert_eq!(
             map_flow_control(FlowControl::Software),
-            tokio_serial::FlowControl::Software
+            serial2::FlowControl::XonXoff
         );
         assert_eq!(
             map_flow_control(FlowControl::Hardware),
-            tokio_serial::FlowControl::Hardware
+            serial2::FlowControl::RtsCts
         );
     }
 
+    #[test]
+    fn actual_open_missing_endpoint_carries_io_raw_os_error_from_open_path() {
+        let endpoint = std::env::temp_dir()
+            .join(format!("seeed-hal-missing-serial-{}", std::process::id()))
+            .display()
+            .to_string();
+        let expected_raw_os_error = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&endpoint)
+            .unwrap_err()
+            .raw_os_error()
+            .expect("missing path should carry a platform raw OS error");
+
+        let error = open_serial_stream(&endpoint, &SerialConfig::default()).unwrap_err();
+
+        assert_eq!(error.name().as_str(), "runtime.resource.not_found");
+        assert!(error.debug_message().contains("io error kind=NotFound"));
+        assert!(
+            error
+                .debug_message()
+                .contains(&format!("raw_os_error={expected_raw_os_error}"))
+        );
+        assert!(!error.debug_message().contains("serialport error"));
+        assert!(!error.debug_message().contains("native_open_error"));
+    }
+
     fn test_session(
-        stream: tokio_serial::SerialStream,
+        stream: SerialStream,
         drain_strategy: Arc<dyn DrainStrategy>,
     ) -> NativeSerialSession {
         NativeSerialSession {
@@ -545,6 +702,27 @@ mod tests {
             state: SessionState::Ready(stream),
             drain_strategy,
         }
+    }
+
+    #[cfg(unix)]
+    fn test_pair() -> ((), SerialStream) {
+        use std::os::fd::OwnedFd;
+
+        let path = std::env::temp_dir().join(format!(
+            "seeed-hal-serial-session-test-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let owned: OwnedFd = file.into();
+        ((), serial2::SerialPort::from(owned))
     }
 
     fn descriptor() -> ResourceDescriptor {
@@ -560,6 +738,8 @@ mod tests {
     struct DrainGate {
         entered: AtomicBool,
         released: AtomicBool,
+        stream_released: AtomicBool,
+        close_completed: AtomicBool,
     }
 
     impl DrainGate {
@@ -567,6 +747,8 @@ mod tests {
             Self {
                 entered: AtomicBool::new(false),
                 released: AtomicBool::new(false),
+                stream_released: AtomicBool::new(false),
+                close_completed: AtomicBool::new(false),
             }
         }
 
@@ -589,32 +771,73 @@ mod tests {
                 thread::yield_now();
             }
         }
+
+        async fn wait_until_stream_released(&self) {
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while !self.stream_released() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("close worker should release the stream without another session poll");
+        }
+
+        fn stream_released(&self) -> bool {
+            self.stream_released.load(Ordering::Acquire)
+        }
+
+        fn mark_stream_released(&self) {
+            self.stream_released.store(true, Ordering::Release);
+        }
+
+        fn close_completed(&self) -> bool {
+            self.close_completed.load(Ordering::Acquire)
+        }
+
+        fn mark_close_completed(&self) {
+            self.close_completed.store(true, Ordering::Release);
+        }
     }
 
     struct GatedDrainStrategy {
         gate: Arc<DrainGate>,
+        flush_error: bool,
     }
 
     impl DrainStrategy for GatedDrainStrategy {
-        fn spawn(
-            &self,
-            operation: &'static str,
-            mut stream: tokio_serial::SerialStream,
-        ) -> DrainTask {
+        fn spawn_flush(&self, operation: &'static str, stream: SerialStream) -> DrainTask {
             let gate = Arc::clone(&self.gate);
+            let flush_error = self.flush_error;
             let join = tokio::task::spawn_blocking(move || {
                 gate.entered.store(true, Ordering::Release);
                 gate.wait_for_release();
-                let result = if operation == "serial.close" {
-                    Ok(())
+                let result = if flush_error {
+                    Err(map_io_error(
+                        operation,
+                        std::io::Error::from_raw_os_error(13),
+                    ))
                 } else {
-                    std::io::Write::flush(&mut stream)
-                }
-                .map_err(|error| map_io_error(operation, error));
+                    Ok(())
+                };
                 Ok((stream, result))
             });
 
             DrainTask { operation, join }
+        }
+
+        fn spawn_close(&self, operation: &'static str, stream: SerialStream) -> CloseTask {
+            let gate = Arc::clone(&self.gate);
+            let join = tokio::task::spawn_blocking(move || {
+                gate.entered.store(true, Ordering::Release);
+                gate.wait_for_release();
+                let result = Ok(());
+                drop(stream);
+                gate.mark_stream_released();
+                gate.mark_close_completed();
+                Ok(result)
+            });
+
+            CloseTask { operation, join }
         }
     }
 }

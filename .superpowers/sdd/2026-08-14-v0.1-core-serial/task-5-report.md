@@ -140,3 +140,50 @@ Output summary: adapter unit tests passed `12/12`; metadata tests passed; packag
 - Drain worker join failures now close the session deterministically and report `runtime.internal`.
 - `serial.open` error mapping now preserves native open diagnostics when available, including `raw_os_error=<code>`.
 - Serialport `NoDevice` messages that discard platform details now infer stable raw busy/access-denied codes where possible (`EBUSY` on Unix, Windows `5`/`170`).
+
+## Fix Round 3
+
+### Files changed
+
+- `Cargo.toml`
+- `Cargo.lock`
+- `adapters/serialport/Cargo.toml`
+- `adapters/serialport/src/lib.rs`
+- `adapters/serialport/src/session.rs`
+- `.superpowers/sdd/2026-08-14-v0.1-core-serial/task-5-report.md`
+
+### RED evidence
+
+```bash
+cargo test -p seeed-hal-adapter-serialport --lib
+```
+
+Output summary: failed as expected before implementation. New focused tests required split close/flush worker ownership and failed to compile with `spawn_flush` / `spawn_close` not members of `DrainStrategy` and missing `CloseTask`.
+
+Focused test names added:
+
+- `dropping_close_future_releases_stream_without_later_session_poll`
+- `close_attempts_terminal_close_after_cancelled_flush_error`
+- `actual_open_missing_endpoint_carries_io_raw_os_error_from_open_path`
+
+### GREEN evidence
+
+```bash
+cargo test -p seeed-hal-adapter-serialport --lib
+cargo test -p seeed-hal-adapter-serialport --test metadata
+cargo test -p seeed-hal-adapter-serialport
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+```
+
+Output summary: adapter unit tests passed `13/13`; metadata tests passed `5/5`; adapter package tests passed with physical loopback ignored; fmt passed; clippy passed with `-D warnings`; workspace tests passed, including serial runtime and shared serial conformance tests, with physical loopback ignored.
+
+### Fixes
+
+- Split drain ownership into `DrainTask` for flush and `CloseTask` for close.
+- Close workers now own and drop the serial stream inside the blocking worker; a cancelled `close()` future no longer leaves the stream retained in an unpolled join result.
+- `close()` now reconciles a cancelled prior flush, records any non-disconnected flush error, then still proceeds to terminal close. If terminal close succeeds, the prior flush error is returned; terminal close errors take precedence.
+- Replaced `tokio-serial` session opening with `serial2::SerialPort::open()`, a safe cross-platform open/configure path returning the actual `std::io::Error` from the failing operation.
+- Removed the separate native open probe and all synthesized raw OS error inference; open diagnostics now come from the same failing open path and preserve `raw_os_error=<code>` through `map_io_error`.
+- Session read/write methods remain async HAL calls by dispatching blocking `serial2` I/O onto Tokio’s blocking pool; default tests still do not open physical serial hardware.
