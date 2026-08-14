@@ -28,6 +28,7 @@ zeroize = { workspace = true }
 rustix = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
+seeed-hal-windows-file = { path = "../../adapters/windows-file" }
 windows-permissions = { workspace = true }
 windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 winapi-util = { workspace = true }

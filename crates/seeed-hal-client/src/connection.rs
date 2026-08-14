@@ -202,6 +202,52 @@ struct Shared {
     writer: mpsc::Sender<Outbound>,
     events: broadcast::Sender<HalResult<ClientEvent>>,
     shutdown: watch::Sender<bool>,
+    #[cfg(test)]
+    inbound_test_hooks: Option<Arc<InboundTestHooks>>,
+}
+
+#[cfg(test)]
+struct InboundTestGate {
+    reached: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl InboundTestGate {
+    fn new() -> Self {
+        Self {
+            reached: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    async fn pause(&self) {
+        self.reached.add_permits(1);
+        self.release
+            .acquire()
+            .await
+            .expect("inbound test gate remains open")
+            .forget();
+    }
+
+    async fn wait_until_reached(&self) {
+        self.reached
+            .acquire()
+            .await
+            .expect("inbound test gate remains open")
+            .forget();
+    }
+
+    fn release(&self) {
+        self.release.add_permits(1);
+    }
+}
+
+#[cfg(test)]
+struct InboundTestHooks {
+    after_frame: Option<Arc<InboundTestGate>>,
+    after_preflight: Option<Arc<InboundTestGate>>,
+    decode_calls: std::sync::atomic::AtomicUsize,
 }
 
 struct ClientTasks {
@@ -286,6 +332,8 @@ impl HalClient {
             writer: writer_tx,
             events: event_tx,
             shutdown: shutdown_tx,
+            #[cfg(test)]
+            inbound_test_hooks: None,
         });
         let writer_shared = shared.clone();
         let writer = tokio::spawn(writer_task(
@@ -495,17 +543,19 @@ impl Drop for CancellationGuard {
             .unwrap_or_else(|p| p.into_inner());
         if let Some(pending) = state.pending.remove(&self.request_id) {
             if state.cancelled.len() >= self.shared.tombstone_capacity {
-                drop(state);
-                terminate(
-                    &self.shared,
-                    client_error(
-                        "runtime.queue.cancelled_full",
-                        ErrorCategory::Unavailable,
-                        "runtime.client.cancel",
-                        false,
-                        "cancelled request tracking is full",
-                    ),
+                let error = client_error(
+                    "runtime.queue.cancelled_full",
+                    ErrorCategory::Unavailable,
+                    "runtime.client.cancel",
+                    false,
+                    "cancelled request tracking is full",
                 );
+                let replies =
+                    begin_termination(&mut state, error.clone(), Some((self.request_id, pending)));
+                drop(state);
+                if let Some(replies) = replies {
+                    finish_termination(&self.shared, error, replies);
+                }
             } else {
                 state.cancelled.insert(self.request_id, pending.expected);
             }
@@ -689,7 +739,11 @@ where
     R: futures_util::Stream<Item = Result<BytesMut, std::io::Error>> + Unpin,
 {
     loop {
+        if connection_is_terminal(&shared) {
+            return;
+        }
         let frame = tokio::select! {
+            biased;
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() { return; }
                 continue;
@@ -710,6 +764,17 @@ where
                 return;
             }
         };
+        #[cfg(test)]
+        if let Some(gate) = shared
+            .inbound_test_hooks
+            .as_ref()
+            .and_then(|hooks| hooks.after_frame.as_ref())
+        {
+            gate.pause().await;
+        }
+        if connection_is_terminal(&shared) {
+            return;
+        }
         let limit = shared
             .limits
             .lock()
@@ -726,7 +791,28 @@ where
             terminate(&shared, error);
             return;
         }
-        let envelope = match v1::Envelope::decode(frame) {
+        #[cfg(test)]
+        if let Some(gate) = shared
+            .inbound_test_hooks
+            .as_ref()
+            .and_then(|hooks| hooks.after_preflight.as_ref())
+        {
+            gate.pause().await;
+        }
+        let decode = {
+            let state = shared.requests.lock().unwrap_or_else(|p| p.into_inner());
+            if state.terminal.is_some() {
+                return;
+            }
+            #[cfg(test)]
+            if let Some(hooks) = &shared.inbound_test_hooks {
+                hooks
+                    .decode_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            }
+            v1::Envelope::decode(frame)
+        };
+        let envelope = match decode {
             Ok(envelope) => envelope,
             Err(error) => {
                 terminate(
@@ -800,6 +886,9 @@ where
 
         let pending = {
             let mut state = shared.requests.lock().unwrap_or_else(|p| p.into_inner());
+            if state.terminal.is_some() {
+                return;
+            }
             if let Some(pending) = state.pending.remove(&envelope.request_id) {
                 remember_completed(&mut state, envelope.request_id, shared.tombstone_capacity);
                 Some(pending)
@@ -859,6 +948,15 @@ where
             return;
         }
     }
+}
+
+fn connection_is_terminal(shared: &Shared) -> bool {
+    shared
+        .requests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .terminal
+        .is_some()
 }
 
 fn preflight_inbound(frame: &[u8], shared: &Shared) -> HalResult<()> {
@@ -1089,16 +1187,35 @@ fn remove_pending(shared: &Shared, request_id: u64) {
 fn terminate(shared: &Shared, error: HalError) {
     let replies = {
         let mut state = shared.requests.lock().unwrap_or_else(|p| p.into_inner());
-        if state.terminal.is_some() {
-            return;
-        }
-        state.terminal = Some(error.clone());
-        state
-            .pending
-            .drain()
-            .map(|(_, pending)| pending.reply)
-            .collect::<Vec<_>>()
+        begin_termination(&mut state, error.clone(), None)
     };
+    let Some(replies) = replies else { return };
+    finish_termination(shared, error, replies);
+}
+
+fn begin_termination(
+    state: &mut RequestState,
+    error: HalError,
+    extra: Option<(u64, PendingRequest)>,
+) -> Option<Vec<oneshot::Sender<HalResult<envelope::Payload>>>> {
+    if state.terminal.is_some() {
+        return None;
+    }
+    state.terminal = Some(error);
+    let pending = state.pending.drain().collect::<Vec<_>>();
+    let mut replies = Vec::with_capacity(pending.len() + usize::from(extra.is_some()));
+    for (request_id, pending) in pending.into_iter().chain(extra) {
+        state.cancelled.insert(request_id, pending.expected);
+        replies.push(pending.reply);
+    }
+    Some(replies)
+}
+
+fn finish_termination(
+    shared: &Shared,
+    error: HalError,
+    replies: Vec<oneshot::Sender<HalResult<envelope::Payload>>>,
+) {
     for reply in replies {
         let _ = reply.send(Err(error.clone()));
     }
@@ -1256,10 +1373,118 @@ fn frame_too_large(message: &'static str) -> HalError {
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet, VecDeque};
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
 
+    use bytes::{Bytes, BytesMut};
+    use futures_util::task::AtomicWaker;
+    use futures_util::{SinkExt, StreamExt};
+    use prost::Message;
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::sync::{broadcast, mpsc, watch};
     use zeroize::Zeroize;
 
-    use super::{RequestState, SecretToken, WireValue, visit_fields};
+    use super::{
+        CancellationGuard, ConnectionOptions, ExpectedResponse, HalClient, InboundTestGate,
+        InboundTestHooks, Limits, PendingRequest, RequestState, SecretToken, Shared, WireValue,
+        begin_termination, client_error, frame_codec, reader_task, visit_fields,
+    };
+    use seeed_hal_core::ErrorCategory;
+    use seeed_hal_protocol::v1::{self, envelope};
+
+    #[derive(Clone, Default)]
+    struct WriterTestGate {
+        state: Arc<WriterTestGateState>,
+    }
+
+    #[derive(Default)]
+    struct WriterTestGateState {
+        armed: AtomicBool,
+        blocked: AtomicBool,
+        released: AtomicBool,
+        blocked_notify: tokio::sync::Notify,
+        write_waker: AtomicWaker,
+    }
+
+    struct WriterGatedIo<T> {
+        inner: T,
+        gate: WriterTestGate,
+    }
+
+    impl WriterTestGate {
+        fn wrap<T>(inner: T) -> (Self, WriterGatedIo<T>) {
+            let gate = Self::default();
+            (gate.clone(), WriterGatedIo { inner, gate })
+        }
+
+        fn arm(&self) {
+            self.state.armed.store(true, Ordering::Release);
+        }
+
+        async fn wait_until_blocked(&self) {
+            loop {
+                let notified = self.state.blocked_notify.notified();
+                if self.state.blocked.load(Ordering::Acquire) {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        fn release(&self) {
+            self.state.released.store(true, Ordering::Release);
+            self.state.write_waker.wake();
+        }
+    }
+
+    impl<T> AsyncRead for WriterGatedIo<T>
+    where
+        T: AsyncRead + Unpin,
+    {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buffer)
+        }
+    }
+
+    impl<T> AsyncWrite for WriterGatedIo<T>
+    where
+        T: AsyncWrite + Unpin,
+    {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.gate.state.armed.load(Ordering::Acquire)
+                && !self.gate.state.released.load(Ordering::Acquire)
+            {
+                self.gate.state.write_waker.register(cx.waker());
+                self.gate.state.blocked.store(true, Ordering::Release);
+                self.gate.state.blocked_notify.notify_waiters();
+                if !self.gate.state.released.load(Ordering::Acquire) {
+                    return Poll::Pending;
+                }
+            }
+            Pin::new(&mut self.inner).poll_write(cx, buffer)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
 
     #[test]
     fn client_secret_zeroize_clears_owned_bytes() {
@@ -1284,6 +1509,272 @@ mod tests {
             state.take_request_id().unwrap_err().name().as_str(),
             "runtime.protocol.request_id_exhausted"
         );
+    }
+
+    #[test]
+    fn terminal_transition_retains_all_expected_metadata_and_drains_replies_once() {
+        let (first_reply, mut first_rx) = tokio::sync::oneshot::channel();
+        let (overflow_reply, mut overflow_rx) = tokio::sync::oneshot::channel();
+        let mut state = RequestState {
+            next_request_id: 5,
+            pending: HashMap::from([(
+                4,
+                PendingRequest {
+                    expected: ExpectedResponse::SerialRead { max_bytes: 8 },
+                    reply: first_reply,
+                },
+            )]),
+            cancelled: HashMap::from([(2, ExpectedResponse::EnumerateSerial)]),
+            completed: HashSet::new(),
+            completed_order: VecDeque::new(),
+            terminal: None,
+        };
+        let error = client_error(
+            "runtime.queue.cancelled_full",
+            ErrorCategory::Unavailable,
+            "runtime.client.cancel",
+            false,
+            "cancelled request tracking is full",
+        );
+
+        let replies = begin_termination(
+            &mut state,
+            error.clone(),
+            Some((
+                3,
+                PendingRequest {
+                    expected: ExpectedResponse::SerialRead { max_bytes: 7 },
+                    reply: overflow_reply,
+                },
+            )),
+        )
+        .unwrap();
+
+        assert_eq!(state.terminal.as_ref().unwrap().name(), error.name());
+        assert!(matches!(
+            state.cancelled.get(&3),
+            Some(ExpectedResponse::SerialRead { max_bytes: 7 })
+        ));
+        assert!(matches!(
+            state.cancelled.get(&4),
+            Some(ExpectedResponse::SerialRead { max_bytes: 8 })
+        ));
+        assert!(state.pending.is_empty());
+        assert_eq!(replies.len(), 2);
+        for reply in replies {
+            reply.send(Err(error.clone())).unwrap();
+        }
+        assert_eq!(
+            first_rx.try_recv().unwrap().unwrap_err().name(),
+            error.name()
+        );
+        assert_eq!(
+            overflow_rx.try_recv().unwrap().unwrap_err().name(),
+            error.name()
+        );
+        assert!(begin_termination(&mut state, error, None).is_none());
+    }
+
+    #[tokio::test]
+    async fn writer_queue_overflow_uses_a_positively_blocked_writer() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (writer_gate, client_io) = WriterTestGate::wrap(client_io);
+        let server = tokio::spawn(async move {
+            let mut wire = tokio_util::codec::Framed::new(
+                server_io,
+                frame_codec(seeed_hal_protocol::MAX_FRAME_BYTES),
+            );
+            let handshake_frame = wire.next().await.unwrap().unwrap();
+            let handshake = v1::Envelope::decode(handshake_frame).unwrap();
+            let request = match handshake.payload.unwrap() {
+                envelope::Payload::HandshakeRequest(request) => request,
+                _ => panic!("expected handshake request"),
+            };
+            wire.send(Bytes::from(
+                v1::Envelope {
+                    request_id: handshake.request_id,
+                    payload: Some(envelope::Payload::HandshakeResponse(
+                        v1::HandshakeResponse {
+                            protocol_major: 1,
+                            protocol_minor: 0,
+                            capabilities: vec!["serial.bytes/v1".to_owned()],
+                            max_frame_bytes: request.max_frame_bytes,
+                            max_read_bytes: request.max_read_bytes,
+                            max_write_bytes: request.max_write_bytes,
+                        },
+                    )),
+                }
+                .encode_to_vec(),
+            ))
+            .await
+            .unwrap();
+            while let Some(frame) = wire.next().await {
+                let request = v1::Envelope::decode(frame.unwrap()).unwrap();
+                if wire
+                    .send(Bytes::from(
+                        v1::Envelope {
+                            request_id: request.request_id,
+                            payload: Some(envelope::Payload::EnumerateSerialResponse(
+                                v1::EnumerateSerialResponse {
+                                    resources: Vec::new(),
+                                },
+                            )),
+                        }
+                        .encode_to_vec(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let client = HalClient::from_io(
+            client_io,
+            ConnectionOptions::new("unused", [0x5a; 32]).with_queue_capacities(8, 1, 1),
+        )
+        .await
+        .unwrap();
+        writer_gate.arm();
+
+        let first_client = client.clone();
+        let first = tokio::spawn(async move { first_client.enumerate_serial().await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            writer_gate.wait_until_blocked(),
+        )
+        .await
+        .expect("writer must positively report its blocked state");
+
+        let second_client = client.clone();
+        let second = tokio::spawn(async move { second_client.enumerate_serial().await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if client
+                    .inner
+                    .shared
+                    .requests
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .pending
+                    .len()
+                    == 2
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second request must positively occupy the bounded writer queue");
+
+        let error = client.enumerate_serial().await.unwrap_err();
+        assert_eq!(error.name().as_str(), "runtime.queue.full");
+        assert_eq!(error.operation().as_str(), "runtime.protocol.write");
+
+        first.abort();
+        second.abort();
+        writer_gate.release();
+        client.close().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .expect("test server must stop after client closure")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tombstone_overflow_stops_ready_frames_before_prost_decode_at_each_boundary() {
+        for (iteration, boundary) in (0..32)
+            .flat_map(|iteration| ["frame", "preflight"].map(move |boundary| (iteration, boundary)))
+        {
+            let gate = Arc::new(InboundTestGate::new());
+            let hooks = Arc::new(InboundTestHooks {
+                after_frame: (boundary == "frame").then(|| gate.clone()),
+                after_preflight: (boundary == "preflight").then(|| gate.clone()),
+                decode_calls: AtomicUsize::new(0),
+            });
+            let (overflow_reply, overflow_rx) = tokio::sync::oneshot::channel();
+            let (read_reply, read_rx) = tokio::sync::oneshot::channel();
+            let (writer, _) = mpsc::channel(1);
+            let (events, _) = broadcast::channel(1);
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let shared = Arc::new(Shared {
+                requests: std::sync::Mutex::new(RequestState {
+                    next_request_id: 5,
+                    pending: HashMap::from([
+                        (
+                            3,
+                            PendingRequest {
+                                expected: ExpectedResponse::EnumerateSerial,
+                                reply: overflow_reply,
+                            },
+                        ),
+                        (
+                            4,
+                            PendingRequest {
+                                expected: ExpectedResponse::SerialRead { max_bytes: 8 },
+                                reply: read_reply,
+                            },
+                        ),
+                    ]),
+                    cancelled: HashMap::from([(2, ExpectedResponse::EnumerateSerial)]),
+                    completed: HashSet::new(),
+                    completed_order: VecDeque::new(),
+                    terminal: None,
+                }),
+                limits: std::sync::Mutex::new(Limits {
+                    frame: 512,
+                    read: 16,
+                    write: 16,
+                }),
+                pending_capacity: 2,
+                tombstone_capacity: 1,
+                writer,
+                events,
+                shutdown,
+                inbound_test_hooks: Some(hooks.clone()),
+            });
+            let data_len = if boundary == "frame" { 12 } else { 8 };
+            let frame = v1::Envelope {
+                request_id: 4,
+                payload: Some(envelope::Payload::SerialReadResponse(
+                    v1::SerialReadResponse {
+                        data: vec![0x91; data_len],
+                    },
+                )),
+            }
+            .encode_to_vec();
+            let stream = futures_util::stream::iter(vec![Ok(BytesMut::from(frame.as_slice()))]);
+            let reader_shared = shared.clone();
+            let reader = tokio::spawn(reader_task(stream, shutdown_rx, reader_shared));
+
+            tokio::time::timeout(std::time::Duration::from_secs(1), gate.wait_until_reached())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "reader must reach the configured {boundary} boundary on iteration {iteration}"
+                    )
+                });
+            drop(CancellationGuard {
+                shared: shared.clone(),
+                request_id: 3,
+                armed: true,
+            });
+            for reply in [overflow_rx, read_rx] {
+                let error = tokio::time::timeout(std::time::Duration::from_secs(1), reply)
+                    .await
+                    .expect("terminal transition must resolve every pending reply")
+                    .unwrap()
+                    .unwrap_err();
+                assert_eq!(error.name().as_str(), "runtime.queue.cancelled_full");
+            }
+            gate.release();
+            tokio::time::timeout(std::time::Duration::from_secs(1), reader)
+                .await
+                .expect("reader must stop after terminal transition")
+                .unwrap();
+            assert_eq!(hooks.decode_calls.load(Ordering::Acquire), 0);
+        }
     }
 
     #[test]

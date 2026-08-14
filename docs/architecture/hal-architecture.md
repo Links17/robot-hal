@@ -240,8 +240,9 @@ the device/inode/owner identities still match. On Windows, the parent and token 
 directory/file objects owned by the current process user. Their DACLs may grant effective access only
 to that user, LocalSystem, built-in administrators, or the Windows Owner Rights principal. The
 executable retains the parent handle and file handles that deny write/delete sharing, requires one
-hard link, and revalidates handle security plus volume/file identity before deletion. A failed length,
-type, ownership, ACL, link-count, or identity check leaves the path in place.
+hard link, and revalidates handle security plus volume/file identity before marking the validated
+file handle for deletion. It does not arm delete-on-close until every trust check succeeds. A failed
+length, type, ownership, ACL, link-count, or identity check leaves the path in place.
 
 The zeroization guarantee is limited to specific mutable startup-token buffers explicitly owned by
 this code: the executable and client token arrays, decoded broker/client protobuf token vectors,

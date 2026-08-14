@@ -322,6 +322,15 @@ mod tests {
     use crate::token::read_and_remove_token;
     use seeed_hal_broker::StartupToken;
 
+    async fn test_deadline<T>(
+        future: impl std::future::Future<Output = T>,
+        message: &'static str,
+    ) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(1), future)
+            .await
+            .expect(message)
+    }
+
     #[cfg(unix)]
     fn private_token_path(label: &str) -> (PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
@@ -523,7 +532,9 @@ mod tests {
 
         let mut saw_close = false;
         for _ in 0..2 {
-            let event = events.recv().await.unwrap();
+            let event = test_deadline(events.recv(), "shutdown must publish runtime events")
+                .await
+                .unwrap();
             if event.kind() == RuntimeEventKind::SessionClosed {
                 saw_close = true;
             }

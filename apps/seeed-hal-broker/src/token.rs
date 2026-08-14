@@ -194,8 +194,19 @@ mod platform {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::sync::Mutex;
 
     use super::platform::TrustedTokenFile;
+
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    struct RestoreCurrentDirectory(PathBuf);
+
+    impl Drop for RestoreCurrentDirectory {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
 
     fn private_directory(label: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
@@ -218,13 +229,16 @@ mod tests {
 
     #[test]
     fn bare_relative_token_uses_current_directory_as_parent() {
+        let _cwd_lock = CWD_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let directory = private_directory("bare-relative");
         let path = directory.join("token");
         write_token(&path, 0x33);
-        let original_directory = std::env::current_dir().unwrap();
+        let restore = RestoreCurrentDirectory(std::env::current_dir().unwrap());
         std::env::set_current_dir(&directory).unwrap();
         let result = TrustedTokenFile::open(PathBuf::from("token")).and_then(|file| file.consume());
-        std::env::set_current_dir(original_directory).unwrap();
+        drop(restore);
 
         assert_eq!(*result.unwrap(), [0x33; 32]);
         assert!(!path.exists());
@@ -303,9 +317,10 @@ mod platform {
     use windows_permissions::{LocalBox, SecurityDescriptor, Sid, Trustee};
     use zeroize::Zeroizing;
 
+    use windows_sys::Win32::Foundation::GENERIC_READ;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_READ,
+        DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
     };
 
     use super::policy_error;
@@ -359,6 +374,7 @@ mod platform {
             validate_real_file_path(&path_metadata)?;
             let file = OpenOptions::new()
                 .read(true)
+                .access_mode(GENERIC_READ | DELETE)
                 .share_mode(FILE_SHARE_READ)
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(&path)?;
@@ -416,8 +432,8 @@ mod platform {
                 return Err(policy_error("token path changed before deletion"));
             }
             drop(path_file);
+            seeed_hal_windows_file::mark_delete_on_close(&self.file)?;
             drop(self.file);
-            std::fs::remove_file(&self.path)?;
             Ok(token)
         }
     }

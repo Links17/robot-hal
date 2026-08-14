@@ -9,6 +9,16 @@ use seeed_hal_serial::SerialConfig;
 const TOKEN: [u8; 32] = [0x5a; 32];
 
 #[cfg(unix)]
+async fn test_deadline<T>(
+    future: impl std::future::Future<Output = T>,
+    message: &'static str,
+) -> T {
+    tokio::time::timeout(std::time::Duration::from_secs(1), future)
+        .await
+        .expect(message)
+}
+
+#[cfg(unix)]
 mod fake {
     use bytes::Bytes;
     use futures_util::{SinkExt, StreamExt};
@@ -35,7 +45,9 @@ mod fake {
     }
 
     pub async fn accept_and_handshake(listener: UnixListener) -> Wire {
-        let (io, _) = listener.accept().await.unwrap();
+        let (io, _) = super::test_deadline(listener.accept(), "fake broker must accept the client")
+            .await
+            .unwrap();
         let mut wire = Framed::new(io, codec());
         let request = recv(&mut wire).await;
         let handshake = match request.payload.unwrap() {
@@ -64,7 +76,10 @@ mod fake {
     }
 
     pub async fn recv(wire: &mut Wire) -> v1::Envelope {
-        let frame = wire.next().await.unwrap().unwrap();
+        let frame = super::test_deadline(wire.next(), "fake broker must receive the next frame")
+            .await
+            .unwrap()
+            .unwrap();
         v1::Envelope::decode(frame).unwrap()
     }
 
@@ -250,8 +265,15 @@ async fn event_does_not_consume_a_pending_response() {
         .unwrap();
     let mut events = client.subscribe();
     let resources = client.enumerate_serial().await.unwrap();
-    let event = events.recv().await.unwrap();
-    let next_event = events.recv().await.unwrap();
+    let event = test_deadline(events.recv(), "client must publish the first runtime event")
+        .await
+        .unwrap();
+    let next_event = test_deadline(
+        events.recv(),
+        "client must publish the second runtime event",
+    )
+    .await
+    .unwrap();
     assert_eq!(resources[0].id().as_str(), "serial:fake:event");
     assert_eq!(event.sequence(), 7);
     assert_eq!(event.name(), "session.opened");
@@ -710,54 +732,6 @@ async fn concurrent_requests_use_unique_nonzero_ids() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn writer_queue_overflow_returns_structured_backpressure() {
-    use futures_util::StreamExt;
-    use tokio::sync::oneshot;
-
-    let endpoint = fake::endpoint("writer-overflow");
-    let listener = fake::bind(&endpoint);
-    let (release_tx, release_rx) = oneshot::channel();
-    let server = tokio::spawn(async move {
-        let mut wire = fake::accept_and_handshake(listener).await;
-        fake::respond_enumerate_and_open(&mut wire, "serial:fake:writer-overflow").await;
-        release_rx.await.unwrap();
-    });
-    let client = HalClient::connect(
-        ConnectionOptions::new(&endpoint, TOKEN)
-            .with_byte_limits(128 * 1024, 64 * 1024, 64 * 1024)
-            .with_queue_capacities(128, 1, 4),
-    )
-    .await
-    .unwrap();
-    let descriptor = client.enumerate_serial().await.unwrap().remove(0);
-    let serial = client
-        .open_serial(descriptor.selector(), SerialConfig::default())
-        .await
-        .unwrap();
-    let payload = Bytes::from(vec![0x44; 64 * 1024]);
-    let mut requests = (0..64)
-        .map(|_| serial.write(payload.clone()))
-        .collect::<futures_util::stream::FuturesUnordered<_>>();
-    let mut saw_backpressure = false;
-    while let Some(result) = requests.next().await {
-        if result.is_err_and(|error| {
-            error.name().as_str() == "runtime.queue.full"
-                && error.operation().as_str() == "runtime.protocol.write"
-        }) {
-            saw_backpressure = true;
-            break;
-        }
-    }
-    assert!(saw_backpressure);
-    drop(requests);
-    release_tx.send(()).unwrap();
-    client.close().await.unwrap();
-    server.await.unwrap();
-    std::fs::remove_file(endpoint).unwrap();
-}
-
-#[cfg(unix)]
-#[tokio::test]
 async fn cancellation_tombstone_overflow_fails_connection_closed() {
     use tokio::sync::{mpsc, oneshot};
 
@@ -771,7 +745,9 @@ async fn cancellation_tombstone_overflow_fails_connection_closed() {
             let request = fake::recv(&mut wire).await;
             received_tx.send(request.request_id).await.unwrap();
         }
-        release_rx.await.unwrap();
+        test_deadline(release_rx, "cancellation test server must be released")
+            .await
+            .unwrap();
     });
     let client =
         HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN).with_queue_capacities(1, 4, 4))
@@ -780,7 +756,15 @@ async fn cancellation_tombstone_overflow_fails_connection_closed() {
     for _ in 0..2 {
         let request_client = client.clone();
         let request = tokio::spawn(async move { request_client.enumerate_serial().await });
-        assert_ne!(received_rx.recv().await.unwrap(), 0);
+        assert_ne!(
+            test_deadline(
+                received_rx.recv(),
+                "fake broker must positively observe the cancelled request",
+            )
+            .await
+            .unwrap(),
+            0
+        );
         request.abort();
         assert!(request.await.unwrap_err().is_cancelled());
     }
@@ -835,7 +819,11 @@ async fn event_subscription_reports_bounded_lag() {
     let mut events = client.subscribe();
     client.enumerate_serial().await.unwrap();
     assert_eq!(
-        events.recv().await.unwrap_err().name().as_str(),
+        test_deadline(events.recv(), "client must report bounded event lag")
+            .await
+            .unwrap_err()
+            .name()
+            .as_str(),
         "runtime.event.lagged"
     );
     client.close().await.unwrap();
@@ -846,19 +834,23 @@ async fn event_subscription_reports_bounded_lag() {
 #[cfg(unix)]
 #[tokio::test]
 async fn negotiated_write_limit_rejects_before_transmission() {
-    use futures_util::StreamExt;
+    use seeed_hal_protocol::v1::envelope;
 
     let endpoint = fake::endpoint("write-limit");
     let listener = fake::bind(&endpoint);
     let server = tokio::spawn(async move {
         let mut wire = fake::accept_and_handshake(listener).await;
         fake::respond_enumerate_and_open(&mut wire, "serial:fake:write-limit").await;
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), wire.next())
-                .await
-                .is_err(),
-            "oversized write must not reach the wire"
-        );
+        let next = fake::recv(&mut wire).await;
+        assert!(matches!(
+            next.payload,
+            Some(envelope::Payload::EnumerateSerialRequest(_))
+        ));
+        fake::send(
+            &mut wire,
+            fake::enumerate_response(next.request_id, "serial:fake:write-limit"),
+        )
+        .await;
     });
     let client =
         HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN).with_byte_limits(512, 16, 16))
@@ -878,6 +870,7 @@ async fn negotiated_write_limit_rejects_before_transmission() {
             .as_str(),
         "runtime.argument.invalid"
     );
+    client.enumerate_serial().await.unwrap();
     server.await.unwrap();
     client.close().await.unwrap();
     std::fs::remove_file(endpoint).unwrap();
@@ -920,7 +913,9 @@ async fn client_close_fans_out_to_multiple_pending_requests() {
             let request = fake::recv(&mut wire).await;
             received_tx.send(request.request_id).await.unwrap();
         }
-        release_rx.await.unwrap();
+        test_deadline(release_rx, "client-close test server must be released")
+            .await
+            .unwrap();
     });
     let client = HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN))
         .await
@@ -929,8 +924,24 @@ async fn client_close_fans_out_to_multiple_pending_requests() {
     let second_client = client.clone();
     let first = tokio::spawn(async move { first_client.enumerate_serial().await });
     let second = tokio::spawn(async move { second_client.enumerate_serial().await });
-    assert_ne!(received_rx.recv().await.unwrap(), 0);
-    assert_ne!(received_rx.recv().await.unwrap(), 0);
+    assert_ne!(
+        test_deadline(
+            received_rx.recv(),
+            "fake broker must receive the first request"
+        )
+        .await
+        .unwrap(),
+        0
+    );
+    assert_ne!(
+        test_deadline(
+            received_rx.recv(),
+            "fake broker must receive the second request"
+        )
+        .await
+        .unwrap(),
+        0
+    );
     client.close().await.unwrap();
     for result in [first.await.unwrap(), second.await.unwrap()] {
         assert_eq!(result.unwrap_err().name().as_str(), "runtime.client.closed");

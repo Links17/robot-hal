@@ -804,6 +804,7 @@ dependencies = [
  "seeed-hal-runtime",
  "seeed-hal-serial",
  "seeed-hal-testkit",
+ "seeed-hal-windows-file",
  "serde",
  "serde_json",
  "sha2",
@@ -887,6 +888,13 @@ dependencies = [
  "seeed-hal-core",
  "seeed-hal-serial",
  "tokio",
+]
+
+[[package]]
+name = "seeed-hal-windows-file"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

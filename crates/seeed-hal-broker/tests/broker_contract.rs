@@ -19,6 +19,15 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 const TOKEN: [u8; 32] = [0xa5; 32];
 
+async fn test_deadline<T>(
+    future: impl std::future::Future<Output = T>,
+    message: &'static str,
+) -> T {
+    tokio::time::timeout(std::time::Duration::from_secs(1), future)
+        .await
+        .expect(message)
+}
+
 #[derive(Clone, Default)]
 struct BlockingWriteGate {
     state: Arc<BlockingWriteGateState>,
@@ -44,6 +53,7 @@ struct SecondEnumerateGateAdapter {
     enumerate_started: Arc<Notify>,
     enumerate_release: Arc<(Mutex<bool>, Condvar)>,
     operation_dropped: Arc<AtomicBool>,
+    operation_dropped_notify: Arc<Notify>,
     close_after_operation_drop: Arc<AtomicBool>,
     close_started: Arc<Notify>,
 }
@@ -56,13 +66,18 @@ impl SecondEnumerateGateAdapter {
             enumerate_started: Arc::new(Notify::new()),
             enumerate_release: Arc::new((Mutex::new(false), Condvar::new())),
             operation_dropped: Arc::new(AtomicBool::new(false)),
+            operation_dropped_notify: Arc::new(Notify::new()),
             close_after_operation_drop: Arc::new(AtomicBool::new(false)),
             close_started: Arc::new(Notify::new()),
         }
     }
 
     async fn wait_until_second_enumerate_started(&self) {
-        self.enumerate_started.notified().await;
+        test_deadline(
+            self.enumerate_started.notified(),
+            "second enumerate operation must start",
+        )
+        .await;
     }
 
     fn release_second_enumerate(&self) {
@@ -72,17 +87,33 @@ impl SecondEnumerateGateAdapter {
     }
 
     async fn wait_until_close_started(&self) {
-        self.close_started.notified().await;
+        test_deadline(
+            self.close_started.notified(),
+            "owner revoke must start session closure",
+        )
+        .await;
+    }
+
+    async fn wait_until_operation_dropped(&self) {
+        loop {
+            let notified = self.operation_dropped_notify.notified();
+            if self.operation_dropped.load(Ordering::Acquire) {
+                return;
+            }
+            test_deadline(notified, "in-flight operation future must be joined").await;
+        }
     }
 }
 
 struct OperationDropGuard {
     dropped: Arc<AtomicBool>,
+    dropped_notify: Arc<Notify>,
 }
 
 impl Drop for OperationDropGuard {
     fn drop(&mut self) {
         self.dropped.store(true, Ordering::Release);
+        self.dropped_notify.notify_one();
     }
 }
 
@@ -96,6 +127,7 @@ impl SerialAdapter for SecondEnumerateGateAdapter {
         if self.enumerate_calls.fetch_add(1, Ordering::AcqRel) == 1 {
             let _drop_guard = OperationDropGuard {
                 dropped: self.operation_dropped.clone(),
+                dropped_notify: self.operation_dropped_notify.clone(),
             };
             self.enumerate_started.notify_one();
             {
@@ -310,7 +342,13 @@ where
     }
 
     async fn recv(&mut self) -> v1::Envelope {
-        let frame = self.framed.next().await.unwrap().unwrap();
+        let frame = test_deadline(
+            self.framed.next(),
+            "test client must receive the next frame",
+        )
+        .await
+        .unwrap()
+        .unwrap();
         v1::Envelope::decode(frame).unwrap()
     }
 
@@ -1028,7 +1066,9 @@ async fn disconnect_revokes_owned_sessions() {
     assert!(outcome.cleanup_error().is_none());
     let mut closed = false;
     for _ in 0..2 {
-        let event = events.recv().await.unwrap();
+        let event = test_deadline(events.recv(), "disconnect must publish runtime events")
+            .await
+            .unwrap();
         if event.kind() == RuntimeEventKind::SessionClosed
             && event.session_id().as_str() == expected_session_id
         {
@@ -1064,10 +1104,12 @@ async fn shutdown_joins_in_flight_operations_before_revoking_owner() {
     let broker = Broker::with_startup_token(runtime.clone(), StartupToken::from_bytes(TOKEN));
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (shutdown_observed_tx, shutdown_observed_rx) = oneshot::channel();
     let server = tokio::spawn(async move {
         broker
             .serve_connection_until(server_io, async {
                 let _ = shutdown_rx.await;
+                let _ = shutdown_observed_tx.send(());
             })
             .await
     });
@@ -1083,23 +1125,23 @@ async fn shutdown_joins_in_flight_operations_before_revoking_owner() {
     adapter.wait_until_second_enumerate_started().await;
 
     shutdown_tx.send(()).unwrap();
-    let close_started_before_release = tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        adapter.wait_until_close_started(),
+    test_deadline(
+        shutdown_observed_rx,
+        "connection shutdown signal must be positively observed",
     )
     .await
-    .is_ok();
+    .unwrap();
     adapter.release_second_enumerate();
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), server)
-        .await
-        .expect("shutdown must join operations and finish connection tasks")
-        .unwrap();
+    adapter.wait_until_operation_dropped().await;
+    adapter.wait_until_close_started().await;
+    let outcome = test_deadline(
+        server,
+        "shutdown must join operations and finish connection tasks",
+    )
+    .await
+    .unwrap();
 
     assert!(outcome.cleanup_error().is_none());
-    assert!(
-        !close_started_before_release,
-        "owner revoke must wait for the in-flight operation task to join"
-    );
     assert!(
         adapter.operation_dropped.load(Ordering::Acquire),
         "the in-flight operation future must terminate"
@@ -1111,7 +1153,9 @@ async fn shutdown_joins_in_flight_operations_before_revoking_owner() {
 
     let mut saw_closed = false;
     for _ in 0..2 {
-        let event = events.recv().await.unwrap();
+        let event = test_deadline(events.recv(), "owner revoke must publish runtime events")
+            .await
+            .unwrap();
         if event.kind() == RuntimeEventKind::SessionClosed
             && event.session_id().as_str() == session.session_id
         {
