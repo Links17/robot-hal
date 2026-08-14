@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::de::{Error as DeError, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::fmt;
 
 use crate::capability::validate_identifier;
 use crate::{HalError, HalResult};
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ResourceId(String);
 
 impl ResourceId {
@@ -20,14 +22,47 @@ impl ResourceId {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+impl<'de> Deserialize<'de> for ResourceId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ResourceIdVisitor;
+
+        impl<'de> Visitor<'de> for ResourceIdVisitor {
+            type Value = ResourceId;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a validated resource identifier string")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                ResourceId::parse(value.to_owned()).map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                ResourceId::parse(value).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(ResourceIdVisitor)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct Endpoint(String);
 
 impl Endpoint {
     pub fn new(value: impl Into<String>) -> HalResult<Self> {
         let value = value.into();
         if value.is_empty() {
-            return Err(HalError::invalid_argument(
+            return Err(HalError::invalid_argument_error(
                 "endpoint.empty",
                 "endpoint.new",
                 "endpoint must not be empty",
@@ -35,7 +70,7 @@ impl Endpoint {
         }
 
         if value.len() > 4096 {
-            return Err(HalError::invalid_argument(
+            return Err(HalError::invalid_argument_error(
                 "endpoint.too_long",
                 "endpoint.new",
                 "endpoint must be at most 4096 bytes",
@@ -47,6 +82,39 @@ impl Endpoint {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Endpoint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct EndpointVisitor;
+
+        impl<'de> Visitor<'de> for EndpointVisitor {
+            type Value = Endpoint;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a validated endpoint string")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                Endpoint::new(value.to_owned()).map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                Endpoint::new(value).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(EndpointVisitor)
     }
 }
 

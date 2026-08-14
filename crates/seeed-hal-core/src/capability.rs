@@ -1,8 +1,10 @@
-use serde::{Deserialize, Serialize};
+use serde::de::{Error as DeError, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::fmt;
 
 use crate::{HalError, HalResult};
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct CapabilityId(String);
 
 impl CapabilityId {
@@ -10,10 +12,18 @@ impl CapabilityId {
         let value = value.into();
         validate_identifier("capability.id", &value)?;
         let (contract, version) = value.split_once('/').ok_or_else(|| {
-            HalError::invalid_argument("capability.id.invalid", "capability.parse", "missing version")
+            HalError::invalid_argument_error(
+                "capability.id.invalid",
+                "capability.parse",
+                "missing version",
+            )
         })?;
         let (namespace, name) = contract.split_once('.').ok_or_else(|| {
-            HalError::invalid_argument("capability.id.invalid", "capability.parse", "missing namespace")
+            HalError::invalid_argument_error(
+                "capability.id.invalid",
+                "capability.parse",
+                "missing namespace",
+            )
         })?;
 
         if namespace.is_empty()
@@ -21,7 +31,7 @@ impl CapabilityId {
             || contract.matches('.').count() != 1
             || !version.starts_with('v')
         {
-            return Err(HalError::invalid_argument(
+            return Err(HalError::invalid_argument_error(
                 "capability.id.invalid",
                 "capability.parse",
                 "expected <namespace>.<name>/v<positive integer>",
@@ -33,7 +43,7 @@ impl CapabilityId {
             || !number.chars().all(|character| character.is_ascii_digit())
             || number.parse::<u64>().ok().filter(|number| *number > 0).is_none()
         {
-            return Err(HalError::invalid_argument(
+            return Err(HalError::invalid_argument_error(
                 "capability.id.invalid",
                 "capability.parse",
                 "version must be a positive integer",
@@ -45,6 +55,39 @@ impl CapabilityId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for CapabilityId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CapabilityIdVisitor;
+
+        impl<'de> Visitor<'de> for CapabilityIdVisitor {
+            type Value = CapabilityId;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a validated capability identifier string")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                CapabilityId::parse(value.to_owned()).map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                CapabilityId::parse(value).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(CapabilityIdVisitor)
     }
 }
 
@@ -63,7 +106,7 @@ impl CapabilitySet {
 
 pub(crate) fn validate_identifier(field: &'static str, value: &str) -> HalResult<()> {
     if value.is_empty() {
-        return Err(HalError::invalid_argument(
+        return Err(HalError::invalid_argument_error(
             format!("{field}.empty"),
             field,
             "identifier must not be empty",
@@ -71,7 +114,7 @@ pub(crate) fn validate_identifier(field: &'static str, value: &str) -> HalResult
     }
 
     if value.len() > 255 {
-        return Err(HalError::invalid_argument(
+        return Err(HalError::invalid_argument_error(
             format!("{field}.too_long"),
             field,
             "identifier must be at most 255 bytes",
@@ -79,7 +122,7 @@ pub(crate) fn validate_identifier(field: &'static str, value: &str) -> HalResult
     }
 
     if !value.is_ascii() {
-        return Err(HalError::invalid_argument(
+        return Err(HalError::invalid_argument_error(
             format!("{field}.non_ascii"),
             field,
             "identifier must be ASCII",

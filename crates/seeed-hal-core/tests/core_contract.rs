@@ -55,3 +55,24 @@ fn error_decisions_do_not_require_message_parsing() {
     assert_eq!(json["retryable"], false);
     assert!(json.get("debug_message").is_none());
 }
+
+#[test]
+fn malformed_serialized_values_are_rejected() {
+    assert!(serde_json::from_str::<seeed_hal_core::ResourceId>("\"\"").is_err());
+    assert!(serde_json::from_str::<seeed_hal_core::Endpoint>("\"\"").is_err());
+    assert!(serde_json::from_str::<seeed_hal_core::CapabilityId>("\"serial.bytes\"").is_err());
+    assert!(serde_json::from_str::<seeed_hal_core::LeaseId>("\"\"").is_err());
+    assert!(serde_json::from_str::<seeed_hal_core::ErrorName>("\"\"").is_err());
+}
+
+#[test]
+fn public_error_construction_returns_result_instead_of_panicking() {
+    let error = seeed_hal_core::HalError::new(
+        "runtime.lease.stale_generation",
+        seeed_hal_core::ErrorCategory::Conflict,
+        "",
+        false,
+        "generation 4 is older than 5",
+    );
+    assert!(error.is_err());
+}

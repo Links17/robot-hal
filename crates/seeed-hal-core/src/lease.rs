@@ -1,10 +1,12 @@
-use serde::{Deserialize, Serialize};
+use serde::de::{Error as DeError, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::fmt;
 use uuid::Uuid;
 
 use crate::capability::validate_identifier;
 use crate::HalResult;
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct LeaseId(String);
 
 impl LeaseId {
@@ -29,7 +31,40 @@ impl Default for LeaseId {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+impl<'de> Deserialize<'de> for LeaseId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct LeaseIdVisitor;
+
+        impl<'de> Visitor<'de> for LeaseIdVisitor {
+            type Value = LeaseId;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a validated lease id string")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                LeaseId::parse(value.to_owned()).map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                LeaseId::parse(value).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(LeaseIdVisitor)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct OwnerId(String);
 
 impl OwnerId {
@@ -44,7 +79,40 @@ impl OwnerId {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+impl<'de> Deserialize<'de> for OwnerId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct OwnerIdVisitor;
+
+        impl<'de> Visitor<'de> for OwnerIdVisitor {
+            type Value = OwnerId;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a validated owner id string")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                OwnerId::parse(value.to_owned()).map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                OwnerId::parse(value).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(OwnerIdVisitor)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct SessionId(String);
 
 impl SessionId {
@@ -56,6 +124,39 @@ impl SessionId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct SessionIdVisitor;
+
+        impl<'de> Visitor<'de> for SessionIdVisitor {
+            type Value = SessionId;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a validated session id string")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                SessionId::parse(value.to_owned()).map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                SessionId::parse(value).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(SessionIdVisitor)
     }
 }
 

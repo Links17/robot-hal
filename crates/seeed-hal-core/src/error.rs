@@ -1,4 +1,6 @@
-use serde::{Deserialize, Serialize};
+use serde::de::{Error as DeError, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::fmt;
 
 use crate::capability::validate_identifier;
 
@@ -11,7 +13,7 @@ pub enum ErrorCategory {
     Internal,
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ErrorName(String);
 
 impl ErrorName {
@@ -26,7 +28,40 @@ impl ErrorName {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+impl<'de> Deserialize<'de> for ErrorName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ErrorNameVisitor;
+
+        impl<'de> Visitor<'de> for ErrorNameVisitor {
+            type Value = ErrorName;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a validated error name string")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                ErrorName::parse(value.to_owned()).map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                ErrorName::parse(value).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(ErrorNameVisitor)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct OperationName(String);
 
 impl OperationName {
@@ -38,6 +73,39 @@ impl OperationName {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for OperationName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct OperationNameVisitor;
+
+        impl<'de> Visitor<'de> for OperationNameVisitor {
+            type Value = OperationName;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a validated operation name string")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                OperationName::parse(value.to_owned()).map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                OperationName::parse(value).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(OperationNameVisitor)
     }
 }
 
@@ -61,19 +129,19 @@ impl HalError {
         ))
     }
 
-    pub fn invalid_argument(
+    pub(crate) fn invalid_argument_error(
         name: impl Into<String>,
         operation: impl Into<String>,
         debug_message: impl Into<String>,
     ) -> Self {
-        Self::new(
-            name,
+        Self(
+            ErrorName::parse(name).expect("static invalid argument error metadata must be valid"),
             ErrorCategory::InvalidArgument,
-            operation,
+            OperationName::parse(operation)
+                .expect("static invalid argument error metadata must be valid"),
             false,
-            debug_message,
+            debug_message.into(),
         )
-        .expect("static invalid argument error metadata must be valid")
     }
 
     pub fn name(&self) -> &ErrorName {
