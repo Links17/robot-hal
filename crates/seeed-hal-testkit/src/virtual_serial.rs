@@ -14,6 +14,12 @@ use tokio::sync::{Mutex, Notify, mpsc};
 const QUEUE_CAPACITY: usize = 64;
 const DEFAULT_ENDPOINT_PREFIX: &str = "virtual://serial/";
 
+/// A deterministic Serial loopback adapter for conformance testing.
+///
+/// Each opened session has a non-blocking receive queue bounded to 64
+/// messages. Successful non-empty writes enqueue immutable [`Bytes`] values
+/// in order. A write made while all 64 message slots are occupied returns
+/// `runtime.queue.full` rather than waiting for capacity.
 #[derive(Clone, Debug)]
 pub struct VirtualSerialAdapter {
     descriptor: ResourceDescriptor,

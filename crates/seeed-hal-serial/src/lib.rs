@@ -108,6 +108,13 @@ pub trait SerialSession: Send {
 
     async fn read(&mut self, max_bytes: usize) -> HalResult<bytes::Bytes>;
 
+    /// Admits `bytes` for transmission while preserving the byte order of
+    /// successfully admitted writes.
+    ///
+    /// Implementations must bound any internal admission queue. If that queue
+    /// has no capacity, this operation must return an error named
+    /// `runtime.queue.full` instead of waiting indefinitely. Queue capacity is
+    /// adapter-specific.
     async fn write_all(&mut self, bytes: &[u8]) -> HalResult<()>;
 
     async fn flush(&mut self) -> HalResult<()>;
