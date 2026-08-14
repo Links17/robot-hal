@@ -192,3 +192,89 @@ handoff because the commit cannot contain its own final SHA.
 
 Windows target compilation is verified; Windows runtime Named Pipe acceptance was not executable on
 the macOS host. Physical Serial hardware remains outside default tests.
+
+## Fix Round 2
+
+### Status and files
+
+Resolved the round-2 handshake admission race and isolated response-queue overflow reporting in:
+
+- `crates/seeed-hal-broker/src/connection.rs`
+- `crates/seeed-hal-broker/tests/broker_contract.rs`
+- `docs/architecture/hal-architecture.md`
+
+The protobuf schema, field numbers, exact 1 MiB hard cap, and Serial-only runtime dispatch remain
+unchanged.
+
+### RED evidence
+
+1. `cargo test -p seeed-hal-broker --test broker_contract
+   response_queue_overflow_is_isolated_structured_and_cleans_up_owner -- --nocapture`
+   - Exit 101.
+   - The isolated response-only overflow returned generic `runtime.queue.full` instead of the
+     required response-specific `runtime.queue.response_full` outcome.
+2. `cargo test -p seeed-hal-broker --test broker_contract
+   pipelined_handshake_then_oversized_frame_uses_negotiated_limit -- --nocapture`
+   - Exit 101 after the one-second bound.
+   - A post-handshake frame already buffered by the peer raced dispatch's publication of the
+     negotiated limit and did not terminate the connection.
+
+`pipelined_zero_id_error_never_uses_pre_handshake_frame_limit`,
+`pipelined_duplicate_id_error_uses_negotiated_frame_limit`,
+`pipelined_request_queue_pressure_uses_negotiated_frame_limit`, and
+`handshake_frame_length_prefix_over_hard_cap_fails_before_decode` extend the same negotiated-limit
+fix across reader-generated errors and the codec boundary. They began green against the minimal
+implementation driven by the oversized-pipeline RED case; no artificial production regression was
+introduced to manufacture extra failures.
+
+### GREEN behavior and named tests
+
+- `response_queue_overflow_is_isolated_structured_and_cleans_up_owner`: deterministically fills only
+  the response queue, reports `runtime.queue.response_full`, revokes the owner, and proves immediate
+  resource reuse.
+- `pipelined_handshake_then_oversized_frame_uses_negotiated_limit`: a pre-buffered oversized frame
+  is checked against the accepted 110-byte limit and terminates with
+  `runtime.protocol.frame_too_large`.
+- `pipelined_zero_id_error_never_uses_pre_handshake_frame_limit` and
+  `pipelined_duplicate_id_error_uses_negotiated_frame_limit`: reader-generated protocol errors never
+  carry the pre-handshake 1 MiB allowance after negotiation.
+- `pipelined_request_queue_pressure_uses_negotiated_frame_limit`: a reader-generated admission error
+  is bounded by the accepted 108-byte limit and cannot be emitted oversized.
+- `handshake_frame_length_prefix_over_hard_cap_fails_before_decode`: a length prefix of 1 MiB plus
+  one byte is rejected by the codec before a protobuf body is read.
+
+### Design decisions
+
+- The frame-limit state is a `watch` channel whose initial value is unnegotiated. Once the reader
+  admits a handshake request, it waits for dispatch either to publish the validated limit or cancel
+  the connection before reading another frame.
+- The reader applies the hard 1 MiB maximum before handshake and the authoritative accepted maximum
+  afterward, including zero-ID, duplicate-ID, and request-queue error paths. Dispatch keeps its raw
+  length check as defense in depth.
+- Dispatch publishes the accepted limit before admitting the handshake response. The writer still
+  checks encoded length against both negotiated and hard maxima before allocating.
+- Response-channel saturation now has the stable name `runtime.queue.response_full`, operation
+  `runtime.protocol.write`, category `Unavailable`, and retryable status; it cannot be confused with
+  request/task admission pressure.
+
+### Verification evidence
+
+- `cargo fmt --all --check`: exit 0, no output.
+- `cargo test -p seeed-hal-protocol -p seeed-hal-broker`: exit 0; 23 broker contract tests and 2
+  protocol contract tests passed, plus doc tests.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: exit 0, no warnings.
+- `cargo test --workspace --all-features`: exit 0; 87 tests passed and the existing physical Serial
+  loopback test remained intentionally ignored without `SEEED_HAL_SERIAL_LOOPBACK`; all doc tests
+  passed.
+- `cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-msvc`: exit 0;
+  the workspace and Windows Named Pipe module compiled for the installed Windows target.
+- `make docs-guard` was attempted because the parent repository guidance requested it, but this
+  standalone `seeed-hal` repository has no Makefile, make target, or alternate docs-check script.
+
+### Commit and remaining concerns
+
+Planned fix subject: `fix(broker): serialize negotiated frame admission`. The SHA is recorded in the
+handoff because the commit cannot contain its own final SHA.
+
+Windows runtime Named Pipe acceptance and physical Serial hardware remain unavailable on this macOS
+host. No repository-owned docs guard exists beyond the Rust checks listed above.

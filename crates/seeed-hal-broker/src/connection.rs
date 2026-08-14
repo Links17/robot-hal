@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -111,7 +110,7 @@ impl Broker {
         let framed = Framed::new(io, frame_codec());
         let (sink, stream) = framed.split();
         let active = Arc::new(Mutex::new(HashSet::new()));
-        let negotiated_frame_bytes = Arc::new(AtomicUsize::new(MAX_FRAME_BYTES));
+        let (frame_limit_tx, frame_limit_rx) = watch::channel(None::<usize>);
         let (request_tx, request_rx) = mpsc::channel(self.config.request_queue_capacity);
         let (response_tx, response_rx) = mpsc::channel(self.config.response_queue_capacity);
         let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -121,7 +120,7 @@ impl Broker {
             request_tx,
             response_tx.clone(),
             active.clone(),
-            negotiated_frame_bytes.clone(),
+            frame_limit_rx,
             cancel_rx.clone(),
         ));
         let writer_cancel = cancel_tx.clone();
@@ -141,7 +140,7 @@ impl Broker {
             request_rx,
             response_tx.clone(),
             active,
-            negotiated_frame_bytes,
+            frame_limit_tx,
             cancel_rx,
         )
         .await;
@@ -170,7 +169,7 @@ async fn read_requests<R>(
     request_tx: mpsc::Sender<InboundRequest>,
     response_tx: mpsc::Sender<OutboundEnvelope>,
     active: Arc<Mutex<HashSet<u64>>>,
-    negotiated_frame_bytes: Arc<AtomicUsize>,
+    mut frame_limit: watch::Receiver<Option<usize>>,
     mut cancel: watch::Receiver<bool>,
 ) -> HalResult<()>
 where
@@ -199,6 +198,11 @@ where
             )
         })?;
         let encoded_len = frame.len();
+        if encoded_len > reader_frame_limit(&frame_limit) {
+            return Err(frame_too_large(
+                "inbound frame exceeds the active connection maximum",
+            ));
+        }
         let request = v1::Envelope::decode(frame).map_err(|error| {
             protocol_error(
                 "runtime.protocol.invalid_message",
@@ -213,7 +217,7 @@ where
             send_response(
                 &response_tx,
                 error_envelope(request_id, invalid_message("request_id must be non-zero")),
-                negotiated_frame_bytes.load(Ordering::Acquire),
+                reader_frame_limit(&frame_limit),
             )?;
             continue;
         }
@@ -237,16 +241,24 @@ where
                         "request_id is already in flight",
                     ),
                 ),
-                negotiated_frame_bytes.load(Ordering::Acquire),
+                reader_frame_limit(&frame_limit),
             )?;
             return Ok(());
         }
 
+        let is_handshake = matches!(
+            request.payload,
+            Some(envelope::Payload::HandshakeRequest(_))
+        );
         match request_tx.try_send(InboundRequest {
             envelope: request,
             encoded_len,
         }) {
-            Ok(()) => {}
+            Ok(()) => {
+                if is_handshake && !wait_for_negotiated_limit(&mut frame_limit, &mut cancel).await {
+                    return Ok(());
+                }
+            }
             Err(mpsc::error::TrySendError::Full(request)) => {
                 remove_active(&active, request_id);
                 send_response(
@@ -255,10 +267,40 @@ where
                         request.envelope.request_id,
                         queue_full("broker request queue is full"),
                     ),
-                    negotiated_frame_bytes.load(Ordering::Acquire),
+                    reader_frame_limit(&frame_limit),
                 )?;
             }
             Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+        }
+    }
+}
+
+fn reader_frame_limit(frame_limit: &watch::Receiver<Option<usize>>) -> usize {
+    (*frame_limit.borrow()).unwrap_or(MAX_FRAME_BYTES)
+}
+
+async fn wait_for_negotiated_limit(
+    frame_limit: &mut watch::Receiver<Option<usize>>,
+    cancel: &mut watch::Receiver<bool>,
+) -> bool {
+    loop {
+        if frame_limit.borrow().is_some() {
+            return true;
+        }
+        if *cancel.borrow() {
+            return false;
+        }
+        tokio::select! {
+            changed = frame_limit.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+            }
+            changed = cancel.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+            }
         }
     }
 }
@@ -309,7 +351,7 @@ async fn dispatch_requests(
     mut requests: mpsc::Receiver<InboundRequest>,
     responses: mpsc::Sender<OutboundEnvelope>,
     active: Arc<Mutex<HashSet<u64>>>,
-    negotiated_frame_bytes: Arc<AtomicUsize>,
+    frame_limit: watch::Sender<Option<usize>>,
     mut cancel: watch::Receiver<bool>,
 ) -> Option<HalError> {
     let mut handshaken = false;
@@ -395,8 +437,7 @@ async fn dispatch_requests(
                                 Ok((response, negotiated)) => {
                                     handshaken = true;
                                     limits = Some(negotiated);
-                                    negotiated_frame_bytes
-                                        .store(negotiated.max_frame_bytes, Ordering::Release);
+                                    frame_limit.send_replace(Some(negotiated.max_frame_bytes));
                                     remove_active(&active, request_id);
                                     if let Err(error) = send_response(
                                         &responses,
@@ -740,7 +781,7 @@ fn send_response(
             max_frame_bytes,
         })
         .map_err(|error| match error {
-            mpsc::error::TrySendError::Full(_) => queue_full("broker response queue is full"),
+            mpsc::error::TrySendError::Full(_) => response_queue_full(),
             mpsc::error::TrySendError::Closed(_) => protocol_error(
                 "runtime.protocol.connection_lost",
                 "runtime.protocol.write",
@@ -749,6 +790,16 @@ fn send_response(
                 "broker response channel is closed",
             ),
         })
+}
+
+fn response_queue_full() -> HalError {
+    protocol_error(
+        "runtime.queue.response_full",
+        "runtime.protocol.write",
+        ErrorCategory::Unavailable,
+        true,
+        "broker response queue is full",
+    )
 }
 
 fn negotiated_frame_limit(limits: Option<NegotiatedLimits>) -> usize {

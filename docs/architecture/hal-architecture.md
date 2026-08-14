@@ -57,15 +57,18 @@ The broker is a deployment adapter, not a separate implementation. Platform hand
 The v0.1 broker accepts frames up to exactly 1 MiB. Each connection has a 32-request admission
 queue, at most 32 executing requests, and a 64-response queue; runtime event subscriptions retain
 64 events. Request or execution admission overflow returns `runtime.queue.full`. Response overflow
-closes the connection and is recorded in its cleanup outcome because no further response can be
-safely admitted; event lag reports `runtime.event.lagged`. These defaults are configurable downward
-or upward for embedding, but all queues remain bounded.
+returns `runtime.queue.response_full`, closes the connection, and is recorded in its cleanup outcome
+because no further response can be safely admitted; event lag reports `runtime.event.lagged`. These
+defaults are configurable downward or upward for embedding, but all queues remain bounded.
 
-The handshake frame limit applies to the raw inbound protobuf frame and to the encoded outbound
-envelope, including protobuf field and envelope overhead. The writer checks both the negotiated
-limit and the hard 1 MiB limit before allocating its encode buffer. Session lifecycle events are
-owner-scoped: a connection receives only events whose `OwnerId` matches that connection; adding a
-future global event kind requires an explicit visibility decision in the broker.
+The codec enforces the hard 1 MiB frame cap before protobuf decode. After a handshake request is
+admitted, the reader pauses until dispatch validates it and publishes the accepted frame limit;
+already-pipelined frames therefore cannot race negotiation. That accepted limit applies to every
+subsequent raw inbound frame and encoded outbound envelope, including reader-generated protocol and
+queue errors. The writer checks protobuf field/envelope overhead against both the negotiated limit
+and the hard cap before allocating its encode buffer. Session lifecycle events are owner-scoped: a
+connection receives only events whose `OwnerId` matches that connection; adding a future global
+event kind requires an explicit visibility decision in the broker.
 
 Connection teardown revokes the owner before waiting for socket reader/writer tasks. The broker
 permits only a bounded response drain and aborts a stalled task after the connection-task shutdown
