@@ -1,8 +1,11 @@
 use std::io;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[cfg(test)]
+use std::sync::Condvar;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -16,6 +19,8 @@ use crate::{internal, invalid_argument, map_io_error, session_closed, timeout};
 
 const COMMAND_QUEUE_CAPACITY: usize = 1;
 const IDLE_CLOSE_POLL: Duration = Duration::from_millis(5);
+const FLUSH_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const MAX_NATIVE_IO_TIMEOUT: Duration = Duration::from_millis(100);
 const LIFECYCLE_OPEN: u8 = 0;
 const LIFECYCLE_CLOSING: u8 = 1;
 const LIFECYCLE_CLOSED: u8 = 2;
@@ -23,21 +28,15 @@ const LIFECYCLE_CLOSED: u8 = 2;
 type SerialStream = serial2::SerialPort;
 
 trait SerialIo: Send {
-    fn try_clone_box(&self) -> io::Result<Box<dyn SerialIo>>;
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize>;
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize>;
-    fn flush(&mut self) -> io::Result<()>;
+    fn set_read_timeout(&mut self, timeout: Duration) -> io::Result<()>;
     fn set_write_timeout(&mut self, timeout: Duration) -> io::Result<()>;
     fn set_control_lines(&mut self, lines: ControlLines) -> io::Result<()>;
-    fn discard_buffers(&mut self) -> io::Result<()>;
+    fn pending_output_bytes(&mut self) -> io::Result<u32>;
 }
 
 impl SerialIo for SerialStream {
-    fn try_clone_box(&self) -> io::Result<Box<dyn SerialIo>> {
-        self.try_clone()
-            .map(|stream| Box::new(stream) as Box<dyn SerialIo>)
-    }
-
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         SerialStream::read(self, buffer)
     }
@@ -46,8 +45,8 @@ impl SerialIo for SerialStream {
         SerialStream::write(self, bytes)
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        SerialStream::flush(self)
+    fn set_read_timeout(&mut self, timeout: Duration) -> io::Result<()> {
+        SerialStream::set_read_timeout(self, timeout)
     }
 
     fn set_write_timeout(&mut self, timeout: Duration) -> io::Result<()> {
@@ -59,8 +58,59 @@ impl SerialIo for SerialStream {
         self.set_rts(lines.request_to_send)
     }
 
-    fn discard_buffers(&mut self) -> io::Result<()> {
-        SerialStream::discard_buffers(self)
+    fn pending_output_bytes(&mut self) -> io::Result<u32> {
+        native_pending_output_bytes(self)
+    }
+}
+
+#[cfg(unix)]
+fn native_pending_output_bytes(stream: &SerialStream) -> io::Result<u32> {
+    use std::os::fd::AsRawFd;
+
+    let mut pending: libc::c_int = 0;
+    // This is the same TIOCOUTQ query used by serialport 4.9's TTYPort::bytes_to_write.
+    // SAFETY: `stream` owns a live serial file descriptor for the duration of the call,
+    // `TIOCOUTQ` only writes one `c_int`, and `pending` is a valid aligned output pointer.
+    let result = unsafe {
+        libc::ioctl(
+            stream.as_raw_fd(),
+            libc::TIOCOUTQ as _,
+            std::ptr::addr_of_mut!(pending),
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    pending.try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "serial output queue reported a negative byte count",
+        )
+    })
+}
+
+#[cfg(windows)]
+fn native_pending_output_bytes(stream: &SerialStream) -> io::Result<u32> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Devices::Communication::{COMSTAT, ClearCommError};
+
+    let mut errors = 0;
+    let mut status = COMSTAT::default();
+    // This is the same ClearCommError/COMSTAT query used by serialport 4.9's
+    // COMPort::bytes_to_write.
+    // SAFETY: `stream` owns a live serial handle for the duration of the call and both
+    // output pointers refer to initialized, correctly sized Windows API structures.
+    let succeeded = unsafe {
+        ClearCommError(
+            stream.as_raw_handle(),
+            std::ptr::addr_of_mut!(errors),
+            std::ptr::addr_of_mut!(status),
+        )
+    };
+    if succeeded == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(status.cbOutQue)
     }
 }
 
@@ -113,27 +163,9 @@ impl WorkerCommand {
     }
 }
 
-#[derive(Clone, Copy)]
-enum WatchdogState {
-    Idle,
-    Flush { id: u64, deadline: Instant },
-    Close { interrupt_flush: bool },
-}
-
-struct CompletionState {
-    actor_result: Option<HalResult<()>>,
-    watchdog_result: Option<HalResult<()>>,
-    published: bool,
-}
-
 struct WorkerControlInner {
     lifecycle: AtomicU8,
-    next_flush_id: AtomicU64,
-    timed_out_flush: AtomicU64,
-    watchdog: Mutex<WatchdogState>,
-    watchdog_changed: Condvar,
     terminal_error: Mutex<Option<HalError>>,
-    completion: Mutex<CompletionState>,
     completion_tx: watch::Sender<Option<HalResult<()>>>,
 }
 
@@ -149,16 +181,7 @@ impl WorkerControl {
             Self {
                 inner: Arc::new(WorkerControlInner {
                     lifecycle: AtomicU8::new(LIFECYCLE_OPEN),
-                    next_flush_id: AtomicU64::new(1),
-                    timed_out_flush: AtomicU64::new(0),
-                    watchdog: Mutex::new(WatchdogState::Idle),
-                    watchdog_changed: Condvar::new(),
                     terminal_error: Mutex::new(None),
-                    completion: Mutex::new(CompletionState {
-                        actor_result: None,
-                        watchdog_result: None,
-                        published: false,
-                    }),
                     completion_tx,
                 }),
             },
@@ -171,51 +194,12 @@ impl WorkerControl {
     }
 
     fn request_close(&self) {
-        if self
-            .inner
-            .lifecycle
-            .compare_exchange(
-                LIFECYCLE_OPEN,
-                LIFECYCLE_CLOSING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            let mut watchdog = lock_unpoisoned(&self.inner.watchdog);
-            let interrupt_flush = matches!(*watchdog, WatchdogState::Flush { .. });
-            *watchdog = WatchdogState::Close { interrupt_flush };
-            self.inner.watchdog_changed.notify_all();
-        }
-    }
-
-    fn arm_flush(&self, deadline: Instant) -> Option<u64> {
-        let mut watchdog = lock_unpoisoned(&self.inner.watchdog);
-        if !self.is_open() {
-            return None;
-        }
-
-        let id = self.inner.next_flush_id.fetch_add(1, Ordering::AcqRel);
-        *watchdog = WatchdogState::Flush { id, deadline };
-        self.inner.watchdog_changed.notify_all();
-        Some(id)
-    }
-
-    fn finish_flush(&self, id: u64) -> bool {
-        let mut watchdog = lock_unpoisoned(&self.inner.watchdog);
-        if matches!(*watchdog, WatchdogState::Flush { id: active, .. } if active == id) {
-            *watchdog = WatchdogState::Idle;
-            self.inner.watchdog_changed.notify_all();
-        }
-
-        self.inner.timed_out_flush.load(Ordering::Acquire) == id
-    }
-
-    fn mark_flush_timed_out(&self, id: u64) {
-        self.inner.timed_out_flush.store(id, Ordering::Release);
-        self.inner
-            .lifecycle
-            .store(LIFECYCLE_CLOSING, Ordering::Release);
+        let _ = self.inner.lifecycle.compare_exchange(
+            LIFECYCLE_OPEN,
+            LIFECYCLE_CLOSING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     fn record_terminal_error<T>(&self, result: &HalResult<T>) {
@@ -246,35 +230,6 @@ impl WorkerControl {
         self.inner
             .lifecycle
             .store(LIFECYCLE_CLOSED, Ordering::Release);
-        let mut completion = lock_unpoisoned(&self.inner.completion);
-        completion.actor_result = Some(result);
-        self.publish_completion(&mut completion);
-    }
-
-    fn finish_watchdog(&self, result: HalResult<()>) {
-        let mut completion = lock_unpoisoned(&self.inner.completion);
-        completion.watchdog_result = Some(result);
-        self.publish_completion(&mut completion);
-    }
-
-    fn publish_completion(&self, completion: &mut CompletionState) {
-        if completion.published {
-            return;
-        }
-
-        let (Some(actor_result), Some(watchdog_result)) = (
-            completion.actor_result.as_ref(),
-            completion.watchdog_result.as_ref(),
-        ) else {
-            return;
-        };
-
-        let result = match (actor_result, watchdog_result) {
-            (Err(error), _) => Err(error.clone()),
-            (Ok(()), Err(error)) => Err(error.clone()),
-            (Ok(()), Ok(())) => Ok(()),
-        };
-        completion.published = true;
         let _ = self.inner.completion_tx.send(Some(result));
     }
 }
@@ -488,22 +443,8 @@ fn spawn_session_worker(
     config: SerialConfig,
     io: Box<dyn SerialIo>,
 ) -> HalResult<NativeSerialSession> {
-    let interrupt_io = io
-        .try_clone_box()
-        .map_err(|error| map_io_error("serial.open", error))?;
     let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_QUEUE_CAPACITY);
     let (control, completion_rx) = WorkerControl::new();
-
-    let watchdog_control = control.clone();
-    thread::Builder::new()
-        .name("seeed-hal-serial-watchdog".to_owned())
-        .spawn(move || run_watchdog(interrupt_io, watchdog_control))
-        .map_err(|error| {
-            internal(
-                "serial.open",
-                format!("failed to start serial cancellation watchdog: {error}"),
-            )
-        })?;
 
     let actor_control = control.clone();
     if let Err(error) = thread::Builder::new()
@@ -579,21 +520,8 @@ fn execute_command(
 ) {
     match command {
         WorkerCommand::Read { max_bytes, reply } => {
-            let mut buffer = vec![0_u8; max_bytes];
-            let result = io
-                .read(&mut buffer)
-                .map_err(|error| map_io_error("serial.read", error))
-                .and_then(|read| {
-                    if read == 0 {
-                        Err(disconnected(
-                            "serial.read",
-                            "serial port returned end of stream",
-                        ))
-                    } else {
-                        buffer.truncate(read);
-                        Ok(Bytes::from(buffer))
-                    }
-                });
+            let deadline = operation_deadline(operation_timeout);
+            let result = read_bounded(io, max_bytes, deadline, &control.inner.lifecycle);
             control.record_terminal_error(&result);
             let _ = reply.send(result);
         }
@@ -605,22 +533,13 @@ fn execute_command(
         }
         WorkerCommand::Flush { reply } => {
             let deadline = operation_deadline(operation_timeout);
-            let result = match control.arm_flush(deadline) {
-                Some(id) => {
-                    let flush_result = io
-                        .flush()
-                        .map_err(|error| map_io_error("serial.flush", error));
-                    if control.finish_flush(id) {
-                        Err(timeout(
-                            "serial.flush",
-                            format!("flush timed out after {operation_timeout:?}"),
-                        ))
-                    } else {
-                        flush_result
-                    }
-                }
-                None => Err(session_closed("serial.flush", "serial session is closing")),
-            };
+            let result = flush_bounded(io, deadline, &control.inner.lifecycle);
+            if matches!(
+                result.as_ref().err().map(|error| error.name().as_str()),
+                Some("runtime.transport.timeout")
+            ) {
+                control.request_close();
+            }
             control.record_terminal_error(&result);
             let _ = reply.send(result);
         }
@@ -634,56 +553,6 @@ fn execute_command(
     }
 }
 
-fn run_watchdog(mut io: Box<dyn SerialIo>, control: WorkerControl) {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        loop {
-            let mut state = lock_unpoisoned(&control.inner.watchdog);
-            match *state {
-                WatchdogState::Idle => {
-                    state = wait_unpoisoned(&control.inner.watchdog_changed, state);
-                    drop(state);
-                }
-                WatchdogState::Close { interrupt_flush } => {
-                    break if interrupt_flush {
-                        io.discard_buffers()
-                            .map_err(|error| map_io_error("serial.close", error))
-                    } else {
-                        Ok(())
-                    };
-                }
-                WatchdogState::Flush { id, deadline } => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        control.mark_flush_timed_out(id);
-                        *state = WatchdogState::Close {
-                            interrupt_flush: true,
-                        };
-                        drop(state);
-                        break io
-                            .discard_buffers()
-                            .map_err(|error| map_io_error("serial.flush", error));
-                    }
-
-                    let (next_state, _) = wait_timeout_unpoisoned(
-                        &control.inner.watchdog_changed,
-                        state,
-                        deadline.saturating_duration_since(now),
-                    );
-                    drop(next_state);
-                }
-            }
-        }
-    }));
-
-    let result = match result {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(error),
-        Err(_) => Err(internal("serial.close", "serial watchdog panicked")),
-    };
-    drop(io);
-    control.finish_watchdog(result);
-}
-
 fn write_all_bounded(
     io: &mut dyn SerialIo,
     bytes: &[u8],
@@ -691,6 +560,104 @@ fn write_all_bounded(
     lifecycle: &AtomicU8,
 ) -> HalResult<()> {
     write_all_bounded_with_clock(io, bytes, deadline, lifecycle, Instant::now)
+}
+
+fn flush_bounded(io: &mut dyn SerialIo, deadline: Instant, lifecycle: &AtomicU8) -> HalResult<()> {
+    flush_bounded_with_clock_and_wait(io, deadline, lifecycle, Instant::now, thread::sleep)
+}
+
+fn flush_bounded_with_clock_and_wait(
+    io: &mut dyn SerialIo,
+    deadline: Instant,
+    lifecycle: &AtomicU8,
+    mut now: impl FnMut() -> Instant,
+    mut wait: impl FnMut(Duration),
+) -> HalResult<()> {
+    loop {
+        if lifecycle.load(Ordering::Acquire) != LIFECYCLE_OPEN {
+            return Err(session_closed("serial.flush", "serial session is closing"));
+        }
+
+        let Some(remaining) = deadline.checked_duration_since(now()) else {
+            return Err(timeout(
+                "serial.flush",
+                "flush exceeded its configured operation deadline",
+            ));
+        };
+        if remaining.is_zero() {
+            return Err(timeout(
+                "serial.flush",
+                "flush exceeded its configured operation deadline",
+            ));
+        }
+
+        let pending = io
+            .pending_output_bytes()
+            .map_err(|error| map_io_error("serial.flush", error))?;
+        if pending == 0 {
+            return Ok(());
+        }
+
+        wait(remaining.min(FLUSH_POLL_INTERVAL));
+    }
+}
+
+fn read_bounded(
+    io: &mut dyn SerialIo,
+    max_bytes: usize,
+    deadline: Instant,
+    lifecycle: &AtomicU8,
+) -> HalResult<Bytes> {
+    read_bounded_with_clock(io, max_bytes, deadline, lifecycle, Instant::now)
+}
+
+fn read_bounded_with_clock(
+    io: &mut dyn SerialIo,
+    max_bytes: usize,
+    deadline: Instant,
+    lifecycle: &AtomicU8,
+    mut now: impl FnMut() -> Instant,
+) -> HalResult<Bytes> {
+    loop {
+        if lifecycle.load(Ordering::Acquire) != LIFECYCLE_OPEN {
+            return Err(session_closed("serial.read", "serial session is closing"));
+        }
+
+        let Some(remaining) = deadline.checked_duration_since(now()) else {
+            return Err(timeout(
+                "serial.read",
+                "read exceeded its configured operation deadline",
+            ));
+        };
+        if remaining.is_zero() {
+            return Err(timeout(
+                "serial.read",
+                "read exceeded its configured operation deadline",
+            ));
+        }
+
+        io.set_read_timeout(normalize_native_timeout(remaining))
+            .map_err(|error| map_io_error("serial.read", error))?;
+        let mut buffer = vec![0_u8; max_bytes];
+        match io.read(&mut buffer) {
+            Ok(0) => {
+                return Err(disconnected(
+                    "serial.read",
+                    "serial port returned end of stream",
+                ));
+            }
+            Ok(read) => {
+                buffer.truncate(read);
+                return Ok(Bytes::from(buffer));
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(map_io_error("serial.read", error)),
+        }
+    }
 }
 
 fn write_all_bounded_with_clock(
@@ -718,7 +685,7 @@ fn write_all_bounded_with_clock(
             ));
         }
 
-        io.set_write_timeout(remaining)
+        io.set_write_timeout(normalize_native_timeout(remaining))
             .map_err(|error| map_io_error("serial.write", error))?;
         match io.write(bytes) {
             Ok(0) => {
@@ -728,7 +695,11 @@ fn write_all_bounded_with_clock(
                 ));
             }
             Ok(written) => bytes = &bytes[written..],
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
+                ) => {}
             Err(error) => return Err(map_io_error("serial.write", error)),
         }
     }
@@ -761,10 +732,10 @@ fn open_serial_stream(endpoint: &str, config: &SerialConfig) -> HalResult<Serial
     .map_err(|error| map_io_error("serial.open", error))?;
 
     stream
-        .set_read_timeout(config.read_timeout)
+        .set_read_timeout(normalize_native_timeout(config.read_timeout))
         .map_err(|error| map_io_error("serial.open", error))?;
     stream
-        .set_write_timeout(config.read_timeout)
+        .set_write_timeout(normalize_native_timeout(config.read_timeout))
         .map_err(|error| map_io_error("serial.open", error))?;
 
     Ok(stream)
@@ -774,6 +745,14 @@ fn operation_deadline(timeout: Duration) -> Instant {
     Instant::now()
         .checked_add(timeout)
         .expect("validated serial operation timeout must fit in Instant")
+}
+
+fn normalize_native_timeout(timeout: Duration) -> Duration {
+    let rounded_millis = timeout
+        .as_millis()
+        .saturating_add(u128::from(timeout.subsec_nanos() % 1_000_000 != 0));
+    let capped_millis = rounded_millis.clamp(1, MAX_NATIVE_IO_TIMEOUT.as_millis());
+    Duration::from_millis(capped_millis as u64)
 }
 
 fn validate_config(config: &SerialConfig) -> HalResult<()> {
@@ -861,22 +840,13 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+#[cfg(test)]
 fn wait_unpoisoned<'a, T>(
     condvar: &Condvar,
     guard: std::sync::MutexGuard<'a, T>,
 ) -> std::sync::MutexGuard<'a, T> {
     condvar
         .wait(guard)
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn wait_timeout_unpoisoned<'a, T>(
-    condvar: &Condvar,
-    guard: std::sync::MutexGuard<'a, T>,
-    timeout: Duration,
-) -> (std::sync::MutexGuard<'a, T>, std::sync::WaitTimeoutResult) {
-    condvar
-        .wait_timeout(guard, timeout)
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
@@ -926,6 +896,18 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_flush_session_does_not_require_an_interrupt_clone() {
+        let probe = Arc::new(IoProbe::new(BlockedOperation::None));
+        let mut session = test_actor_session(Arc::clone(&probe));
+
+        assert_eq!(probe.handles.load(Ordering::Acquire), 1);
+
+        session.close().await.unwrap();
+
+        probe.wait_until_all_handles_dropped().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_read_closes_worker_before_next_access() {
         let probe = Arc::new(IoProbe::new(BlockedOperation::Read));
         let mut session = test_actor_session(Arc::clone(&probe));
@@ -964,27 +946,58 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelled_close_while_flush_is_in_flight_releases_port_autonomously() {
-        let probe = Arc::new(IoProbe::new(BlockedOperation::Flush));
+    async fn cancelled_flush_releases_port_without_later_session_poll() {
+        let probe = Arc::new(IoProbe::new_with_pending_output());
         let mut session = test_actor_session(Arc::clone(&probe));
         let mut flush = Box::pin(session.flush());
 
         tokio::select! {
             result = &mut flush => panic!("flush should remain blocked, got {result:?}"),
-            () = probe.wait_until_operation_entered() => {}
+            () = probe.wait_until_output_queried() => {}
         }
         drop(flush);
-        probe.wait_until_interrupt_entered().await;
 
+        probe.wait_until_all_handles_dropped().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_polled_close_future_still_releases_port_autonomously() {
+        let probe = Arc::new(IoProbe::new(BlockedOperation::None));
+        let mut session = test_actor_session(Arc::clone(&probe));
         let mut close = Box::pin(session.close());
+
         tokio::select! {
-            result = &mut close => panic!("close should remain blocked, got {result:?}"),
+            _ = &mut close => {}
             () = tokio::task::yield_now() => {}
         }
         drop(close);
-        probe.release_interrupt();
 
         probe.wait_until_all_handles_dropped().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn output_queue_poll_panic_releases_port_without_later_session_poll() {
+        let probe = Arc::new(IoProbe::new_with_output_query_panic());
+        let mut session = test_actor_session(Arc::clone(&probe));
+
+        let error = session.flush().await.unwrap_err();
+
+        assert_eq!(error.name().as_str(), "runtime.internal");
+        probe.wait_until_all_handles_dropped().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flush_timeout_returns_structured_error_and_releases_port() {
+        let probe = Arc::new(IoProbe::new_with_pending_output());
+        let mut session =
+            test_actor_session_with_timeout(Arc::clone(&probe), Duration::from_nanos(1));
+
+        let error = session.flush().await.unwrap_err();
+
+        assert_eq!(error.name().as_str(), "runtime.transport.timeout");
+        probe.wait_until_all_handles_dropped().await;
+        let error = session.read(1).await.unwrap_err();
+        assert_eq!(error.name().as_str(), "runtime.session.closed");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -998,8 +1011,7 @@ mod tests {
             () = probe.wait_until_operation_entered() => {}
         }
         drop(flush);
-        probe.wait_until_interrupt_entered().await;
-        probe.release_interrupt();
+        probe.release_operation();
 
         let error = session.close().await.unwrap_err();
 
@@ -1062,6 +1074,147 @@ mod tests {
 
         assert_eq!(error.name().as_str(), "runtime.transport.timeout");
         assert_eq!(probe.write_calls.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn flush_succeeds_only_after_the_native_output_queue_is_empty() {
+        let started = Instant::now();
+        let lifecycle = AtomicU8::new(LIFECYCLE_OPEN);
+        let mut io = OutputQueueIo::new([Ok(2), Ok(1), Ok(0)]);
+        let mut ticks = [
+            started,
+            started + Duration::from_millis(1),
+            started + Duration::from_millis(2),
+        ]
+        .into_iter();
+        let mut waits = Vec::new();
+
+        flush_bounded_with_clock_and_wait(
+            &mut io,
+            started + Duration::from_secs(1),
+            &lifecycle,
+            || ticks.next().unwrap(),
+            |duration| waits.push(duration),
+        )
+        .unwrap();
+
+        assert_eq!(io.queries, 3);
+        assert_eq!(waits.len(), 2);
+        assert!(waits.iter().all(|duration| !duration.is_zero()));
+    }
+
+    #[test]
+    fn flush_polling_stops_at_the_logical_deadline_without_native_flush() {
+        let started = Instant::now();
+        let lifecycle = AtomicU8::new(LIFECYCLE_OPEN);
+        let mut io = OutputQueueIo::new([Ok(1)]);
+        let mut ticks = [started, started + Duration::from_millis(11)].into_iter();
+
+        let error = flush_bounded_with_clock_and_wait(
+            &mut io,
+            started + Duration::from_millis(10),
+            &lifecycle,
+            || ticks.next().unwrap(),
+            |_| {},
+        )
+        .unwrap_err();
+
+        assert_eq!(error.name().as_str(), "runtime.transport.timeout");
+        assert_eq!(io.queries, 1);
+    }
+
+    #[test]
+    fn native_timeout_rounds_every_positive_sub_millisecond_value_up() {
+        assert_eq!(
+            normalize_native_timeout(Duration::from_nanos(1)),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            normalize_native_timeout(Duration::from_micros(999)),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            normalize_native_timeout(Duration::from_micros(1_001)),
+            Duration::from_millis(2)
+        );
+    }
+
+    #[test]
+    fn native_timeout_clamps_extreme_values_before_platform_conversion() {
+        assert_eq!(
+            normalize_native_timeout(Duration::MAX),
+            Duration::from_millis(100)
+        );
+    }
+
+    #[test]
+    fn read_rounds_sub_millisecond_remainder_to_nonzero_native_timeout() {
+        let started = Instant::now();
+        let lifecycle = AtomicU8::new(LIFECYCLE_OPEN);
+        let mut io = NativeTimeoutIo::with_reads([Ok(1)]);
+        let mut ticks = [started].into_iter();
+
+        let bytes = read_bounded_with_clock(
+            &mut io,
+            1,
+            started + Duration::from_micros(500),
+            &lifecycle,
+            || ticks.next().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(bytes.as_ref(), b"x");
+        assert_eq!(io.read_timeouts, [Duration::from_millis(1)]);
+    }
+
+    #[test]
+    fn read_retries_native_slices_until_logical_deadline() {
+        let started = Instant::now();
+        let lifecycle = AtomicU8::new(LIFECYCLE_OPEN);
+        let mut io = NativeTimeoutIo::with_reads([
+            Err(io::ErrorKind::TimedOut.into()),
+            Err(io::ErrorKind::TimedOut.into()),
+        ]);
+        let mut ticks = [
+            started,
+            started + Duration::from_millis(99),
+            started + Duration::from_millis(151),
+        ]
+        .into_iter();
+
+        let error = read_bounded_with_clock(
+            &mut io,
+            1,
+            started + Duration::from_millis(150),
+            &lifecycle,
+            || ticks.next().unwrap(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.name().as_str(), "runtime.transport.timeout");
+        assert_eq!(
+            io.read_timeouts,
+            [Duration::from_millis(100), Duration::from_millis(51)]
+        );
+    }
+
+    #[test]
+    fn write_rounds_sub_millisecond_remainder_to_nonzero_native_timeout() {
+        let started = Instant::now();
+        let lifecycle = AtomicU8::new(LIFECYCLE_OPEN);
+        let mut io = NativeTimeoutIo::with_writes([Ok(1)]);
+        let mut ticks = [started].into_iter();
+
+        write_all_bounded_with_clock(
+            &mut io,
+            b"x",
+            started + Duration::from_micros(500),
+            &lifecycle,
+            || ticks.next().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(io.write_timeouts, [Duration::from_millis(1)]);
     }
 
     #[cfg(unix)]
@@ -1129,10 +1282,17 @@ mod tests {
     }
 
     fn test_actor_session(probe: Arc<IoProbe>) -> NativeSerialSession {
+        test_actor_session_with_timeout(probe, Duration::from_secs(5))
+    }
+
+    fn test_actor_session_with_timeout(
+        probe: Arc<IoProbe>,
+        read_timeout: Duration,
+    ) -> NativeSerialSession {
         NativeSerialSession::from_io_for_test(
             descriptor(),
             SerialConfig {
-                read_timeout: Duration::from_secs(5),
+                read_timeout,
                 ..SerialConfig::default()
             },
             Box::new(TestIo::new(probe)),
@@ -1216,7 +1376,9 @@ mod tests {
     struct IoProbe {
         blocked: BlockedOperation,
         operation_gate: Gate,
-        interrupt_gate: Gate,
+        output_queries: AtomicUsize,
+        pending_output_bytes: AtomicUsize,
+        output_query_panics: AtomicBool,
         handles: AtomicUsize,
         max_active: AtomicUsize,
         active: AtomicUsize,
@@ -1230,7 +1392,9 @@ mod tests {
             Self {
                 blocked,
                 operation_gate: Gate::default(),
-                interrupt_gate: Gate::default(),
+                output_queries: AtomicUsize::new(0),
+                pending_output_bytes: AtomicUsize::new(0),
+                output_query_panics: AtomicBool::new(false),
                 handles: AtomicUsize::new(0),
                 max_active: AtomicUsize::new(0),
                 active: AtomicUsize::new(0),
@@ -1244,6 +1408,20 @@ mod tests {
             Self {
                 flush_error: true,
                 ..Self::new(BlockedOperation::Flush)
+            }
+        }
+
+        fn new_with_pending_output() -> Self {
+            Self {
+                pending_output_bytes: AtomicUsize::new(1),
+                ..Self::new(BlockedOperation::None)
+            }
+        }
+
+        fn new_with_output_query_panic() -> Self {
+            Self {
+                output_query_panics: AtomicBool::new(true),
+                ..Self::new(BlockedOperation::None)
             }
         }
 
@@ -1261,13 +1439,12 @@ mod tests {
             self.operation_gate.wait_until_entered().await;
         }
 
-        async fn wait_until_interrupt_entered(&self) {
-            self.interrupt_gate.wait_until_entered().await;
-        }
-
-        fn release_interrupt(&self) {
-            self.interrupt_gate.release();
-            self.operation_gate.release();
+        async fn wait_until_output_queried(&self) {
+            wait_until(
+                || self.output_queries.load(Ordering::Acquire) > 0,
+                "serial output queue was not queried",
+            )
+            .await;
         }
 
         fn release_operation(&self) {
@@ -1294,6 +1471,108 @@ mod tests {
         }
     }
 
+    struct NativeTimeoutIo {
+        reads: std::collections::VecDeque<io::Result<usize>>,
+        writes: std::collections::VecDeque<io::Result<usize>>,
+        read_timeouts: Vec<Duration>,
+        write_timeouts: Vec<Duration>,
+    }
+
+    struct OutputQueueIo {
+        pending: std::collections::VecDeque<io::Result<u32>>,
+        queries: usize,
+    }
+
+    impl OutputQueueIo {
+        fn new(pending: impl IntoIterator<Item = io::Result<u32>>) -> Self {
+            Self {
+                pending: pending.into_iter().collect(),
+                queries: 0,
+            }
+        }
+    }
+
+    impl SerialIo for OutputQueueIo {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            unreachable!("flush test must not read")
+        }
+
+        fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+            unreachable!("flush test must not write")
+        }
+
+        fn set_read_timeout(&mut self, _timeout: Duration) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn set_write_timeout(&mut self, _timeout: Duration) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn set_control_lines(&mut self, _lines: ControlLines) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn pending_output_bytes(&mut self) -> io::Result<u32> {
+            self.queries += 1;
+            self.pending
+                .pop_front()
+                .expect("unexpected output queue query")
+        }
+    }
+
+    impl NativeTimeoutIo {
+        fn with_reads(reads: impl IntoIterator<Item = io::Result<usize>>) -> Self {
+            Self {
+                reads: reads.into_iter().collect(),
+                writes: std::collections::VecDeque::new(),
+                read_timeouts: Vec::new(),
+                write_timeouts: Vec::new(),
+            }
+        }
+
+        fn with_writes(writes: impl IntoIterator<Item = io::Result<usize>>) -> Self {
+            Self {
+                reads: std::collections::VecDeque::new(),
+                writes: writes.into_iter().collect(),
+                read_timeouts: Vec::new(),
+                write_timeouts: Vec::new(),
+            }
+        }
+    }
+
+    impl SerialIo for NativeTimeoutIo {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let result = self.reads.pop_front().expect("unexpected read call")?;
+            if result > 0 {
+                buffer[..result].fill(b'x');
+            }
+            Ok(result)
+        }
+
+        fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+            self.writes.pop_front().expect("unexpected write call")
+        }
+
+        fn set_read_timeout(&mut self, timeout: Duration) -> io::Result<()> {
+            self.read_timeouts.push(timeout);
+            Ok(())
+        }
+
+        fn set_write_timeout(&mut self, timeout: Duration) -> io::Result<()> {
+            self.write_timeouts.push(timeout);
+            Ok(())
+        }
+
+        fn set_control_lines(&mut self, _lines: ControlLines) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn pending_output_bytes(&mut self) -> io::Result<u32> {
+            Ok(0)
+        }
+    }
+
     impl Drop for TestIo {
         fn drop(&mut self) {
             self.probe.handles.fetch_sub(1, Ordering::AcqRel);
@@ -1301,10 +1580,6 @@ mod tests {
     }
 
     impl SerialIo for TestIo {
-        fn try_clone_box(&self) -> io::Result<Box<dyn SerialIo>> {
-            Ok(Box::new(Self::new(Arc::clone(&self.probe))))
-        }
-
         fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
             self.probe.enter(BlockedOperation::Read);
             buffer[0] = b'x';
@@ -1317,13 +1592,8 @@ mod tests {
             Ok(bytes.len().min(1))
         }
 
-        fn flush(&mut self) -> io::Result<()> {
-            self.probe.enter(BlockedOperation::Flush);
-            if self.probe.flush_error {
-                Err(io::Error::from(io::ErrorKind::PermissionDenied))
-            } else {
-                Ok(())
-            }
+        fn set_read_timeout(&mut self, _timeout: Duration) -> io::Result<()> {
+            Ok(())
         }
 
         fn set_write_timeout(&mut self, _timeout: Duration) -> io::Result<()> {
@@ -1335,11 +1605,17 @@ mod tests {
             Ok(())
         }
 
-        fn discard_buffers(&mut self) -> io::Result<()> {
-            if self.probe.blocked != BlockedOperation::None {
-                self.probe.interrupt_gate.enter_and_wait();
+        fn pending_output_bytes(&mut self) -> io::Result<u32> {
+            self.probe.output_queries.fetch_add(1, Ordering::AcqRel);
+            if self.probe.output_query_panics.load(Ordering::Acquire) {
+                panic!("output queue query panic")
             }
-            Ok(())
+            self.probe.enter(BlockedOperation::Flush);
+            if self.probe.flush_error {
+                Err(io::ErrorKind::PermissionDenied.into())
+            } else {
+                Ok(self.probe.pending_output_bytes.load(Ordering::Acquire) as u32)
+            }
         }
     }
 }

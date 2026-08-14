@@ -250,6 +250,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "libc",
  "percent-encoding",
  "seeed-hal-core",
  "seeed-hal-serial",
@@ -257,6 +258,7 @@ dependencies = [
  "serial2",
  "serialport",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

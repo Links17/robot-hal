@@ -17,6 +17,7 @@ license = "Apache-2.0"
 async-trait = "0.1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
+libc = "0.2"
 percent-encoding = "2"
 prost = "0.14"
 prost-build = "0.14"
@@ -34,3 +35,4 @@ tokio-util = { version = "0.7", features = ["codec"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+windows-sys = "0.61"

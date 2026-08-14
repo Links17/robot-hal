@@ -270,3 +270,92 @@ Output summary:
 
 - Tests are hardware-free and deterministic. The active-flush cancellation path is exercised with a fake that blocks drain until the watchdog’s purge arrives and verifies autonomous release after both the flush and close futures are dropped.
 - The current host only has the macOS target available. Linux and Windows were not cross-compiled or physically exercised in this round; the production abort path uses `serial2`’s safe cross-platform `discard_buffers()` implementation (`tcflush` on Unix and `PurgeComm` on Windows).
+
+## Fix Round 5
+
+### Files changed
+
+- `Cargo.toml`
+- `Cargo.lock`
+- `adapters/serialport/Cargo.toml`
+- `adapters/serialport/src/lib.rs`
+- `adapters/serialport/src/session.rs`
+- `docs/architecture/hal-architecture.md`
+- `.superpowers/sdd/2026-08-14-v0.1-core-serial/task-5-report.md`
+
+### RED evidence
+
+Timeout normalization tests were added first and run with:
+
+```bash
+cargo test -p seeed-hal-adapter-serialport --lib native_timeout_
+```
+
+Output summary: compilation failed as expected because `normalize_native_timeout` and `MAX_NATIVE_IO_TIMEOUT` did not exist. The new read/write tests also required the missing deadline-aware read seam and independently derived expected native millisecond values.
+
+The interruption-clone dependency was then exposed with:
+
+```bash
+cargo test -p seeed-hal-adapter-serialport --lib bounded_flush_session_does_not_require_an_interrupt_clone
+```
+
+Output summary: the test failed as expected because round 4 called `try_clone_box()` during session construction and propagated the fake clone's `Unsupported` error as `runtime.transport.disconnected`.
+
+The bounded drain seam was added to tests and run with:
+
+```bash
+cargo test -p seeed-hal-adapter-serialport --lib flush_succeeds_only_after_the_native_output_queue_is_empty
+```
+
+Output summary: compilation failed as expected because `SerialIo::pending_output_bytes` and `flush_bounded_with_clock_and_wait` did not exist. This established that the round-4 implementation could only enter native `flush()` and could not observe queue progress itself.
+
+### Architecture decision
+
+- Removed the watchdog, interrupt clone, `discard_buffers()` cancellation path, and native `serial2::SerialPort::flush()` call entirely. A session now owns exactly one native handle on one blocking actor, so an interrupt-helper error or panic cannot strand a second actor inside an intrinsically unbounded drain.
+- Flush now polls the native output queue with a bounded, cancellation-observable loop: `TIOCOUTQ` on Unix/macOS and `ClearCommError` with `COMSTAT.cbOutQue` on Windows. It returns success only after the queue reaches zero. A timeout returns `runtime.transport.timeout`, marks the session terminal, and the actor drops its only handle; dropping an admitted future also fails closed and is observed between 5 ms polls.
+- The two small platform queries are adapter-local `unsafe` calls with explicit lifetime/pointer invariants and citations to the equivalent `serialport` 4.9 `bytes_to_write` implementations. Core/runtime crates remain `unsafe`-forbidden, and the public HAL is unchanged.
+- Every positive native read/write timeout is rounded up to at least 1 ms and capped at 100 ms, well below Windows' finite `u32` limit and Unix `poll(2)`'s signed `i32` limit. Read and write retry native timeout slices while the original logical `SerialConfig::read_timeout` deadline remains authoritative; partial writes retain the same outer deadline.
+- Safe `serial2::SerialPort::open` plus configuration remains wholly inside `spawn_blocking`, preserving the exact `std::io::Error` and `raw_os_error` from the same failing operation. The bounded queue, fail-closed cancellation, close-before-first-await, hardware-free defaults, stable errors, identity behavior, and public traits remain unchanged.
+
+### Named deterministic tests
+
+- `bounded_flush_session_does_not_require_an_interrupt_clone`
+- `cancelled_flush_releases_port_without_later_session_poll`
+- `dropping_polled_close_future_still_releases_port_autonomously`
+- `output_queue_poll_panic_releases_port_without_later_session_poll`
+- `flush_timeout_returns_structured_error_and_releases_port`
+- `flush_succeeds_only_after_the_native_output_queue_is_empty`
+- `flush_polling_stops_at_the_logical_deadline_without_native_flush`
+- `native_timeout_rounds_every_positive_sub_millisecond_value_up`
+- `native_timeout_clamps_extreme_values_before_platform_conversion`
+- `read_rounds_sub_millisecond_remainder_to_nonzero_native_timeout`
+- `read_retries_native_slices_until_logical_deadline`
+- `write_rounds_sub_millisecond_remainder_to_nonzero_native_timeout`
+- `write_all_deadline_terminates_repeated_partial_writes` (retained bounded partial-write regression)
+- `close_reports_cancelled_flush_error_after_terminal_release` (retained terminal diagnostic regression)
+- `actual_open_missing_endpoint_carries_io_raw_os_error_from_open_path` (retained same-operation open regression)
+
+### GREEN evidence
+
+```bash
+cargo test -p seeed-hal-adapter-serialport --lib
+cargo test -p seeed-hal-adapter-serialport
+for i in {1..20}; do cargo test -q -p seeed-hal-adapter-serialport --lib cancelled_flush_releases_port_without_later_session_poll || exit 1; cargo test -q -p seeed-hal-adapter-serialport --lib output_queue_poll_panic_releases_port_without_later_session_poll || exit 1; cargo test -q -p seeed-hal-adapter-serialport --lib dropping_polled_close_future_still_releases_port_autonomously || exit 1; done
+cargo check -p seeed-hal-adapter-serialport --target x86_64-pc-windows-msvc
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+```
+
+Output summary:
+
+- Adapter unit tests passed `27/27`; metadata tests passed `5/5`; the opt-in physical loopback remained ignored.
+- The three autonomous-release regressions passed 20 consecutive repetitions each (`60/60`).
+- The production adapter compiled successfully for `x86_64-pc-windows-msvc` after installing that standard-library target.
+- Formatting passed; workspace clippy passed with `-D warnings`.
+- Workspace tests passed: adapter `27`, metadata `5`, core contract `7`, runtime unit `1`, runtime integration `14`, and shared Serial conformance `8`; the one physical loopback test remained ignored and all doc tests passed.
+
+### Limitations and platform coverage
+
+- All default tests are deterministic and hardware-free. No physical serial device was opened; physical flush behavior remains covered only by the opt-in ignored loopback test.
+- Production code was built on macOS and cross-checked for Windows. A Linux cross-check was attempted with `cargo check -p seeed-hal-adapter-serialport --target x86_64-unknown-linux-gnu`, but the macOS host lacks a Linux `libudev` sysroot/pkg-config configuration, so the existing `libudev-sys` build script stopped before this crate compiled. The Linux output-queue implementation uses the same `TIOCOUTQ` ABI and pointer shape as `serialport` 4.9's Linux `TTYPort::bytes_to_write`.

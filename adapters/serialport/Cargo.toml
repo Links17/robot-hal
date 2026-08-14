@@ -18,5 +18,14 @@ serial2 = { workspace = true, features = ["unix"] }
 serialport = { workspace = true }
 tokio = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Devices_Communication",
+    "Win32_Foundation",
+] }
+
 [dev-dependencies]
 seeed-hal-testkit = { path = "../../crates/seeed-hal-testkit" }
