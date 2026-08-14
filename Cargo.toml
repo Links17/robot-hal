@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "adapters/serialport",
     "crates/seeed-hal-core",
     "crates/seeed-hal-runtime",
     "crates/seeed-hal-serial",

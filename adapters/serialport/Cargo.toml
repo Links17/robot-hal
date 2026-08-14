@@ -1,0 +1,22 @@
+[package]
+name = "seeed-hal-adapter-serialport"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+hardware-loopback = []
+
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+percent-encoding = { workspace = true }
+seeed-hal-core = { path = "../../crates/seeed-hal-core" }
+seeed-hal-serial = { path = "../../crates/seeed-hal-serial" }
+serialport = { workspace = true }
+tokio = { workspace = true }
+tokio-serial = { workspace = true }
+
+[dev-dependencies]
+seeed-hal-testkit = { path = "../../crates/seeed-hal-testkit" }
