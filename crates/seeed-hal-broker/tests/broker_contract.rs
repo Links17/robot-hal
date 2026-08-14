@@ -1,3 +1,8 @@
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
+
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
@@ -7,10 +12,124 @@ use seeed_hal_protocol::v1::{self, envelope};
 use seeed_hal_runtime::{HalRuntime, RuntimeEventKind};
 use seeed_hal_serial::SerialConfig;
 use seeed_hal_testkit::VirtualSerialAdapter;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::sync::Notify;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 const TOKEN: [u8; 32] = [0xa5; 32];
+
+#[derive(Clone, Default)]
+struct BlockingWriteGate {
+    state: Arc<BlockingWriteGateState>,
+}
+
+#[derive(Default)]
+struct BlockingWriteGateState {
+    armed: AtomicBool,
+    blocked: AtomicBool,
+    blocked_notify: Notify,
+}
+
+struct GatedIo<T> {
+    inner: T,
+    gate: BlockingWriteGate,
+    target_request_id: u64,
+}
+
+impl BlockingWriteGate {
+    fn wrap<T>(inner: T, target_request_id: u64) -> (Self, GatedIo<T>) {
+        let gate = Self::default();
+        (
+            gate.clone(),
+            GatedIo {
+                inner,
+                gate,
+                target_request_id,
+            },
+        )
+    }
+
+    fn arm(&self) {
+        self.state.armed.store(true, Ordering::Release);
+    }
+
+    async fn wait_until_blocked(&self) {
+        loop {
+            let notified = self.state.blocked_notify.notified();
+            if self.state.blocked.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl<T> AsyncRead for GatedIo<T>
+where
+    T: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T> AsyncWrite for GatedIo<T>
+where
+    T: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        if self.gate.state.armed.load(Ordering::Acquire)
+            && framed_buffer_contains_request_id(buf, self.target_request_id)
+        {
+            if !self.gate.state.blocked.swap(true, Ordering::AcqRel) {
+                self.gate.state.blocked_notify.notify_waiters();
+            }
+            return Poll::Pending;
+        }
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+fn framed_buffer_contains_request_id(mut buf: &[u8], target_request_id: u64) -> bool {
+    while buf.len() >= 4 {
+        let frame_len = u32::from_be_bytes(buf[..4].try_into().unwrap()) as usize;
+        let Some(frame_end) = 4_usize.checked_add(frame_len) else {
+            return false;
+        };
+        let Some(frame) = buf.get(4..frame_end) else {
+            return false;
+        };
+        if v1::Envelope::decode(frame)
+            .is_ok_and(|envelope| envelope.request_id == target_request_id)
+        {
+            return true;
+        }
+        buf = &buf[frame_end..];
+    }
+    false
+}
 
 struct Client<T> {
     framed: Framed<T, LengthDelimitedCodec>,
@@ -864,16 +983,26 @@ async fn stalled_writer_cannot_delay_owner_revoke_or_resource_reuse() {
 
 #[tokio::test]
 async fn response_queue_overflow_is_isolated_structured_and_cleans_up_owner() {
+    const REQUEST_QUEUE_CAPACITY: usize = 8;
+    const TASK_CAPACITY: usize = 8;
+    const RESPONSE_QUEUE_CAPACITY: usize = 2;
+    const BLOCKING_REQUEST_ID: u64 = 600;
+    const FOLLOW_UP_REQUEST_IDS: [u64; 3] = [601, 602, 603];
+
+    assert!(FOLLOW_UP_REQUEST_IDS.len() < REQUEST_QUEUE_CAPACITY);
+    assert!(FOLLOW_UP_REQUEST_IDS.len() < TASK_CAPACITY);
+
     let runtime = runtime();
     let broker = Broker::with_config(
         runtime.clone(),
         StartupToken::from_bytes(TOKEN),
         BrokerConfig::default()
-            .with_request_queue_capacity(8)
-            .with_response_queue_capacity(2)
-            .with_max_in_flight_requests(8),
+            .with_request_queue_capacity(REQUEST_QUEUE_CAPACITY)
+            .with_response_queue_capacity(RESPONSE_QUEUE_CAPACITY)
+            .with_max_in_flight_requests(TASK_CAPACITY),
     );
     let (server_io, client_io) = tokio::io::duplex(512);
+    let (write_gate, server_io) = BlockingWriteGate::wrap(server_io, BLOCKING_REQUEST_ID);
     let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
     let mut client = Client::new(client_io);
     client.handshake().await;
@@ -893,9 +1022,10 @@ async fn response_queue_overflow_is_isolated_structured_and_cleans_up_owner() {
         Some(envelope::Payload::SerialWriteResponse(_))
     ));
 
+    write_gate.arm();
     client
         .send(
-            600,
+            BLOCKING_REQUEST_ID,
             envelope::Payload::SerialReadRequest(v1::SerialReadRequest {
                 session_id: session.session_id,
                 lease: session.lease,
@@ -903,18 +1033,20 @@ async fn response_queue_overflow_is_isolated_structured_and_cleans_up_owner() {
             }),
         )
         .await;
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    for request_id in [601, 602, 603] {
-        if client
-            .try_send(
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        write_gate.wait_until_blocked(),
+    )
+    .await
+    .expect("writer must consume and block on the designated read response");
+
+    for request_id in FOLLOW_UP_REQUEST_IDS {
+        client
+            .send(
                 request_id,
                 envelope::Payload::EnumerateSerialRequest(v1::EnumerateSerialRequest {}),
             )
-            .await
-            .is_err()
-        {
-            break;
-        }
+            .await;
     }
 
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), server)
@@ -926,6 +1058,11 @@ async fn response_queue_overflow_is_isolated_structured_and_cleans_up_owner() {
         outcome.connection_error().unwrap().name().as_str(),
         "runtime.queue.response_full"
     );
+
+    let eof = tokio::time::timeout(std::time::Duration::from_secs(1), client.framed.next())
+        .await
+        .expect("response overflow must close the connection");
+    assert!(eof.is_none(), "broker must initiate EOF after overflow");
 
     let descriptor = runtime.enumerate_serial().await.unwrap().remove(0);
     runtime

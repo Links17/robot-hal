@@ -278,3 +278,74 @@ handoff because the commit cannot contain its own final SHA.
 
 Windows runtime Named Pipe acceptance and physical Serial hardware remain unavailable on this macOS
 host. No repository-owned docs guard exists beyond the Rust checks listed above.
+
+## Fix Round 3
+
+### Status and files
+
+Made the isolated response-queue overflow contract test scheduler-independent in:
+
+- `crates/seeed-hal-broker/tests/broker_contract.rs`
+
+No production code, public API, protobuf contract, queue behavior, or cleanup ordering changed.
+
+### RED evidence
+
+Command:
+
+`cargo test -p seeed-hal-broker --test broker_contract
+response_queue_overflow_is_isolated_structured_and_cleans_up_owner -- --nocapture`
+
+- Exit 101 after 1.01 seconds.
+- With the new test waiting on a pass-through writer seam, it failed at
+  `writer must consume and block on the designated read response: Elapsed(())`.
+- This demonstrates that the prior 10 ms sleep exposed no observable proof that the 4 KiB response
+  had left the response channel and stalled in the writer.
+
+### GREEN behavior and synchronization design
+
+- `BlockingWriteGate` wraps only the integration test's server-side `AsyncWrite`; production broker
+  construction and behavior are untouched.
+- The test arms the gate immediately before request `600`. The wrapper parses complete
+  length-delimited protobuf envelopes already presented to `poll_write`, signals only when it sees
+  response `600`, and deliberately leaves that write pending.
+- The test does not send requests `601` through `603` until the signal proves the writer has removed
+  response `600` from the channel and is stalled on it. No sleep participates in correctness.
+- Request admission and task capacities are both 8 while only three follow-up requests are sent;
+  response capacity is 2. The third completed follow-up therefore isolates response-channel
+  saturation, which must terminate as `runtime.queue.response_full`.
+- The test additionally asserts broker-initiated EOF, no cleanup error, owner revocation, and
+  immediate reuse of the virtual Serial resource.
+
+Focused GREEN command:
+
+`cargo test -p seeed-hal-broker --test broker_contract
+response_queue_overflow_is_isolated_structured_and_cleans_up_owner -- --nocapture`
+
+- Exit 0; 1 passed, 0 failed.
+
+Scheduler stress command:
+
+`for iteration in {1..100}; do target/debug/deps/broker_contract-37029e912b75d9bf --exact
+response_queue_overflow_is_isolated_structured_and_cleans_up_owner --quiet >/dev/null || exit 1;
+done`
+
+- Exit 0; the exact focused test passed 100 consecutive runs.
+
+### Verification evidence
+
+- `cargo fmt --all --check`: exit 0, no output.
+- `cargo test -p seeed-hal-protocol -p seeed-hal-broker`: exit 0; 23 broker contract tests and 2
+  protocol contract tests passed, plus doc tests.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: exit 0, no warnings.
+- `cargo test --workspace --all-features`: exit 0; 87 tests passed and the existing physical Serial
+  loopback test remained intentionally ignored without `SEEED_HAL_SERIAL_LOOPBACK`; all doc tests
+  passed.
+
+### Commit and remaining concerns
+
+Planned fix subject: `test(broker): synchronize response queue overflow`. The SHA is recorded in the
+handoff because the commit cannot contain its own final SHA.
+
+The deterministic gate covers the in-memory integration boundary. Windows runtime Named Pipe
+acceptance and physical Serial hardware remain unavailable on this macOS host.
