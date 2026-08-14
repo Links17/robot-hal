@@ -2,6 +2,8 @@
 resolver = "3"
 members = [
     "adapters/serialport",
+    "apps/seeed-hal-broker",
+    "crates/seeed-hal-client",
     "crates/seeed-hal-broker",
     "crates/seeed-hal-core",
     "crates/seeed-hal-protocol",
