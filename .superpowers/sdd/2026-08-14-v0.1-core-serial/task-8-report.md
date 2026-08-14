@@ -178,3 +178,75 @@ GREEN:
   job rather than a real Named Pipe acceptance run on this macOS host.
 - Physical Serial hardware remains intentionally untested; all defaults and verification stay
   hardware-free.
+
+## Fix Round 2
+
+### Status
+
+Closed the remaining Windows connect-cancellation ownership gap, normalized released buffer errors
+at the public Serial write boundary, and made generated-binding drift verification non-mutating.
+The progress ledger was not edited because it remains controller-owned.
+
+### Root causes and fixes
+
+- Windows cancellation cleanup still ran inside the already-cancelling connect task. A second or
+  later `Task.cancel()` could cancel its direct worker/close await, return before ownership was
+  reclaimed, or let a `CloseHandle` exception replace the promised cancellation. Cancellation now
+  starts one independent cleanup task that owns the worker result and single close attempt. The
+  connect task repeatedly shields that cleanup from arbitrary further cancellation and re-raises
+  the original `CancelledError` only after cleanup finishes. All pywin32 work remains off-loop;
+  setup failure still closes exactly once in the blocking worker.
+- `SerialSession.write()` handled a non-buffer with `TypeError` but leaked `ValueError` for a
+  released `memoryview`. Buffer acquisition, sizing, and normalization now map only expected
+  `TypeError`, `ValueError`, `BufferError`, and `OverflowError` failures to
+  `runtime.argument.invalid`; protobuf and other internal failures remain visible. Noncontiguous
+  and multibyte views retain their byte sequence. The transport byte-format/`nbytes`
+  normalization itself was already fixed in Fix Round 1 and was not reimplemented here.
+- The drift checker called the intentional in-place generator before inspecting Git state, so it
+  could silently restore modified/deleted files or rewrite tracked output for schema drift. It now
+  generates into a `mktemp` output tree through an explicit generator output override, compares
+  the exact Python file set and `hal_pb2.py` bytes, and independently checks scoped tracked,
+  deleted, and untracked status. The default generator destination is unchanged for intentional
+  regeneration.
+
+### TDD evidence
+
+RED:
+
+- `cd bindings/python && uv run --python 3.11 --frozen pytest tests/test_client_hardening.py -q`
+  - `7 failed, 73 passed`. The failures reproduced worker-pending and close-pending repeated
+    cancellation leaks, close-error replacement of cancellation, released-view `ValueError`, and
+    checker mutation/restoration for modified, deleted, and schema-drifted output.
+
+GREEN:
+
+- `cd bindings/python && uv run --python 3.11 --frozen pytest tests/test_client_hardening.py -q`
+  - `80 passed`, including deterministic worker-pending, worker-complete-before-claim, and
+    close-pending double/triple cancellation boundaries plus the existing setup-failure case.
+- `uv run --project bindings/python --python 3.11 --frozen pytest -q`
+  - `95 passed`.
+- `uv run --project bindings/python --python 3.11 --frozen python -m compileall -q bindings/python/seeed_hal bindings/python/tests`
+  - passed.
+- `./scripts/check-generated-protocol.sh` twice
+  - passed twice; before/after SHA-256 remained
+    `0d17a1312ff3f0b9e797d44c94d6b19d72e5c0e7bfd78647d64b18a91428e3e7` and scoped Git status
+    remained unchanged.
+- `./scripts/generate-protocol.sh`
+  - passed at its default intentional-regeneration destination and reproduced the same bytes.
+- `cargo fmt --all --check`
+  - passed.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  - passed.
+- `cargo test --workspace --all-features`
+  - passed; the physical Serial loopback test remained ignored as intended.
+- `cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-msvc`
+  - passed.
+
+### Concerns and limitations
+
+- Native Windows Python/pywin32 acceptance is still represented by deterministic mocked boundary
+  tests and Windows CI rather than a real Named Pipe run on this macOS host.
+- A platform `CloseHandle` failure is deliberately suppressed only while preserving an already
+  requested connect cancellation; the cleanup still makes exactly one off-loop close attempt.
+- Physical Serial hardware remains intentionally untested and all default verification stays
+  hardware-free.

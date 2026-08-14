@@ -235,7 +235,7 @@ class HalClient:
         try:
             token_view = memoryview(startup_token)
             owned_token = bytearray(token_view)
-        except (TypeError, ValueError, BufferError) as error:
+        except (TypeError, ValueError, BufferError, OverflowError) as error:
             raise _argument_error(
                 "runtime.broker.connect", "startup token must be bytes-like"
             ) from error
@@ -416,9 +416,9 @@ class HalClient:
     ) -> None:
         try:
             view = memoryview(data)
-        except TypeError as error:
+            size = view.nbytes
+        except (TypeError, ValueError, BufferError, OverflowError) as error:
             raise _argument_error("serial.write", "write data must be bytes-like") from error
-        size = view.nbytes
         if size > self._write_limit:
             raise _argument_error(
                 "serial.write", "write size exceeds the negotiated maximum"
@@ -430,7 +430,13 @@ class HalClient:
             raise _argument_error(
                 "serial.write", "write envelope exceeds the negotiated frame maximum"
             )
-        request_without_data.data = view.tobytes()
+        try:
+            normalized = view.tobytes()
+        except (TypeError, ValueError, BufferError, OverflowError) as error:
+            raise _argument_error(
+                "serial.write", "write data must be bytes-like"
+            ) from error
+        request_without_data.data = normalized
         await self._request(
             "serial_write_request",
             request_without_data,

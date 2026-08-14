@@ -4,6 +4,7 @@ import asyncio
 from array import array
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+import shutil
 import struct
 import subprocess
 import sys
@@ -255,6 +256,219 @@ async def test_windows_cancelled_connect_closes_late_handle_once_off_loop(monkey
     assert all(thread != main_thread for _name, thread in calls)
 
 
+@pytest.mark.asyncio
+async def test_windows_repeated_cancel_while_worker_pending_cannot_abandon_handle(
+    monkeypatch,
+) -> None:
+    from seeed_hal.transport_windows import WindowsFramedTransport
+
+    main_thread = threading.get_ident()
+    handle = object()
+    state_started = threading.Event()
+    state_release = threading.Event()
+    closed = threading.Event()
+    calls: list[tuple[str, int]] = []
+    win32file = ModuleType("win32file")
+    win32pipe = ModuleType("win32pipe")
+
+    def create_file(*_args):
+        calls.append(("create", threading.get_ident()))
+        return handle
+
+    def set_state(*_args):
+        calls.append(("state", threading.get_ident()))
+        state_started.set()
+        assert state_release.wait(1)
+
+    def close_handle(value):
+        assert value is handle
+        calls.append(("close", threading.get_ident()))
+        closed.set()
+
+    win32file.CreateFile = create_file
+    win32file.CloseHandle = close_handle
+    win32pipe.SetNamedPipeHandleState = set_state
+    install_win32_modules(monkeypatch, win32file, win32pipe)
+
+    connecting = asyncio.create_task(
+        WindowsFramedTransport.connect(r"\\.\pipe\seeed-hal-repeat-worker")
+    )
+    assert await asyncio.to_thread(state_started.wait, 1)
+    connecting.cancel()
+    await asyncio.sleep(0)
+    connecting.cancel()
+    connecting.cancel()
+    await asyncio.sleep(0)
+    completed_before_release = connecting.done()
+    state_release.set()
+    result = (await asyncio.gather(connecting, return_exceptions=True))[0]
+    await asyncio.to_thread(closed.wait, 1)
+
+    assert not completed_before_release
+    assert isinstance(result, asyncio.CancelledError)
+    assert [name for name, _thread in calls].count("close") == 1
+    assert closed.is_set()
+    assert all(thread != main_thread for _name, thread in calls)
+
+
+@pytest.mark.asyncio
+async def test_windows_repeated_cancel_after_worker_completion_closes_once(
+    monkeypatch,
+) -> None:
+    from seeed_hal.transport_windows import WindowsFramedTransport
+
+    main_thread = threading.get_ident()
+    handle = object()
+    worker_completed = asyncio.Event()
+    allow_claim = asyncio.Event()
+    calls: list[tuple[str, int]] = []
+    win32file = ModuleType("win32file")
+    win32pipe = ModuleType("win32pipe")
+    real_shield = asyncio.shield
+    shield_calls = 0
+
+    async def pause_first_claim(awaitable):
+        nonlocal shield_calls
+        shield_calls += 1
+        value = await real_shield(awaitable)
+        if shield_calls == 1:
+            worker_completed.set()
+            await allow_claim.wait()
+        return value
+
+    def create_file(*_args):
+        calls.append(("create", threading.get_ident()))
+        return handle
+
+    def set_state(*_args):
+        calls.append(("state", threading.get_ident()))
+
+    def close_handle(value):
+        assert value is handle
+        calls.append(("close", threading.get_ident()))
+
+    win32file.CreateFile = create_file
+    win32file.CloseHandle = close_handle
+    win32pipe.SetNamedPipeHandleState = set_state
+    install_win32_modules(monkeypatch, win32file, win32pipe)
+    monkeypatch.setattr(asyncio, "shield", pause_first_claim)
+
+    connecting = asyncio.create_task(
+        WindowsFramedTransport.connect(r"\\.\pipe\seeed-hal-repeat-claim")
+    )
+    await asyncio.wait_for(worker_completed.wait(), 1)
+    connecting.cancel()
+    connecting.cancel()
+    connecting.cancel()
+    allow_claim.set()
+    result = (await asyncio.gather(connecting, return_exceptions=True))[0]
+
+    assert isinstance(result, asyncio.CancelledError)
+    assert [name for name, _thread in calls].count("close") == 1
+    assert all(thread != main_thread for _name, thread in calls)
+
+
+@pytest.mark.asyncio
+async def test_windows_repeated_cancel_while_close_pending_waits_for_cleanup(
+    monkeypatch,
+) -> None:
+    from seeed_hal.transport_windows import WindowsFramedTransport
+
+    main_thread = threading.get_ident()
+    handle = object()
+    state_started = threading.Event()
+    state_release = threading.Event()
+    close_started = threading.Event()
+    close_release = threading.Event()
+    calls: list[tuple[str, int]] = []
+    win32file = ModuleType("win32file")
+    win32pipe = ModuleType("win32pipe")
+
+    def create_file(*_args):
+        calls.append(("create", threading.get_ident()))
+        return handle
+
+    def set_state(*_args):
+        calls.append(("state", threading.get_ident()))
+        state_started.set()
+        assert state_release.wait(1)
+
+    def close_handle(value):
+        assert value is handle
+        calls.append(("close", threading.get_ident()))
+        close_started.set()
+        assert close_release.wait(1)
+
+    win32file.CreateFile = create_file
+    win32file.CloseHandle = close_handle
+    win32pipe.SetNamedPipeHandleState = set_state
+    install_win32_modules(monkeypatch, win32file, win32pipe)
+
+    connecting = asyncio.create_task(
+        WindowsFramedTransport.connect(r"\\.\pipe\seeed-hal-repeat-close")
+    )
+    assert await asyncio.to_thread(state_started.wait, 1)
+    connecting.cancel()
+    state_release.set()
+    assert await asyncio.to_thread(close_started.wait, 1)
+    connecting.cancel()
+    await asyncio.sleep(0)
+    connecting.cancel()
+    await asyncio.sleep(0)
+    completed_before_close = connecting.done()
+    close_release.set()
+    result = (await asyncio.gather(connecting, return_exceptions=True))[0]
+
+    assert not completed_before_close
+    assert isinstance(result, asyncio.CancelledError)
+    assert [name for name, _thread in calls].count("close") == 1
+    assert all(thread != main_thread for _name, thread in calls)
+
+
+@pytest.mark.asyncio
+async def test_windows_close_failure_does_not_replace_connect_cancellation(
+    monkeypatch,
+) -> None:
+    from seeed_hal.transport_windows import WindowsFramedTransport
+
+    handle = object()
+    state_started = threading.Event()
+    state_release = threading.Event()
+    calls: list[str] = []
+    win32file = ModuleType("win32file")
+    win32pipe = ModuleType("win32pipe")
+
+    def create_file(*_args):
+        calls.append("create")
+        return handle
+
+    def set_state(*_args):
+        calls.append("state")
+        state_started.set()
+        assert state_release.wait(1)
+
+    def close_handle(value):
+        assert value is handle
+        calls.append("close")
+        raise OSError("close failed")
+
+    win32file.CreateFile = create_file
+    win32file.CloseHandle = close_handle
+    win32pipe.SetNamedPipeHandleState = set_state
+    install_win32_modules(monkeypatch, win32file, win32pipe)
+
+    connecting = asyncio.create_task(
+        WindowsFramedTransport.connect(r"\\.\pipe\seeed-hal-close-error")
+    )
+    assert await asyncio.to_thread(state_started.wait, 1)
+    connecting.cancel()
+    state_release.set()
+    result = (await asyncio.gather(connecting, return_exceptions=True))[0]
+
+    assert isinstance(result, asyncio.CancelledError)
+    assert calls.count("close") == 1
+
+
 class InvalidPath:
     def __fspath__(self):
         return 42
@@ -359,6 +573,62 @@ async def test_invalid_control_lines_and_read_sizes_are_structured_arguments() -
             await serial.read(size)
         assert caught.value.name == "runtime.argument.invalid"
     assert transport.sent.empty()
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_released_serial_write_view_is_a_structured_argument_error() -> None:
+    transport = ScriptedTransport()
+    client = direct_client(transport)
+    serial = SerialSession(
+        client,
+        "session:valid",
+        "lease:valid",
+        1,
+        hal_pb2.LEASE_MODE_CONTROL,
+    )
+    payload = memoryview(b"released")
+    payload.release()
+
+    with pytest.raises(HalError) as caught:
+        await serial.write(payload)
+
+    assert caught.value.name == "runtime.argument.invalid"
+    assert transport.sent.empty()
+    await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (memoryview(bytearray(b"abcdef"))[::2], b"ace"),
+        (memoryview(array("H", [0x0102, 0x0304])), struct.pack("=HH", 0x0102, 0x0304)),
+    ],
+)
+async def test_serial_write_normalizes_noncontiguous_and_multibyte_views(
+    payload: memoryview, expected: bytes
+) -> None:
+    transport = ScriptedTransport()
+    client = direct_client(transport)
+    serial = SerialSession(
+        client,
+        "session:valid",
+        "lease:valid",
+        1,
+        hal_pb2.LEASE_MODE_CONTROL,
+    )
+
+    writing = asyncio.create_task(serial.write(payload))
+    request = await next_request(transport)
+    assert request.serial_write_request.data == expected
+    transport.inbound.put_nowait(
+        hal_pb2.Envelope(
+            request_id=request.request_id,
+            serial_write_response=hal_pb2.Empty(),
+        ).SerializeToString()
+    )
+    await writing
     await client.close()
 
 
@@ -493,9 +763,101 @@ def test_generation_check_rejects_untracked_stale_outputs() -> None:
     stale.write_text("# stale generated output\n", encoding="utf-8")
     try:
         result = subprocess.run(
-            [checker], cwd=REPO_ROOT, text=True, capture_output=True, timeout=30
+            ["bash", checker],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            timeout=30,
         )
     finally:
         stale.unlink(missing_ok=True)
     assert result.returncode != 0
     assert "stale_pb2.py" in result.stdout + result.stderr
+
+
+def _generation_check_repo(tmp_path: Path) -> Path:
+    fixture = tmp_path / "repo"
+    files = [
+        ".gitignore",
+        "scripts/check-generated-protocol.sh",
+        "scripts/generate-protocol.sh",
+        "bindings/python/pyproject.toml",
+        "bindings/python/uv.lock",
+        "bindings/python/seeed_hal/proto/__init__.py",
+        "bindings/python/seeed_hal/proto/hal_pb2.py",
+        "proto/seeed/hal/v1/hal.proto",
+    ]
+    for relative in files:
+        source = REPO_ROOT / relative
+        destination = fixture / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    subprocess.run(["git", "init", "-q"], cwd=fixture, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "tests@example.invalid"],
+        cwd=fixture,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Tests"], cwd=fixture, check=True
+    )
+    subprocess.run(["git", "add", "."], cwd=fixture, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "fixture"], cwd=fixture, check=True
+    )
+    return fixture
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ["clean", "modified", "deleted", "stale", "schema"],
+)
+def test_generation_check_is_non_mutating_for_clean_and_drifted_trees(
+    tmp_path: Path, drift: str
+) -> None:
+    fixture = _generation_check_repo(tmp_path)
+    output = fixture / "bindings/python/seeed_hal/proto"
+    generated = output / "hal_pb2.py"
+    if drift == "modified":
+        generated.write_text("# locally modified\n", encoding="utf-8")
+    elif drift == "deleted":
+        generated.unlink()
+    elif drift == "stale":
+        (output / "stale_pb2.py").write_text("# stale\n", encoding="utf-8")
+    elif drift == "schema":
+        schema = fixture / "proto/seeed/hal/v1/hal.proto"
+        schema.write_text(
+            schema.read_text(encoding="utf-8") + "\nmessage DriftProbe {}\n",
+            encoding="utf-8",
+        )
+
+    original_bytes = generated.read_bytes() if generated.exists() else None
+    original_status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=fixture,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout
+    result = subprocess.run(
+        ["bash", fixture / "scripts/check-generated-protocol.sh"],
+        cwd=fixture,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    final_bytes = generated.read_bytes() if generated.exists() else None
+    final_status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=fixture,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout
+
+    if drift == "clean":
+        assert result.returncode == 0, result.stdout + result.stderr
+    else:
+        assert result.returncode != 0
+    assert final_bytes == original_bytes
+    assert final_status == original_status

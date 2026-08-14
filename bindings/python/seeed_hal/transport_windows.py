@@ -21,6 +21,29 @@ def _load_pywin32() -> tuple[Any, Any]:
     return win32file, win32pipe
 
 
+async def _cleanup_cancelled_connect(
+    worker: asyncio.Task[Any], win32file: Any
+) -> None:
+    try:
+        handle = await worker
+    except BaseException:
+        return
+    try:
+        await asyncio.to_thread(win32file.CloseHandle, handle)
+    except BaseException:
+        return
+
+
+async def _await_cleanup_despite_cancellation(cleanup: asyncio.Task[None]) -> None:
+    while True:
+        try:
+            await asyncio.shield(cleanup)
+            return
+        except asyncio.CancelledError:
+            if cleanup.done():
+                return
+
+
 class WindowsFramedTransport:
     __slots__ = ("_handle", "_win32file", "_frame_limit", "_closed")
 
@@ -64,14 +87,12 @@ class WindowsFramedTransport:
         worker = asyncio.create_task(asyncio.to_thread(blocking_connect))
         try:
             handle = await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            try:
-                handle = await worker
-            except Exception:
-                pass
-            else:
-                await asyncio.to_thread(win32file.CloseHandle, handle)
-            raise
+        except asyncio.CancelledError as cancelled:
+            cleanup = asyncio.create_task(
+                _cleanup_cancelled_connect(worker, win32file)
+            )
+            await _await_cleanup_despite_cancellation(cleanup)
+            raise cancelled
         except OSError as error:
             raise disconnected_error("runtime.broker.connect", str(error)) from error
         return cls(handle, win32file, frame_limit)
