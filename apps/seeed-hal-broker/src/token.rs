@@ -15,6 +15,41 @@ fn policy_error(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message)
 }
 
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowsTokenShareModes {
+    primary: u32,
+    identity_reopen: u32,
+}
+
+#[cfg(any(windows, test))]
+fn windows_token_share_modes() -> WindowsTokenShareModes {
+    #[cfg(windows)]
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+    #[cfg(not(windows))]
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    #[cfg(not(windows))]
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+
+    WindowsTokenShareModes {
+        primary: FILE_SHARE_READ,
+        identity_reopen: FILE_SHARE_READ | FILE_SHARE_DELETE,
+    }
+}
+
+#[cfg(test)]
+mod share_mode_tests {
+    use super::windows_token_share_modes;
+
+    #[test]
+    fn identity_reopen_shares_delete_without_weakening_the_primary_handle() {
+        let share_modes = windows_token_share_modes();
+
+        assert_eq!(share_modes.primary, 0x0000_0001);
+        assert_eq!(share_modes.identity_reopen, 0x0000_0001 | 0x0000_0004);
+    }
+}
+
 #[cfg(unix)]
 mod platform {
     use std::ffi::OsString;
@@ -320,10 +355,10 @@ mod platform {
     use windows_sys::Win32::Foundation::GENERIC_READ;
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        FILE_FLAG_OPEN_REPARSE_POINT,
     };
 
-    use super::policy_error;
+    use super::{policy_error, windows_token_share_modes};
 
     pub(super) struct TrustedTokenFile {
         path: PathBuf,
@@ -372,10 +407,11 @@ mod platform {
 
             let path_metadata = std::fs::symlink_metadata(&path)?;
             validate_real_file_path(&path_metadata)?;
+            let share_modes = windows_token_share_modes();
             let file = OpenOptions::new()
                 .read(true)
                 .access_mode(GENERIC_READ | DELETE)
-                .share_mode(FILE_SHARE_READ)
+                .share_mode(share_modes.primary)
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(&path)?;
             let metadata = file.metadata()?;
@@ -418,9 +454,16 @@ mod platform {
             validate_handle_security(&self.file, &self.user)?;
             let path_metadata = std::fs::symlink_metadata(&self.path)?;
             validate_real_file_path(&path_metadata)?;
+            let share_modes = windows_token_share_modes();
+            // Windows checks sharing bidirectionally: the new handle's desired access must be
+            // allowed by every existing handle's share mode, and every existing handle's access
+            // must be allowed by the new handle's share mode. The primary handle owns DELETE
+            // access, so this read-only identity re-open must share DELETE with it. The primary
+            // handle itself still shares only reads, which continues to deny external DELETE-access
+            // opens used for pathname replacement or deletion.
             let path_file = OpenOptions::new()
                 .read(true)
-                .share_mode(FILE_SHARE_READ)
+                .share_mode(share_modes.identity_reopen)
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(&self.path)?;
             let path_file_metadata = path_file.metadata()?;
@@ -527,15 +570,58 @@ mod platform {
     mod tests {
         use std::io;
         use std::os::windows::fs::OpenOptionsExt;
+        use std::path::Path;
 
+        use windows_permissions::constants::{SeObjectType, SecurityInformation};
         use windows_permissions::utilities::current_process_sid;
         use windows_permissions::{LocalBox, SecurityDescriptor};
         use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
+        use super::super::read_and_remove_token;
         use super::{Identity, validate_private_security_descriptor, validate_real_file};
 
         fn descriptor(sddl: &str) -> LocalBox<SecurityDescriptor> {
             sddl.parse().expect("test SDDL must be valid")
+        }
+
+        fn apply_private_acl(path: &Path) {
+            let user = current_process_sid().unwrap();
+            let descriptor = descriptor(&format!(
+                "O:{user}D:P(A;;FA;;;{user})(A;;FA;;;SY)(A;;FA;;;BA)"
+            ));
+            windows_permissions::wrappers::SetNamedSecurityInfo(
+                path.as_os_str(),
+                SeObjectType::SE_FILE_OBJECT,
+                SecurityInformation::Owner | SecurityInformation::Dacl,
+                descriptor.owner(),
+                None,
+                descriptor.dacl(),
+                None,
+            )
+            .unwrap();
+        }
+
+        #[tokio::test]
+        async fn broker_app_reopens_and_deletes_private_token_by_validated_handle() {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "seeed-hal-windows-token-consume-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            apply_private_acl(&directory);
+            let path = directory.join("token");
+            std::fs::write(&path, [0x5a_u8; 32]).unwrap();
+            apply_private_acl(&path);
+
+            let token = read_and_remove_token(path.clone()).await.unwrap();
+
+            assert_eq!(token.expose_bytes(), &[0x5a_u8; 32]);
+            assert!(!path.exists());
+            std::fs::remove_dir(directory).unwrap();
         }
 
         #[test]
