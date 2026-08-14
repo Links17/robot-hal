@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["crates/seeed-hal-core"]
+members = [
+    "crates/seeed-hal-core",
+    "crates/seeed-hal-serial",
+    "crates/seeed-hal-testkit",
+]
 
 [workspace.package]
 edition = "2024"

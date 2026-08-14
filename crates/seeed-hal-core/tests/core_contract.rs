@@ -1,6 +1,6 @@
 use seeed_hal_core::{
-    CapabilityId, Endpoint, IdentityQuality, LeaseMode, LeaseToken, ResourceId,
-    ResourceSelector, TransportKind,
+    CapabilityId, Endpoint, IdentityQuality, LeaseMode, LeaseToken, ResourceId, ResourceSelector,
+    TransportKind,
 };
 
 #[test]

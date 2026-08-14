@@ -29,7 +29,7 @@ impl<'de> Deserialize<'de> for ResourceId {
     {
         struct ResourceIdVisitor;
 
-        impl<'de> Visitor<'de> for ResourceIdVisitor {
+        impl Visitor<'_> for ResourceIdVisitor {
             type Value = ResourceId;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -92,7 +92,7 @@ impl<'de> Deserialize<'de> for Endpoint {
     {
         struct EndpointVisitor;
 
-        impl<'de> Visitor<'de> for EndpointVisitor {
+        impl Visitor<'_> for EndpointVisitor {
             type Value = Endpoint;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -160,7 +160,13 @@ impl ResourceDescriptor {
         transport: TransportKind,
         properties: ResourceProperties,
     ) -> Self {
-        Self(id, endpoint, minimum_identity_quality, transport, properties)
+        Self(
+            id,
+            endpoint,
+            minimum_identity_quality,
+            transport,
+            properties,
+        )
     }
 
     pub fn id(&self) -> &ResourceId {

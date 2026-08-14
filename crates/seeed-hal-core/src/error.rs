@@ -35,7 +35,7 @@ impl<'de> Deserialize<'de> for ErrorName {
     {
         struct ErrorNameVisitor;
 
-        impl<'de> Visitor<'de> for ErrorNameVisitor {
+        impl Visitor<'_> for ErrorNameVisitor {
             type Value = ErrorName;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -83,7 +83,7 @@ impl<'de> Deserialize<'de> for OperationName {
     {
         struct OperationNameVisitor;
 
-        impl<'de> Visitor<'de> for OperationNameVisitor {
+        impl Visitor<'_> for OperationNameVisitor {
             type Value = OperationName;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

@@ -41,7 +41,11 @@ impl CapabilityId {
         let number = &version[1..];
         if number.is_empty()
             || !number.chars().all(|character| character.is_ascii_digit())
-            || number.parse::<u64>().ok().filter(|number| *number > 0).is_none()
+            || number
+                .parse::<u64>()
+                .ok()
+                .filter(|number| *number > 0)
+                .is_none()
         {
             return Err(HalError::invalid_argument_error(
                 "capability.id.invalid",
@@ -65,7 +69,7 @@ impl<'de> Deserialize<'de> for CapabilityId {
     {
         struct CapabilityIdVisitor;
 
-        impl<'de> Visitor<'de> for CapabilityIdVisitor {
+        impl Visitor<'_> for CapabilityIdVisitor {
             type Value = CapabilityId;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

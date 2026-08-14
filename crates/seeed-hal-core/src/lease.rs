@@ -3,8 +3,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use uuid::Uuid;
 
-use crate::capability::validate_identifier;
 use crate::HalResult;
+use crate::capability::validate_identifier;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct LeaseId(String);
@@ -38,7 +38,7 @@ impl<'de> Deserialize<'de> for LeaseId {
     {
         struct LeaseIdVisitor;
 
-        impl<'de> Visitor<'de> for LeaseIdVisitor {
+        impl Visitor<'_> for LeaseIdVisitor {
             type Value = LeaseId;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -86,7 +86,7 @@ impl<'de> Deserialize<'de> for OwnerId {
     {
         struct OwnerIdVisitor;
 
-        impl<'de> Visitor<'de> for OwnerIdVisitor {
+        impl Visitor<'_> for OwnerIdVisitor {
             type Value = OwnerId;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -134,7 +134,7 @@ impl<'de> Deserialize<'de> for SessionId {
     {
         struct SessionIdVisitor;
 
-        impl<'de> Visitor<'de> for SessionIdVisitor {
+        impl Visitor<'_> for SessionIdVisitor {
             type Value = SessionId;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
