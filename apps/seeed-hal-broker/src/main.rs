@@ -227,6 +227,66 @@ fn log_connection_result(
     }
 }
 
+#[cfg(any(test, windows))]
+async fn wait_for_either_shutdown_signal<C, B>(ctrl_c: C, ctrl_break: B) -> io::Result<()>
+where
+    C: std::future::Future<Output = io::Result<()>>,
+    B: std::future::Future<Output = io::Result<()>>,
+{
+    tokio::pin!(ctrl_c);
+    tokio::pin!(ctrl_break);
+    tokio::select! {
+        result = &mut ctrl_c => result,
+        result = &mut ctrl_break => result,
+    }
+}
+
+#[cfg(windows)]
+async fn wait_for_windows_shutdown() -> io::Result<()> {
+    let mut ctrl_c = tokio::signal::windows::ctrl_c()?;
+    let mut ctrl_break = tokio::signal::windows::ctrl_break()?;
+    wait_for_either_shutdown_signal(
+        async move {
+            ctrl_c.recv().await.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "Ctrl-C signal stream closed")
+            })
+        },
+        async move {
+            ctrl_break.recv().await.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "Ctrl-Break signal stream closed")
+            })
+        },
+    )
+    .await
+}
+
+#[cfg(test)]
+mod shutdown_signal_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn either_shutdown_signal_accepts_the_second_signal() {
+        let ctrl_c = std::future::pending::<io::Result<()>>();
+        let ctrl_break = std::future::ready(Ok(()));
+
+        wait_for_either_shutdown_signal(ctrl_c, ctrl_break)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn either_shutdown_signal_propagates_listener_failure() {
+        let ctrl_c = std::future::ready(Err(io::Error::other("listener failed")));
+        let ctrl_break = std::future::pending::<io::Result<()>>();
+
+        let error = wait_for_either_shutdown_signal(ctrl_c, ctrl_break)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "listener failed");
+    }
+}
+
 #[cfg(unix)]
 struct UnixSocketCleanup(PathBuf);
 
@@ -242,7 +302,7 @@ async fn serve(endpoint: PathBuf, broker: Broker) -> Result<(), Box<dyn std::err
     serve_windows_until(
         endpoint,
         broker,
-        async { tokio::signal::ctrl_c().await },
+        wait_for_windows_shutdown(),
         MAX_CONNECTIONS,
     )
     .await?;

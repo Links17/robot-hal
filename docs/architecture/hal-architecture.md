@@ -282,8 +282,9 @@ Implementation status is intentionally separate from cross-platform release qual
 - Implemented in v0.1: core identity/capability/lease/error/event types, runtime ownership and
   fencing, the versioned local broker, Rust and Python clients, the virtual Serial conformance
   adapter, and the native `serialport` adapter.
-- Qualified locally: hardware-free macOS execution and the cross-target compile checks recorded in
-  [v0.1.0 acceptance](../releases/v0.1.0-acceptance.md).
+- Qualified locally: hardware-free macOS execution and the warnings-denied Windows Rust cross-target
+  check recorded in [v0.1.0 acceptance](../releases/v0.1.0-acceptance.md). The Linux cross-target
+  check remains blocked by the missing libudev pkg-config target sysroot/wrapper.
 - Pending external acceptance: native Linux and Windows CI execution and physical Serial loopback.
 - Planned: CAN/CAN FD, USB, GPIO, Camera, Node bindings, shared-memory frame transport, device
   protocols, and consuming-application migration.

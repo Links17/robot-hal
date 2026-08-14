@@ -30,6 +30,7 @@ PROTOCOL_MINOR = 0
 SERIAL_CAPABILITY = "serial.bytes/v1"
 TRANSFER_LIMIT = 64 * 1024
 FRAME_LIMIT = 1024 * 1024
+DIAGNOSTIC_LIMIT = 64 * 1024
 
 
 def endpoint_for_platform(directory: Path, nonce: str, os_name: str) -> str:
@@ -59,6 +60,117 @@ def parse_readiness_endpoint(line: bytes) -> str:
     return endpoint
 
 
+async def capture_stream_tail(reader: asyncio.StreamReader, limit: int) -> bytes:
+    _require(limit > 0, "diagnostic byte limit must be greater than zero")
+    tail = bytearray()
+    while chunk := await reader.read(4096):
+        tail.extend(chunk)
+        if len(tail) > limit:
+            del tail[:-limit]
+    return bytes(tail)
+
+
+async def _finish_task_with_cap(task: asyncio.Task, timeout: float):
+    done, _pending = await asyncio.wait({task}, timeout=timeout)
+    if not done:
+        task.cancel()
+        task.add_done_callback(_consume_task_result)
+        raise asyncio.TimeoutError
+    return task.result()
+
+
+def _consume_task_result(task: asyncio.Task) -> None:
+    with contextlib.suppress(BaseException):
+        task.result()
+
+
+async def _await_with_cap(awaitable, timeout: float):
+    return await _finish_task_with_cap(asyncio.ensure_future(awaitable), timeout)
+
+
+async def cleanup_process(
+    process: asyncio.subprocess.Process,
+    diagnostics: asyncio.Task[bytes],
+    timeout: float,
+) -> bytes:
+    if process.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        process_wait = asyncio.create_task(process.wait())
+        try:
+            await _finish_task_with_cap(process_wait, timeout)
+        except asyncio.TimeoutError:
+            pass
+    try:
+        return await _finish_task_with_cap(diagnostics, timeout)
+    except asyncio.TimeoutError:
+        return b"diagnostic capture timed out"
+
+
+def apply_windows_private_dacl(path: Path) -> None:
+    import ntsecuritycon
+    import win32api
+    import win32con
+    import win32security
+
+    process_token = win32security.OpenProcessToken(
+        win32api.GetCurrentProcess(), win32con.TOKEN_QUERY
+    )
+    user = win32security.GetTokenInformation(
+        process_token, win32security.TokenUser
+    )[0]
+    system = win32security.CreateWellKnownSid(
+        win32security.WinLocalSystemSid, None
+    )
+    administrators = win32security.CreateWellKnownSid(
+        win32security.WinBuiltinAdministratorsSid, None
+    )
+    dacl = win32security.ACL()
+    for trustee in (user, system, administrators):
+        dacl.AddAccessAllowedAce(
+            win32security.ACL_REVISION,
+            ntsecuritycon.FILE_ALL_ACCESS,
+            trustee,
+        )
+    information = (
+        win32security.OWNER_SECURITY_INFORMATION
+        | win32security.DACL_SECURITY_INFORMATION
+        | win32security.PROTECTED_DACL_SECURITY_INFORMATION
+    )
+    win32security.SetNamedSecurityInfo(
+        str(path),
+        win32security.SE_FILE_OBJECT,
+        information,
+        user,
+        None,
+        dacl,
+        None,
+    )
+
+
+async def prepare_private_token(
+    directory: Path,
+    token_path: Path,
+    token: bytes,
+    *,
+    os_name: str,
+    timeout: float,
+) -> None:
+    if os_name == "nt":
+        await _await_with_cap(
+            asyncio.to_thread(apply_windows_private_dacl, directory), timeout
+        )
+    else:
+        await _await_with_cap(asyncio.to_thread(directory.chmod, 0o700), timeout)
+    await _await_with_cap(asyncio.to_thread(token_path.write_bytes, token), timeout)
+    if os_name == "nt":
+        await _await_with_cap(
+            asyncio.to_thread(apply_windows_private_dacl, token_path), timeout
+        )
+    else:
+        await _await_with_cap(asyncio.to_thread(token_path.chmod, 0o600), timeout)
+
+
 async def connect_transport(endpoint: str):
     if os.name == "nt":
         from seeed_hal.transport_windows import WindowsFramedTransport
@@ -78,20 +190,22 @@ class RawClient:
         self.next_request_id += 1
         envelope = hal_pb2.Envelope(request_id=request_id)
         getattr(envelope, payload_name).CopyFrom(payload)
-        await asyncio.wait_for(
-            self.transport.send(envelope.SerializeToString()), self.timeout
-        )
-        while True:
-            frame = await asyncio.wait_for(self.transport.receive(), self.timeout)
-            response = hal_pb2.Envelope()
-            response.ParseFromString(frame)
-            if response.request_id == request_id:
-                return response
-            _require(
-                response.request_id == 0
-                and response.WhichOneof("payload") == "runtime_event",
-                f"unexpected response correlation id {response.request_id}",
-            )
+
+        async def exchange():
+            await self.transport.send(envelope.SerializeToString())
+            while True:
+                frame = await self.transport.receive()
+                response = hal_pb2.Envelope()
+                response.ParseFromString(frame)
+                if response.request_id == request_id:
+                    return response
+                _require(
+                    response.request_id == 0
+                    and response.WhichOneof("payload") == "runtime_event",
+                    f"unexpected response correlation id {response.request_id}",
+                )
+
+        return await _await_with_cap(exchange(), self.timeout)
 
     async def handshake(self, token: bytes) -> None:
         response = await self.request(
@@ -113,7 +227,7 @@ class RawClient:
         self.transport.set_frame_limit(handshake.max_frame_bytes)
 
     async def close(self) -> None:
-        await asyncio.wait_for(self.transport.close(), self.timeout)
+        await _await_with_cap(self.transport.close(), self.timeout)
 
 
 def _require(condition: bool, message: str) -> None:
@@ -165,7 +279,9 @@ async def _open_serial(client: RawClient, descriptor):
 
 
 async def exercise_contract(endpoint: str, token: bytes, timeout: float) -> None:
-    first = RawClient(await connect_transport(endpoint), timeout)
+    first = RawClient(
+        await _await_with_cap(connect_transport(endpoint), timeout), timeout
+    )
     second = None
     try:
         await first.handshake(token)
@@ -256,21 +372,23 @@ async def exercise_contract(endpoint: str, token: bytes, timeout: float) -> None
         # Abruptly disconnect with the reopened session still owned. A fresh owner
         # must be able to reuse the resource after broker cleanup completes.
         await first.close()
-        second = RawClient(await connect_transport(endpoint), timeout)
-        await second.handshake(token)
-        deadline = asyncio.get_running_loop().time() + timeout
-        while True:
-            response = await _open_serial(second, descriptor)
-            if response.WhichOneof("payload") == "open_serial_response":
-                break
-            _require(
-                response.WhichOneof("payload") == "error"
-                and response.error.name == "runtime.lease.conflict",
-                f"unexpected cleanup response {response.WhichOneof('payload')}",
-            )
-            if asyncio.get_running_loop().time() >= deadline:
-                raise AssertionError("disconnect cleanup did not release the resource")
-            await asyncio.sleep(0.025)
+
+        async def wait_for_resource_reuse() -> None:
+            nonlocal second
+            second = RawClient(await connect_transport(endpoint), timeout)
+            await second.handshake(token)
+            while True:
+                response = await _open_serial(second, descriptor)
+                if response.WhichOneof("payload") == "open_serial_response":
+                    break
+                _require(
+                    response.WhichOneof("payload") == "error"
+                    and response.error.name == "runtime.lease.conflict",
+                    f"unexpected cleanup response {response.WhichOneof('payload')}",
+                )
+                await asyncio.sleep(0.025)
+
+        await _await_with_cap(wait_for_resource_reuse(), timeout)
     finally:
         with contextlib.suppress(Exception):
             await first.close()
@@ -281,7 +399,7 @@ async def exercise_contract(endpoint: str, token: bytes, timeout: float) -> None
 
 async def _wait_for_readiness(process, endpoint: str, timeout: float) -> None:
     _require(process.stdout is not None, "broker stdout was not captured")
-    line = await asyncio.wait_for(process.stdout.readline(), timeout)
+    line = await _await_with_cap(process.stdout.readline(), timeout)
     if not line:
         raise AssertionError("broker exited before publishing readiness")
     reported_endpoint = parse_readiness_endpoint(line)
@@ -295,7 +413,7 @@ async def _graceful_shutdown(process, timeout: float) -> None:
         process.send_signal(signal.CTRL_BREAK_EVENT)
     else:
         process.send_signal(signal.SIGINT)
-    await asyncio.wait_for(process.wait(), timeout)
+    await _await_with_cap(process.wait(), timeout)
     _require(process.returncode == 0, f"broker shutdown returned {process.returncode}")
 
 
@@ -304,35 +422,41 @@ async def run(broker: Path, timeout: float) -> None:
     _require(broker.is_file(), f"broker executable not found: {broker}")
     with tempfile.TemporaryDirectory(prefix="seeed-hal-conformance-") as temporary:
         directory = Path(temporary)
-        if os.name != "nt":
-            directory.chmod(0o700)
         nonce = uuid.uuid4().hex
         endpoint = endpoint_for_platform(directory, nonce, os.name)
         token_path = directory / "startup-token"
         token = secrets.token_bytes(32)
-        token_path.write_bytes(token)
-        if os.name != "nt":
-            token_path.chmod(0o600)
+        await prepare_private_token(
+            directory,
+            token_path,
+            token,
+            os_name=os.name,
+            timeout=timeout,
+        )
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-        process = await asyncio.create_subprocess_exec(
-            *broker_command(broker, endpoint, token_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            creationflags=creationflags,
+        spawn = asyncio.create_task(
+            asyncio.create_subprocess_exec(
+                *broker_command(broker, endpoint, token_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                creationflags=creationflags,
+            )
+        )
+        process = await _finish_task_with_cap(spawn, timeout)
+        _require(process.stderr is not None, "broker stderr was not captured")
+        diagnostics = asyncio.create_task(
+            capture_stream_tail(process.stderr, DIAGNOSTIC_LIMIT)
         )
         try:
             await _wait_for_readiness(process, endpoint, timeout)
             await exercise_contract(endpoint, token, timeout)
             await _graceful_shutdown(process, timeout)
         finally:
-            if process.returncode is None:
-                process.kill()
-                with contextlib.suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(process.wait(), timeout)
-            if process.stderr is not None:
-                stderr = (await process.stderr.read()).decode("utf-8", errors="replace")
-                if process.returncode not in (0, None) and stderr:
-                    print(stderr, file=sys.stderr, end="")
+            stderr = (await cleanup_process(process, diagnostics, timeout)).decode(
+                "utf-8", errors="replace"
+            )
+            if process.returncode not in (0, None) and stderr:
+                print(stderr, file=sys.stderr, end="")
 
 
 def parse_args() -> argparse.Namespace:
