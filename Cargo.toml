@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/seeed-hal-core",
+    "crates/seeed-hal-runtime",
     "crates/seeed-hal-serial",
     "crates/seeed-hal-testkit",
 ]

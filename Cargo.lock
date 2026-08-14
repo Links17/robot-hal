@@ -158,6 +158,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "seeed-hal-runtime"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "seeed-hal-core",
+ "seeed-hal-serial",
+ "seeed-hal-testkit",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "seeed-hal-serial"
 version = "0.1.0"
 dependencies = [

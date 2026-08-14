@@ -1,0 +1,16 @@
+[package]
+name = "seeed-hal-runtime"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+seeed-hal-core = { path = "../seeed-hal-core" }
+seeed-hal-serial = { path = "../seeed-hal-serial" }
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+seeed-hal-testkit = { path = "../seeed-hal-testkit" }
