@@ -126,6 +126,21 @@ async fn close_is_idempotent_and_blocks_future_operations() {
 }
 
 #[tokio::test]
+async fn closed_state_takes_precedence_over_invalid_read_size() {
+    let adapter = VirtualSerialAdapter::loopback("serial:virtual:loopback-1");
+    let descriptor = adapter.enumerate().await.unwrap().remove(0);
+    let mut session = adapter
+        .open(&descriptor.selector(), SerialConfig::default())
+        .await
+        .unwrap();
+
+    session.close().await.unwrap();
+
+    let error = session.read(0).await.unwrap_err();
+    assert_eq!(error.name().as_str(), "runtime.session.closed");
+}
+
+#[tokio::test]
 async fn receive_queue_is_bounded() {
     let adapter = VirtualSerialAdapter::loopback("serial:virtual:loopback-1");
     let descriptor = adapter.enumerate().await.unwrap().remove(0);

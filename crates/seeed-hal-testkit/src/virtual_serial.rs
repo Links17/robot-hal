@@ -196,15 +196,15 @@ impl SerialSession for VirtualSerialSession {
     }
 
     async fn read(&mut self, max_bytes: usize) -> HalResult<Bytes> {
+        if self.is_closed() {
+            return Err(self.closed_error("serial.read"));
+        }
+
         if max_bytes == 0 {
             return Err(invalid_argument(
                 "serial.read",
                 "max_bytes must be greater than zero",
             ));
-        }
-
-        if self.is_closed() {
-            return Err(self.closed_error("serial.read"));
         }
 
         let bytes = self.next_bytes().await?;
