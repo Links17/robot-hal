@@ -35,8 +35,13 @@ async fn physical_loopback_round_trip_preserves_byte_order() {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut received = Vec::new();
         while received.len() < payload.len() && Instant::now() < deadline {
-            let bytes = session.read(payload.len() - received.len()).await.unwrap();
-            received.extend_from_slice(&bytes);
+            match session.read(payload.len() - received.len()).await {
+                Ok(bytes) => received.extend_from_slice(&bytes),
+                Err(error)
+                    if error.name().as_str() == "runtime.transport.timeout"
+                        && Instant::now() < deadline => {}
+                Err(error) => panic!("loopback read failed: {error}"),
+            }
         }
 
         assert_eq!(received, payload);

@@ -144,10 +144,9 @@ fn insert_optional(properties: &mut BTreeMap<String, String>, key: &str, value: 
 }
 
 pub(crate) fn map_serialport_error(operation: &'static str, error: serialport::Error) -> HalError {
+    let description = error.to_string();
     let (name, category, retryable) = match error.kind() {
-        serialport::ErrorKind::NoDevice => {
-            ("runtime.resource.not_found", ErrorCategory::NotFound, false)
-        }
+        serialport::ErrorKind::NoDevice => no_device_decision(operation, &description),
         serialport::ErrorKind::InvalidInput => (
             "runtime.transport.unsupported_configuration",
             ErrorCategory::InvalidArgument,
@@ -166,18 +165,60 @@ pub(crate) fn map_serialport_error(operation: &'static str, error: serialport::E
         category,
         operation,
         retryable,
-        format!("serialport error {:?}: {}", error.kind(), error),
+        format!(
+            "serialport error kind={:?} raw_os_error=unavailable: {}",
+            error.kind(),
+            description
+        ),
     )
 }
 
 pub(crate) fn map_io_error(operation: &'static str, error: std::io::Error) -> HalError {
     let (name, category, retryable) = io_error_decision(error.kind());
+    let raw_os_error = error
+        .raw_os_error()
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "none".to_owned());
     hal_error(
         name,
         category,
         operation,
         retryable,
-        format!("io error {:?}: {}", error.kind(), error),
+        format!(
+            "io error kind={:?} raw_os_error={}: {}",
+            error.kind(),
+            raw_os_error,
+            error
+        ),
+    )
+}
+
+fn no_device_decision(
+    operation: &'static str,
+    description: &str,
+) -> (&'static str, ErrorCategory, bool) {
+    let normalized = description.to_ascii_lowercase();
+
+    if normalized.contains("busy") || normalized.contains("lock") {
+        return ("runtime.transport.busy", ErrorCategory::Conflict, true);
+    }
+
+    if normalized.contains("access is denied") || normalized.contains("permission denied") {
+        return (
+            "runtime.transport.permission_denied",
+            ErrorCategory::Conflict,
+            false,
+        );
+    }
+
+    if operation == "serial.open" || operation == "serial.enumerate" {
+        return ("runtime.resource.not_found", ErrorCategory::NotFound, false);
+    }
+
+    (
+        "runtime.transport.disconnected",
+        ErrorCategory::Unavailable,
+        true,
     )
 }
 
@@ -280,7 +321,7 @@ pub(crate) fn session_closed(
     )
 }
 
-fn internal(operation: &'static str, debug_message: impl Into<String>) -> HalError {
+pub(crate) fn internal(operation: &'static str, debug_message: impl Into<String>) -> HalError {
     hal_error(
         "runtime.internal",
         ErrorCategory::Internal,
@@ -299,4 +340,50 @@ fn hal_error(
 ) -> HalError {
     HalError::new(name, category, operation, retryable, debug_message)
         .expect("static serialport adapter error metadata must be valid")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::*;
+
+    #[test]
+    fn serialport_no_device_from_exclusive_lock_maps_to_busy() {
+        let error = serialport::Error::new(
+            serialport::ErrorKind::NoDevice,
+            "Unable to acquire exclusive lock on serial port",
+        );
+
+        let error = map_serialport_error("serial.open", error);
+
+        assert_eq!(error.name().as_str(), "runtime.transport.busy");
+    }
+
+    #[test]
+    fn serialport_no_device_from_access_denied_maps_to_permission_denied() {
+        let error = serialport::Error::new(serialport::ErrorKind::NoDevice, "Access is denied.");
+
+        let error = map_serialport_error("serial.open", error);
+
+        assert_eq!(error.name().as_str(), "runtime.transport.permission_denied");
+    }
+
+    #[test]
+    fn serialport_no_device_without_busy_or_permission_signal_maps_to_not_found() {
+        let error = serialport::Error::new(serialport::ErrorKind::NoDevice, "No such file");
+
+        let error = map_serialport_error("serial.open", error);
+
+        assert_eq!(error.name().as_str(), "runtime.resource.not_found");
+    }
+
+    #[test]
+    fn io_error_diagnostics_preserve_raw_os_error_code() {
+        let io_error = io::Error::from_raw_os_error(13);
+
+        let error = map_io_error("serial.open", io_error);
+
+        assert!(error.debug_message().contains("raw_os_error=13"));
+    }
 }

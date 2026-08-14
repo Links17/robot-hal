@@ -53,3 +53,50 @@ Results:
 
 - Current host only has the `aarch64-apple-darwin` Rust target installed, so no cross-target compile command was run.
 - Default test commands do not open hardware; the physical loopback test remains ignored unless explicitly selected.
+
+## Fix Round 1
+
+### Files changed
+
+- `adapters/serialport/src/identity.rs`
+- `adapters/serialport/src/lib.rs`
+- `adapters/serialport/src/session.rs`
+- `adapters/serialport/tests/metadata.rs`
+- `adapters/serialport/tests/hardware_loopback.rs`
+- `.superpowers/sdd/2026-08-14-v0.1-core-serial/task-5-report.md`
+
+### RED evidence
+
+```bash
+cargo test -p seeed-hal-adapter-serialport --test metadata
+```
+
+Output summary: failed as expected. New tests showed USB ports without serial numbers were still reported as `Medium` and same-model devices shared `serial:usb:10c4:ea60:meta:...` identities.
+
+```bash
+cargo test -p seeed-hal-adapter-serialport --lib
+```
+
+Output summary: failed as expected because `run_blocking_drain` did not exist yet; this covered the new drain-isolation seam before implementation.
+
+### GREEN evidence
+
+```bash
+cargo test -p seeed-hal-adapter-serialport --test metadata
+cargo test -p seeed-hal-adapter-serialport --lib
+cargo test -p seeed-hal-adapter-serialport
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+```
+
+Output summary: metadata tests passed `5/5`; adapter unit tests passed `7/7`; package tests passed with the physical loopback test ignored; fmt passed; clippy passed with `-D warnings`; workspace tests passed with adapter loopback ignored.
+
+### Fixes
+
+- Serial-less USB metadata now falls back to percent-encoded weak endpoint identity; VID/PID/manufacturer/product no longer claim instance identity.
+- `NoDevice` errors with upstream lock/busy descriptions map to `runtime.transport.busy`; access-denied descriptions map to `runtime.transport.permission_denied`; generic open/enumerate `NoDevice` remains `runtime.resource.not_found`.
+- `map_io_error` diagnostics now include `raw_os_error=<code|none>`.
+- Serial `flush()` and `close()` avoid Tokio `poll_flush`/`shutdown`; they move the stream through an explicitly owned `spawn_blocking` drain worker so Unix `tcdrain()` cannot block a Tokio executor worker.
+- `read(0)` now returns `runtime.session.closed` after close.
+- Hardware loopback read retries timeout results until the overall deadline.

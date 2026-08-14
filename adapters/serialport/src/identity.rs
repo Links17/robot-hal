@@ -54,29 +54,6 @@ pub fn identity_from_usb_metadata(
         );
     }
 
-    let manufacturer = non_empty(metadata.manufacturer.as_deref());
-    let product = non_empty(metadata.product.as_deref());
-
-    if manufacturer.is_some() || product.is_some() {
-        return identity(
-            format!(
-                "serial:usb:{:04x}:{:04x}:meta:{}:{}",
-                metadata.vid,
-                metadata.pid,
-                encode_segment(manufacturer.unwrap_or("unknown")),
-                encode_segment(product.unwrap_or("unknown"))
-            ),
-            IdentityQuality::Medium,
-        );
-    }
-
-    if metadata.vid != 0 || metadata.pid != 0 {
-        return identity(
-            format!("serial:usb:{:04x}:{:04x}", metadata.vid, metadata.pid),
-            IdentityQuality::Medium,
-        );
-    }
-
     identity_from_endpoint(endpoint)
 }
 

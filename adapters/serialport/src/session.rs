@@ -7,7 +7,9 @@ use seeed_hal_serial::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_serial::SerialPortBuilderExt;
 
-use crate::{invalid_argument, map_io_error, map_serialport_error, session_closed, timeout};
+use crate::{
+    internal, invalid_argument, map_io_error, map_serialport_error, session_closed, timeout,
+};
 
 pub(crate) struct NativeSerialSession {
     descriptor: ResourceDescriptor,
@@ -55,6 +57,13 @@ impl SerialSession for NativeSerialSession {
     }
 
     async fn read(&mut self, max_bytes: usize) -> HalResult<Bytes> {
+        if self.stream.is_none() {
+            return Err(session_closed(
+                "serial.read",
+                "serial session is already closed",
+            ));
+        }
+
         if max_bytes == 0 {
             return Err(invalid_argument(
                 "serial.read",
@@ -100,10 +109,18 @@ impl SerialSession for NativeSerialSession {
     }
 
     async fn flush(&mut self) -> HalResult<()> {
-        self.stream_mut("serial.flush")?
-            .flush()
-            .await
-            .map_err(|error| map_io_error("serial.flush", error))
+        let stream = self
+            .stream
+            .take()
+            .ok_or_else(|| session_closed("serial.flush", "serial session is already closed"))?;
+
+        match blocking_flush_stream("serial.flush", stream).await {
+            Ok((stream, result)) => {
+                self.stream = Some(stream);
+                result
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn set_control_lines(&mut self, lines: ControlLines) -> HalResult<()> {
@@ -115,16 +132,53 @@ impl SerialSession for NativeSerialSession {
     }
 
     async fn close(&mut self) -> HalResult<()> {
-        let Some(mut stream) = self.stream.take() else {
+        if self.stream.is_none() {
             return Ok(());
         };
 
-        match stream.shutdown().await {
-            Ok(()) => Ok(()),
-            Err(error) if is_disconnect_like(error.kind()) => Ok(()),
-            Err(error) => Err(map_io_error("serial.close", error)),
+        let stream = self
+            .stream
+            .take()
+            .expect("stream existence was checked before close drain");
+        let drain_result = blocking_flush_stream("serial.close", stream).await;
+
+        match drain_result {
+            Ok((_stream, Ok(()))) => Ok(()),
+            Ok((_stream, Err(error)))
+                if error.name().as_str() == "runtime.transport.disconnected" =>
+            {
+                Ok(())
+            }
+            Ok((_stream, Err(error))) => Err(error),
+            Err(error) if error.name().as_str() == "runtime.transport.disconnected" => Ok(()),
+            Err(error) => Err(error),
         }
     }
+}
+
+async fn blocking_flush_stream(
+    operation: &'static str,
+    mut stream: tokio_serial::SerialStream,
+) -> HalResult<(tokio_serial::SerialStream, HalResult<()>)> {
+    run_blocking_drain(move || {
+        let result =
+            std::io::Write::flush(&mut stream).map_err(|error| map_io_error(operation, error));
+        Ok((stream, result))
+    })
+    .await
+}
+
+async fn run_blocking_drain<T, F>(drain: F) -> HalResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> HalResult<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(drain).await.map_err(|error| {
+        internal(
+            "serial.drain",
+            format!("serial drain blocking worker failed: {error}"),
+        )
+    })?
 }
 
 fn validate_config(config: &SerialConfig) -> HalResult<()> {
@@ -188,13 +242,82 @@ fn disconnected(operation: &'static str, debug_message: impl Into<String>) -> Ha
     .expect("static serialport adapter error metadata must be valid")
 }
 
-fn is_disconnect_like(kind: std::io::ErrorKind) -> bool {
-    matches!(
-        kind,
-        std::io::ErrorKind::NotConnected
-            | std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::BrokenPipe
-            | std::io::ErrorKind::UnexpectedEof
-    )
+#[cfg(test)]
+mod tests {
+    use std::thread;
+
+    use seeed_hal_core::{
+        Endpoint, IdentityQuality, ResourceDescriptor, ResourceId, ResourceProperties,
+        TransportKind,
+    };
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn blocking_drain_runs_outside_tokio_worker() {
+        let caller_thread = thread::current().id();
+
+        let drain_thread = run_blocking_drain(|| Ok(thread::current().id()))
+            .await
+            .unwrap();
+
+        assert_ne!(drain_thread, caller_thread);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn closed_state_takes_precedence_over_invalid_read_size() {
+        let (_master, slave) = tokio_serial::SerialStream::pair().unwrap();
+        let mut session = NativeSerialSession {
+            descriptor: descriptor(),
+            config: SerialConfig::default(),
+            stream: Some(slave),
+        };
+
+        session.close().await.unwrap();
+        let error = session.read(0).await.unwrap_err();
+
+        assert_eq!(error.name().as_str(), "runtime.session.closed");
+    }
+
+    #[test]
+    fn maps_serial_config_to_tokio_serial_types() {
+        assert_eq!(map_data_bits(DataBits::Five), tokio_serial::DataBits::Five);
+        assert_eq!(map_data_bits(DataBits::Six), tokio_serial::DataBits::Six);
+        assert_eq!(
+            map_data_bits(DataBits::Seven),
+            tokio_serial::DataBits::Seven
+        );
+        assert_eq!(
+            map_data_bits(DataBits::Eight),
+            tokio_serial::DataBits::Eight
+        );
+        assert_eq!(map_parity(Parity::None), tokio_serial::Parity::None);
+        assert_eq!(map_parity(Parity::Odd), tokio_serial::Parity::Odd);
+        assert_eq!(map_parity(Parity::Even), tokio_serial::Parity::Even);
+        assert_eq!(map_stop_bits(StopBits::One), tokio_serial::StopBits::One);
+        assert_eq!(map_stop_bits(StopBits::Two), tokio_serial::StopBits::Two);
+        assert_eq!(
+            map_flow_control(FlowControl::None),
+            tokio_serial::FlowControl::None
+        );
+        assert_eq!(
+            map_flow_control(FlowControl::Software),
+            tokio_serial::FlowControl::Software
+        );
+        assert_eq!(
+            map_flow_control(FlowControl::Hardware),
+            tokio_serial::FlowControl::Hardware
+        );
+    }
+
+    fn descriptor() -> ResourceDescriptor {
+        ResourceDescriptor::new(
+            ResourceId::parse("serial:test:loopback").unwrap(),
+            Endpoint::new("test://loopback").unwrap(),
+            IdentityQuality::Weak,
+            TransportKind::Serial,
+            ResourceProperties::default(),
+        )
+    }
 }
