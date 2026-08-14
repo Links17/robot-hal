@@ -1,5 +1,7 @@
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
@@ -10,7 +12,7 @@ use seeed_hal_protocol::{
     MAX_FRAME_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR, SERIAL_CAPABILITY, invalid_message,
     parse_session_lease,
 };
-use seeed_hal_runtime::HalRuntime;
+use seeed_hal_runtime::{HalRuntime, RuntimeEvent, RuntimeEventKind};
 use seeed_hal_serial::ControlLines;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -24,6 +26,7 @@ use crate::{Broker, StartupToken};
 const DEFAULT_REQUEST_QUEUE_CAPACITY: usize = 32;
 const DEFAULT_RESPONSE_QUEUE_CAPACITY: usize = 64;
 const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 32;
+const CONNECTION_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Bounded broker admission settings.
 ///
@@ -83,8 +86,19 @@ impl ConnectionOutcome {
 
 #[derive(Clone, Copy)]
 struct NegotiatedLimits {
+    max_frame_bytes: usize,
     max_read_bytes: usize,
     max_write_bytes: usize,
+}
+
+struct InboundRequest {
+    envelope: v1::Envelope,
+    encoded_len: usize,
+}
+
+struct OutboundEnvelope {
+    envelope: v1::Envelope,
+    max_frame_bytes: usize,
 }
 
 impl Broker {
@@ -97,6 +111,7 @@ impl Broker {
         let framed = Framed::new(io, frame_codec());
         let (sink, stream) = framed.split();
         let active = Arc::new(Mutex::new(HashSet::new()));
+        let negotiated_frame_bytes = Arc::new(AtomicUsize::new(MAX_FRAME_BYTES));
         let (request_tx, request_rx) = mpsc::channel(self.config.request_queue_capacity);
         let (response_tx, response_rx) = mpsc::channel(self.config.response_queue_capacity);
         let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -106,6 +121,7 @@ impl Broker {
             request_tx,
             response_tx.clone(),
             active.clone(),
+            negotiated_frame_bytes.clone(),
             cancel_rx.clone(),
         ));
         let writer_cancel = cancel_tx.clone();
@@ -125,15 +141,16 @@ impl Broker {
             request_rx,
             response_tx.clone(),
             active,
+            negotiated_frame_bytes,
             cancel_rx,
         )
         .await;
 
+        let cleanup_error = self.runtime.revoke_owner(&owner).await.err();
         let _ = cancel_tx.send(true);
         drop(response_tx);
-        let reader_error = join_error(reader.await, "runtime.protocol.read");
-        let writer_error = join_error(writer.await, "runtime.protocol.write");
-        let cleanup_error = self.runtime.revoke_owner(&owner).await.err();
+        let reader_error = finish_connection_task(reader, "runtime.protocol.read").await;
+        let writer_error = finish_connection_task(writer, "runtime.protocol.write").await;
 
         ConnectionOutcome {
             cleanup_error,
@@ -150,9 +167,10 @@ fn frame_codec() -> LengthDelimitedCodec {
 
 async fn read_requests<R>(
     mut stream: futures_util::stream::SplitStream<Framed<R, LengthDelimitedCodec>>,
-    request_tx: mpsc::Sender<v1::Envelope>,
-    response_tx: mpsc::Sender<v1::Envelope>,
+    request_tx: mpsc::Sender<InboundRequest>,
+    response_tx: mpsc::Sender<OutboundEnvelope>,
     active: Arc<Mutex<HashSet<u64>>>,
+    negotiated_frame_bytes: Arc<AtomicUsize>,
     mut cancel: watch::Receiver<bool>,
 ) -> HalResult<()>
 where
@@ -180,6 +198,7 @@ where
                 error.to_string(),
             )
         })?;
+        let encoded_len = frame.len();
         let request = v1::Envelope::decode(frame).map_err(|error| {
             protocol_error(
                 "runtime.protocol.invalid_message",
@@ -194,6 +213,7 @@ where
             send_response(
                 &response_tx,
                 error_envelope(request_id, invalid_message("request_id must be non-zero")),
+                negotiated_frame_bytes.load(Ordering::Acquire),
             )?;
             continue;
         }
@@ -217,20 +237,25 @@ where
                         "request_id is already in flight",
                     ),
                 ),
+                negotiated_frame_bytes.load(Ordering::Acquire),
             )?;
             return Ok(());
         }
 
-        match request_tx.try_send(request) {
+        match request_tx.try_send(InboundRequest {
+            envelope: request,
+            encoded_len,
+        }) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(request)) => {
                 remove_active(&active, request_id);
                 send_response(
                     &response_tx,
                     error_envelope(
-                        request.request_id,
+                        request.envelope.request_id,
                         queue_full("broker request queue is full"),
                     ),
+                    negotiated_frame_bytes.load(Ordering::Acquire),
                 )?;
             }
             Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
@@ -240,14 +265,20 @@ where
 
 async fn write_responses<S>(
     mut sink: futures_util::stream::SplitSink<Framed<S, LengthDelimitedCodec>, Bytes>,
-    mut responses: mpsc::Receiver<v1::Envelope>,
+    mut responses: mpsc::Receiver<OutboundEnvelope>,
 ) -> HalResult<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     while let Some(response) = responses.recv().await {
-        let mut encoded = BytesMut::with_capacity(response.encoded_len());
-        response.encode(&mut encoded).map_err(|error| {
+        let encoded_len = response.envelope.encoded_len();
+        if encoded_len > MAX_FRAME_BYTES || encoded_len > response.max_frame_bytes {
+            return Err(frame_too_large(
+                "outbound envelope exceeds the negotiated maximum",
+            ));
+        }
+        let mut encoded = BytesMut::with_capacity(encoded_len);
+        response.envelope.encode(&mut encoded).map_err(|error| {
             protocol_error(
                 "runtime.protocol.encode_failed",
                 "runtime.protocol.write",
@@ -275,20 +306,20 @@ async fn dispatch_requests(
     startup_token: StartupToken,
     config: BrokerConfig,
     owner: OwnerId,
-    mut requests: mpsc::Receiver<v1::Envelope>,
-    responses: mpsc::Sender<v1::Envelope>,
+    mut requests: mpsc::Receiver<InboundRequest>,
+    responses: mpsc::Sender<OutboundEnvelope>,
     active: Arc<Mutex<HashSet<u64>>>,
+    negotiated_frame_bytes: Arc<AtomicUsize>,
     mut cancel: watch::Receiver<bool>,
 ) -> Option<HalError> {
     let mut handshaken = false;
-    let mut limits = None;
+    let mut limits: Option<NegotiatedLimits> = None;
     let mut events = runtime.subscribe();
     let mut tasks = JoinSet::new();
     let mut failure = None;
 
     loop {
         tokio::select! {
-            biased;
             changed = cancel.changed() => {
                 if changed.is_err() || *cancel.borrow() {
                     break;
@@ -299,7 +330,11 @@ async fn dispatch_requests(
                     match result {
                         Ok((request_id, response)) => {
                             remove_active(&active, request_id);
-                            if let Err(error) = send_response(&responses, response) {
+                            if let Err(error) = send_response(
+                                &responses,
+                                response,
+                                negotiated_frame_limit(limits),
+                            ) {
                                 failure = Some(error);
                                 break;
                             }
@@ -319,19 +354,37 @@ async fn dispatch_requests(
             }
             event = events.recv(), if handshaken => {
                 let response = match event {
-                    Ok(event) => v1::Envelope {
+                    Ok(event) if event_is_visible_to_owner(&event, &owner) => v1::Envelope {
                         request_id: 0,
                         payload: Some(envelope::Payload::RuntimeEvent((&event).into())),
                     },
+                    Ok(_) => continue,
                     Err(error) => error_envelope(0, error),
                 };
-                if let Err(error) = send_response(&responses, response) {
+                if let Err(error) = send_response(
+                    &responses,
+                    response,
+                    negotiated_frame_limit(limits),
+                ) {
                     failure = Some(error);
                     break;
                 }
             }
             request = requests.recv() => {
                 let Some(request) = request else { break; };
+                if handshaken
+                    && request.encoded_len
+                        > limits
+                            .expect("successful handshake sets negotiated limits")
+                            .max_frame_bytes
+                {
+                    remove_active(&active, request.envelope.request_id);
+                    failure = Some(frame_too_large(
+                        "inbound frame exceeds the negotiated maximum",
+                    ));
+                    break;
+                }
+                let request = request.envelope;
                 let request_id = request.request_id;
                 let payload = request.payload;
 
@@ -342,6 +395,8 @@ async fn dispatch_requests(
                                 Ok((response, negotiated)) => {
                                     handshaken = true;
                                     limits = Some(negotiated);
+                                    negotiated_frame_bytes
+                                        .store(negotiated.max_frame_bytes, Ordering::Release);
                                     remove_active(&active, request_id);
                                     if let Err(error) = send_response(
                                         &responses,
@@ -349,6 +404,7 @@ async fn dispatch_requests(
                                             request_id,
                                             payload: Some(envelope::Payload::HandshakeResponse(response)),
                                         },
+                                        negotiated.max_frame_bytes,
                                     ) {
                                         failure = Some(error);
                                         break;
@@ -356,7 +412,11 @@ async fn dispatch_requests(
                                 }
                                 Err(error) => {
                                     remove_active(&active, request_id);
-                                    if let Err(error) = send_response(&responses, error_envelope(request_id, error)) {
+                                    if let Err(error) = send_response(
+                                        &responses,
+                                        error_envelope(request_id, error),
+                                        MAX_FRAME_BYTES,
+                                    ) {
                                         failure = Some(error);
                                     }
                                     break;
@@ -372,7 +432,11 @@ async fn dispatch_requests(
                                 false,
                                 "the connection must complete a handshake before operations",
                             );
-                            if let Err(error) = send_response(&responses, error_envelope(request_id, error)) {
+                            if let Err(error) = send_response(
+                                &responses,
+                                error_envelope(request_id, error),
+                                MAX_FRAME_BYTES,
+                            ) {
                                 failure = Some(error);
                                 break;
                             }
@@ -384,7 +448,11 @@ async fn dispatch_requests(
                 if matches!(payload, Some(envelope::Payload::HandshakeRequest(_))) {
                     remove_active(&active, request_id);
                     let error = invalid_message("handshake may only be sent once per connection");
-                    if let Err(error) = send_response(&responses, error_envelope(request_id, error)) {
+                    if let Err(error) = send_response(
+                        &responses,
+                        error_envelope(request_id, error),
+                        negotiated_frame_limit(limits),
+                    ) {
                         failure = Some(error);
                         break;
                     }
@@ -396,6 +464,7 @@ async fn dispatch_requests(
                     if let Err(error) = send_response(
                         &responses,
                         error_envelope(request_id, queue_full("broker task queue is full")),
+                        negotiated_frame_limit(limits),
                     ) {
                         failure = Some(error);
                         break;
@@ -417,6 +486,14 @@ async fn dispatch_requests(
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     failure
+}
+
+fn event_is_visible_to_owner(event: &RuntimeEvent, owner: &OwnerId) -> bool {
+    match event.kind() {
+        RuntimeEventKind::SessionOpened | RuntimeEventKind::SessionClosed => {
+            event.owner_id() == owner
+        }
+    }
 }
 
 fn validate_handshake(
@@ -465,29 +542,78 @@ fn validate_handshake(
     if frame_limit == 0
         || frame_limit > MAX_FRAME_BYTES
         || read_limit == 0
-        || read_limit > frame_limit
         || write_limit == 0
-        || write_limit > frame_limit
+        || read_response_encoded_len(read_limit) > frame_limit
+        || write_request_encoded_len(write_limit) > frame_limit
     {
         return Err(invalid_message(
             "negotiated frame/read/write byte limits are invalid",
         ));
     }
 
+    let response = v1::HandshakeResponse {
+        protocol_major: PROTOCOL_MAJOR,
+        protocol_minor: PROTOCOL_MINOR,
+        capabilities: vec![SERIAL_CAPABILITY.to_owned()],
+        max_frame_bytes: request.max_frame_bytes,
+        max_read_bytes: request.max_read_bytes,
+        max_write_bytes: request.max_write_bytes,
+    };
+    let response_envelope = v1::Envelope {
+        request_id: u64::MAX,
+        payload: Some(envelope::Payload::HandshakeResponse(response.clone())),
+    };
+    if response_envelope.encoded_len() > frame_limit {
+        return Err(invalid_message(
+            "negotiated frame limit cannot contain the handshake response",
+        ));
+    }
+
     Ok((
-        v1::HandshakeResponse {
-            protocol_major: PROTOCOL_MAJOR,
-            protocol_minor: PROTOCOL_MINOR,
-            capabilities: vec![SERIAL_CAPABILITY.to_owned()],
-            max_frame_bytes: request.max_frame_bytes,
-            max_read_bytes: request.max_read_bytes,
-            max_write_bytes: request.max_write_bytes,
-        },
+        response,
         NegotiatedLimits {
+            max_frame_bytes: frame_limit,
             max_read_bytes: read_limit,
             max_write_bytes: write_limit,
         },
     ))
+}
+
+fn read_response_encoded_len(data_len: usize) -> usize {
+    let inner_len = length_delimited_field_len(1, data_len);
+    envelope_encoded_len(25, inner_len)
+}
+
+fn write_request_encoded_len(data_len: usize) -> usize {
+    const RUNTIME_UUID_LEN: usize = 36;
+    let session_id = length_delimited_field_len(1, RUNTIME_UUID_LEN);
+    let lease_inner = length_delimited_field_len(1, RUNTIME_UUID_LEN) + 1 + 10 + 1 + 1;
+    let lease = length_delimited_field_len(2, lease_inner);
+    let data = length_delimited_field_len(3, data_len);
+    envelope_encoded_len(26, session_id + lease + data)
+}
+
+fn envelope_encoded_len(payload_field_number: u32, payload_len: usize) -> usize {
+    // request_id field/tag plus the largest possible non-zero uint64 value.
+    1 + 10
+        + prost_varint_len((u64::from(payload_field_number) << 3) | 2)
+        + prost_varint_len(payload_len as u64)
+        + payload_len
+}
+
+fn length_delimited_field_len(field_number: u32, value_len: usize) -> usize {
+    prost_varint_len((u64::from(field_number) << 3) | 2)
+        + prost_varint_len(value_len as u64)
+        + value_len
+}
+
+fn prost_varint_len(mut value: u64) -> usize {
+    let mut len = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        len += 1;
+    }
+    len
 }
 
 async fn dispatch_operation(
@@ -603,17 +729,32 @@ async fn dispatch_operation_inner(
     }
 }
 
-fn send_response(responses: &mpsc::Sender<v1::Envelope>, response: v1::Envelope) -> HalResult<()> {
-    responses.try_send(response).map_err(|error| match error {
-        mpsc::error::TrySendError::Full(_) => queue_full("broker response queue is full"),
-        mpsc::error::TrySendError::Closed(_) => protocol_error(
-            "runtime.protocol.connection_lost",
-            "runtime.protocol.write",
-            ErrorCategory::Unavailable,
-            true,
-            "broker response channel is closed",
-        ),
-    })
+fn send_response(
+    responses: &mpsc::Sender<OutboundEnvelope>,
+    response: v1::Envelope,
+    max_frame_bytes: usize,
+) -> HalResult<()> {
+    responses
+        .try_send(OutboundEnvelope {
+            envelope: response,
+            max_frame_bytes,
+        })
+        .map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => queue_full("broker response queue is full"),
+            mpsc::error::TrySendError::Closed(_) => protocol_error(
+                "runtime.protocol.connection_lost",
+                "runtime.protocol.write",
+                ErrorCategory::Unavailable,
+                true,
+                "broker response channel is closed",
+            ),
+        })
+}
+
+fn negotiated_frame_limit(limits: Option<NegotiatedLimits>) -> usize {
+    limits
+        .map(|limits| limits.max_frame_bytes)
+        .unwrap_or(MAX_FRAME_BYTES)
 }
 
 fn error_envelope(request_id: u64, error: HalError) -> v1::Envelope {
@@ -640,6 +781,16 @@ fn queue_full(message: &'static str) -> HalError {
     )
 }
 
+fn frame_too_large(message: &'static str) -> HalError {
+    protocol_error(
+        "runtime.protocol.frame_too_large",
+        "runtime.protocol.frame",
+        ErrorCategory::InvalidArgument,
+        false,
+        message,
+    )
+}
+
 fn protocol_error(
     name: &'static str,
     operation: &'static str,
@@ -651,10 +802,24 @@ fn protocol_error(
         .expect("static broker error metadata is valid")
 }
 
-fn join_error(
-    result: Result<HalResult<()>, tokio::task::JoinError>,
+async fn finish_connection_task(
+    mut task: tokio::task::JoinHandle<HalResult<()>>,
     operation: &'static str,
 ) -> Option<HalError> {
+    let result = match tokio::time::timeout(CONNECTION_TASK_SHUTDOWN_TIMEOUT, &mut task).await {
+        Ok(result) => result,
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            return Some(protocol_error(
+                "runtime.protocol.task_shutdown_timeout",
+                operation,
+                ErrorCategory::Internal,
+                false,
+                "connection task did not stop before its shutdown deadline",
+            ));
+        }
+    };
     match result {
         Ok(Ok(())) => None,
         Ok(Err(error)) => Some(error),

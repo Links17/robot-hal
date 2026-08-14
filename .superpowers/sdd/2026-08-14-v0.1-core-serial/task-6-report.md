@@ -96,3 +96,99 @@ The resulting SHA is recorded in the task handoff because a commit cannot contai
 - The Windows Named Pipe implementation was compiled only through its `cfg(windows)` source design
   on this macOS host; no Windows target/runtime acceptance test was available in this worktree.
 - Default tests do not exercise physical hardware by design.
+
+## Fix Round 1
+
+### Status and files
+
+Resolved all critical and important round-1 findings in:
+
+- `crates/seeed-hal-broker/src/connection.rs`
+- `crates/seeed-hal-broker/tests/broker_contract.rs`
+- `docs/architecture/hal-architecture.md`
+
+The protobuf schema and its field numbers were unchanged.
+
+### RED evidence
+
+1. `cargo test -p seeed-hal-broker --test broker_contract
+   stalled_writer_cannot_delay_owner_revoke_or_resource_reuse -- --nocapture`
+   - Exit 101 after 1.02 seconds.
+   - Failed with `stalled output must not block connection teardown: Elapsed(())`, reproducing the
+     writer-before-revoke deadlock.
+2. `cargo test -p seeed-hal-broker --test broker_contract
+   handshake_version_capability_and_byte_limits_fail_closed -- --nocapture`
+   - Exit 101.
+   - A 128-byte frame with a 128-byte read payload was incorrectly accepted, so the test observed a
+     handshake response where it required `runtime.protocol.invalid_message`.
+3. `cargo test -p seeed-hal-broker --test broker_contract
+   negotiated_frame_limit_rejects_oversized_raw_inbound_frame -- --nocapture`
+   - Exit 101.
+   - The oversized post-handshake frame was dispatched instead of causing broker-initiated EOF.
+4. `cargo test -p seeed-hal-broker --test broker_contract
+   negotiated_frame_limit_rejects_oversized_outbound_before_encoding -- --nocapture`
+   - Exit 101.
+   - The broker wrote an enumerate envelope larger than the negotiated limit.
+5. `cargo test -p seeed-hal-broker --test broker_contract
+   runtime_events_are_filtered_to_the_connection_owner -- --nocapture`
+   - Exit 101.
+   - A second authenticated connection received the first connection's session event.
+
+The request-queue, event-lag, and strengthened duplicate-ID tests were coverage additions for
+already-present observable behavior and began green; no artificial production change was made to
+manufacture a red state for those characterization cases.
+
+### GREEN behavior and named tests
+
+- `stalled_writer_cannot_delay_owner_revoke_or_resource_reuse`: response backpressure cannot delay
+  owner revocation or resource reuse, even while the peer remains connected and unread.
+- `negotiated_frame_limit_rejects_oversized_raw_inbound_frame`: raw inbound frame length is retained
+  through admission and enforced before dispatch, including pipelined post-handshake requests.
+- `negotiated_frame_limit_rejects_oversized_outbound_before_encoding`: encoded length is checked
+  against both negotiated and hard limits before `BytesMut` allocation.
+- `handshake_version_capability_and_byte_limits_fail_closed`: negotiated read/write payloads include
+  worst-case protobuf envelope and field overhead, and the handshake response itself must fit.
+- `runtime_events_are_filtered_to_the_connection_owner`: session events are visible only when the
+  event `OwnerId` matches the connection owner.
+- `request_queue_overflow_is_deterministic_and_structured`,
+  `task_queue_overflow_is_deterministic_and_structured`,
+  `stalled_writer_cannot_delay_owner_revoke_or_resource_reuse`, and
+  `runtime_event_queue_lag_is_reported_structurally`: all bounded queue results are explicit.
+- `duplicate_in_flight_request_ids_fail_closed`: verifies structured rejection, broker-initiated
+  EOF, owner cleanup, and immediate resource reuse without the client first disconnecting.
+
+### Design decisions
+
+- `revoke_owner` now runs immediately after dispatch stops and before any socket-task join. Reader
+  cancellation follows cleanup; the writer gets a bounded 100 ms drain and is aborted/recorded as
+  `runtime.protocol.task_shutdown_timeout` if it remains stalled.
+- Each inbound queue item retains the raw frame length. Each outbound queue item carries the
+  negotiated frame maximum. The writer calculates `encoded_len`, rejects anything over the
+  negotiated or 1 MiB hard maximum, and only then allocates the encode buffer.
+- Handshake negotiation accounts for protobuf tags, length varints, envelope/request correlation,
+  the runtime's UUID session/lease identifiers, and the handshake response envelope.
+- Runtime session events are explicitly classified as owner-scoped. The exhaustive
+  `RuntimeEventKind` match makes any future genuinely global event require a deliberate visibility
+  rule. Lag errors contain no session/resource/lease metadata.
+- Dispatch uses Tokio's fair `select!`; the prior event-biased branch was removed so continuously
+  ready events cannot indefinitely starve requests or cancellation.
+
+### Verification evidence
+
+- `cargo fmt --all --check`: exit 0, no output.
+- `cargo test -p seeed-hal-protocol -p seeed-hal-broker`: exit 0; 17 broker tests and 2 protocol
+  tests passed, plus doc tests.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: exit 0, no warnings.
+- `cargo test --workspace --all-features`: exit 0; all default tests and doc tests passed; the
+  existing physical loopback test remained intentionally ignored without
+  `SEEED_HAL_SERIAL_LOOPBACK`.
+- `cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-msvc`: exit 0;
+  the installed Windows target compiled the workspace, including the Named Pipe module.
+
+### Commit and remaining concerns
+
+Fix commit subject: `fix(broker): bound teardown and negotiated frames`. The SHA is recorded in the
+handoff because the commit cannot contain its own final SHA.
+
+Windows target compilation is verified; Windows runtime Named Pipe acceptance was not executable on
+the macOS host. Physical Serial hardware remains outside default tests.

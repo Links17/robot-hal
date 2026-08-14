@@ -61,6 +61,16 @@ closes the connection and is recorded in its cleanup outcome because no further 
 safely admitted; event lag reports `runtime.event.lagged`. These defaults are configurable downward
 or upward for embedding, but all queues remain bounded.
 
+The handshake frame limit applies to the raw inbound protobuf frame and to the encoded outbound
+envelope, including protobuf field and envelope overhead. The writer checks both the negotiated
+limit and the hard 1 MiB limit before allocating its encode buffer. Session lifecycle events are
+owner-scoped: a connection receives only events whose `OwnerId` matches that connection; adding a
+future global event kind requires an explicit visibility decision in the broker.
+
+Connection teardown revokes the owner before waiting for socket reader/writer tasks. The broker
+permits only a bounded response drain and aborts a stalled task after the connection-task shutdown
+deadline, so a peer that stops reading cannot retain hardware ownership.
+
 Each launch creates a 256-bit startup token. The handshake compares it in constant time and rejects
 incompatible protocol versions, unsupported required capabilities, and invalid frame/read/write
 limits before exposing resources. Unix endpoints live in a caller-private `0700` directory and the

@@ -45,12 +45,20 @@ where
     }
 
     async fn send(&mut self, request_id: u64, payload: envelope::Payload) {
+        self.try_send(request_id, payload).await.unwrap();
+    }
+
+    async fn try_send(
+        &mut self,
+        request_id: u64,
+        payload: envelope::Payload,
+    ) -> std::io::Result<()> {
         let encoded = v1::Envelope {
             request_id,
             payload: Some(payload),
         }
         .encode_to_vec();
-        self.framed.send(Bytes::from(encoded)).await.unwrap();
+        self.framed.send(Bytes::from(encoded)).await
     }
 
     async fn recv(&mut self) -> v1::Envelope {
@@ -232,6 +240,99 @@ async fn handshake_version_capability_and_byte_limits_fail_closed() {
         rejected_handshake(oversized_frame).await,
         "runtime.protocol.invalid_message"
     );
+
+    let mut missing_envelope_overhead = valid_handshake(TOKEN.to_vec());
+    missing_envelope_overhead.max_frame_bytes = 128;
+    missing_envelope_overhead.max_read_bytes = 128;
+    missing_envelope_overhead.max_write_bytes = 1;
+    assert_eq!(
+        rejected_handshake(missing_envelope_overhead).await,
+        "runtime.protocol.invalid_message"
+    );
+}
+
+#[tokio::test]
+async fn negotiated_frame_limit_rejects_oversized_raw_inbound_frame() {
+    let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+    let broker = broker();
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    let mut handshake = valid_handshake(TOKEN.to_vec());
+    handshake.max_frame_bytes = 256;
+    handshake.max_read_bytes = 64;
+    handshake.max_write_bytes = 1;
+    let response = client
+        .request(envelope::Payload::HandshakeRequest(handshake))
+        .await;
+    assert!(matches!(
+        response.payload,
+        Some(envelope::Payload::HandshakeResponse(_))
+    ));
+
+    client
+        .send(
+            40,
+            envelope::Payload::SerialFlushRequest(v1::SerialFlushRequest {
+                session_id: "s".repeat(255),
+                lease: Some(v1::LeaseToken {
+                    lease_id: "l".repeat(255),
+                    generation: 1,
+                    mode: v1::LeaseMode::Control as i32,
+                }),
+            }),
+        )
+        .await;
+
+    let next = tokio::time::timeout(std::time::Duration::from_secs(1), client.framed.next())
+        .await
+        .expect("negotiated frame violation must close the connection");
+    assert!(
+        next.is_none(),
+        "broker must initiate EOF without dispatching"
+    );
+    let outcome = server.await.unwrap();
+    assert_eq!(
+        outcome.connection_error().unwrap().name().as_str(),
+        "runtime.protocol.frame_too_large"
+    );
+}
+
+#[tokio::test]
+async fn negotiated_frame_limit_rejects_oversized_outbound_before_encoding() {
+    let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+    let broker = broker();
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    let mut handshake = valid_handshake(TOKEN.to_vec());
+    handshake.max_frame_bytes = 110;
+    handshake.max_read_bytes = 1;
+    handshake.max_write_bytes = 1;
+    let response = client
+        .request(envelope::Payload::HandshakeRequest(handshake))
+        .await;
+    assert!(matches!(
+        response.payload,
+        Some(envelope::Payload::HandshakeResponse(_))
+    ));
+
+    client
+        .send(
+            41,
+            envelope::Payload::EnumerateSerialRequest(v1::EnumerateSerialRequest {}),
+        )
+        .await;
+    let next = tokio::time::timeout(std::time::Duration::from_secs(1), client.framed.next())
+        .await
+        .expect("oversized outbound envelope must close the connection");
+    assert!(
+        next.is_none(),
+        "broker must not write an oversized envelope: observed {next:?}"
+    );
+    let outcome = server.await.unwrap();
+    assert_eq!(
+        outcome.connection_error().unwrap().name().as_str(),
+        "runtime.protocol.frame_too_large"
+    );
 }
 
 #[tokio::test]
@@ -374,6 +475,96 @@ async fn runtime_events_are_forwarded_as_unsolicited_envelopes() {
 }
 
 #[tokio::test]
+async fn runtime_events_are_filtered_to_the_connection_owner() {
+    let runtime = runtime();
+    let broker = Broker::with_startup_token(runtime, StartupToken::from_bytes(TOKEN));
+    let (server_one_io, client_one_io) = tokio::io::duplex(64 * 1024);
+    let (server_two_io, client_two_io) = tokio::io::duplex(64 * 1024);
+    let server_one_broker = broker.clone();
+    let server_one =
+        tokio::spawn(async move { server_one_broker.serve_connection(server_one_io).await });
+    let server_two = tokio::spawn(async move { broker.serve_connection(server_two_io).await });
+    let mut client_one = Client::new(client_one_io);
+    let mut client_two = Client::new(client_two_io);
+    client_one.handshake().await;
+    client_two.handshake().await;
+
+    let _session = open_virtual_serial(&mut client_one, 1_000).await;
+    let leaked = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        client_two.framed.next(),
+    )
+    .await;
+    assert!(
+        leaked.is_err(),
+        "a connection must not observe another owner's runtime event"
+    );
+
+    drop(client_one);
+    drop(client_two);
+    assert!(server_one.await.unwrap().cleanup_error().is_none());
+    assert!(server_two.await.unwrap().cleanup_error().is_none());
+}
+
+#[tokio::test]
+async fn runtime_event_queue_lag_is_reported_structurally() {
+    let runtime = runtime();
+    let broker = Broker::with_startup_token(runtime.clone(), StartupToken::from_bytes(TOKEN));
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+
+    let before_handshake = client
+        .request(envelope::Payload::EnumerateSerialRequest(
+            v1::EnumerateSerialRequest {},
+        ))
+        .await;
+    assert_eq!(
+        error_name(&before_handshake),
+        "runtime.protocol.handshake_required"
+    );
+
+    let descriptor = runtime.enumerate_serial().await.unwrap().remove(0);
+    for index in 0..33 {
+        runtime
+            .open_serial(
+                OwnerId::parse(format!("broker-contract:event-lag-{index}")).unwrap(),
+                descriptor.selector(),
+                SerialConfig::default(),
+            )
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+    }
+
+    client
+        .send(
+            500,
+            envelope::Payload::HandshakeRequest(valid_handshake(TOKEN.to_vec())),
+        )
+        .await;
+    let mut saw_handshake = false;
+    let mut saw_lag = false;
+    while !saw_handshake || !saw_lag {
+        let response = client.recv().await;
+        match response.payload.as_ref() {
+            Some(envelope::Payload::HandshakeResponse(_)) => saw_handshake = true,
+            Some(envelope::Payload::Error(error))
+                if error.name == "runtime.event.lagged" && response.request_id == 0 =>
+            {
+                saw_lag = true;
+            }
+            _ => panic!("unexpected response while observing event lag"),
+        }
+    }
+
+    drop(client);
+    assert!(server.await.unwrap().cleanup_error().is_none());
+}
+
+#[tokio::test]
 async fn disconnect_revokes_owned_sessions() {
     let runtime = runtime();
     let mut events = runtime.subscribe();
@@ -417,6 +608,62 @@ async fn disconnect_revokes_owned_sessions() {
 }
 
 #[tokio::test]
+async fn stalled_writer_cannot_delay_owner_revoke_or_resource_reuse() {
+    let runtime = runtime();
+    let broker = Broker::with_config(
+        runtime.clone(),
+        StartupToken::from_bytes(TOKEN),
+        BrokerConfig::default()
+            .with_request_queue_capacity(2_048)
+            .with_response_queue_capacity(512)
+            .with_max_in_flight_requests(2_048),
+    );
+    let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    client.handshake().await;
+    let _session = open_virtual_serial(&mut client, 1_000).await;
+
+    for request_id in 1_000..4_000 {
+        if client
+            .try_send(
+                request_id,
+                envelope::Payload::EnumerateSerialRequest(v1::EnumerateSerialRequest {}),
+            )
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), server)
+        .await
+        .expect("stalled output must not block connection teardown")
+        .unwrap();
+    assert!(outcome.cleanup_error().is_none());
+    assert_eq!(
+        outcome.connection_error().unwrap().name().as_str(),
+        "runtime.queue.full"
+    );
+
+    let descriptor = runtime.enumerate_serial().await.unwrap().remove(0);
+    runtime
+        .open_serial(
+            OwnerId::parse("broker-contract:stalled-writer-reuse").unwrap(),
+            descriptor.selector(),
+            SerialConfig::default(),
+        )
+        .await
+        .unwrap()
+        .close()
+        .await
+        .unwrap();
+
+    drop(client);
+}
+
+#[tokio::test]
 async fn task_queue_overflow_is_deterministic_and_structured() {
     let runtime = runtime();
     let broker = Broker::with_config(
@@ -454,9 +701,58 @@ async fn task_queue_overflow_is_deterministic_and_structured() {
 }
 
 #[tokio::test]
+async fn request_queue_overflow_is_deterministic_and_structured() {
+    let runtime = runtime();
+    let broker = Broker::with_config(
+        runtime,
+        StartupToken::from_bytes(TOKEN),
+        BrokerConfig::default().with_request_queue_capacity(1),
+    );
+    let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+    let mut client = Client::new(client_io);
+    client
+        .send(
+            1,
+            envelope::Payload::HandshakeRequest(valid_handshake(TOKEN.to_vec())),
+        )
+        .await;
+    client
+        .send(
+            2,
+            envelope::Payload::EnumerateSerialRequest(v1::EnumerateSerialRequest {}),
+        )
+        .await;
+    client
+        .send(
+            3,
+            envelope::Payload::EnumerateSerialRequest(v1::EnumerateSerialRequest {}),
+        )
+        .await;
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+
+    let mut saw_queue_full = false;
+    for _ in 0..3 {
+        let response = client.recv().await;
+        if matches!(response.payload, Some(envelope::Payload::Error(_)))
+            && error_name(&response) == "runtime.queue.full"
+        {
+            saw_queue_full = true;
+            break;
+        }
+    }
+    assert!(
+        saw_queue_full,
+        "the bounded request queue must reject overflow"
+    );
+    drop(client);
+    assert!(server.await.unwrap().cleanup_error().is_none());
+}
+
+#[tokio::test]
 async fn duplicate_in_flight_request_ids_fail_closed() {
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
-    let broker = broker();
+    let runtime = runtime();
+    let broker = Broker::with_startup_token(runtime.clone(), StartupToken::from_bytes(TOKEN));
     let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
     let mut client = Client::new(client_io);
     client.handshake().await;
@@ -485,8 +781,27 @@ async fn duplicate_in_flight_request_ids_fail_closed() {
             break;
         }
     }
-    drop(client);
+    let eof = tokio::time::timeout(std::time::Duration::from_secs(1), client.framed.next())
+        .await
+        .expect("duplicate request IDs must terminate the connection");
+    assert!(
+        eof.is_none(),
+        "broker must initiate EOF after duplicate IDs"
+    );
     assert!(server.await.unwrap().cleanup_error().is_none());
+
+    let descriptor = runtime.enumerate_serial().await.unwrap().remove(0);
+    runtime
+        .open_serial(
+            OwnerId::parse("broker-contract:duplicate-id-reuse").unwrap(),
+            descriptor.selector(),
+            SerialConfig::default(),
+        )
+        .await
+        .unwrap()
+        .close()
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
