@@ -27,7 +27,9 @@ Architecture and implementation planning only. No production implementation exis
 
 ## Verification
 
-The workspace uses Rust 1.85 and Rust 2024. Run the canonical checks from the repository root:
+The workspace uses Rust 1.85 and Rust 2024. The initial workspace is intentionally empty, so
+`cargo metadata --no-deps --format-version 1` is the baseline check and must report an empty
+`packages` array. The full Rust gate becomes active automatically once a workspace crate exists:
 
 ```bash
 cargo fmt --all --check
