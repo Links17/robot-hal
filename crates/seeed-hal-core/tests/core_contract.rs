@@ -184,8 +184,20 @@ fn error_context_rejects_one_byte_over_limits() {
     );
 
     let over_total = (0..8)
-        .map(|index| (format!("k{index}"), "x".repeat(1023)))
+        .map(|index| {
+            (
+                format!("k{index}"),
+                "x".repeat(if index == 0 { 1023 } else { 1022 }),
+            )
+        })
         .collect::<Vec<_>>();
+    assert_eq!(
+        over_total
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum::<usize>(),
+        8193
+    );
     assert_eq!(
         ErrorContext::new(over_total).unwrap_err().name().as_str(),
         "error.context.too_large"
@@ -202,10 +214,41 @@ fn error_codes_reuse_identifier_validation() {
         "queue is full",
     )
     .unwrap();
+    let exact_code = "x".repeat(255);
+    assert!(error.clone().with_platform_code(exact_code.clone()).is_ok());
+    assert!(error.clone().with_vendor_code(exact_code).is_ok());
     for code in [String::new(), "é".to_owned(), "x".repeat(256)] {
         assert!(error.clone().with_platform_code(code.clone()).is_err());
         assert!(error.clone().with_vendor_code(code).is_err());
     }
+}
+
+#[test]
+fn hal_error_debug_is_redacted() {
+    let context = ErrorContext::new([("secret_key", "secretValue")]).unwrap();
+    let error = seeed_hal_core::HalError::new(
+        "runtime.queue.full",
+        seeed_hal_core::ErrorCategory::Unavailable,
+        "serial.write",
+        true,
+        "private diagnostic",
+    )
+    .unwrap()
+    .with_resource_id(ResourceId::parse("serial:private:resource").unwrap())
+    .with_platform_code("11")
+    .unwrap()
+    .with_vendor_code("VENDOR_PRIVATE")
+    .unwrap()
+    .with_context(context);
+
+    let debug = format!("{error:?}");
+    assert!(!debug.contains("serial:private:resource"));
+    assert!(!debug.contains("11"));
+    assert!(!debug.contains("VENDOR_PRIVATE"));
+    assert!(!debug.contains("secret_key"));
+    assert!(!debug.contains("secretValue"));
+    assert!(!debug.contains("private diagnostic"));
+    assert!(debug.contains("runtime.queue.full"));
 }
 
 #[test]

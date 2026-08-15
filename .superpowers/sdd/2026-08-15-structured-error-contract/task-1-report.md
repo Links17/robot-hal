@@ -27,3 +27,10 @@ Not run. Verification is explicitly deferred by the user until the unified verif
 ## Concerns
 
 - Validation error names for context limit/key failures are newly defined under `error.context.*`; duplicate keys use the explicitly required `error.context.duplicate_key` name.
+
+## Fix round 1
+
+- Corrected the aggregate-overflow test to construct and assert exactly 8,193 bytes.
+- Added successful 255-byte platform/vendor code boundary coverage before the 256-byte failures.
+- Replaced derived `HalError` debug output with a redacted custom implementation and added regression assertions that details and the debug message are absent.
+- Verification remains deferred; no tests, lint, build, cargo check, rustfmt, or formatting checks were run.

@@ -221,7 +221,7 @@ fn validate_context_key(key: &str) -> HalResult<()> {
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct HalError {
     name: ErrorName,
     category: ErrorCategory,
@@ -232,6 +232,18 @@ pub struct HalError {
     platform_code: Option<String>,
     vendor_code: Option<String>,
     context: ErrorContext,
+}
+
+impl fmt::Debug for HalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HalError")
+            .field("name", &self.name)
+            .field("category", &self.category)
+            .field("operation", &self.operation)
+            .field("retryable", &self.retryable)
+            .finish()
+    }
 }
 
 impl HalError {
