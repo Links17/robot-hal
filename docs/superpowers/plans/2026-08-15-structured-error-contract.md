@@ -19,7 +19,7 @@
 - Context keys match `[a-z][a-zA-Z0-9_-]*`; duplicate input keys fail.
 - Do not put secrets, startup tokens, raw payloads, device serial numbers, or user paths in error context or default logs.
 - Keep every queue bounded and preserve existing frame-limit behavior.
-- Use red-green-refactor for every behavior change.
+- Write focused contract tests alongside every behavior change, but do not run tests, lint, builds, or formatting checks during Tasks 1–6. Run all verification once, after implementation is complete, in Task 7.
 - Do not change event, listener, CAN, USB, GPIO, Camera, or unrelated wire-policy modules.
 
 ## File Structure
@@ -50,7 +50,7 @@
 - Consumes: existing `ResourceId`, `HalError::new`, decision-only serde contract.
 - Produces: `ErrorContext`, four `HalError` enrichment methods, and four read-only detail accessors used by all later tasks.
 
-- [ ] **Step 1: Write failing core interface tests**
+- [ ] **Step 1: Write core interface tests without running them**
 
 Add imports for `ErrorContext` and `BTreeMap`, then add focused tests equivalent to:
 
@@ -105,17 +105,7 @@ fn legacy_error_constructor_has_empty_details() {
 
 Add separate tests for duplicate keys, invalid key syntax, the 17th entry, a 65-byte key, a 1,025-byte value, 8,193 aggregate bytes, empty/non-ASCII/256-byte codes, and unchanged decision-only serde output. Construct exact-limit inputs and assert they succeed before asserting one-byte-over inputs fail.
 
-- [ ] **Step 2: Run the core tests and verify RED**
-
-Run:
-
-```bash
-cargo test -p seeed-hal-core --test core_contract
-```
-
-Expected: compilation fails because `ErrorContext` and the new `HalError` methods do not exist.
-
-- [ ] **Step 3: Implement `ErrorContext` and named `HalError` fields**
+- [ ] **Step 2: Implement `ErrorContext` and named `HalError` fields**
 
 In `error.rs`, add:
 
@@ -148,28 +138,11 @@ Replace the tuple `HalError` implementation with named private fields while keep
 
 Export `ErrorContext` from `crates/seeed-hal-core/src/lib.rs`.
 
-- [ ] **Step 4: Run core tests and verify GREEN**
+- [ ] **Step 3: Refactor and statically self-review without executing tools**
 
-Run:
+Keep validation helpers private, remove repeated error construction, and inspect the changed source and tests for contract coverage. Do not run formatting, lint, build, or test commands.
 
-```bash
-cargo test -p seeed-hal-core --test core_contract
-cargo test -p seeed-hal-core
-```
-
-Expected: all core tests pass and decision-only JSON remains byte-for-byte shape-compatible.
-
-- [ ] **Step 5: Refactor without changing behavior**
-
-Keep validation helpers private, remove repeated error construction, then rerun:
-
-```bash
-cargo fmt --all --check
-cargo clippy -p seeed-hal-core --all-targets --all-features -- -D warnings
-cargo test -p seeed-hal-core
-```
-
-- [ ] **Step 6: Commit the core contract**
+- [ ] **Step 4: Commit the core contract**
 
 ```bash
 git add crates/seeed-hal-core/src/error.rs crates/seeed-hal-core/src/lib.rs crates/seeed-hal-core/tests/core_contract.rs
@@ -189,7 +162,7 @@ git commit -m "feat(core): add structured error details"
 - Consumes: `ErrorContext` and enriched `HalError` from Task 1.
 - Produces: additive protobuf fields 6–9 and `pub fn error_from_proto(v1::Error) -> HalResult<HalError>`.
 
-- [ ] **Step 1: Write failing protocol round-trip and compatibility tests**
+- [ ] **Step 1: Write protocol round-trip and compatibility tests without running them**
 
 Add a rich-error round-trip test that constructs all details, converts with `v1::Error::from(&error)`, then calls `error_from_proto` and compares every accessor. Add a legacy test using only fields 1–5 and asserting empty details. Add malformed tests for invalid `resource_id`, invalid codes, invalid context keys, and every size/count bound.
 
@@ -206,17 +179,7 @@ let encoded = v1::Error {
 // Assert fields 6, 7, 8, and 9 are present without changing fields 1–5.
 ```
 
-- [ ] **Step 2: Run protocol tests and verify RED**
-
-Run:
-
-```bash
-cargo test -p seeed-hal-protocol --test protocol_contract
-```
-
-Expected: compilation fails because protobuf fields and `error_from_proto` are missing.
-
-- [ ] **Step 3: Add protobuf fields and generate bindings**
+- [ ] **Step 2: Add protobuf fields and generate bindings**
 
 Append to `message Error` without changing existing tags:
 
@@ -227,15 +190,15 @@ string vendor_code = 8;
 map<string, string> context = 9;
 ```
 
-Run the repository generator:
+Run the repository generator as an implementation step:
 
 ```bash
 ./scripts/generate-protocol.sh
 ```
 
-Review the generated Python diff and confirm no hand-written file outside the expected binding changed.
+This is permitted because it materializes the checked-in binding; it is not a test, lint, build, or formatting check. Review the generated Python diff and confirm no hand-written file outside the expected binding changed. The generated-code verification check runs in Task 7.
 
-- [ ] **Step 4: Implement both Rust conversion directions**
+- [ ] **Step 3: Implement both Rust conversion directions**
 
 Extend `From<&HalError> for v1::Error` to populate all details. Add:
 
@@ -245,19 +208,9 @@ pub fn error_from_proto(value: v1::Error) -> HalResult<HalError>;
 
 Map the category first, build the legacy error with `HalError::new`, then conditionally validate non-empty optional strings and construct `ErrorContext::new(value.context)`. Map every peer-supplied detail validation failure to `invalid_message` inside `error_from_proto`, retaining only a safe field-level diagnostic. Export the function from `lib.rs`. Do not silently drop or truncate invalid details.
 
-- [ ] **Step 5: Run protocol tests and generated-code check**
+- [ ] **Step 4: Statically self-review and commit the additive wire contract**
 
-Run:
-
-```bash
-cargo test -p seeed-hal-protocol --test protocol_contract
-cargo test -p seeed-hal-protocol
-./scripts/check-generated-protocol.sh
-```
-
-Expected: all commands pass; the generated check reports no drift.
-
-- [ ] **Step 6: Commit the additive wire contract**
+Inspect the schema tags, both conversion directions, generated binding diff, and tests. Do not run formatting, lint, build, or test commands.
 
 ```bash
 git add proto/seeed/hal/v1/hal.proto crates/seeed-hal-protocol/src/conversion.rs crates/seeed-hal-protocol/src/lib.rs crates/seeed-hal-protocol/tests/protocol_contract.rs bindings/python/seeed_hal/proto/hal_pb2.py
@@ -276,7 +229,7 @@ git commit -m "feat(protocol): preserve structured error details"
 - Consumes: `HalError::with_resource_id` from Task 1.
 - Produces: resource-scoped resolver and active-lease errors that carry the canonical `ResourceId`.
 
-- [ ] **Step 1: Write failing enrichment assertions**
+- [ ] **Step 1: Write enrichment assertions without running them**
 
 Extend resolver tests so both not-found and ambiguous failures assert:
 
@@ -286,34 +239,15 @@ assert_eq!(error.resource_id(), Some(selector.id()));
 
 Extend `stale_generation_never_reaches_the_adapter` so the stale error asserts the selected descriptor ID. Add a conflict-open assertion that `runtime.lease.conflict` also carries the descriptor ID.
 
-- [ ] **Step 2: Run focused tests and verify RED**
-
-Run:
-
-```bash
-cargo test -p seeed-hal-core --test core_contract resolver
-cargo test -p seeed-hal-runtime --test serial_runtime stale_generation_never_reaches_the_adapter
-cargo test -p seeed-hal-runtime --test serial_runtime control_lease_is_exclusive_until_the_session_closes
-```
-
-Expected: assertions fail because `resource_id()` is `None`.
-
-- [ ] **Step 3: Enrich errors at creation sites**
+- [ ] **Step 2: Enrich errors at creation sites**
 
 In `resolve_resource`, attach `selector.id().clone()` to not-found and ambiguous errors. In `LeaseTable::reserve_control` and every error path of `LeaseTable::validate`, attach the supplied `resource_id.clone()` after constructing the stable error.
 
 Do not add a resource ID to closed-session replay errors because `Registry::ClosedSession` does not currently retain one; expanding retained replay state is outside this task.
 
-- [ ] **Step 4: Run core and runtime tests and verify GREEN**
+- [ ] **Step 3: Statically self-review and commit resource enrichment**
 
-Run:
-
-```bash
-cargo test -p seeed-hal-core
-cargo test -p seeed-hal-runtime
-```
-
-- [ ] **Step 5: Commit resource enrichment**
+Inspect every changed error path and its assertions. Do not run formatting, lint, build, or test commands.
 
 ```bash
 git add crates/seeed-hal-core/src/identity.rs crates/seeed-hal-core/tests/core_contract.rs crates/seeed-hal-runtime/src/lease_table.rs crates/seeed-hal-runtime/tests/serial_runtime.rs
@@ -330,7 +264,7 @@ git commit -m "fix(runtime): attach canonical resource error identity"
 - Consumes: `HalError::with_platform_code` from Task 1.
 - Produces: native `std::io::Error::raw_os_error()` as a decimal `platform_code` without debug-message parsing.
 
-- [ ] **Step 1: Change existing diagnostics tests to require structured codes**
+- [ ] **Step 1: Change existing diagnostics tests to require structured codes without running them**
 
 Update `io_error_diagnostics_preserve_raw_os_error_code`:
 
@@ -340,18 +274,7 @@ assert_eq!(error.platform_code(), Some("13"));
 
 Update `actual_open_missing_endpoint_carries_io_raw_os_error_from_open_path` to assert `platform_code()` equals the independently obtained decimal OS code. Keep the existing debug assertion only as a diagnostic regression, not as the source of the structured assertion.
 
-- [ ] **Step 2: Run focused adapter tests and verify RED**
-
-Run:
-
-```bash
-cargo test -p seeed-hal-adapter-serialport io_error_diagnostics_preserve_raw_os_error_code
-cargo test -p seeed-hal-adapter-serialport actual_open_missing_endpoint_carries_io_raw_os_error_from_open_path
-```
-
-Expected: failures because `platform_code()` is `None`.
-
-- [ ] **Step 3: Enrich `map_io_error` without parsing messages**
+- [ ] **Step 2: Enrich `map_io_error` without parsing messages**
 
 Capture `raw_os_error()` before consuming the I/O error. Build the existing `HalError`, and only when the integer exists call:
 
@@ -362,18 +285,9 @@ error.with_platform_code(raw_os_error.to_string())
 
 Do not populate `vendor_code`; `serialport::ErrorKind` is not a documented vendor code.
 
-- [ ] **Step 4: Run the complete adapter suite and verify GREEN**
+- [ ] **Step 3: Statically self-review and commit platform enrichment**
 
-Run:
-
-```bash
-cargo test -p seeed-hal-adapter-serialport --all-features
-cargo clippy -p seeed-hal-adapter-serialport --all-targets --all-features -- -D warnings
-```
-
-The physical loopback test remains ignored.
-
-- [ ] **Step 5: Commit platform enrichment**
+Inspect both native I/O mapping paths and their tests. Do not run formatting, lint, build, or test commands. The physical loopback test remains ignored.
 
 ```bash
 git add adapters/serialport/src/lib.rs adapters/serialport/src/session.rs
@@ -390,37 +304,19 @@ git commit -m "fix(serial): preserve native platform error codes"
 - Consumes: `seeed_hal_protocol::error_from_proto` from Task 2.
 - Produces: rich and legacy broker errors through every Rust-client response path.
 
-- [ ] **Step 1: Write failing Rust-client tests**
+- [ ] **Step 1: Write Rust-client tests without running them**
 
 Add a fake-server request error containing all four details and assert the returned `HalError` preserves them. Add a legacy fields-1–5 error test. Add malformed detail tests for normal responses and `request_id == 0` unsolicited errors; assert they terminate the connection with `runtime.protocol.invalid_message` and fan out to pending requests.
 
 Add one real broker round-trip using `Broker` with `VirtualSerialAdapter`: connect `HalClient`, construct a valid `ResourceSelector::exact` for the absent ID `serial:virtual:missing`, call `open_serial`, and assert the returned `runtime.resource.not_found` error carries that exact resource ID. This proves core resolver → adapter → runtime → broker → protocol → Rust client preservation without test-only production hooks.
 
-- [ ] **Step 2: Run client tests and verify RED**
-
-Run:
-
-```bash
-cargo test -p seeed-hal-client --test client_contract structured_error
-```
-
-Expected: rich-detail assertions fail because the local decoder discards fields 6–9.
-
-- [ ] **Step 3: Delegate decoding to `seeed-hal-protocol`**
+- [ ] **Step 2: Delegate decoding to `seeed-hal-protocol`**
 
 Import `error_from_proto`, replace all local `decode_error` calls, and delete the duplicate category/error constructor in `connection.rs`. Preserve existing termination behavior: `error_from_proto` already normalizes malformed peer details to `runtime.protocol.invalid_message`, which closes the connection.
 
-- [ ] **Step 4: Run Rust-client and broker integration suites**
+- [ ] **Step 3: Statically self-review and commit the Rust client conversion**
 
-Run:
-
-```bash
-cargo test -p seeed-hal-client --all-features
-cargo test -p seeed-hal-broker --all-features
-cargo clippy -p seeed-hal-client --all-targets --all-features -- -D warnings
-```
-
-- [ ] **Step 5: Commit the Rust client conversion**
+Inspect all normal and unsolicited error paths and their tests. Do not run formatting, lint, build, or test commands.
 
 ```bash
 git add crates/seeed-hal-client/src/connection.rs crates/seeed-hal-client/tests/client_contract.rs
@@ -439,7 +335,7 @@ git commit -m "fix(client): retain structured broker errors"
 - Consumes: generated protobuf fields from Task 2.
 - Produces: backward-compatible Python `HalError` details and identical Rust/Python wire validation bounds.
 
-- [ ] **Step 1: Write failing Python model and decode tests**
+- [ ] **Step 1: Write Python model and decode tests without running them**
 
 Add a direct construction test:
 
@@ -464,17 +360,7 @@ with pytest.raises(TypeError):
 
 Add broker-response tests for rich fields, legacy absent fields, duplicate-copy fan-out, invalid IDs/codes/keys, the 17th entry, 65-byte key, 1,025-byte value, and 8,193 aggregate bytes. Assert malformed details terminate with `runtime.protocol.invalid_message`.
 
-- [ ] **Step 2: Run Python tests and verify RED**
-
-Run:
-
-```bash
-uv run --project bindings/python --python 3.11 --frozen pytest -q bindings/python/tests/test_client_contract.py bindings/python/tests/test_client_hardening.py
-```
-
-Expected: construction or assertions fail because Python `HalError` lacks details.
-
-- [ ] **Step 3: Implement immutable Python details**
+- [ ] **Step 2: Implement immutable Python details**
 
 In `errors.py`, import `field`, `Mapping`, and `MappingProxyType`. Add optional fields after `debug_message` and normalize in `__post_init__`:
 
@@ -491,7 +377,7 @@ def __post_init__(self) -> None:
 
 Extend `_ErrorData` to store `resource_id`, both codes, and `context_items: tuple[tuple[str, str], ...]`. `_error_data` snapshots sorted items; `_fresh_error` constructs a fresh mapping so terminal fan-out retains fresh immutable errors.
 
-- [ ] **Step 4: Validate wire details in one Python helper**
+- [ ] **Step 3: Validate wire details in one Python helper**
 
 In `client.py`, add constants matching the Rust bounds and a helper that:
 
@@ -504,24 +390,16 @@ In `client.py`, add constants matching the Rust bounds and a helper that:
 
 Extend `_decode_error` to pass all details to `HalError`. Do not parse `debug_message`.
 
-- [ ] **Step 5: Run the frozen Python suite and verify GREEN**
+- [ ] **Step 4: Statically self-review and commit the Python client contract**
 
-Run:
-
-```bash
-uv run --project bindings/python --python 3.11 --frozen pytest -q
-```
-
-Expected: all Python tests pass with no warnings.
-
-- [ ] **Step 6: Commit the Python client contract**
+Inspect immutability, fresh fan-out, validation parity, and their tests. Do not run formatting, lint, build, or test commands.
 
 ```bash
 git add bindings/python/seeed_hal/errors.py bindings/python/seeed_hal/client.py bindings/python/tests/test_client_contract.py bindings/python/tests/test_client_hardening.py
 git commit -m "fix(python): retain immutable structured errors"
 ```
 
-### Task 7: Align documentation and run release-grade verification
+### Task 7: Align documentation and run the single release-grade verification gate
 
 **Files:**
 - Modify: `docs/architecture/hal-architecture.md`
@@ -611,4 +489,4 @@ git commit -m "docs(v0.1): record structured error contract"
 - Spec coverage: all Rust core, wire, runtime, native adapter, Rust client, Python client, observability, compatibility, and verification requirements have an owning task.
 - Scope: event, listener, future hardware classes, and unrelated protocol refactors remain excluded.
 - Type consistency: `ErrorContext`, enrichment method names, protobuf fields 6–9, and `error_from_proto` match the approved spec in every task.
-- TDD: every production behavior starts with a focused failing test and an explicit RED command.
+- Deferred verification: every production behavior has focused contract tests, but Tasks 1–6 execute no test, lint, build, or formatting command. Task 7 is the sole verification gate after all implementation is complete; protocol generation in Task 2 is an implementation step, not verification.
