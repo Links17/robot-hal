@@ -317,8 +317,8 @@ pub fn error_from_proto(value: v1::Error) -> HalResult<HalError> {
             .with_vendor_code(vendor_code)
             .map_err(|_| invalid_message("error has an invalid vendor_code"))?;
     }
-    let context = ErrorContext::new(context)
-        .map_err(|_| invalid_message("error has an invalid context"))?;
+    let context =
+        ErrorContext::new(context).map_err(|_| invalid_message("error has an invalid context"))?;
     Ok(error.with_context(context))
 }
 

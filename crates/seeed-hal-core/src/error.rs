@@ -3,8 +3,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::capability::validate_identifier;
 use crate::ResourceId;
+use crate::capability::validate_identifier;
 
 const ERROR_CONTEXT_MAX_ENTRIES: usize = 16;
 const ERROR_CONTEXT_MAX_KEY_BYTES: usize = 64;
@@ -208,9 +208,8 @@ fn validate_context_key(key: &str) -> HalResult<()> {
     if !characters
         .next()
         .is_some_and(|character| character.is_ascii_lowercase())
-        || !characters.all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
-        })
+        || !characters
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
     {
         return Err(HalError::invalid_argument_error(
             "error.context.key.invalid",

@@ -394,10 +394,8 @@ async fn broker_round_trip_preserves_missing_resource_id() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let directory = std::path::PathBuf::from(format!(
-        "/tmp/shc-missing-{}-{nonce}",
-        std::process::id()
-    ));
+    let directory =
+        std::path::PathBuf::from(format!("/tmp/shc-missing-{}-{nonce}", std::process::id()));
     let runtime = HalRuntime::builder()
         .serial_adapter(VirtualSerialAdapter::loopback("serial:virtual:present"))
         .build();

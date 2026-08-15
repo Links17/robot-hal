@@ -118,16 +118,15 @@ fn legacy_error_constructor_has_empty_details() {
 
 #[test]
 fn error_context_rejects_duplicate_and_invalid_keys() {
-    let duplicate = ErrorContext::new([
-        ("queueDepth", "64"),
-        ("queueDepth", "65"),
-    ])
-    .unwrap_err();
+    let duplicate = ErrorContext::new([("queueDepth", "64"), ("queueDepth", "65")]).unwrap_err();
     assert_eq!(duplicate.name().as_str(), "error.context.duplicate_key");
 
     for key in ["", "QueueDepth", "queue.depth", "queue depth", "é"] {
         assert_eq!(
-            ErrorContext::new([(key, "value")]).unwrap_err().name().as_str(),
+            ErrorContext::new([(key, "value")])
+                .unwrap_err()
+                .name()
+                .as_str(),
             if key.is_empty() {
                 "error.context.key.empty"
             } else if !key.is_ascii() {
@@ -154,7 +153,13 @@ fn error_context_accepts_entry_key_value_and_aggregate_limits() {
     let exact_total = (0..8)
         .map(|index| (format!("k{index}"), "x".repeat(1022)))
         .collect::<Vec<_>>();
-    assert_eq!(exact_total.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>(), 8192);
+    assert_eq!(
+        exact_total
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .sum::<usize>(),
+        8192
+    );
     assert!(ErrorContext::new(exact_total).is_ok());
 }
 
