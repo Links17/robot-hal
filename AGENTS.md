@@ -66,7 +66,9 @@ If a proposed change requires a forbidden concept, place it in the consuming app
 
 ## Testing
 
-- Use red-green-refactor for behavior changes.
+- Complete the focused implementation and its test coverage before running tests. Do not require
+  per-case red-green cycles; run the relevant tests and canonical verification gates together after
+  the change is fully written.
 - The interface is the primary test surface.
 - Every adapter must pass the shared conformance suite.
 - Tests requiring physical hardware must be marked and excluded from the default test command.

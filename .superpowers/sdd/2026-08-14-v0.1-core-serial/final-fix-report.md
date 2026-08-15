@@ -6,6 +6,8 @@
 
 **Implementation commit:** `d05ffe8a96c4ca1db1b1a7c7b21d205aca9480ea`
 
+**Residual correction commit:** `7f383398823b5c9eda786ded66b50b1a5e902856`
+
 **Host:** macOS arm64
 
 **Status:** All final-review findings are implemented and all available local gates pass. Native
@@ -91,6 +93,15 @@ Windows, native Linux, remote CI, and physical Serial acceptance remain external
 - Files: `bindings/python/seeed_hal/transport_windows.py` and Python contract/hardening tests.
 - Limitation: real pywin32 `PIPE_NOWAIT` behavior and cancellation timing require native Windows.
 
+The final scoped re-review then identified a Windows-only semantic gap in this finding: pywin32 311
+raises `pywintypes.error` directly from `Exception`, so the original `OSError` handlers did not see
+normal `ERROR_NO_DATA` polling results. The residual correction explicitly carries the native error
+type through connect and the actor, retries only `ERROR_NO_DATA` (`232`), treats zero-byte writes as
+backpressure, and fails closed for other native status codes. Faithful platform-neutral tests cover
+empty-read and write-backpressure progress, cancellation, actor termination, repeated close, and
+non-retryable errors. Per the current repository workflow, implementation and tests were completed
+before the unified verification run; no per-case red-green cycle was used.
+
 ### 6. Compatible `HalError` serde
 
 - RED: the derived tuple deserializer could not consume the decision-only serialized map.
@@ -148,7 +159,7 @@ Windows, native Linux, remote CI, and physical Serial acceptance remain external
 | Format | `cargo fmt --all --check` | Passed |
 | Rust lint | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | Passed |
 | Rust suite | `cargo test --workspace --all-features` | 150 passed, 1 ignored physical test |
-| Python suite | `uv run --project bindings/python --frozen pytest bindings/python/tests` | 99 passed |
+| Python suite | `uv run --project bindings/python --python 3.11 --frozen pytest -q` | 119 passed |
 | Generated protocol | `./scripts/check-generated-protocol.sh` twice | Passed twice |
 | Windows cross-target lint | `cargo clippy --target x86_64-pc-windows-msvc --workspace --all-targets --all-features -- -D warnings` | Passed |
 | Production manifest | `cargo test -p seeed-hal-broker-app --no-default-features --test manifest` | 1 passed |
