@@ -309,6 +309,7 @@ async fn serial_close_uses_a_two_second_default_deadline() {
         Err(error) => error,
     };
     assert_eq!(error.name().as_str(), "runtime.session.close_timeout");
+    assert_eq!(error.resource_id(), Some(descriptor.id()));
 
     runtime
         .open_serial(
@@ -339,8 +340,17 @@ async fn serial_close_deadline_is_runtime_configurable() {
         )
         .await
         .unwrap();
+    let session_id = handle.session_id();
+    let lease = handle.lease_token().clone();
     let close = tokio::spawn(handle.close());
     adapter.wait_until_close_started().await;
+
+    let closing = runtime
+        .write_serial(session_id, &lease, Bytes::from_static(b"closing"))
+        .await
+        .unwrap_err();
+    assert_eq!(closing.name().as_str(), "runtime.session.closed");
+    assert_eq!(closing.resource_id(), Some(descriptor.id()));
 
     tokio::time::advance(Duration::from_millis(24)).await;
     tokio::task::yield_now().await;
@@ -352,6 +362,7 @@ async fn serial_close_deadline_is_runtime_configurable() {
         Err(error) => error,
     };
     assert_eq!(error.name().as_str(), "runtime.session.close_timeout");
+    assert_eq!(error.resource_id(), Some(descriptor.id()));
 }
 
 #[tokio::test(start_paused = true)]
@@ -378,6 +389,7 @@ async fn owner_revoke_reports_close_timeout_and_releases_the_resource() {
     tokio::time::advance(Duration::from_millis(25)).await;
     let error = revoke.await.unwrap().unwrap_err();
     assert_eq!(error.name().as_str(), "runtime.session.close_timeout");
+    assert_eq!(error.resource_id(), Some(descriptor.id()));
 
     let second = runtime
         .open_serial(
@@ -486,6 +498,7 @@ async fn failed_reopen_after_exposure_does_not_erase_or_skip_the_last_generation
         Err(error) => error,
     };
     assert_eq!(error.name().as_str(), "runtime.transport.unavailable");
+    assert_eq!(error.resource_id(), Some(descriptor.id()));
     assert_eq!(runtime.retained_generation_count().await, 1);
 
     let reopened = runtime
@@ -530,6 +543,7 @@ async fn revoking_an_owner_cancels_its_in_progress_open() {
         Err(error) => error,
     };
     assert_eq!(error.name().as_str(), "runtime.session.closed");
+    assert_eq!(error.resource_id(), Some(descriptor.id()));
 
     adapter.allow_one_open();
     runtime
@@ -753,6 +767,7 @@ async fn operation_queue_admits_exactly_64_waiters_then_rejects_the_next() {
     .expect("the 65th queued request must reject immediately")
     .unwrap_err();
     assert_eq!(overflow.name().as_str(), "runtime.queue.full");
+    assert_eq!(overflow.resource_id(), Some(descriptor.id()));
 
     handle.close().await.unwrap();
     let error = in_flight.await.unwrap().unwrap_err();

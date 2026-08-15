@@ -118,7 +118,7 @@ impl HalRuntime {
             Err(error) => {
                 self.inner.registry.lock().await.cancel_open(&session_id);
                 pending_open.disarm();
-                return Err(error);
+                return Err(error.with_resource_id(resource_id));
             }
         };
 
@@ -140,14 +140,18 @@ impl HalRuntime {
         pending_open.disarm();
         if !accepted {
             actor.request_close();
-            actor.wait_closed().await?;
+            actor
+                .wait_closed()
+                .await
+                .map_err(|error| error.with_resource_id(resource_id.clone()))?;
             return Err(runtime_error(
                 "runtime.session.closed",
                 ErrorCategory::Conflict,
                 "serial.open",
                 false,
                 "the owner was revoked while the serial resource was opening",
-            ));
+            )
+            .with_resource_id(resource_id));
         }
 
         Ok(SerialHandle {
@@ -212,14 +216,17 @@ impl HalRuntime {
         let action = {
             let mut registry = self.inner.registry.lock().await;
             let action = registry.begin_close(&session_id, lease)?;
-            if let CloseAction::Wait(actor) = &action {
+            if let CloseAction::Wait(actor, _) = &action {
                 actor.request_close();
             }
             action
         };
         match action {
             CloseAction::AlreadyClosed => Ok(()),
-            CloseAction::Wait(actor) => actor.wait_closed().await,
+            CloseAction::Wait(actor, resource_id) => actor
+                .wait_closed()
+                .await
+                .map_err(|error| error.with_resource_id(resource_id)),
         }
     }
 
@@ -240,7 +247,8 @@ impl HalRuntime {
             let result = match target.actor {
                 Some(actor) => actor.wait_closed().await,
                 None => wait_until_done(target.done).await,
-            };
+            }
+            .map_err(|error| error.with_resource_id(target.resource_id));
             if first_error.is_none() {
                 first_error = result.err();
             }
@@ -269,21 +277,23 @@ impl HalRuntime {
         command: impl FnOnce(oneshot::Sender<HalResult<T>>) -> SerialCommand,
     ) -> HalResult<T> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.inner.registry.lock().await.enqueue(
+        let resource_id = self.inner.registry.lock().await.enqueue(
             &session_id,
             lease,
             command(reply_tx),
             operation,
         )?;
-        reply_rx.await.map_err(|_| {
-            runtime_error(
+        match reply_rx.await {
+            Ok(result) => result,
+            Err(_) => Err(runtime_error(
                 "runtime.actor.unavailable",
                 ErrorCategory::Internal,
                 operation,
                 false,
                 "the serial actor dropped an operation reply",
-            )
-        })?
+            )),
+        }
+        .map_err(|error| error.with_resource_id(resource_id))
     }
 
     fn serial_adapter(&self, operation: &'static str) -> HalResult<Arc<dyn SerialAdapter>> {
@@ -554,6 +564,7 @@ mod tests {
         tokio::time::advance(Duration::from_millis(25)).await;
         let error = revoke.await.unwrap().unwrap_err();
         assert_eq!(error.name().as_str(), "runtime.session.close_timeout");
+        assert_eq!(error.resource_id(), Some(descriptor.id()));
 
         runtime
             .open_serial(

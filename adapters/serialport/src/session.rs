@@ -272,14 +272,19 @@ impl NativeSerialSession {
         descriptor: ResourceDescriptor,
         config: SerialConfig,
     ) -> HalResult<Self> {
-        validate_config(&config)?;
-        let endpoint = descriptor.endpoint().as_str().to_owned();
+        let resource_id = descriptor.id().clone();
+        let result = async {
+            validate_config(&config)?;
+            let endpoint = descriptor.endpoint().as_str().to_owned();
 
-        run_blocking_open(move || {
-            let stream = open_serial_stream(&endpoint, &config)?;
-            spawn_session_worker(descriptor, config, Box::new(stream))
-        })
-        .await
+            run_blocking_open(move || {
+                let stream = open_serial_stream(&endpoint, &config)?;
+                spawn_session_worker(descriptor, config, Box::new(stream))
+            })
+            .await
+        }
+        .await;
+        result.map_err(|error| error.with_resource_id(resource_id))
     }
 
     fn ensure_open(&self, operation: &'static str) -> HalResult<()> {
@@ -308,6 +313,10 @@ impl NativeSerialSession {
             })
     }
 
+    fn resource_result<T>(&self, result: HalResult<T>) -> HalResult<T> {
+        result.map_err(|error| error.with_resource_id(self.descriptor.id().clone()))
+    }
+
     async fn wait_closed(&mut self) -> HalResult<()> {
         loop {
             if let Some(result) = self.completion_rx.borrow().clone() {
@@ -328,7 +337,9 @@ impl NativeSerialSession {
         config: SerialConfig,
         io: Box<dyn SerialIo>,
     ) -> HalResult<Self> {
+        let resource_id = descriptor.id().clone();
         spawn_session_worker(descriptor, config, io)
+            .map_err(|error| error.with_resource_id(resource_id))
     }
 }
 
@@ -345,96 +356,113 @@ impl SerialSession for NativeSerialSession {
     }
 
     async fn read(&mut self, max_bytes: usize) -> HalResult<Bytes> {
-        self.ensure_open("serial.read")?;
-        if max_bytes == 0 {
-            return Err(invalid_argument(
-                "serial.read",
-                "max_bytes must be greater than zero",
-            ));
-        }
+        let result = async {
+            self.ensure_open("serial.read")?;
+            if max_bytes == 0 {
+                return Err(invalid_argument(
+                    "serial.read",
+                    "max_bytes must be greater than zero",
+                ));
+            }
 
-        let (reply, response) = oneshot::channel();
-        self.enqueue(WorkerCommand::Read { max_bytes, reply }, "serial.read")?;
-        let mut guard = OperationGuard::new(self.control.clone());
-        let result = response.await.map_err(|_| {
-            internal(
-                "serial.read",
-                "serial adapter worker dropped the read response",
-            )
-        });
-        if result.is_ok() {
-            guard.complete();
+            let (reply, response) = oneshot::channel();
+            self.enqueue(WorkerCommand::Read { max_bytes, reply }, "serial.read")?;
+            let mut guard = OperationGuard::new(self.control.clone());
+            let result = response.await.map_err(|_| {
+                internal(
+                    "serial.read",
+                    "serial adapter worker dropped the read response",
+                )
+            });
+            if result.is_ok() {
+                guard.complete();
+            }
+            result?
         }
-        result?
+        .await;
+        self.resource_result(result)
     }
 
     async fn write_all(&mut self, bytes: &[u8]) -> HalResult<()> {
-        self.ensure_open("serial.write")?;
-        if bytes.is_empty() {
-            return Ok(());
-        }
+        let result = async {
+            self.ensure_open("serial.write")?;
+            if bytes.is_empty() {
+                return Ok(());
+            }
 
-        let (reply, response) = oneshot::channel();
-        self.enqueue(
-            WorkerCommand::Write {
-                bytes: Bytes::copy_from_slice(bytes),
-                reply,
-            },
-            "serial.write",
-        )?;
-        let mut guard = OperationGuard::new(self.control.clone());
-        let result = response.await.map_err(|_| {
-            internal(
+            let (reply, response) = oneshot::channel();
+            self.enqueue(
+                WorkerCommand::Write {
+                    bytes: Bytes::copy_from_slice(bytes),
+                    reply,
+                },
                 "serial.write",
-                "serial adapter worker dropped the write response",
-            )
-        });
-        if result.is_ok() {
-            guard.complete();
+            )?;
+            let mut guard = OperationGuard::new(self.control.clone());
+            let result = response.await.map_err(|_| {
+                internal(
+                    "serial.write",
+                    "serial adapter worker dropped the write response",
+                )
+            });
+            if result.is_ok() {
+                guard.complete();
+            }
+            result?
         }
-        result?
+        .await;
+        self.resource_result(result)
     }
 
     async fn flush(&mut self) -> HalResult<()> {
-        self.ensure_open("serial.flush")?;
-        let (reply, response) = oneshot::channel();
-        self.enqueue(WorkerCommand::Flush { reply }, "serial.flush")?;
-        let mut guard = OperationGuard::new(self.control.clone());
-        let result = response.await.map_err(|_| {
-            internal(
-                "serial.flush",
-                "serial adapter worker dropped the flush response",
-            )
-        });
-        if result.is_ok() {
-            guard.complete();
+        let result = async {
+            self.ensure_open("serial.flush")?;
+            let (reply, response) = oneshot::channel();
+            self.enqueue(WorkerCommand::Flush { reply }, "serial.flush")?;
+            let mut guard = OperationGuard::new(self.control.clone());
+            let result = response.await.map_err(|_| {
+                internal(
+                    "serial.flush",
+                    "serial adapter worker dropped the flush response",
+                )
+            });
+            if result.is_ok() {
+                guard.complete();
+            }
+            result?
         }
-        result?
+        .await;
+        self.resource_result(result)
     }
 
     async fn set_control_lines(&mut self, lines: ControlLines) -> HalResult<()> {
-        self.ensure_open("serial.set_control_lines")?;
-        let (reply, response) = oneshot::channel();
-        self.enqueue(
-            WorkerCommand::SetControlLines { lines, reply },
-            "serial.set_control_lines",
-        )?;
-        let mut guard = OperationGuard::new(self.control.clone());
-        let result = response.await.map_err(|_| {
-            internal(
+        let result = async {
+            self.ensure_open("serial.set_control_lines")?;
+            let (reply, response) = oneshot::channel();
+            self.enqueue(
+                WorkerCommand::SetControlLines { lines, reply },
                 "serial.set_control_lines",
-                "serial adapter worker dropped the control-line response",
-            )
-        });
-        if result.is_ok() {
-            guard.complete();
+            )?;
+            let mut guard = OperationGuard::new(self.control.clone());
+            let result = response.await.map_err(|_| {
+                internal(
+                    "serial.set_control_lines",
+                    "serial adapter worker dropped the control-line response",
+                )
+            });
+            if result.is_ok() {
+                guard.complete();
+            }
+            result?
         }
-        result?
+        .await;
+        self.resource_result(result)
     }
 
     async fn close(&mut self) -> HalResult<()> {
         self.control.request_close();
-        self.wait_closed().await
+        let result = self.wait_closed().await;
+        self.resource_result(result)
     }
 }
 
@@ -923,6 +951,7 @@ mod tests {
 
         let error = session.write_all(b"later").await.unwrap_err();
         assert_eq!(error.name().as_str(), "runtime.session.closed");
+        assert_eq!(error.resource_id(), Some(descriptor().id()));
         assert_eq!(probe.write_calls.load(Ordering::Acquire), 0);
     }
 
@@ -1016,7 +1045,27 @@ mod tests {
         let error = session.close().await.unwrap_err();
 
         assert_eq!(error.name().as_str(), "runtime.transport.permission_denied");
+        assert_eq!(error.resource_id(), Some(descriptor().id()));
         probe.wait_until_all_handles_dropped().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_read_error_preserves_resource_and_platform_code() {
+        let expected = descriptor();
+        let mut session = NativeSerialSession::from_io_for_test(
+            expected.clone(),
+            SerialConfig::default(),
+            Box::new(NativeTimeoutIo::with_reads([Err(
+                io::Error::from_raw_os_error(5),
+            )])),
+        )
+        .unwrap();
+
+        let error = session.read(1).await.unwrap_err();
+
+        assert_eq!(error.resource_id(), Some(expected.id()));
+        assert_eq!(error.platform_code(), Some("5"));
+        session.close().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1227,6 +1276,7 @@ mod tests {
         let error = session.read(0).await.unwrap_err();
 
         assert_eq!(error.name().as_str(), "runtime.session.closed");
+        assert_eq!(error.resource_id(), Some(descriptor().id()));
     }
 
     #[test]
@@ -1254,12 +1304,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn actual_open_missing_endpoint_carries_io_raw_os_error_from_open_path() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn actual_open_missing_endpoint_carries_resource_and_io_raw_os_error() {
         let endpoint = std::env::temp_dir()
             .join(format!("seeed-hal-missing-serial-{}", std::process::id()))
             .display()
             .to_string();
+        let resource_id = ResourceId::parse("serial:test:missing-open").unwrap();
+        let descriptor = ResourceDescriptor::new(
+            resource_id.clone(),
+            Endpoint::new(endpoint.clone()).unwrap(),
+            IdentityQuality::Weak,
+            TransportKind::Serial,
+            ResourceProperties::default(),
+            seeed_hal_core::CapabilitySet::new(vec![seeed_hal_serial::serial_bytes_capability()]),
+        );
         let expected_raw_os_error = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -1269,9 +1328,13 @@ mod tests {
             .expect("missing path should carry a platform raw OS error");
         let expected_platform_code = expected_raw_os_error.to_string();
 
-        let error = open_serial_stream(&endpoint, &SerialConfig::default()).unwrap_err();
+        let error = match NativeSerialSession::open(descriptor, SerialConfig::default()).await {
+            Ok(_) => panic!("opening a missing native endpoint must fail"),
+            Err(error) => error,
+        };
 
         assert_eq!(error.name().as_str(), "runtime.resource.not_found");
+        assert_eq!(error.resource_id(), Some(&resource_id));
         assert_eq!(error.platform_code(), Some(expected_platform_code.as_str()));
         assert!(error.debug_message().contains("io error kind=NotFound"));
         assert!(

@@ -34,6 +34,7 @@ struct ClosedSession {
 pub(crate) struct RevokeTarget {
     pub(crate) actor: Option<ActorHandle>,
     pub(crate) done: watch::Receiver<Option<HalResult<()>>>,
+    pub(crate) resource_id: ResourceId,
 }
 
 pub(crate) struct OpenReservation {
@@ -43,7 +44,7 @@ pub(crate) struct OpenReservation {
 
 pub(crate) enum CloseAction {
     AlreadyClosed,
-    Wait(ActorHandle),
+    Wait(ActorHandle, ResourceId),
 }
 
 #[derive(Default)]
@@ -131,7 +132,7 @@ impl Registry {
         lease: &LeaseToken,
         command: SerialCommand,
         operation: &'static str,
-    ) -> HalResult<()> {
+    ) -> HalResult<ResourceId> {
         let Some(entry) = self.sessions.get(session_id) else {
             return Err(self.missing_session_error(session_id, lease, operation));
         };
@@ -143,7 +144,7 @@ impl Registry {
             operation,
         )?;
         if entry.state != SessionState::Active {
-            return Err(session_closed(operation));
+            return Err(session_closed(operation).with_resource_id(entry.resource_id.clone()));
         }
         let actor = entry.actor.as_ref().ok_or_else(|| {
             runtime_error(
@@ -153,8 +154,12 @@ impl Registry {
                 false,
                 "the active serial session has no actor",
             )
+            .with_resource_id(entry.resource_id.clone())
         })?;
-        actor.try_enqueue(command, operation)
+        actor
+            .try_enqueue(command, operation)
+            .map_err(|error| error.with_resource_id(entry.resource_id.clone()))?;
+        Ok(entry.resource_id.clone())
     }
 
     pub(crate) fn begin_close(
@@ -181,8 +186,9 @@ impl Registry {
                 false,
                 "the serial session is still opening and has no actor",
             )
+            .with_resource_id(entry.resource_id.clone())
         })?;
-        Ok(CloseAction::Wait(actor))
+        Ok(CloseAction::Wait(actor, entry.resource_id.clone()))
     }
 
     pub(crate) fn begin_revoke(&mut self, owner_id: &OwnerId) -> Vec<RevokeTarget> {
@@ -197,6 +203,7 @@ impl Registry {
                 RevokeTarget {
                     actor: entry.actor.clone(),
                     done: entry.done.subscribe(),
+                    resource_id: entry.resource_id.clone(),
                 }
             })
             .collect()
