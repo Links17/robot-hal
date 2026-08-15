@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use seeed_hal_core::{
-    CapabilityId, CapabilitySet, Endpoint, ErrorCategory, HalError, HalResult, IdentityQuality,
-    LeaseId, LeaseMode, LeaseToken, ResourceDescriptor, ResourceId, ResourceProperties,
-    ResourceSelector, SessionId, TransportKind,
+    CapabilityId, CapabilitySet, Endpoint, ErrorCategory, ErrorContext, HalError, HalResult,
+    IdentityQuality, LeaseId, LeaseMode, LeaseToken, ResourceDescriptor, ResourceId,
+    ResourceProperties, ResourceSelector, SessionId, TransportKind,
 };
 use seeed_hal_runtime::{RuntimeEvent, RuntimeEventKind};
 use seeed_hal_serial::{DataBits, FlowControl, Parity, SerialConfig, StopBits};
@@ -260,8 +260,66 @@ impl From<&HalError> for v1::Error {
             operation: value.operation().as_str().to_owned(),
             retryable: value.retryable(),
             debug_message: value.debug_message().to_owned(),
+            resource_id: value
+                .resource_id()
+                .map_or_else(String::new, |resource_id| resource_id.as_str().to_owned()),
+            platform_code: value.platform_code().unwrap_or_default().to_owned(),
+            vendor_code: value.vendor_code().unwrap_or_default().to_owned(),
+            context: value
+                .context()
+                .iter()
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect(),
         }
     }
+}
+
+/// Decode a wire error, rejecting malformed peer-supplied details uniformly.
+pub fn error_from_proto(value: v1::Error) -> HalResult<HalError> {
+    let v1::Error {
+        name,
+        category,
+        operation,
+        retryable,
+        debug_message,
+        resource_id,
+        platform_code,
+        vendor_code,
+        context,
+    } = value;
+
+    let category = match required_enum::<v1::ErrorCategory>(category, "category")? {
+        v1::ErrorCategory::InvalidArgument => ErrorCategory::InvalidArgument,
+        v1::ErrorCategory::NotFound => ErrorCategory::NotFound,
+        v1::ErrorCategory::Conflict => ErrorCategory::Conflict,
+        v1::ErrorCategory::Unavailable => ErrorCategory::Unavailable,
+        v1::ErrorCategory::Internal => ErrorCategory::Internal,
+        v1::ErrorCategory::Unspecified => {
+            return Err(invalid_message("error category is required"));
+        }
+    };
+
+    let mut error = HalError::new(name, category, operation, retryable, debug_message)
+        .map_err(|_| invalid_message("error has invalid name or operation"))?;
+
+    if !resource_id.is_empty() {
+        let resource_id = ResourceId::parse(resource_id)
+            .map_err(|_| invalid_message("error has an invalid resource_id"))?;
+        error = error.with_resource_id(resource_id);
+    }
+    if !platform_code.is_empty() {
+        error = error
+            .with_platform_code(platform_code)
+            .map_err(|_| invalid_message("error has an invalid platform_code"))?;
+    }
+    if !vendor_code.is_empty() {
+        error = error
+            .with_vendor_code(vendor_code)
+            .map_err(|_| invalid_message("error has an invalid vendor_code"))?;
+    }
+    let context = ErrorContext::new(context)
+        .map_err(|_| invalid_message("error has an invalid context"))?;
+    Ok(error.with_context(context))
 }
 
 impl From<&RuntimeEvent> for v1::RuntimeEvent {

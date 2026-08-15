@@ -204,6 +204,10 @@ message Error {
   string operation = 3;
   bool retryable = 4;
   string debug_message = 5;
+  string resource_id = 6;
+  string platform_code = 7;
+  string vendor_code = 8;
+  map<string, string> context = 9;
 }
 
 enum ErrorCategory {

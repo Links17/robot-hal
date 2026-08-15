@@ -6,7 +6,7 @@ pub mod v1 {
 
 mod conversion;
 
-pub use conversion::{invalid_message, parse_session_lease};
+pub use conversion::{error_from_proto, invalid_message, parse_session_lease};
 
 pub const PROTOCOL_MAJOR: u32 = 1;
 pub const PROTOCOL_MINOR_MINIMUM: u32 = 0;

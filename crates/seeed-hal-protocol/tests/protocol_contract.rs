@@ -1,4 +1,5 @@
 use prost::Message;
+use seeed_hal_core::{ErrorCategory, ErrorContext, HalError, ResourceId};
 use seeed_hal_protocol::v1::{self, envelope};
 
 fn envelope_with(payload: envelope::Payload) -> v1::Envelope {
@@ -40,6 +41,17 @@ fn read_varint(encoded: &[u8], mut index: usize) -> (u64, usize) {
         }
     }
     panic!("invalid test varint")
+}
+
+fn valid_error() -> v1::Error {
+    v1::Error {
+        name: "runtime.queue.full".to_owned(),
+        category: v1::ErrorCategory::Unavailable as i32,
+        operation: "serial.write".to_owned(),
+        retryable: true,
+        debug_message: "queue is full".to_owned(),
+        ..Default::default()
+    }
 }
 
 #[test]
@@ -197,4 +209,143 @@ fn invalid_required_enum_is_a_structured_protocol_error() {
 
     let error = seeed_hal_core::ResourceSelector::try_from(selector).unwrap_err();
     assert_eq!(error.name().as_str(), "runtime.protocol.invalid_message");
+}
+
+#[test]
+fn error_fields_are_additive_and_locked() {
+    let encoded = v1::Error {
+        resource_id: "serial:virtual:0".to_owned(),
+        platform_code: "11".to_owned(),
+        vendor_code: "VENDOR_BUSY".to_owned(),
+        context: [("queueDepth".to_owned(), "64".to_owned())].into(),
+        ..valid_error()
+    }
+    .encode_to_vec();
+
+    assert_eq!(top_level_fields(&encoded), vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+}
+
+#[test]
+fn rich_error_round_trips_all_structured_details() {
+    let context = ErrorContext::new([("queueDepth", "64"), ("portName", "ttyUSB0")]).unwrap();
+    let error = HalError::new(
+        "runtime.queue.full",
+        ErrorCategory::Unavailable,
+        "serial.write",
+        true,
+        "queue is full",
+    )
+    .unwrap()
+    .with_resource_id(ResourceId::parse("serial:virtual:0").unwrap())
+    .with_platform_code("11")
+    .unwrap()
+    .with_vendor_code("VENDOR_BUSY")
+    .unwrap()
+    .with_context(context);
+
+    let decoded = seeed_hal_protocol::error_from_proto(v1::Error::from(&error)).unwrap();
+    assert_eq!(decoded.name().as_str(), error.name().as_str());
+    assert_eq!(decoded.category(), error.category());
+    assert_eq!(decoded.operation().as_str(), error.operation().as_str());
+    assert_eq!(decoded.retryable(), error.retryable());
+    assert_eq!(decoded.debug_message(), error.debug_message());
+    assert_eq!(decoded.resource_id(), error.resource_id());
+    assert_eq!(decoded.platform_code(), error.platform_code());
+    assert_eq!(decoded.vendor_code(), error.vendor_code());
+    assert_eq!(
+        decoded.context().iter().collect::<Vec<_>>(),
+        error.context().iter().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn legacy_error_round_trip_has_empty_structured_details() {
+    let decoded = seeed_hal_protocol::error_from_proto(valid_error()).unwrap();
+    assert!(decoded.resource_id().is_none());
+    assert!(decoded.platform_code().is_none());
+    assert!(decoded.vendor_code().is_none());
+    assert!(decoded.context().is_empty());
+}
+
+#[test]
+fn malformed_error_details_are_invalid_messages() {
+    let invalid_resource = seeed_hal_protocol::error_from_proto(v1::Error {
+        resource_id: "é".to_owned(),
+        ..valid_error()
+    })
+    .unwrap_err();
+    assert_eq!(
+        invalid_resource.name().as_str(),
+        "runtime.protocol.invalid_message"
+    );
+    assert!(invalid_resource.debug_message().contains("resource_id"));
+
+    for (field, value) in [("platform_code", "é"), ("vendor_code", "é")] {
+        let result = if field == "platform_code" {
+            v1::Error {
+                platform_code: value.to_owned(),
+                ..valid_error()
+            }
+        } else {
+            v1::Error {
+                vendor_code: value.to_owned(),
+                ..valid_error()
+            }
+        };
+        let error = seeed_hal_protocol::error_from_proto(result).unwrap_err();
+        assert_eq!(error.name().as_str(), "runtime.protocol.invalid_message");
+        assert!(error.debug_message().contains(field));
+    }
+
+    let error = seeed_hal_protocol::error_from_proto(v1::Error {
+        context: [("QueueDepth".to_owned(), "64".to_owned())].into(),
+        ..valid_error()
+    })
+    .unwrap_err();
+    assert_eq!(error.name().as_str(), "runtime.protocol.invalid_message");
+    assert!(error.debug_message().contains("context"));
+}
+
+#[test]
+fn malformed_error_details_reject_every_size_and_count_bound() {
+    let cases = [
+        v1::Error {
+            platform_code: "x".repeat(256),
+            ..valid_error()
+        },
+        v1::Error {
+            vendor_code: "x".repeat(256),
+            ..valid_error()
+        },
+        v1::Error {
+            context: [("k".repeat(65), "x".to_owned())].into(),
+            ..valid_error()
+        },
+        v1::Error {
+            context: [("k".to_owned(), "x".repeat(1025))].into(),
+            ..valid_error()
+        },
+        v1::Error {
+            context: (0..17)
+                .map(|index| (format!("key{index}"), "x".to_owned()))
+                .collect(),
+            ..valid_error()
+        },
+        v1::Error {
+            context: (0..8)
+                .map(|index| {
+                    (
+                        format!("k{index}"),
+                        "x".repeat(if index == 0 { 1023 } else { 1022 }),
+                    )
+                })
+                .collect(),
+            ..valid_error()
+        },
+    ];
+
+    for value in cases {
+        let error = seeed_hal_protocol::error_from_proto(value).unwrap_err();
+        assert_eq!(error.name().as_str(), "runtime.protocol.invalid_message");
+    }
 }
