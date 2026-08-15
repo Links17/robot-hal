@@ -249,7 +249,8 @@ pub fn resolve_resource<'a>(
             operation,
             false,
             "resource selector did not match an enumerated descriptor",
-        )?);
+        )?
+        .with_resource_id(selector.id().clone()));
     };
     if matches.next().is_some() {
         return Err(HalError::new(
@@ -258,7 +259,8 @@ pub fn resolve_resource<'a>(
             operation,
             false,
             "resource selector matched more than one enumerated descriptor",
-        )?);
+        )?
+        .with_resource_id(selector.id().clone()));
     }
     Ok(selected)
 }

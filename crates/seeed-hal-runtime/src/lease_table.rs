@@ -33,7 +33,8 @@ impl LeaseTable {
                 "serial.open",
                 false,
                 "the resource already has an active control lease",
-            ));
+            )
+            .with_resource_id(resource_id.clone()));
         }
 
         let current = self
@@ -48,6 +49,7 @@ impl LeaseTable {
                 false,
                 "the resource lease generation reached u64::MAX",
             )
+            .with_resource_id(resource_id.clone())
         })?;
         let token = LeaseToken::new(LeaseId::new(), *current, LeaseMode::Control);
         self.active.insert(
@@ -101,7 +103,8 @@ impl LeaseTable {
                     "lease generation {} is older than current generation {current_generation}",
                     lease.generation()
                 ),
-            ));
+            )
+            .with_resource_id(resource_id.clone()));
         }
 
         let active = self.active.get(resource_id).ok_or_else(|| {
@@ -112,6 +115,7 @@ impl LeaseTable {
                 false,
                 "the serial session is closed",
             )
+            .with_resource_id(resource_id.clone())
         })?;
         if &active.session_id != session_id {
             return Err(runtime_error(
@@ -120,7 +124,8 @@ impl LeaseTable {
                 operation,
                 false,
                 "the lease does not belong to the requested session",
-            ));
+            )
+            .with_resource_id(resource_id.clone()));
         }
         if &active.owner_id != owner_id {
             return Err(runtime_error(
@@ -129,7 +134,8 @@ impl LeaseTable {
                 operation,
                 false,
                 "the lease owner does not match the session owner",
-            ));
+            )
+            .with_resource_id(resource_id.clone()));
         }
         if &active.token != lease {
             return Err(runtime_error(
@@ -138,7 +144,8 @@ impl LeaseTable {
                 operation,
                 false,
                 "the lease token does not match the active lease",
-            ));
+            )
+            .with_resource_id(resource_id.clone()));
         }
 
         Ok(())

@@ -572,6 +572,7 @@ async fn stale_generation_never_reaches_the_adapter() {
         .unwrap_err();
 
     assert_eq!(error.name().as_str(), "runtime.lease.stale_generation");
+    assert_eq!(error.resource_id(), Some(descriptor.id()));
     assert!(second.lease_token().generation() > stale.generation());
 
     let error = second.read(1).await.unwrap_err();
@@ -609,6 +610,7 @@ async fn control_lease_is_exclusive_until_the_session_closes() {
     };
 
     assert_eq!(error.name().as_str(), "runtime.lease.conflict");
+    assert_eq!(error.resource_id(), Some(descriptor.id()));
 
     first.close().await.unwrap();
     runtime

@@ -345,13 +345,9 @@ fn resolver_requires_transport_capability_and_exact_persisted_id() {
     let selected = resolve_resource(&descriptors, &selector, &serial, "serial.open").unwrap();
     assert_eq!(selected.id().as_str(), "serial:second");
     assert_eq!(selected.endpoint().as_str(), "/dev/shared");
-    assert_eq!(
-        resolve_resource(&descriptors, &selector, &other, "serial.open")
-            .unwrap_err()
-            .name()
-            .as_str(),
-        "runtime.resource.not_found",
-    );
+    let error = resolve_resource(&descriptors, &selector, &other, "serial.open").unwrap_err();
+    assert_eq!(error.name().as_str(), "runtime.resource.not_found");
+    assert_eq!(error.resource_id(), Some(selector.id()));
 }
 
 #[test]
@@ -372,6 +368,7 @@ fn duplicate_persisted_identity_is_ambiguous_even_when_endpoints_differ() {
 
     assert_eq!(error.name().as_str(), "runtime.resource.ambiguous");
     assert_eq!(error.category(), seeed_hal_core::ErrorCategory::Conflict);
+    assert_eq!(error.resource_id(), Some(descriptors[0].id()));
 }
 
 #[test]
