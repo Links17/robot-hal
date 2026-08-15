@@ -24,18 +24,19 @@ from .transport_unix import HARD_FRAME_BYTES
 
 _COMMAND_CAPACITY = 4
 _POLL_SECONDS = 0.001
-_WOULD_BLOCK_CODES = frozenset((231, 232, 536))
+_WOULD_BLOCK_CODES = frozenset((232,))
 
 
-def _load_pywin32() -> tuple[Any, Any]:
+def _load_pywin32() -> tuple[Any, Any, type[BaseException]]:
     try:
+        import pywintypes
         import win32file
         import win32pipe
     except ImportError as error:
         raise disconnected_error(
             "runtime.broker.connect", "pywin32 is required for Windows Named Pipes"
         ) from error
-    return win32file, win32pipe
+    return win32file, win32pipe, pywintypes.error
 
 
 async def _cleanup_cancelled_connect(
@@ -74,9 +75,15 @@ class _Command:
 
 
 class _PipeActor:
-    def __init__(self, handle: Any, win32file: Any) -> None:
+    def __init__(
+        self,
+        handle: Any,
+        win32file: Any,
+        native_error: type[BaseException],
+    ) -> None:
         self._handle = handle
         self._win32file = win32file
+        self._native_errors = (OSError, native_error)
         self._commands: queue.Queue[_Command] = queue.Queue(_COMMAND_CAPACITY)
         self._slots = threading.BoundedSemaphore(_COMMAND_CAPACITY)
         self._shutdown = threading.Event()
@@ -160,17 +167,19 @@ class _PipeActor:
             _status, written = self._win32file.WriteFile(
                 self._handle, command.payload[command.offset :]
             )
-        except OSError as error:
+        except self._native_errors as error:
             if _would_block(error):
                 return False
             writes.popleft()
             self._finish(command, error=error)
             raise
-        if not isinstance(written, int) or written <= 0:
+        if not isinstance(written, int) or written < 0:
             error = ConnectionError("Named Pipe write made no progress")
             writes.popleft()
             self._finish(command, error=error)
             raise error
+        if written == 0:
+            return False
         command.offset += written
         if command.offset >= len(command.payload):
             writes.popleft()
@@ -182,7 +191,7 @@ class _PipeActor:
         remaining = command.expected - len(command.buffer)
         try:
             _status, chunk = self._win32file.ReadFile(self._handle, remaining)
-        except OSError as error:
+        except self._native_errors as error:
             if _would_block(error):
                 return False
             reads.popleft()
@@ -234,7 +243,7 @@ class _PipeActor:
             self._finish(commands.popleft(), error=error)
 
 
-def _would_block(error: OSError) -> bool:
+def _would_block(error: BaseException) -> bool:
     code = getattr(error, "winerror", None)
     if code is None and error.args and isinstance(error.args[0], int):
         code = error.args[0]
@@ -242,12 +251,19 @@ def _would_block(error: OSError) -> bool:
 
 
 class WindowsFramedTransport:
-    __slots__ = ("_actor", "_frame_limit", "_closed")
+    __slots__ = ("_actor", "_frame_limit", "_closed", "_transport_errors")
 
-    def __init__(self, handle: Any, win32file: Any, frame_limit: int) -> None:
-        self._actor = _PipeActor(handle, win32file)
+    def __init__(
+        self,
+        handle: Any,
+        win32file: Any,
+        native_error: type[BaseException],
+        frame_limit: int,
+    ) -> None:
+        self._actor = _PipeActor(handle, win32file, native_error)
         self._frame_limit = min(frame_limit, HARD_FRAME_BYTES)
         self._closed = False
+        self._transport_errors = (ConnectionError, OSError, native_error)
 
     @classmethod
     async def connect(
@@ -257,7 +273,8 @@ class WindowsFramedTransport:
             raise disconnected_error(
                 "runtime.broker.connect", "only local Named Pipe endpoints are accepted"
             )
-        win32file, win32pipe = _load_pywin32()
+        win32file, win32pipe, native_error = _load_pywin32()
+        native_errors = (OSError, native_error)
 
         def blocking_connect() -> Any:
             handle = None
@@ -292,9 +309,9 @@ class WindowsFramedTransport:
             )
             await _await_cleanup_despite_cancellation(cleanup)
             raise cancelled
-        except OSError as error:
+        except native_errors as error:
             raise disconnected_error("runtime.broker.connect", str(error)) from error
-        return cls(handle, win32file, frame_limit)
+        return cls(handle, win32file, native_error, frame_limit)
 
     def set_frame_limit(self, frame_limit: int) -> None:
         self._frame_limit = min(frame_limit, HARD_FRAME_BYTES)
@@ -311,7 +328,7 @@ class WindowsFramedTransport:
         except HalError:
             await self._finish_close()
             raise
-        except (ConnectionError, OSError) as error:
+        except self._transport_errors as error:
             await self._finish_close()
             raise disconnected_error("runtime.protocol.read", str(error)) from error
 
@@ -331,7 +348,7 @@ class WindowsFramedTransport:
         except asyncio.CancelledError as cancelled:
             await self._close_after_operation_cancellation()
             raise cancelled
-        except (ConnectionError, OSError) as error:
+        except self._transport_errors as error:
             await self._finish_close()
             raise disconnected_error("runtime.protocol.write", str(error)) from error
 

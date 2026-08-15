@@ -437,6 +437,7 @@ async def test_windows_transport_owns_steady_state_pywin32_calls_on_one_thread(
     win32file = ModuleType("win32file")
     win32pipe = ModuleType("win32pipe")
     pywintypes = ModuleType("pywintypes")
+    pywintypes.error = type("error", (Exception,), {})
     calls = []
     main_thread = threading.get_ident()
     wire = bytearray(struct.pack(">I", 2) + b"ok")

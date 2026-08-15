@@ -9,6 +9,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 from types import ModuleType
 
 import pytest
@@ -169,6 +170,8 @@ async def test_cancellation_response_boundary_stress_keeps_unrelated_requests_he
 
 def install_win32_modules(monkeypatch, win32file: ModuleType, win32pipe: ModuleType) -> None:
     pywintypes = ModuleType("pywintypes")
+    pywintypes.error = FaithfulPyWinTypesError
+    win32file.error = FaithfulPyWinTypesError
     win32file.GENERIC_READ = 1
     win32file.GENERIC_WRITE = 2
     win32file.OPEN_EXISTING = 3
@@ -178,6 +181,294 @@ def install_win32_modules(monkeypatch, win32file: ModuleType, win32pipe: ModuleT
     monkeypatch.setitem(sys.modules, "win32file", win32file)
     monkeypatch.setitem(sys.modules, "win32pipe", win32pipe)
     monkeypatch.setitem(sys.modules, "pywintypes", pywintypes)
+
+
+class FaithfulPyWinTypesError(Exception):
+    """Match pywin32 311's direct-Exception error type and public fields."""
+
+    def __init__(self, *args) -> None:
+        self.winerror = args[0] if args else None
+        self.funcname = args[1] if len(args) > 1 else None
+        self.strerror = args[2] if len(args) > 2 else None
+        super().__init__(*args)
+
+
+@pytest.mark.asyncio
+async def test_windows_native_no_data_read_retries_then_progresses(monkeypatch) -> None:
+    from seeed_hal.transport_windows import WindowsFramedTransport
+
+    handle = object()
+    wire = bytearray(struct.pack(">I", 2) + b"ok")
+    read_calls = 0
+    close_calls = 0
+    win32file = ModuleType("win32file")
+    win32pipe = ModuleType("win32pipe")
+
+    win32file.CreateFile = lambda *_args: handle
+    win32pipe.SetNamedPipeHandleState = lambda *_args: None
+
+    def read_file(value, count):
+        nonlocal read_calls
+        assert value is handle
+        read_calls += 1
+        if read_calls == 1:
+            raise FaithfulPyWinTypesError(232, "ReadFile", "No data")
+        chunk = bytes(wire[:count])
+        del wire[:count]
+        return 0, chunk
+
+    def close_handle(value):
+        nonlocal close_calls
+        assert value is handle
+        close_calls += 1
+
+    win32file.ReadFile = read_file
+    win32file.WriteFile = lambda _handle, data: (0, len(data))
+    win32file.CloseHandle = close_handle
+    install_win32_modules(monkeypatch, win32file, win32pipe)
+
+    transport = await WindowsFramedTransport.connect(r"\\.\pipe\seeed-hal-no-data")
+    assert await transport.receive() == b"ok"
+    await transport.close()
+
+    assert read_calls == 3
+    assert close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_windows_native_no_data_read_deadline_terminates_actor(
+    monkeypatch,
+) -> None:
+    import seeed_hal.transport_windows as transport_windows
+
+    handle = object()
+    read_times: list[float] = []
+    close_calls = 0
+    win32file = ModuleType("win32file")
+    win32pipe = ModuleType("win32pipe")
+
+    win32file.CreateFile = lambda *_args: handle
+    win32pipe.SetNamedPipeHandleState = lambda *_args: None
+
+    def read_file(value, _count):
+        assert value is handle
+        read_times.append(time.monotonic())
+        raise FaithfulPyWinTypesError(232, "ReadFile", "No data")
+
+    def close_handle(value):
+        nonlocal close_calls
+        assert value is handle
+        close_calls += 1
+
+    win32file.ReadFile = read_file
+    win32file.WriteFile = lambda _handle, data: (0, len(data))
+    win32file.CloseHandle = close_handle
+    install_win32_modules(monkeypatch, win32file, win32pipe)
+    monkeypatch.setattr(transport_windows, "_POLL_SECONDS", 0.01)
+
+    transport = await transport_windows.WindowsFramedTransport.connect(
+        r"\\.\pipe\seeed-hal-no-data-deadline"
+    )
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(transport.receive(), 0.025)
+    await asyncio.gather(transport.close(), transport.close())
+
+    assert 1 <= len(read_times) <= 4
+    assert all(
+        later - earlier >= 0.008
+        for earlier, later in zip(read_times, read_times[1:])
+    )
+    assert close_calls == 1
+    assert not any(
+        thread.name.startswith("seeed-hal-pipe-io") and thread.is_alive()
+        for thread in threading.enumerate()
+    )
+
+
+@pytest.mark.asyncio
+async def test_windows_native_write_backpressure_error_retries_then_progresses(
+    monkeypatch,
+) -> None:
+    from seeed_hal.transport_windows import WindowsFramedTransport
+
+    handle = object()
+    write_calls = 0
+    close_calls = 0
+    win32file = ModuleType("win32file")
+    win32pipe = ModuleType("win32pipe")
+
+    win32file.CreateFile = lambda *_args: handle
+    win32pipe.SetNamedPipeHandleState = lambda *_args: None
+    win32file.ReadFile = lambda _handle, count: (0, b"\0" * count)
+
+    def write_file(value, data):
+        nonlocal write_calls
+        assert value is handle
+        write_calls += 1
+        if write_calls == 1:
+            raise FaithfulPyWinTypesError(232, "WriteFile", "No data")
+        return 0, len(data)
+
+    def close_handle(value):
+        nonlocal close_calls
+        assert value is handle
+        close_calls += 1
+
+    win32file.WriteFile = write_file
+    win32file.CloseHandle = close_handle
+    install_win32_modules(monkeypatch, win32file, win32pipe)
+
+    transport = await WindowsFramedTransport.connect(
+        r"\\.\pipe\seeed-hal-write-backpressure"
+    )
+    await transport.send(b"ok")
+    await transport.close()
+
+    assert write_calls == 2
+    assert close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_windows_zero_byte_write_waits_then_progresses(monkeypatch) -> None:
+    import seeed_hal.transport_windows as transport_windows
+
+    handle = object()
+    write_times: list[float] = []
+    close_calls = 0
+    win32file = ModuleType("win32file")
+    win32pipe = ModuleType("win32pipe")
+
+    win32file.CreateFile = lambda *_args: handle
+    win32pipe.SetNamedPipeHandleState = lambda *_args: None
+    win32file.ReadFile = lambda _handle, count: (0, b"\0" * count)
+
+    def write_file(value, data):
+        assert value is handle
+        write_times.append(time.monotonic())
+        if len(write_times) == 1:
+            return 0, 0
+        return 0, len(data)
+
+    def close_handle(value):
+        nonlocal close_calls
+        assert value is handle
+        close_calls += 1
+
+    win32file.WriteFile = write_file
+    win32file.CloseHandle = close_handle
+    install_win32_modules(monkeypatch, win32file, win32pipe)
+    monkeypatch.setattr(transport_windows, "_POLL_SECONDS", 0.01)
+
+    transport = await transport_windows.WindowsFramedTransport.connect(
+        r"\\.\pipe\seeed-hal-zero-write"
+    )
+    await transport.send(b"eventual")
+    await transport.close()
+
+    assert len(write_times) == 2
+    assert write_times[1] - write_times[0] >= 0.008
+    assert close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_windows_zero_byte_write_cancellation_and_repeated_close_terminate_actor(
+    monkeypatch,
+) -> None:
+    import seeed_hal.transport_windows as transport_windows
+
+    handle = object()
+    write_started = threading.Event()
+    write_calls = 0
+    close_calls = 0
+    win32file = ModuleType("win32file")
+    win32pipe = ModuleType("win32pipe")
+
+    win32file.CreateFile = lambda *_args: handle
+    win32pipe.SetNamedPipeHandleState = lambda *_args: None
+    win32file.ReadFile = lambda _handle, count: (0, b"\0" * count)
+
+    def write_file(value, _data):
+        nonlocal write_calls
+        assert value is handle
+        write_calls += 1
+        write_started.set()
+        return 0, 0
+
+    def close_handle(value):
+        nonlocal close_calls
+        assert value is handle
+        close_calls += 1
+
+    win32file.WriteFile = write_file
+    win32file.CloseHandle = close_handle
+    install_win32_modules(monkeypatch, win32file, win32pipe)
+    monkeypatch.setattr(transport_windows, "_POLL_SECONDS", 0.01)
+
+    transport = await transport_windows.WindowsFramedTransport.connect(
+        r"\\.\pipe\seeed-hal-zero-write-cancel"
+    )
+    sending = asyncio.create_task(transport.send(b"blocked"))
+    assert await asyncio.to_thread(write_started.wait, 1)
+    await asyncio.sleep(0.025)
+    sending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await sending
+    await asyncio.gather(transport.close(), transport.close())
+
+    assert write_calls <= 4
+    assert close_calls == 1
+    assert not any(
+        thread.name.startswith("seeed-hal-pipe-io") and thread.is_alive()
+        for thread in threading.enumerate()
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["read", "write"])
+@pytest.mark.parametrize("code", [5, 231, 536])
+async def test_windows_nonretryable_native_error_fails_closed_once(
+    monkeypatch, operation: str, code: int
+) -> None:
+    from seeed_hal.transport_windows import WindowsFramedTransport
+
+    handle = object()
+    close_calls = 0
+    win32file = ModuleType("win32file")
+    win32pipe = ModuleType("win32pipe")
+
+    win32file.CreateFile = lambda *_args: handle
+    win32pipe.SetNamedPipeHandleState = lambda *_args: None
+
+    def fail(*_args):
+        raise FaithfulPyWinTypesError(code, operation.title(), "Native pipe failure")
+
+    def close_handle(value):
+        nonlocal close_calls
+        assert value is handle
+        close_calls += 1
+
+    win32file.ReadFile = fail if operation == "read" else lambda _handle, count: (0, b"\0" * count)
+    win32file.WriteFile = fail if operation == "write" else lambda _handle, data: (0, len(data))
+    win32file.CloseHandle = close_handle
+    install_win32_modules(monkeypatch, win32file, win32pipe)
+    transport = await WindowsFramedTransport.connect(
+        rf"\\.\pipe\seeed-hal-terminal-{operation}"
+    )
+
+    with pytest.raises(HalError) as caught:
+        if operation == "read":
+            await asyncio.wait_for(transport.receive(), 0.1)
+        else:
+            await asyncio.wait_for(transport.send(b"fail"), 0.1)
+    await asyncio.gather(transport.close(), transport.close())
+
+    assert caught.value.name == "runtime.broker.disconnected"
+    assert caught.value.operation == f"runtime.protocol.{operation}"
+    assert close_calls == 1
+    assert not any(
+        thread.name.startswith("seeed-hal-pipe-io") and thread.is_alive()
+        for thread in threading.enumerate()
+    )
 
 
 @pytest.mark.asyncio
