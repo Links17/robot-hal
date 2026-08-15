@@ -131,6 +131,30 @@ def test_public_api_is_typed_and_does_not_export_protobuf_objects() -> None:
     assert "proto" not in seeed_hal.__all__
 
 
+def test_hal_error_structured_details_are_immutable_copies() -> None:
+    source = {"queueDepth": "64"}
+    error = HalError(
+        "runtime.queue.full",
+        ErrorCategory.UNAVAILABLE,
+        "serial.write",
+        True,
+        "full",
+        resource_id="serial:virtual:0",
+        platform_code="11",
+        vendor_code="VENDOR_BUSY",
+        context=source,
+    )
+
+    source["queueDepth"] = "changed"
+
+    assert error.resource_id == "serial:virtual:0"
+    assert error.platform_code == "11"
+    assert error.vendor_code == "VENDOR_BUSY"
+    assert dict(error.context) == {"queueDepth": "64"}
+    with pytest.raises(TypeError):
+        error.context["new"] = "value"
+
+
 @pytest.mark.asyncio
 async def test_python_client_accepts_overlap_selection_and_rejects_no_shared_minor() -> None:
     release = asyncio.Event()
@@ -249,6 +273,74 @@ async def test_pending_backpressure_and_cancellation_are_bounded() -> None:
         release.set()
         assert (await asyncio.wait_for(next_call, 1))[0].resource_id == "serial:next"
         await asyncio.sleep(0)
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_broker_error_response_preserves_rich_structured_details() -> None:
+    async def handler(reader, writer):
+        request = hal_pb2.Envelope.FromString(await read_frame(reader))
+        await send_frame(
+            writer,
+            envelope(
+                request.request_id,
+                "error",
+                hal_pb2.Error(
+                    name="runtime.queue.full",
+                    category=hal_pb2.ERROR_CATEGORY_UNAVAILABLE,
+                    operation="serial.write",
+                    retryable=True,
+                    debug_message="full",
+                    resource_id="serial:virtual:0",
+                    platform_code="11",
+                    vendor_code="VENDOR_BUSY",
+                    context={"queueDepth": "64"},
+                ),
+            ).SerializeToString(),
+        )
+
+    async with fake_broker(handler) as endpoint:
+        client = await HalClient.connect(endpoint, TOKEN)
+        with pytest.raises(HalError) as caught:
+            await client.enumerate_serial()
+        error = caught.value
+        assert error.resource_id == "serial:virtual:0"
+        assert error.platform_code == "11"
+        assert error.vendor_code == "VENDOR_BUSY"
+        assert dict(error.context) == {"queueDepth": "64"}
+        with pytest.raises(TypeError):
+            error.context["new"] = "value"
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_broker_error_response_has_empty_structured_details() -> None:
+    async def handler(reader, writer):
+        request = hal_pb2.Envelope.FromString(await read_frame(reader))
+        await send_frame(
+            writer,
+            envelope(
+                request.request_id,
+                "error",
+                hal_pb2.Error(
+                    name="runtime.queue.full",
+                    category=hal_pb2.ERROR_CATEGORY_UNAVAILABLE,
+                    operation="serial.write",
+                    retryable=True,
+                    debug_message="full",
+                ),
+            ).SerializeToString(),
+        )
+
+    async with fake_broker(handler) as endpoint:
+        client = await HalClient.connect(endpoint, TOKEN)
+        with pytest.raises(HalError) as caught:
+            await client.enumerate_serial()
+        error = caught.value
+        assert error.resource_id is None
+        assert error.platform_code is None
+        assert error.vendor_code is None
+        assert dict(error.context) == {}
         await client.close()
 
 

@@ -52,6 +52,11 @@ DEFAULT_CAPACITY = 32
 DEFAULT_EVENT_CAPACITY = 64
 MAX_U32 = (1 << 32) - 1
 MAX_U64 = (1 << 64) - 1
+ERROR_CODE_MAX_BYTES = 255
+ERROR_CONTEXT_MAX_ENTRIES = 16
+ERROR_CONTEXT_MAX_KEY_BYTES = 64
+ERROR_CONTEXT_MAX_VALUE_BYTES = 1024
+ERROR_CONTEXT_MAX_TOTAL_BYTES = 8192
 
 
 class FramedTransport(Protocol):
@@ -149,6 +154,10 @@ class EventSubscription:
             "runtime.event.receive",
             False,
             "the client event stream is closed",
+            None,
+            None,
+            None,
+            (),
         )
         if self._queue.empty():
             self._queue.put_nowait(self._terminal)
@@ -932,7 +941,77 @@ def _decode_error(error: hal_pb2.Error) -> HalError:
         raise _invalid_message("broker error metadata is invalid") from invalid
     if category is None:
         raise _invalid_message("broker error has an unknown category")
-    return HalError(name, category, operation, error.retryable, error.debug_message)
+    resource_id, platform_code, vendor_code, context = _decode_error_details(error)
+    return HalError(
+        name,
+        category,
+        operation,
+        error.retryable,
+        error.debug_message,
+        resource_id,
+        platform_code,
+        vendor_code,
+        context,
+    )
+
+
+def _decode_error_details(
+    error: hal_pb2.Error,
+) -> tuple[str | None, str | None, str | None, dict[str, str]]:
+    try:
+        resource_id = (
+            _valid_identifier(error.resource_id, "error.resource_id")
+            if error.resource_id
+            else None
+        )
+        platform_code = _optional_error_code(error.platform_code, "platform_code")
+        vendor_code = _optional_error_code(error.vendor_code, "vendor_code")
+        context = _valid_error_context(error.context)
+    except HalError as invalid:
+        raise _invalid_message("broker error details are invalid") from invalid
+    return resource_id, platform_code, vendor_code, context
+
+
+def _optional_error_code(value: str, field: str) -> str | None:
+    if not value:
+        return None
+    if len(value) > ERROR_CODE_MAX_BYTES or not value.isascii():
+        raise _invalid_message(f"error {field} is invalid")
+    return value
+
+
+def _valid_error_context(entries) -> dict[str, str]:
+    if len(entries) > ERROR_CONTEXT_MAX_ENTRIES:
+        raise _invalid_message("error context has too many entries")
+    context: dict[str, str] = {}
+    total_bytes = 0
+    for key, value in entries.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise _invalid_message("error context entry is invalid")
+        try:
+            key_bytes = key.encode("utf-8")
+            value_bytes = value.encode("utf-8")
+        except UnicodeEncodeError as invalid:
+            raise _invalid_message("error context entry is invalid") from invalid
+        if (
+            not key
+            or len(key_bytes) > ERROR_CONTEXT_MAX_KEY_BYTES
+            or not key.isascii()
+            or not "a" <= key[0] <= "z"
+            or not all(
+                character.isascii()
+                and (character.isalnum() or character in "_-")
+                for character in key[1:]
+            )
+        ):
+            raise _invalid_message("error context key is invalid")
+        if len(value_bytes) > ERROR_CONTEXT_MAX_VALUE_BYTES:
+            raise _invalid_message("error context value is invalid")
+        total_bytes += len(key_bytes) + len(value_bytes)
+        if total_bytes > ERROR_CONTEXT_MAX_TOTAL_BYTES:
+            raise _invalid_message("error context is too large")
+        context[key] = value
+    return context
 
 
 def _decode_descriptor(value: hal_pb2.ResourceDescriptor) -> ResourceDescriptor:

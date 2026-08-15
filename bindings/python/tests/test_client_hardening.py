@@ -1113,7 +1113,19 @@ async def test_terminal_fanout_and_repeated_calls_receive_fresh_immutable_errors
     second = asyncio.create_task(client.enumerate_serial())
     await next_request(transport)
     await next_request(transport)
-    transport.inbound.put_nowait(OSError("connection lost"))
+    client._terminate(
+        HalError(
+            "runtime.queue.full",
+            ErrorCategory.UNAVAILABLE,
+            "serial.write",
+            True,
+            "full",
+            resource_id="serial:virtual:0",
+            platform_code="11",
+            vendor_code="VENDOR_BUSY",
+            context={"queueDepth": "64"},
+        )
+    )
     first_error, second_error = await asyncio.gather(
         first, second, return_exceptions=True
     )
@@ -1121,12 +1133,77 @@ async def test_terminal_fanout_and_repeated_calls_receive_fresh_immutable_errors
     assert isinstance(second_error, HalError)
     assert first_error == second_error
     assert first_error is not second_error
+    assert dict(first_error.context) == {"queueDepth": "64"}
+    assert first_error.context is not second_error.context
     with pytest.raises(FrozenInstanceError):
         first_error.name = "changed"
+    with pytest.raises(TypeError):
+        first_error.context["new"] = "value"
 
     with pytest.raises(HalError) as repeated:
         await client.enumerate_serial()
     assert repeated.value == first_error
+    assert repeated.value is not first_error
+    assert repeated.value.context is not first_error.context
+    await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "peer_error",
+    [
+        hal_pb2.Error(resource_id="é"),
+        hal_pb2.Error(resource_id="r" * 256),
+        hal_pb2.Error(platform_code="é"),
+        hal_pb2.Error(platform_code="x" * 256),
+        hal_pb2.Error(vendor_code="é"),
+        hal_pb2.Error(vendor_code="x" * 256),
+        hal_pb2.Error(context={"QueueDepth": "64"}),
+        hal_pb2.Error(context={"k" * 65: "x"}),
+        hal_pb2.Error(context={"key": "x" * 1025}),
+        hal_pb2.Error(
+            context={f"key{index}": "x" for index in range(17)}
+        ),
+        hal_pb2.Error(
+            context={
+                f"k{index}": "x" * (1023 if index == 0 else 1022)
+                for index in range(8)
+            }
+        ),
+    ],
+)
+async def test_malformed_broker_error_details_terminate_with_invalid_message(
+    peer_error: hal_pb2.Error,
+) -> None:
+    transport = ScriptedTransport()
+    client = direct_client(transport)
+    first = asyncio.create_task(client.enumerate_serial())
+    second = asyncio.create_task(client.enumerate_serial())
+    first_request = await next_request(transport)
+    await next_request(transport)
+    peer_error.name = "runtime.queue.full"
+    peer_error.category = hal_pb2.ERROR_CATEGORY_UNAVAILABLE
+    peer_error.operation = "serial.write"
+    peer_error.retryable = True
+    peer_error.debug_message = "full"
+    transport.inbound.put_nowait(
+        hal_pb2.Envelope(
+            request_id=first_request.request_id,
+            error=peer_error,
+        ).SerializeToString()
+    )
+
+    first_error, second_error = await asyncio.gather(
+        first, second, return_exceptions=True
+    )
+    assert isinstance(first_error, HalError)
+    assert isinstance(second_error, HalError)
+    assert first_error.name == "runtime.protocol.invalid_message"
+    assert second_error.name == "runtime.protocol.invalid_message"
+    assert first_error is not second_error
+    with pytest.raises(HalError) as repeated:
+        await client.enumerate_serial()
+    assert repeated.value.name == "runtime.protocol.invalid_message"
     assert repeated.value is not first_error
     await client.close()
 

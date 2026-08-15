@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from types import MappingProxyType
+from typing import Mapping
 
 
 class ErrorCategory(Enum):
@@ -21,9 +23,17 @@ class HalError(Exception):
     operation: str
     retryable: bool
     debug_message: str
+    resource_id: str | None = None
+    platform_code: str | None = None
+    vendor_code: str | None = None
+    context: Mapping[str, str] = field(
+        default_factory=lambda: MappingProxyType({}),
+        hash=False,
+    )
 
     def __post_init__(self) -> None:
         Exception.__init__(self, self.debug_message)
+        object.__setattr__(self, "context", MappingProxyType(dict(self.context)))
 
     def __str__(self) -> str:
         return f"{self.name} during {self.operation}: {self.debug_message}"
@@ -36,6 +46,10 @@ class _ErrorData:
     operation: str
     retryable: bool
     debug_message: str
+    resource_id: str | None
+    platform_code: str | None
+    vendor_code: str | None
+    context_items: tuple[tuple[str, str], ...]
 
 
 def _error_data(error: HalError) -> _ErrorData:
@@ -45,6 +59,10 @@ def _error_data(error: HalError) -> _ErrorData:
         error.operation,
         error.retryable,
         error.debug_message,
+        error.resource_id,
+        error.platform_code,
+        error.vendor_code,
+        tuple(sorted(error.context.items())),
     )
 
 
@@ -55,6 +73,10 @@ def _fresh_error(data: _ErrorData) -> HalError:
         data.operation,
         data.retryable,
         data.debug_message,
+        data.resource_id,
+        data.platform_code,
+        data.vendor_code,
+        dict(data.context_items),
     )
 
 
