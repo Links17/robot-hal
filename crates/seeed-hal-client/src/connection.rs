@@ -7,7 +7,9 @@ use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use seeed_hal_core::{ErrorCategory, HalError, HalResult, ResourceDescriptor, ResourceSelector};
 use seeed_hal_protocol::v1::{self, envelope};
-use seeed_hal_protocol::{MAX_FRAME_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR, SERIAL_CAPABILITY};
+use seeed_hal_protocol::{
+    MAX_FRAME_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR, SERIAL_CAPABILITY, error_from_proto,
+};
 use seeed_hal_protocol::{
     PROTOCOL_MINOR_MAXIMUM, PROTOCOL_MINOR_MINIMUM, handshake_response_minor_range,
 };
@@ -740,7 +742,7 @@ where
                 write: response.max_write_bytes as usize,
             })
         }
-        Some(envelope::Payload::Error(error)) => Err(decode_error(error)?),
+        Some(envelope::Payload::Error(error)) => Err(error_from_proto(error)?),
         _ => Err(client_error(
             "runtime.protocol.unexpected_response",
             ErrorCategory::InvalidArgument,
@@ -875,7 +877,7 @@ where
                     };
                     let _ = shared.events.send(Ok(event));
                 }
-                Some(envelope::Payload::Error(error)) => match decode_error(error) {
+                Some(envelope::Payload::Error(error)) => match error_from_proto(error) {
                     Ok(error) => {
                         let _ = shared.events.send(Err(error));
                     }
@@ -939,7 +941,7 @@ where
             continue;
         };
         let result = match envelope.payload {
-            Some(envelope::Payload::Error(error)) => decode_error(error).and_then(Err),
+            Some(envelope::Payload::Error(error)) => error_from_proto(error).and_then(Err),
             Some(payload) if response_matches(pending.expected, &payload) => Ok(payload),
             _ => Err(client_error(
                 "runtime.protocol.unexpected_response",
@@ -1305,41 +1307,6 @@ fn validate_handshake_response(
         ));
     }
     Ok(())
-}
-
-fn decode_error(error: v1::Error) -> HalResult<HalError> {
-    let category = match v1::ErrorCategory::try_from(error.category) {
-        Ok(v1::ErrorCategory::InvalidArgument) => ErrorCategory::InvalidArgument,
-        Ok(v1::ErrorCategory::NotFound) => ErrorCategory::NotFound,
-        Ok(v1::ErrorCategory::Conflict) => ErrorCategory::Conflict,
-        Ok(v1::ErrorCategory::Unavailable) => ErrorCategory::Unavailable,
-        Ok(v1::ErrorCategory::Internal) => ErrorCategory::Internal,
-        _ => {
-            return Err(client_error(
-                "runtime.protocol.invalid_message",
-                ErrorCategory::InvalidArgument,
-                "runtime.protocol.decode",
-                false,
-                "broker error has an unknown category",
-            ));
-        }
-    };
-    HalError::new(
-        error.name,
-        category,
-        error.operation,
-        error.retryable,
-        error.debug_message,
-    )
-    .map_err(|_| {
-        client_error(
-            "runtime.protocol.invalid_message",
-            ErrorCategory::InvalidArgument,
-            "runtime.protocol.decode",
-            false,
-            "broker error metadata is invalid",
-        )
-    })
 }
 
 fn frame_codec(max_frame_bytes: usize) -> LengthDelimitedCodec {

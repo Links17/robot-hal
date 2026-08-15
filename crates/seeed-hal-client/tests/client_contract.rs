@@ -115,6 +115,13 @@ mod fake {
         }
     }
 
+    pub fn error_response(request_id: u64, error: v1::Error) -> v1::Envelope {
+        v1::Envelope {
+            request_id,
+            payload: Some(envelope::Payload::Error(error)),
+        }
+    }
+
     pub async fn respond_enumerate_and_open(wire: &mut Wire, resource_id: &str) {
         let enumerate = recv(wire).await;
         send(wire, enumerate_response(enumerate.request_id, resource_id)).await;
@@ -181,6 +188,245 @@ async fn rust_client_round_trips_serial_through_broker() {
     serial.close().await.unwrap();
     client.close().await.unwrap();
 
+    assert!(server.await.unwrap().cleanup_error().is_none());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rich_broker_error_preserves_all_wire_details() {
+    use seeed_hal_core::ErrorCategory;
+    use seeed_hal_protocol::v1;
+    use std::collections::HashMap;
+
+    let endpoint = fake::endpoint("rich-error");
+    let listener = fake::bind(&endpoint);
+    let server = tokio::spawn(async move {
+        let mut wire = fake::accept_and_handshake(listener).await;
+        let request = fake::recv(&mut wire).await;
+        fake::send(
+            &mut wire,
+            fake::error_response(
+                request.request_id,
+                v1::Error {
+                    name: "runtime.resource.failed".to_owned(),
+                    category: v1::ErrorCategory::Unavailable as i32,
+                    operation: "runtime.serial.open".to_owned(),
+                    retryable: true,
+                    debug_message: "adapter failed to open resource".to_owned(),
+                    resource_id: "serial:virtual:rich".to_owned(),
+                    platform_code: "platform-code".to_owned(),
+                    vendor_code: "vendor-code".to_owned(),
+                    context: HashMap::from([
+                        ("attempt".to_owned(), "2".to_owned()),
+                        ("phase".to_owned(), "open".to_owned()),
+                    ]),
+                },
+            ),
+        )
+        .await;
+    });
+    let client = HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN))
+        .await
+        .unwrap();
+    let error = client.enumerate_serial().await.unwrap_err();
+    assert_eq!(error.name().as_str(), "runtime.resource.failed");
+    assert_eq!(error.category(), ErrorCategory::Unavailable);
+    assert_eq!(error.operation().as_str(), "runtime.serial.open");
+    assert!(error.retryable());
+    assert_eq!(error.debug_message(), "adapter failed to open resource");
+    assert_eq!(error.resource_id().unwrap().as_str(), "serial:virtual:rich");
+    assert_eq!(error.platform_code(), Some("platform-code"));
+    assert_eq!(error.vendor_code(), Some("vendor-code"));
+    assert_eq!(
+        error.context().iter().collect::<Vec<_>>(),
+        vec![("attempt", "2"), ("phase", "open")]
+    );
+    client.close().await.unwrap();
+    server.await.unwrap();
+    std::fs::remove_file(endpoint).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn legacy_broker_error_preserves_fields_one_through_five() {
+    use seeed_hal_core::ErrorCategory;
+    use seeed_hal_protocol::v1;
+
+    let endpoint = fake::endpoint("legacy-error");
+    let listener = fake::bind(&endpoint);
+    let server = tokio::spawn(async move {
+        let mut wire = fake::accept_and_handshake(listener).await;
+        let request = fake::recv(&mut wire).await;
+        fake::send(
+            &mut wire,
+            fake::error_response(
+                request.request_id,
+                v1::Error {
+                    name: "runtime.resource.not_found".to_owned(),
+                    category: v1::ErrorCategory::NotFound as i32,
+                    operation: "runtime.serial.enumerate".to_owned(),
+                    retryable: false,
+                    debug_message: "resource was not found".to_owned(),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await;
+    });
+    let client = HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN))
+        .await
+        .unwrap();
+    let error = client.enumerate_serial().await.unwrap_err();
+    assert_eq!(error.name().as_str(), "runtime.resource.not_found");
+    assert_eq!(error.category(), ErrorCategory::NotFound);
+    assert_eq!(error.operation().as_str(), "runtime.serial.enumerate");
+    assert!(!error.retryable());
+    assert_eq!(error.debug_message(), "resource was not found");
+    assert!(error.resource_id().is_none());
+    assert!(error.platform_code().is_none());
+    assert!(error.vendor_code().is_none());
+    assert!(error.context().is_empty());
+    client.close().await.unwrap();
+    server.await.unwrap();
+    std::fs::remove_file(endpoint).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn malformed_normal_error_terminates_and_fans_out_to_pending_requests() {
+    use seeed_hal_protocol::v1;
+    use std::collections::HashMap;
+
+    let endpoint = fake::endpoint("malformed-error");
+    let listener = fake::bind(&endpoint);
+    let server = tokio::spawn(async move {
+        let mut wire = fake::accept_and_handshake(listener).await;
+        let first = fake::recv(&mut wire).await;
+        let _second = fake::recv(&mut wire).await;
+        fake::send(
+            &mut wire,
+            fake::error_response(
+                first.request_id,
+                v1::Error {
+                    name: "runtime.resource.failed".to_owned(),
+                    category: v1::ErrorCategory::Internal as i32,
+                    operation: "runtime.serial.enumerate".to_owned(),
+                    context: HashMap::from([("InvalidKey".to_owned(), "value".to_owned())]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await;
+    });
+    let client = HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN))
+        .await
+        .unwrap();
+    let first_client = client.clone();
+    let second_client = client.clone();
+    let first = tokio::spawn(async move { first_client.enumerate_serial().await });
+    let second = tokio::spawn(async move { second_client.enumerate_serial().await });
+    for result in [first.await.unwrap(), second.await.unwrap()] {
+        assert_eq!(
+            result.unwrap_err().name().as_str(),
+            "runtime.protocol.invalid_message"
+        );
+    }
+    client.close().await.unwrap();
+    server.await.unwrap();
+    std::fs::remove_file(endpoint).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn malformed_unsolicited_error_terminates_and_fans_out_to_pending_requests() {
+    use seeed_hal_protocol::v1::{self, envelope};
+    use std::collections::HashMap;
+
+    let endpoint = fake::endpoint("malformed-unsolicited-error");
+    let listener = fake::bind(&endpoint);
+    let server = tokio::spawn(async move {
+        let mut wire = fake::accept_and_handshake(listener).await;
+        let _first = fake::recv(&mut wire).await;
+        let _second = fake::recv(&mut wire).await;
+        fake::send(
+            &mut wire,
+            v1::Envelope {
+                request_id: 0,
+                payload: Some(envelope::Payload::Error(v1::Error {
+                    name: "runtime.resource.failed".to_owned(),
+                    category: v1::ErrorCategory::Internal as i32,
+                    operation: "runtime.serial.enumerate".to_owned(),
+                    context: HashMap::from([("InvalidKey".to_owned(), "value".to_owned())]),
+                    ..Default::default()
+                })),
+            },
+        )
+        .await;
+    });
+    let client = HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN))
+        .await
+        .unwrap();
+    let first_client = client.clone();
+    let second_client = client.clone();
+    let first = tokio::spawn(async move { first_client.enumerate_serial().await });
+    let second = tokio::spawn(async move { second_client.enumerate_serial().await });
+    for result in [first.await.unwrap(), second.await.unwrap()] {
+        assert_eq!(
+            result.unwrap_err().name().as_str(),
+            "runtime.protocol.invalid_message"
+        );
+    }
+    client.close().await.unwrap();
+    server.await.unwrap();
+    std::fs::remove_file(endpoint).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn broker_round_trip_preserves_missing_resource_id() {
+    use seeed_hal_broker::{Broker, StartupToken, listener::UnixBroker};
+    use seeed_hal_core::{IdentityQuality, ResourceId, ResourceSelector, TransportKind};
+    use seeed_hal_runtime::HalRuntime;
+    use seeed_hal_testkit::VirtualSerialAdapter;
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::path::PathBuf::from(format!(
+        "/tmp/shc-missing-{}-{nonce}",
+        std::process::id()
+    ));
+    let runtime = HalRuntime::builder()
+        .serial_adapter(VirtualSerialAdapter::loopback("serial:virtual:present"))
+        .build();
+    let broker = UnixBroker::bind(
+        Broker::with_startup_token(runtime, StartupToken::from_bytes(TOKEN)),
+        &directory,
+    )
+    .await
+    .unwrap();
+    let socket_path = broker.socket_path().to_owned();
+    let server = tokio::spawn(async move { broker.serve_one().await.unwrap() });
+    let client = HalClient::connect(ConnectionOptions::new(socket_path, TOKEN))
+        .await
+        .unwrap();
+    let selector = ResourceSelector::exact(
+        ResourceId::parse("serial:virtual:missing").unwrap(),
+        IdentityQuality::Strong,
+        TransportKind::Serial,
+    );
+    let error = match client.open_serial(selector, SerialConfig::default()).await {
+        Ok(_) => panic!("opening an absent resource must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.name().as_str(), "runtime.resource.not_found");
+    assert_eq!(
+        error.resource_id().unwrap().as_str(),
+        "serial:virtual:missing"
+    );
+    client.close().await.unwrap();
     assert!(server.await.unwrap().cleanup_error().is_none());
     std::fs::remove_dir_all(directory).unwrap();
 }
