@@ -1267,10 +1267,12 @@ mod tests {
             .unwrap_err()
             .raw_os_error()
             .expect("missing path should carry a platform raw OS error");
+        let expected_platform_code = expected_raw_os_error.to_string();
 
         let error = open_serial_stream(&endpoint, &SerialConfig::default()).unwrap_err();
 
         assert_eq!(error.name().as_str(), "runtime.resource.not_found");
+        assert_eq!(error.platform_code(), Some(expected_platform_code.as_str()));
         assert!(error.debug_message().contains("io error kind=NotFound"));
         assert!(
             error

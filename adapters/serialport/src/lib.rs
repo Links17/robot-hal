@@ -178,11 +178,11 @@ pub(crate) fn map_serialport_error(operation: &'static str, error: serialport::E
 
 pub(crate) fn map_io_error(operation: &'static str, error: std::io::Error) -> HalError {
     let (name, category, retryable) = io_error_decision(error.kind());
-    let raw_os_error = error
-        .raw_os_error()
+    let raw_os_error = error.raw_os_error();
+    let raw_os_error_description = raw_os_error
         .map(|code| code.to_string())
         .unwrap_or_else(|| "none".to_owned());
-    hal_error(
+    let mut mapped = hal_error(
         name,
         category,
         operation,
@@ -190,10 +190,18 @@ pub(crate) fn map_io_error(operation: &'static str, error: std::io::Error) -> Ha
         format!(
             "io error kind={:?} raw_os_error={}: {}",
             error.kind(),
-            raw_os_error,
+            raw_os_error_description,
             error
         ),
-    )
+    );
+
+    if let Some(raw_os_error) = raw_os_error {
+        mapped = mapped
+            .with_platform_code(raw_os_error.to_string())
+            .expect("a decimal OS error code is a valid platform code");
+    }
+
+    mapped
 }
 
 fn no_device_decision(
@@ -377,6 +385,7 @@ mod tests {
 
         let error = map_io_error("serial.open", io_error);
 
+        assert_eq!(error.platform_code(), Some("13"));
         assert!(error.debug_message().contains("raw_os_error=13"));
     }
 }
