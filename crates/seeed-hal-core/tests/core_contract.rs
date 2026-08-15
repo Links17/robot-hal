@@ -1,8 +1,9 @@
 use seeed_hal_core::{
-    CapabilityId, CapabilitySet, Endpoint, IdentityQuality, LeaseMode, LeaseToken,
+    CapabilityId, CapabilitySet, Endpoint, ErrorContext, IdentityQuality, LeaseMode, LeaseToken,
     ResourceDescriptor, ResourceId, ResourceProperties, ResourceSelector, TransportKind,
     resolve_resource,
 };
+use std::collections::BTreeMap;
 
 fn serial_descriptor(id: &str, endpoint: &str, quality: IdentityQuality) -> ResourceDescriptor {
     ResourceDescriptor::new(
@@ -66,6 +67,172 @@ fn error_decisions_do_not_require_message_parsing() {
     assert_eq!(json["operation"], "serial.write");
     assert_eq!(json["retryable"], false);
     assert!(json.get("debug_message").is_none());
+}
+
+#[test]
+fn structured_error_details_are_validated_and_preserved() {
+    let context = ErrorContext::new([
+        ("queueDepth".to_owned(), "64".to_owned()),
+        ("limit_bytes".to_owned(), "1024".to_owned()),
+    ])
+    .unwrap();
+    let error = seeed_hal_core::HalError::new(
+        "runtime.queue.full",
+        seeed_hal_core::ErrorCategory::Unavailable,
+        "serial.write",
+        true,
+        "queue is full",
+    )
+    .unwrap()
+    .with_resource_id(ResourceId::parse("serial:virtual:0").unwrap())
+    .with_platform_code("11")
+    .unwrap()
+    .with_vendor_code("VENDOR_BUSY")
+    .unwrap()
+    .with_context(context);
+
+    assert_eq!(error.resource_id().unwrap().as_str(), "serial:virtual:0");
+    assert_eq!(error.platform_code(), Some("11"));
+    assert_eq!(error.vendor_code(), Some("VENDOR_BUSY"));
+    assert_eq!(
+        error.context().iter().collect::<Vec<_>>(),
+        vec![("limit_bytes", "1024"), ("queueDepth", "64")]
+    );
+}
+
+#[test]
+fn legacy_error_constructor_has_empty_details() {
+    let error = seeed_hal_core::HalError::new(
+        "runtime.session.closed",
+        seeed_hal_core::ErrorCategory::Conflict,
+        "serial.read",
+        false,
+        "closed",
+    )
+    .unwrap();
+    assert!(error.resource_id().is_none());
+    assert!(error.platform_code().is_none());
+    assert!(error.vendor_code().is_none());
+    assert!(error.context().is_empty());
+}
+
+#[test]
+fn error_context_rejects_duplicate_and_invalid_keys() {
+    let duplicate = ErrorContext::new([
+        ("queueDepth", "64"),
+        ("queueDepth", "65"),
+    ])
+    .unwrap_err();
+    assert_eq!(duplicate.name().as_str(), "error.context.duplicate_key");
+
+    for key in ["", "QueueDepth", "queue.depth", "queue depth", "é"] {
+        assert_eq!(
+            ErrorContext::new([(key, "value")]).unwrap_err().name().as_str(),
+            if key.is_empty() {
+                "error.context.key.empty"
+            } else if !key.is_ascii() {
+                "error.context.key.non_ascii"
+            } else {
+                "error.context.key.invalid"
+            }
+        );
+    }
+}
+
+#[test]
+fn error_context_accepts_entry_key_value_and_aggregate_limits() {
+    let entries = (0..16)
+        .map(|index| (format!("k{index}"), String::new()))
+        .collect::<Vec<_>>();
+    assert!(ErrorContext::new(entries).is_ok());
+
+    let key = format!("a{}", "x".repeat(63));
+    assert_eq!(key.len(), 64);
+    assert!(ErrorContext::new([(key, "value")]).is_ok());
+    assert!(ErrorContext::new([("a", "x".repeat(1024))]).is_ok());
+
+    let exact_total = (0..8)
+        .map(|index| (format!("k{index}"), "x".repeat(1022)))
+        .collect::<Vec<_>>();
+    assert_eq!(exact_total.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>(), 8192);
+    assert!(ErrorContext::new(exact_total).is_ok());
+}
+
+#[test]
+fn error_context_rejects_one_byte_over_limits() {
+    let entries = (0..17)
+        .map(|index| (format!("k{index}"), String::new()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ErrorContext::new(entries).unwrap_err().name().as_str(),
+        "error.context.too_many_entries"
+    );
+
+    assert_eq!(
+        ErrorContext::new([("a".to_owned() + &"x".repeat(64), "value")])
+            .unwrap_err()
+            .name()
+            .as_str(),
+        "error.context.key.too_long"
+    );
+    assert_eq!(
+        ErrorContext::new([("a", "x".repeat(1025))])
+            .unwrap_err()
+            .name()
+            .as_str(),
+        "error.context.value.too_long"
+    );
+
+    let over_total = (0..8)
+        .map(|index| (format!("k{index}"), "x".repeat(1023)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ErrorContext::new(over_total).unwrap_err().name().as_str(),
+        "error.context.too_large"
+    );
+}
+
+#[test]
+fn error_codes_reuse_identifier_validation() {
+    let error = seeed_hal_core::HalError::new(
+        "runtime.queue.full",
+        seeed_hal_core::ErrorCategory::Unavailable,
+        "serial.write",
+        true,
+        "queue is full",
+    )
+    .unwrap();
+    for code in [String::new(), "é".to_owned(), "x".repeat(256)] {
+        assert!(error.clone().with_platform_code(code.clone()).is_err());
+        assert!(error.clone().with_vendor_code(code).is_err());
+    }
+}
+
+#[test]
+fn enriched_error_serde_remains_decision_only() {
+    let context = ErrorContext::new([(String::from("queueDepth"), String::from("64"))]).unwrap();
+    let error = seeed_hal_core::HalError::new(
+        "runtime.queue.full",
+        seeed_hal_core::ErrorCategory::Unavailable,
+        "serial.write",
+        true,
+        "private diagnostic",
+    )
+    .unwrap()
+    .with_resource_id(ResourceId::parse("serial:virtual:0").unwrap())
+    .with_platform_code("11")
+    .unwrap()
+    .with_vendor_code("VENDOR_BUSY")
+    .unwrap()
+    .with_context(context);
+    let json = serde_json::to_value(error).unwrap();
+    let expected = BTreeMap::from([
+        ("category", serde_json::json!("Unavailable")),
+        ("name", serde_json::json!("runtime.queue.full")),
+        ("operation", serde_json::json!("serial.write")),
+        ("retryable", serde_json::json!(true)),
+    ]);
+    assert_eq!(json, serde_json::to_value(expected).unwrap());
 }
 
 #[test]
