@@ -34,6 +34,28 @@ All use SemVer 2.0.0. Their versions may advance independently, but every broker
 - Required semantic changes, ordering changes, or changed defaults require a new major.
 - Clients and brokers ignore unknown fields when doing so is safe and preserve request correlation.
 
+### Structured errors in wire v1
+
+The wire-v1 `Error` message retains its original fields without changing their meaning: `name = 1`,
+`category = 2`, `operation = 3`, `retryable = 4`, and `debug_message = 5`. Structured diagnostics
+are the following additive fields:
+
+```protobuf
+string resource_id = 6;
+string platform_code = 7;
+string vendor_code = 8;
+map<string, string> context = 9;
+```
+
+Legacy errors with fields 6–9 absent remain valid. Empty optional strings decode as absent values,
+and missing or empty context decodes as an empty `ErrorContext`. Non-empty details are validated by
+the same core invariants as in-process errors; a malformed detail makes the containing error payload
+an invalid protocol message and fails the connection closed.
+
+Older peers may ignore the unknown fields 6–9, and newer peers tolerate their absence. No field
+number is reused. Only `name`, `category`, `operation`, and `retryable` are stable decision fields;
+`debug_message` and fields 6–9 are diagnostics and must not drive application decisions.
+
 ## Capability contracts
 
 Capability identifiers carry their own contract version, for example `serial.bytes/v1` or `camera.frames/v1`. Adding a capability does not require a wire major change. Changing the meaning or invariant of an existing capability requires a new capability version.

@@ -198,19 +198,32 @@ All errors carry stable structure:
 
 ```rust
 pub struct HalError {
-    pub name: ErrorName,
-    pub category: ErrorCategory,
-    pub operation: OperationName,
-    pub retryable: bool,
-    pub resource_id: Option<ResourceId>,
-    pub platform_code: Option<String>,
-    pub vendor_code: Option<String>,
-    pub debug_message: String,
-    pub context: ErrorContext,
+    name: ErrorName,
+    category: ErrorCategory,
+    operation: OperationName,
+    retryable: bool,
+    debug_message: String,
+    resource_id: Option<ResourceId>,
+    platform_code: Option<String>,
+    vendor_code: Option<String>,
+    context: ErrorContext,
 }
 ```
 
-Callers make decisions from `name`, `category`, and `retryable`; they never parse `debug_message`.
+`HalError::new(name, category, operation, retryable, debug_message)` preserves the legacy empty-detail
+construction path. Read-only accessors expose every field, while the consuming
+`with_resource_id`, `with_platform_code`, `with_vendor_code`, and `with_context` methods add
+diagnostics. Platform and vendor codes reuse the non-empty ASCII identifier bound of 255 bytes.
+
+`ErrorContext` is an ordered, validated string-to-string map with at most 16 entries. Keys are 1–64
+ASCII bytes and match `[a-z][a-zA-Z0-9_-]*`; values may be empty and are at most 1,024 UTF-8 bytes.
+The aggregate key-plus-value size is at most 8,192 bytes, and duplicate input keys fail rather than
+overwrite an earlier value.
+
+Callers make stable decisions only from `name`, `category`, `operation`, and `retryable`. The debug
+message, resource identity, platform/vendor codes, and context are non-decision diagnostics and
+must never be parsed to select behavior. Decision-only serde excludes all diagnostics; broker
+protobuf conversion is the explicit cross-process detail transport.
 
 ### 5.5 Events
 
