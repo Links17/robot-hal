@@ -97,3 +97,20 @@ Addressed the three Critical and five Important review findings without running 
 - Strengthened concurrency coverage with actor gates and barriers: true concurrent whole-batch FIFO, contended atomic TX admission, failed-actor reuse, provisional rollback and handle-drop cleanup under proven management-queue saturation, bounded receive progress under pressure, duplicate-ID capability mismatches, worker-local hung-future drops, open/revoke event ordering, CAN health event ordering, and mixed Serial/CAN owner cleanup after an injected Serial close error.
 
 Per the task execution rule, no build, test, lint, formatting, protocol, or generated-code check was run in this fix round. Static inspection and `git diff --check` were the only permitted verification steps. The final unstaged `git diff --check` exited 0 with no output.
+
+## Fix round 2
+
+Addressed the remaining cleanup-termination and deterministic-test findings plus the new terminal-health reconciliation finding:
+
+- Provisional actor removal now waits for either the per-session cleanup-completion watch or actor completion, with actor completion prioritized when both terminal conditions become ready. The original finite deadline still bounds cleanup admission and waiting.
+- Queued `AddSession` rejection now signals its session cleanup watch. Provisional `RemoveSession` commands carry an optional cleanup watch that is signalled on execution, missing-session completion, or queued shutdown rejection.
+- Active sessions share actor-written expected-termination and close-failure flags with the manager. Last-session removal records its terminal outcome before replying; reconciliation emits `CanBusUnknown` only for unexpected termination or a failed expected close.
+- Terminal health publication moved to the manager's serialized close/reconciliation paths and uses a shared deduplication flag. Normal last-session close emits no unknown-health event, while failed or timed-out close emits at most one `CanBusUnknown` before `SessionClosed`.
+- Drop-under-saturation coverage now retains the dropped session identity and proves the spawned cleanup task reached close admission while the backend gate remains blocked before releasing the actor.
+- Receive-starvation coverage now admits the receive while the actor is gated, starts 64 replenishing management producers, and sustains pressure until the receive deadline completes; a one-time queue burst is no longer sufficient to satisfy the test.
+- Test-only manager gates exercise revocation after actor admission but immediately before lease commit/activation, plus reconciliation between actor termination and close finalization. The event tests lock normal-close ordering and failed-close unknown-health deduplication.
+- Focused unit coverage also locks cleanup completion on confirmed actor termination and completion signalling for rejected queued add/remove commands.
+
+The pre-existing cancellation concern after explicit close enters its `closing` state remains outside this scoped round as directed and is reserved for the final broad review.
+
+Per the task execution rule, no test, build, lint, formatting, protocol, generated-code, or dependency-generation command was run in fix round 2. Verification was limited to static source/diff inspection and the permitted diff checks. The final unstaged `git diff --check` exited 0 with no output.

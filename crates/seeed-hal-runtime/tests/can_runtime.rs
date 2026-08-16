@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -87,6 +87,45 @@ async fn enqueue_blocked_filter_command(
         _ = tokio::task::yield_now() => {}
     }
     tokio::spawn(operation)
+}
+
+async fn enqueue_blocked_receive(
+    runtime: &HalRuntime,
+    handle: &seeed_hal_runtime::CanHandle,
+    timeout: Duration,
+) -> tokio::task::JoinHandle<HalResult<Vec<ReceivedCanFrame>>> {
+    let runtime = runtime.clone();
+    let session = handle.session_id();
+    let token = handle.lease_token().clone();
+    let mut operation = Box::pin(async move {
+        runtime.receive_can(session, &token, 1, timeout).await
+    });
+    tokio::select! {
+        biased;
+        result = &mut operation => panic!("blocked CAN actor completed receive unexpectedly: {result:?}"),
+        _ = tokio::task::yield_now() => {}
+    }
+    tokio::spawn(operation)
+}
+
+async fn wait_for_close_admission(
+    runtime: &HalRuntime,
+    session: seeed_hal_core::SessionId,
+    token: &seeed_hal_core::LeaseToken,
+) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match runtime.receive_can(session.clone(), token, 1, Duration::ZERO).await {
+                Err(error) if error.name().as_str() == "runtime.session.closed" => return,
+                Err(error) if error.name().as_str() == "runtime.queue.full" => {
+                    tokio::task::yield_now().await;
+                }
+                result => panic!("expected queued drop cleanup admission, got {result:?}"),
+            }
+        }
+    })
+    .await
+    .expect("dropped handle must attempt cleanup while the actor remains blocked");
 }
 
 #[tokio::test]
@@ -441,6 +480,8 @@ async fn drop_cleanup_survives_saturated_management_queue() {
     let runtime = HalRuntime::builder().can_adapter(adapter.clone()).can_close_timeout(Duration::from_millis(100)).build();
     let first = runtime.open_can(owner("drop-first"), adapter.selector(), LeaseMode::Observe, attach(), all_frames()).await.unwrap();
     let dropped = runtime.open_can(owner("drop-second"), adapter.selector(), LeaseMode::Observe, attach(), all_frames()).await.unwrap();
+    let dropped_session = dropped.session_id();
+    let dropped_token = dropped.lease_token().clone();
     let status_runtime = runtime.clone();
     let status_session = first.session_id();
     let status_token = first.lease_token().clone();
@@ -451,10 +492,10 @@ async fn drop_cleanup_survives_saturated_management_queue() {
         pressure.push(enqueue_blocked_filter_command(&runtime, &first).await);
     }
     drop(dropped);
+    wait_for_close_admission(&runtime, dropped_session, &dropped_token).await;
     gate.release();
     let _ = blocked.await;
     for task in pressure { let _ = task.await; }
-    tokio::time::sleep(Duration::from_millis(20)).await;
     let (session, token) = first.into_parts();
     runtime.close_can(session, &token).await.unwrap();
     assert_eq!(adapter.state.lock().unwrap().close_count, 1);
@@ -463,26 +504,39 @@ async fn drop_cleanup_survives_saturated_management_queue() {
 #[tokio::test]
 async fn management_pressure_does_not_starve_receive_deadline() {
     let adapter = ScriptedAdapter::new("can:runtime:command-budget");
+    let gate = Arc::new(CallGate::default());
+    adapter.state.lock().unwrap().receive_gate = Some(Arc::clone(&gate));
     let runtime = HalRuntime::builder().can_adapter(adapter.clone()).build();
     let observer = runtime.open_can(owner("budget"), adapter.selector(), LeaseMode::Observe, attach(), all_frames()).await.unwrap();
-    let receive_runtime = runtime.clone();
-    let receive_session = observer.session_id();
-    let receive_token = observer.lease_token().clone();
+    gate.wait_started().await;
     let started = Instant::now();
-    let receive = tokio::spawn(async move {
-        receive_runtime.receive_can(receive_session, &receive_token, 1, Duration::from_millis(10)).await
-    });
-    tokio::time::sleep(Duration::from_millis(2)).await;
-    let mut pressure = Vec::new();
+    let receive = enqueue_blocked_receive(&runtime, &observer, Duration::from_millis(20)).await;
+    let stop = Arc::new(AtomicBool::new(false));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mut producers = Vec::new();
     for _ in 0..64 {
         let runtime = runtime.clone();
         let session = observer.session_id();
         let token = observer.lease_token().clone();
-        pressure.push(tokio::spawn(async move { runtime.replace_can_filters(session, &token, all_frames()).await }));
+        let stop = Arc::clone(&stop);
+        let attempts = Arc::clone(&attempts);
+        producers.push(tokio::spawn(async move {
+            while !stop.load(Ordering::Acquire) {
+                attempts.fetch_add(1, Ordering::AcqRel);
+                let _ = runtime
+                    .replace_can_filters(session.clone(), &token, all_frames())
+                    .await;
+            }
+        }));
     }
+    while attempts.load(Ordering::Acquire) < 64 {
+        tokio::task::yield_now().await;
+    }
+    gate.release();
     assert!(receive.await.unwrap().unwrap().is_empty());
     assert!(started.elapsed() < Duration::from_millis(100));
-    for task in pressure { let _ = task.await; }
+    stop.store(true, Ordering::Release);
+    for producer in producers { producer.await.unwrap(); }
 }
 
 #[tokio::test]

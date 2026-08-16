@@ -33,6 +33,8 @@ pub(crate) struct ActorSessionSpec {
     pub(crate) activation: Arc<Mutex<Option<LeaseToken>>>,
     pub(crate) cancelled: Arc<AtomicBool>,
     pub(crate) cleanup_done: watch::Sender<bool>,
+    pub(crate) termination_expected: Arc<AtomicBool>,
+    pub(crate) termination_failed: Arc<AtomicBool>,
 }
 
 struct ActorSession {
@@ -40,6 +42,8 @@ struct ActorSession {
     activation: Arc<Mutex<Option<LeaseToken>>>,
     cancelled: Arc<AtomicBool>,
     cleanup_done: watch::Sender<bool>,
+    termination_expected: Arc<AtomicBool>,
+    termination_failed: Arc<AtomicBool>,
     filters: CanFilterSet,
     received: VecDeque<ReceivedCanFrame>,
     dropped: u64,
@@ -80,6 +84,7 @@ pub(crate) enum CanCommand {
     },
     RemoveSession {
         session_id: SessionId,
+        cleanup_done: Option<watch::Sender<bool>>,
         reply: oneshot::Sender<RemoveOutcome>,
     },
 }
@@ -92,10 +97,21 @@ pub(crate) struct RemoveOutcome {
 impl CanCommand {
     fn reject_unavailable(self) {
         match self {
-            Self::AddSession { reply, .. } | Self::ReplaceFilters { reply, .. } => {
+            Self::AddSession { session, reply } => {
+                session.cleanup_done.send_replace(true);
                 let _ = reply.send(Err(actor_unavailable("can.session")));
             }
-            Self::RemoveSession { reply, .. } => {
+            Self::ReplaceFilters { reply, .. } => {
+                let _ = reply.send(Err(actor_unavailable("can.session")));
+            }
+            Self::RemoveSession {
+                cleanup_done,
+                reply,
+                ..
+            } => {
+                if let Some(done) = cleanup_done {
+                    done.send_replace(true);
+                }
                 let _ = reply.send(RemoveOutcome {
                     last_session: false,
                     result: Err(actor_unavailable("can.close")),
@@ -189,6 +205,28 @@ impl CanActorHandle {
                 return Err(actor_unavailable("can.close"));
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_handle() -> (
+        Self,
+        mpsc::Receiver<CanCommand>,
+        watch::Sender<Option<HalResult<()>>>,
+    ) {
+        let (commands, _command_rx) = mpsc::sync_channel(1);
+        let (cleanup, cleanup_rx) = mpsc::sync_channel(1);
+        let (completion_tx, completion) = watch::channel(None);
+        (
+            Self {
+                commands,
+                cleanup,
+                tx_reserved: Arc::new(AtomicUsize::new(0)),
+                tx_capacity: 1,
+                completion,
+            },
+            cleanup_rx,
+            completion_tx,
+        )
     }
 }
 
@@ -314,6 +352,8 @@ fn run_actor(
             first_session.activation,
             first_session.cancelled,
             first_session.cleanup_done,
+            first_session.termination_expected,
+            first_session.termination_failed,
             rx_capacity,
         ),
     );
@@ -454,6 +494,8 @@ fn execute_command(
                             session.activation,
                             session.cancelled,
                             session.cleanup_done,
+                            session.termination_expected,
+                            session.termination_failed,
                             rx_capacity,
                         ),
                     );
@@ -545,8 +587,15 @@ fn execute_command(
             };
             let _ = reply.send(result);
         }
-        CanCommand::RemoveSession { session_id, reply } => {
+        CanCommand::RemoveSession {
+            session_id,
+            cleanup_done,
+            reply,
+        } => {
             let Some(mut removed) = sessions.remove(&session_id) else {
+                if let Some(done) = cleanup_done {
+                    done.send_replace(true);
+                }
                 let _ = reply.send(RemoveOutcome {
                     last_session: false,
                     result: Err(session_closed("can.close", resource_id)),
@@ -573,23 +622,26 @@ fn execute_command(
                 } else {
                     backend_result
                 };
-                if result.is_err() {
-                    publish_health_for_session(
-                        RuntimeEventKind::CanBusUnknown,
-                        resource_id,
-                        &session_id,
-                        &removed,
-                        events,
-                    );
-                }
+                removed
+                    .termination_failed
+                    .store(result.is_err(), Ordering::Release);
+                removed
+                    .termination_expected
+                    .store(true, Ordering::Release);
                 let _ = reply.send(RemoveOutcome {
                     last_session: true,
                     result,
                 });
                 removed.cleanup_done.send_replace(true);
+                if let Some(done) = cleanup_done {
+                    done.send_replace(true);
+                }
                 return true;
             }
             removed.cleanup_done.send_replace(true);
+            if let Some(done) = cleanup_done {
+                done.send_replace(true);
+            }
             let _ = reply.send(RemoveOutcome {
                 last_session: false,
                 result: Ok(()),
@@ -605,6 +657,8 @@ fn new_session(
     activation: Arc<Mutex<Option<LeaseToken>>>,
     cancelled: Arc<AtomicBool>,
     cleanup_done: watch::Sender<bool>,
+    termination_expected: Arc<AtomicBool>,
+    termination_failed: Arc<AtomicBool>,
     rx_capacity: usize,
 ) -> ActorSession {
     ActorSession {
@@ -612,6 +666,8 @@ fn new_session(
         activation,
         cancelled,
         cleanup_done,
+        termination_expected,
+        termination_failed,
         filters,
         received: VecDeque::with_capacity(rx_capacity),
         dropped: 0,
@@ -914,4 +970,57 @@ fn session_error(
 ) -> HalError {
     runtime_error(name, ErrorCategory::Conflict, operation, false, message)
         .with_resource_id(resource_id.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    use seeed_hal_can::{CanFilterSet, CanLinkExpectation, CanOpenConfig};
+    use seeed_hal_core::{OwnerId, SessionId};
+    use tokio::sync::{oneshot, watch};
+
+    use super::{ActorSessionSpec, CanCommand};
+
+    fn session(done: watch::Sender<bool>) -> ActorSessionSpec {
+        ActorSessionSpec {
+            session_id: SessionId::parse("rejected-add").unwrap(),
+            owner_id: OwnerId::parse("rejected-owner").unwrap(),
+            config: CanOpenConfig::Attach(
+                CanLinkExpectation::new(None, None, None, None, None).unwrap(),
+            ),
+            filters: CanFilterSet::new(Vec::new()).unwrap(),
+            activation: Arc::new(Mutex::new(None)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            cleanup_done: done,
+            termination_expected: Arc::new(AtomicBool::new(false)),
+            termination_failed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[test]
+    fn rejecting_queued_add_session_signals_cleanup_completion() {
+        let (done, done_rx) = watch::channel(false);
+        let (reply, _) = oneshot::channel();
+        CanCommand::AddSession {
+            session: session(done),
+            reply,
+        }
+        .reject_unavailable();
+        assert!(*done_rx.borrow());
+    }
+
+    #[test]
+    fn rejecting_queued_remove_signals_cleanup_completion() {
+        let (done, done_rx) = watch::channel(false);
+        let (reply, _) = oneshot::channel();
+        CanCommand::RemoveSession {
+            session_id: SessionId::parse("rejected-remove").unwrap(),
+            cleanup_done: Some(done),
+            reply,
+        }
+        .reject_unavailable();
+        assert!(*done_rx.borrow());
+    }
 }
