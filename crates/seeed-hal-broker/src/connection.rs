@@ -10,7 +10,7 @@ use seeed_hal_core::{ErrorCategory, HalError, HalResult, OwnerId};
 use seeed_hal_protocol::v1::{self, envelope};
 use seeed_hal_protocol::{
     MAX_FRAME_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR_MAXIMUM, PROTOCOL_MINOR_MINIMUM,
-    SERIAL_CAPABILITY, handshake_minor_range, invalid_message, negotiate_protocol_minor,
+    handshake_minor_range, invalid_message, negotiate_protocol_minor,
     open_serial_request_from_proto, parse_serial_session_lease, parse_session_lease,
 };
 use seeed_hal_runtime::{HalRuntime, RuntimeEvent, RuntimeEventKind};
@@ -22,6 +22,10 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::can_dispatch::{
+    self, CanDispatchLimits, CanSessions, broker_capabilities, is_can_payload, is_can_session,
+    new_session_registry,
+};
 use crate::{Broker, StartupToken};
 
 const DEFAULT_REQUEST_QUEUE_CAPACITY: usize = 32;
@@ -87,6 +91,7 @@ impl ConnectionOutcome {
 
 #[derive(Clone, Copy)]
 struct NegotiatedLimits {
+    protocol_minor: u32,
     max_frame_bytes: usize,
     max_read_bytes: usize,
     max_write_bytes: usize,
@@ -166,6 +171,7 @@ impl Broker {
         let framed = Framed::new(io, frame_codec());
         let (sink, stream) = framed.split();
         let active = Arc::new(Mutex::new(HashSet::new()));
+        let can_sessions = new_session_registry();
         let (frame_limit_tx, frame_limit_rx) = watch::channel(None::<usize>);
         let (request_tx, request_rx) = mpsc::channel(self.config.request_queue_capacity);
         let (response_tx, response_rx) = mpsc::channel(self.config.response_queue_capacity);
@@ -196,6 +202,7 @@ impl Broker {
             request_rx,
             response_tx.clone(),
             active,
+            can_sessions,
             frame_limit_tx,
             cancel_rx,
         ));
@@ -418,6 +425,7 @@ async fn dispatch_requests(
     mut requests: mpsc::Receiver<InboundRequest>,
     responses: mpsc::Sender<OutboundEnvelope>,
     active: Arc<Mutex<HashSet<u64>>>,
+    can_sessions: CanSessions,
     frame_limit: watch::Sender<Option<usize>>,
     mut cancel: watch::Receiver<bool>,
 ) -> Option<HalError> {
@@ -584,10 +592,18 @@ async fn dispatch_requests(
 
                 let runtime = runtime.clone();
                 let owner = owner.clone();
+                let can_sessions = can_sessions.clone();
                 let limits = limits.expect("successful handshake sets negotiated limits");
                 let payload = request.envelope.payload.take();
                 tasks.spawn(async move {
-                    let response = dispatch_operation(runtime, owner, request_id, payload, limits).await;
+                    let response = dispatch_operation(
+                        runtime,
+                        owner,
+                        request_id,
+                        payload,
+                        limits,
+                        can_sessions,
+                    ).await;
                     (request_id, response)
                 });
             }
@@ -631,8 +647,9 @@ fn validate_handshake(
         PROTOCOL_MINOR_MINIMUM,
         PROTOCOL_MINOR_MAXIMUM,
     )?;
+    let capabilities = broker_capabilities(selected_minor);
     for capability in &request.required_capabilities {
-        if capability != SERIAL_CAPABILITY {
+        if !capabilities.contains(capability) {
             return Err(protocol_error(
                 "runtime.protocol.unsupported_capability",
                 "runtime.protocol.handshake",
@@ -660,7 +677,7 @@ fn validate_handshake(
     let response = v1::HandshakeResponse {
         protocol_major: PROTOCOL_MAJOR,
         protocol_minor: selected_minor,
-        capabilities: vec![SERIAL_CAPABILITY.to_owned()],
+        capabilities,
         max_frame_bytes: request.max_frame_bytes,
         max_read_bytes: request.max_read_bytes,
         max_write_bytes: request.max_write_bytes,
@@ -680,6 +697,7 @@ fn validate_handshake(
     Ok((
         response,
         NegotiatedLimits {
+            protocol_minor: selected_minor,
             max_frame_bytes: frame_limit,
             max_read_bytes: read_limit,
             max_write_bytes: write_limit,
@@ -730,8 +748,28 @@ async fn dispatch_operation(
     request_id: u64,
     payload: Option<envelope::Payload>,
     limits: NegotiatedLimits,
+    can_sessions: CanSessions,
 ) -> v1::Envelope {
-    let result = dispatch_operation_inner(runtime, owner, payload, limits).await;
+    let result = match payload {
+        Some(payload) if is_can_payload(&payload) => {
+            can_dispatch::dispatch(
+                runtime,
+                owner,
+                payload,
+                CanDispatchLimits {
+                    protocol_minor: limits.protocol_minor,
+                    max_frame_bytes: limits.max_frame_bytes,
+                    max_read_bytes: limits.max_read_bytes,
+                    max_write_bytes: limits.max_write_bytes,
+                },
+                can_sessions,
+            )
+            .await
+        }
+        payload => {
+            dispatch_operation_inner(runtime, owner, payload, limits, can_sessions).await
+        }
+    };
     match result {
         Ok(payload) => v1::Envelope {
             request_id,
@@ -746,6 +784,7 @@ async fn dispatch_operation_inner(
     owner: OwnerId,
     payload: Option<envelope::Payload>,
     limits: NegotiatedLimits,
+    can_sessions: CanSessions,
 ) -> HalResult<envelope::Payload> {
     match payload {
         Some(envelope::Payload::EnumerateSerialRequest(_)) => {
@@ -819,6 +858,9 @@ async fn dispatch_operation_inner(
             ))
         }
         Some(envelope::Payload::CloseSessionRequest(request)) => {
+            if is_can_session(&can_sessions, &request.session_id) {
+                return can_dispatch::close(runtime, request, can_sessions).await;
+            }
             let (session, lease) = parse_session_lease(request.session_id, request.lease)?;
             runtime.close_serial(session, &lease).await?;
             Ok(envelope::Payload::CloseSessionResponse(v1::Empty {}))

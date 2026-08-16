@@ -8,11 +8,17 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use seeed_hal_broker::{Broker, BrokerConfig, StartupToken};
-use seeed_hal_core::{HalResult, OwnerId, ResourceDescriptor, ResourceSelector};
+use seeed_hal_can::{
+    CanAdapter, CanBitTiming, CanChannel, CanConfigureConfig, CanFrame, CanId, CanMode,
+    CanOpenConfig,
+};
+use seeed_hal_core::{
+    CapabilityId, CapabilitySet, HalResult, OwnerId, ResourceDescriptor, ResourceSelector,
+};
 use seeed_hal_protocol::v1::{self, envelope};
 use seeed_hal_runtime::{HalRuntime, RuntimeEventKind};
 use seeed_hal_serial::{ControlLines, SerialAdapter, SerialConfig, SerialSession};
-use seeed_hal_testkit::VirtualSerialAdapter;
+use seeed_hal_testkit::{VirtualCanAdapter, VirtualSerialAdapter};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{Notify, oneshot};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
@@ -56,6 +62,49 @@ struct SecondEnumerateGateAdapter {
     operation_dropped_notify: Arc<Notify>,
     close_after_operation_drop: Arc<AtomicBool>,
     close_started: Arc<Notify>,
+}
+
+#[derive(Clone)]
+struct MaskedCanAdapter {
+    inner: VirtualCanAdapter,
+    descriptor: ResourceDescriptor,
+}
+
+impl MaskedCanAdapter {
+    fn classic_only(resource_id: &str) -> Self {
+        let inner = VirtualCanAdapter::loopback(resource_id);
+        let source = inner.descriptor();
+        let descriptor = ResourceDescriptor::new(
+            source.id().clone(),
+            source.endpoint().clone(),
+            source.minimum_identity_quality(),
+            source.transport(),
+            source.properties().clone(),
+            CapabilitySet::new(vec![
+                CapabilityId::parse("can.classic/v1").unwrap(),
+            ]),
+        );
+        Self { inner, descriptor }
+    }
+}
+
+#[async_trait::async_trait]
+impl CanAdapter for MaskedCanAdapter {
+    fn adapter_name(&self) -> &'static str {
+        "virtual.can.masked"
+    }
+
+    async fn enumerate(&self) -> HalResult<Vec<ResourceDescriptor>> {
+        Ok(vec![self.descriptor.clone()])
+    }
+
+    async fn open(
+        &self,
+        selector: &ResourceSelector,
+        config: &CanOpenConfig,
+    ) -> HalResult<Box<dyn CanChannel>> {
+        self.inner.open(selector, config).await
+    }
 }
 
 impl SecondEnumerateGateAdapter {
@@ -406,6 +455,89 @@ fn runtime() -> HalRuntime {
         .build()
 }
 
+fn can_runtime(adapter: VirtualCanAdapter) -> HalRuntime {
+    HalRuntime::builder().can_adapter(adapter).build()
+}
+
+fn can_handshake() -> v1::HandshakeRequest {
+    let mut handshake = valid_handshake(TOKEN.to_vec());
+    handshake.protocol_minor = 1;
+    handshake.protocol_minor_minimum = 1;
+    handshake.protocol_minor_maximum = 1;
+    handshake.required_capabilities = vec!["can.classic/v1".to_owned()];
+    handshake
+}
+
+async fn handshake_can<T>(client: &mut Client<T>) -> v1::HandshakeResponse
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let response = client
+        .request(envelope::Payload::HandshakeRequest(can_handshake()))
+        .await;
+    match response.payload.unwrap() {
+        envelope::Payload::HandshakeResponse(response) => response,
+        other => panic!("expected CAN handshake response, got {other:?}"),
+    }
+}
+
+fn can_attach(mode: Option<v1::CanMode>) -> v1::CanOpenConfig {
+    v1::CanOpenConfig {
+        config: Some(v1::can_open_config::Config::Attach(v1::CanLinkExpectation {
+            mode: mode.map(|value| value as i32),
+            nominal_bitrate: None,
+            data_bitrate: None,
+            listen_only: None,
+            loopback: None,
+        })),
+    }
+}
+
+fn can_filter_data() -> v1::CanFilterSet {
+    v1::CanFilterSet { filters: vec![] }
+}
+
+fn classic_can_frame(byte: u8) -> v1::CanFrame {
+    v1::CanFrame {
+        id: Some(v1::CanId {
+            value: 0x123,
+            format: v1::CanIdFormat::Standard as i32,
+        }),
+        kind: v1::CanFrameKind::ClassicData as i32,
+        data: vec![byte],
+        ..Default::default()
+    }
+}
+
+async fn open_virtual_can<T>(client: &mut Client<T>, mode: Option<v1::CanMode>) -> v1::OpenCanResponse
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let enumerate = client
+        .request(envelope::Payload::EnumerateCanRequest(v1::EnumerateCanRequest {}))
+        .await;
+    let descriptor = match enumerate.payload.unwrap() {
+        envelope::Payload::EnumerateCanResponse(response) => response.resources.into_iter().next().unwrap(),
+        other => panic!("expected CAN enumerate response, got {other:?}"),
+    };
+    let response = client
+        .request(envelope::Payload::OpenCanRequest(v1::OpenCanRequest {
+            selector: Some(v1::ResourceSelector {
+                resource_id: descriptor.resource_id,
+                minimum_identity_quality: descriptor.identity_quality,
+                transport: descriptor.transport,
+            }),
+            mode: v1::LeaseMode::Control as i32,
+            config: Some(can_attach(mode)),
+            filters: Some(can_filter_data()),
+        }))
+        .await;
+    match response.payload.unwrap() {
+        envelope::Payload::OpenCanResponse(response) => response,
+        other => panic!("expected CAN open response, got {other:?}"),
+    }
+}
+
 fn serial_config(read_timeout_ms: u64) -> v1::SerialConfig {
     v1::SerialConfig {
         baud_rate: 115_200,
@@ -565,9 +697,9 @@ async fn broker_selects_highest_shared_minor_and_reports_its_supported_range() {
         Some(envelope::Payload::HandshakeResponse(response)) => response,
         other => panic!("expected handshake response, got {other:?}"),
     };
-    assert_eq!(accepted.protocol_minor, 0);
+    assert_eq!(accepted.protocol_minor, 1);
     assert_eq!(accepted.protocol_minor_minimum, 0);
-    assert_eq!(accepted.protocol_minor_maximum, 0);
+    assert_eq!(accepted.protocol_minor_maximum, 1);
 
     drop(client);
     assert!(server.await.unwrap().cleanup_error().is_none());
@@ -1545,6 +1677,595 @@ fn resource_descriptor_selector_conversion_is_canonical() {
     })
     .unwrap();
     assert_eq!(selector, descriptor.selector());
+}
+
+#[tokio::test]
+async fn can_envelopes_require_wire_minor_one_without_affecting_serial() {
+    let adapter = VirtualCanAdapter::loopback("can:virtual:minor-gate");
+    let runtime = HalRuntime::builder()
+        .serial_adapter(VirtualSerialAdapter::loopback("serial:virtual:minor-gate"))
+        .can_adapter(adapter)
+        .build();
+    let broker = Broker::with_startup_token(runtime, StartupToken::from_bytes(TOKEN));
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    client.handshake().await;
+
+    let rejected = client
+        .request(envelope::Payload::EnumerateCanRequest(v1::EnumerateCanRequest {}))
+        .await;
+    assert_eq!(
+        error_name(&rejected),
+        "runtime.protocol.capability_unsupported"
+    );
+    let serial = client
+        .request(envelope::Payload::EnumerateSerialRequest(
+            v1::EnumerateSerialRequest {},
+        ))
+        .await;
+    assert!(matches!(
+        serial.payload,
+        Some(envelope::Payload::EnumerateSerialResponse(_))
+    ));
+
+    drop(client);
+    assert!(server.await.unwrap().cleanup_error().is_none());
+}
+
+#[tokio::test]
+async fn minor_one_handshake_enumerates_and_opens_can_with_exact_capabilities() {
+    let adapter = VirtualCanAdapter::loopback("can:virtual:broker-open");
+    let broker = Broker::with_startup_token(
+        can_runtime(adapter),
+        StartupToken::from_bytes(TOKEN),
+    );
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+
+    let handshake = handshake_can(&mut client).await;
+    assert_eq!(handshake.protocol_minor, 1);
+    for capability in [
+        "can.classic/v1",
+        "can.fd/v1",
+        "can.configure/v1",
+        "can.error-frames/v1",
+        "can.rx-timestamp/v1",
+    ] {
+        assert!(handshake.capabilities.iter().any(|value| value == capability));
+    }
+    let session = open_virtual_can(&mut client, Some(v1::CanMode::Classic)).await;
+    assert_eq!(
+        session.lease.as_ref().unwrap().mode,
+        v1::LeaseMode::Control as i32
+    );
+
+    let close = client
+        .request(envelope::Payload::CloseSessionRequest(
+            v1::CloseSessionRequest {
+                session_id: session.session_id,
+                lease: session.lease,
+            },
+        ))
+        .await;
+    assert!(matches!(
+        close.payload,
+        Some(envelope::Payload::CloseSessionResponse(_))
+    ));
+    drop(client);
+    assert!(server.await.unwrap().cleanup_error().is_none());
+}
+
+#[tokio::test]
+async fn can_classic_batch_receive_filter_and_status_use_correlated_responses_only() {
+    let adapter = VirtualCanAdapter::loopback("can:virtual:broker-operations");
+    let broker = Broker::with_startup_token(
+        can_runtime(adapter),
+        StartupToken::from_bytes(TOKEN),
+    );
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    handshake_can(&mut client).await;
+    let session = open_virtual_can(&mut client, Some(v1::CanMode::Classic)).await;
+
+    let send = client
+        .request(envelope::Payload::CanSendRequest(v1::CanSendRequest {
+            session_id: session.session_id.clone(),
+            lease: session.lease.clone(),
+            frames: vec![classic_can_frame(1), classic_can_frame(2)],
+        }))
+        .await;
+    match send.payload.unwrap() {
+        envelope::Payload::CanSendResponse(response) => {
+            assert_eq!(response.committed_count, 2);
+            assert!(response.error.is_none());
+        }
+        other => panic!("expected CAN send response, got {other:?}"),
+    }
+
+    let receive = client
+        .request(envelope::Payload::CanReceiveRequest(
+            v1::CanReceiveRequest {
+                session_id: session.session_id.clone(),
+                lease: session.lease.clone(),
+                max_frames: 2,
+                timeout_ms: 100,
+            },
+        ))
+        .await;
+    match receive.payload.unwrap() {
+        envelope::Payload::CanReceiveResponse(response) => {
+            assert_eq!(response.frames.len(), 2);
+            assert_eq!(response.frames[0].frame.as_ref().unwrap().data, [1]);
+            assert_eq!(response.frames[1].frame.as_ref().unwrap().data, [2]);
+            assert!(response.frames.iter().all(|frame| frame.timestamp.is_some()));
+        }
+        other => panic!("expected CAN receive response, got {other:?}"),
+    }
+
+    let replace = client
+        .request(envelope::Payload::ReplaceCanFiltersRequest(
+            v1::ReplaceCanFiltersRequest {
+                session_id: session.session_id.clone(),
+                lease: session.lease.clone(),
+                filters: Some(v1::CanFilterSet {
+                    filters: vec![v1::CanFilter {
+                        id: 0x123,
+                        mask: 0x7ff,
+                        format: v1::CanIdFormat::Standard as i32,
+                        classes: Some(v1::CanFrameClasses {
+                            data: true,
+                            remote: false,
+                            error: false,
+                        }),
+                    }],
+                }),
+            },
+        ))
+        .await;
+    assert!(matches!(
+        replace.payload,
+        Some(envelope::Payload::ReplaceCanFiltersResponse(_))
+    ));
+
+    let status = client
+        .request(envelope::Payload::GetCanBusStatusRequest(
+            v1::GetCanBusStatusRequest {
+                session_id: session.session_id,
+                lease: session.lease,
+            },
+        ))
+        .await;
+    match status.payload.unwrap() {
+        envelope::Payload::GetCanBusStatusResponse(response) => assert_eq!(
+            response.status.unwrap().state,
+            v1::CanBusState::Active as i32
+        ),
+        other => panic!("expected CAN status response, got {other:?}"),
+    }
+
+    let unsolicited = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        client.framed.next(),
+    )
+    .await;
+    assert!(
+        unsolicited.is_err(),
+        "ordinary CAN frames and diagnostics must never use the event path"
+    );
+    drop(client);
+    assert!(server.await.unwrap().cleanup_error().is_none());
+}
+
+#[tokio::test]
+async fn can_send_partial_progress_is_nested_and_stale_leases_are_fenced() {
+    let adapter = VirtualCanAdapter::loopback("can:virtual:broker-partial");
+    let broker = Broker::with_startup_token(
+        can_runtime(adapter),
+        StartupToken::from_bytes(TOKEN),
+    );
+    let (server_io, client_io) = tokio::io::duplex(128 * 1024);
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    handshake_can(&mut client).await;
+    let session = open_virtual_can(&mut client, Some(v1::CanMode::Classic)).await;
+
+    let fill = client
+        .request(envelope::Payload::CanSendRequest(v1::CanSendRequest {
+            session_id: session.session_id.clone(),
+            lease: session.lease.clone(),
+            frames: (0..63).map(|value| classic_can_frame(value)).collect(),
+        }))
+        .await;
+    assert!(matches!(
+        fill.payload,
+        Some(envelope::Payload::CanSendResponse(v1::CanSendResponse {
+            committed_count: 63,
+            error: None,
+        }))
+    ));
+
+    let partial = client
+        .request(envelope::Payload::CanSendRequest(v1::CanSendRequest {
+            session_id: session.session_id.clone(),
+            lease: session.lease.clone(),
+            frames: vec![classic_can_frame(64), classic_can_frame(65)],
+        }))
+        .await;
+    match partial.payload.unwrap() {
+        envelope::Payload::CanSendResponse(response) => {
+            assert_eq!(response.committed_count, 1);
+            assert_eq!(response.error.unwrap().name, "runtime.queue.full");
+        }
+        other => panic!("partial progress must be a CAN send response, got {other:?}"),
+    }
+
+    let stale = session.lease.clone().unwrap();
+    let closed = client
+        .request(envelope::Payload::CloseSessionRequest(
+            v1::CloseSessionRequest {
+                session_id: session.session_id,
+                lease: session.lease,
+            },
+        ))
+        .await;
+    assert!(matches!(
+        closed.payload,
+        Some(envelope::Payload::CloseSessionResponse(_))
+    ));
+    let reopened = open_virtual_can(&mut client, Some(v1::CanMode::Classic)).await;
+    let rejected = client
+        .request(envelope::Payload::CanReceiveRequest(
+            v1::CanReceiveRequest {
+                session_id: reopened.session_id,
+                lease: Some(stale),
+                max_frames: 1,
+                timeout_ms: 0,
+            },
+        ))
+        .await;
+    assert_eq!(error_name(&rejected), "runtime.lease.stale_generation");
+
+    drop(client);
+    assert!(server.await.unwrap().cleanup_error().is_none());
+}
+
+#[tokio::test]
+async fn can_fd_configuration_and_frames_use_resource_capabilities() {
+    let adapter = VirtualCanAdapter::loopback("can:virtual:broker-fd");
+    let broker = Broker::with_startup_token(
+        can_runtime(adapter),
+        StartupToken::from_bytes(TOKEN),
+    );
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    handshake_can(&mut client).await;
+    let enumerate = client
+        .request(envelope::Payload::EnumerateCanRequest(v1::EnumerateCanRequest {}))
+        .await;
+    let descriptor = match enumerate.payload.unwrap() {
+        envelope::Payload::EnumerateCanResponse(response) => response.resources.into_iter().next().unwrap(),
+        other => panic!("expected CAN enumerate response, got {other:?}"),
+    };
+    let opened = client
+        .request(envelope::Payload::OpenCanRequest(v1::OpenCanRequest {
+            selector: Some(v1::ResourceSelector {
+                resource_id: descriptor.resource_id,
+                minimum_identity_quality: descriptor.identity_quality,
+                transport: descriptor.transport,
+            }),
+            mode: v1::LeaseMode::Maintenance as i32,
+            config: Some(v1::CanOpenConfig {
+                config: Some(v1::can_open_config::Config::Configure(
+                    v1::CanConfigureConfig {
+                        mode: v1::CanMode::Fd as i32,
+                        nominal: Some(v1::CanBitTiming {
+                            bitrate: 500_000,
+                            sample_point_permill: None,
+                            sjw: None,
+                        }),
+                        data: Some(v1::CanBitTiming {
+                            bitrate: 2_000_000,
+                            sample_point_permill: None,
+                            sjw: None,
+                        }),
+                        listen_only: false,
+                        loopback: true,
+                        restart_ms: None,
+                    },
+                )),
+            }),
+            filters: Some(can_filter_data()),
+        }))
+        .await;
+    let session = match opened.payload.unwrap() {
+        envelope::Payload::OpenCanResponse(response) => response,
+        other => panic!("expected configured CAN response, got {other:?}"),
+    };
+    let sent = client
+        .request(envelope::Payload::CanSendRequest(v1::CanSendRequest {
+            session_id: session.session_id,
+            lease: session.lease,
+            frames: vec![v1::CanFrame {
+                id: Some(v1::CanId {
+                    value: 0x1abc,
+                    format: v1::CanIdFormat::Extended as i32,
+                }),
+                kind: v1::CanFrameKind::FdData as i32,
+                data: vec![0xa5; 12],
+                bitrate_switch: true,
+                error_state_indicator: false,
+                ..Default::default()
+            }],
+        }))
+        .await;
+    assert!(matches!(
+        sent.payload,
+        Some(envelope::Payload::CanSendResponse(v1::CanSendResponse {
+            committed_count: 1,
+            error: None,
+        }))
+    ));
+    drop(client);
+    assert!(server.await.unwrap().cleanup_error().is_none());
+}
+
+#[tokio::test]
+async fn can_receive_limit_is_rejected_before_dequeue_and_disconnect_releases_resources() {
+    let can_adapter = VirtualCanAdapter::loopback("can:virtual:broker-cleanup");
+    let runtime = HalRuntime::builder()
+        .serial_adapter(VirtualSerialAdapter::loopback("serial:virtual:broker-cleanup"))
+        .can_adapter(can_adapter.clone())
+        .build();
+    let broker = Broker::with_startup_token(runtime.clone(), StartupToken::from_bytes(TOKEN));
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    let mut handshake = can_handshake();
+    handshake.max_frame_bytes = 512;
+    handshake.max_read_bytes = 64;
+    handshake.max_write_bytes = 64;
+    let accepted = client
+        .request(envelope::Payload::HandshakeRequest(handshake))
+        .await;
+    assert!(matches!(
+        accepted.payload,
+        Some(envelope::Payload::HandshakeResponse(_))
+    ));
+    let can_session = open_virtual_can(&mut client, Some(v1::CanMode::Classic)).await;
+    let _serial_session = open_virtual_serial(&mut client, 1_000).await;
+    can_adapter
+        .inject_received(
+            CanFrame::classic_data(CanId::standard(0x123).unwrap(), Bytes::from_static(&[7]))
+                .unwrap(),
+            None,
+        )
+        .unwrap();
+
+    let oversized = client
+        .request(envelope::Payload::CanReceiveRequest(
+            v1::CanReceiveRequest {
+                session_id: can_session.session_id,
+                lease: can_session.lease,
+                max_frames: 2,
+                timeout_ms: 0,
+            },
+        ))
+        .await;
+    assert_eq!(error_name(&oversized), "runtime.protocol.invalid_message");
+
+    drop(client);
+    let outcome = server.await.unwrap();
+    assert!(outcome.cleanup_error().is_none());
+
+    let descriptor = runtime.enumerate_can().await.unwrap().remove(0);
+    let config = CanOpenConfig::Configure(
+        CanConfigureConfig::new(
+            CanMode::Classic,
+            CanBitTiming::new(500_000, None, None).unwrap(),
+            None,
+            false,
+            true,
+        )
+        .unwrap(),
+    );
+    runtime
+        .open_can(
+            OwnerId::parse("broker-contract:cleanup-reuse").unwrap(),
+            descriptor.selector(),
+            seeed_hal_core::LeaseMode::Maintenance,
+            config,
+            seeed_hal_can::CanFilterSet::new(vec![]).unwrap(),
+        )
+        .await
+        .unwrap()
+        .close()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn broker_uses_selected_descriptor_capabilities_without_normalizing_them() {
+    let adapter = MaskedCanAdapter::classic_only("can:virtual:broker-capabilities");
+    let broker = Broker::with_startup_token(
+        HalRuntime::builder().can_adapter(adapter).build(),
+        StartupToken::from_bytes(TOKEN),
+    );
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    handshake_can(&mut client).await;
+    let enumerate = client
+        .request(envelope::Payload::EnumerateCanRequest(v1::EnumerateCanRequest {}))
+        .await;
+    let descriptor = match enumerate.payload.unwrap() {
+        envelope::Payload::EnumerateCanResponse(response) => response.resources.into_iter().next().unwrap(),
+        other => panic!("expected CAN enumerate response, got {other:?}"),
+    };
+
+    let fd_open = client
+        .request(envelope::Payload::OpenCanRequest(v1::OpenCanRequest {
+            selector: Some(v1::ResourceSelector {
+                resource_id: descriptor.resource_id.clone(),
+                minimum_identity_quality: descriptor.identity_quality,
+                transport: descriptor.transport,
+            }),
+            mode: v1::LeaseMode::Control as i32,
+            config: Some(can_attach(Some(v1::CanMode::Fd))),
+            filters: Some(can_filter_data()),
+        }))
+        .await;
+    assert_eq!(error_name(&fd_open), "runtime.protocol.capability_unsupported");
+
+    let configure_open = client
+        .request(envelope::Payload::OpenCanRequest(v1::OpenCanRequest {
+            selector: Some(v1::ResourceSelector {
+                resource_id: descriptor.resource_id,
+                minimum_identity_quality: descriptor.identity_quality,
+                transport: descriptor.transport,
+            }),
+            mode: v1::LeaseMode::Maintenance as i32,
+            config: Some(v1::CanOpenConfig {
+                config: Some(v1::can_open_config::Config::Configure(
+                    v1::CanConfigureConfig {
+                        mode: v1::CanMode::Classic as i32,
+                        nominal: Some(v1::CanBitTiming {
+                            bitrate: 500_000,
+                            sample_point_permill: None,
+                            sjw: None,
+                        }),
+                        data: None,
+                        listen_only: false,
+                        loopback: true,
+                        restart_ms: None,
+                    },
+                )),
+            }),
+            filters: Some(can_filter_data()),
+        }))
+        .await;
+    assert_eq!(
+        error_name(&configure_open),
+        "runtime.protocol.capability_unsupported"
+    );
+
+    let session = open_virtual_can(&mut client, Some(v1::CanMode::Classic)).await;
+    let error_send = client
+        .request(envelope::Payload::CanSendRequest(v1::CanSendRequest {
+            session_id: session.session_id,
+            lease: session.lease,
+            frames: vec![v1::CanFrame {
+                kind: v1::CanFrameKind::Error as i32,
+                data: vec![1],
+                error_classes: vec![v1::CanErrorClass::BusError as i32],
+                ..Default::default()
+            }],
+        }))
+        .await;
+    assert_eq!(error_name(&error_send), "runtime.protocol.capability_unsupported");
+
+    let timestamped = client
+        .request(envelope::Payload::CanSendRequest(v1::CanSendRequest {
+            session_id: session.session_id.clone(),
+            lease: session.lease.clone(),
+            frames: vec![classic_can_frame(7)],
+        }))
+        .await;
+    assert!(matches!(
+        timestamped.payload,
+        Some(envelope::Payload::CanSendResponse(_))
+    ));
+    let timestamp_delivery = client
+        .request(envelope::Payload::CanReceiveRequest(v1::CanReceiveRequest {
+            session_id: session.session_id.clone(),
+            lease: session.lease.clone(),
+            max_frames: 1,
+            timeout_ms: 100,
+        }))
+        .await;
+    assert_eq!(
+        error_name(&timestamp_delivery),
+        "runtime.protocol.capability_unsupported"
+    );
+
+    let error_filter = client
+        .request(envelope::Payload::ReplaceCanFiltersRequest(
+            v1::ReplaceCanFiltersRequest {
+                session_id: session.session_id,
+                lease: session.lease,
+                filters: Some(v1::CanFilterSet {
+                    filters: vec![v1::CanFilter {
+                        id: 0,
+                        mask: 0,
+                        format: v1::CanIdFormat::Either as i32,
+                        classes: Some(v1::CanFrameClasses {
+                            data: false,
+                            remote: false,
+                            error: true,
+                        }),
+                    }],
+                }),
+            },
+        ))
+        .await;
+    assert_eq!(
+        error_name(&error_filter),
+        "runtime.protocol.capability_unsupported"
+    );
+
+    drop(client);
+    assert!(server.await.unwrap().cleanup_error().is_none());
+}
+
+#[tokio::test]
+async fn can_receive_lag_is_reported_once_and_newest_frame_remains_available() {
+    let adapter = VirtualCanAdapter::loopback("can:virtual:broker-lag");
+    let runtime = HalRuntime::builder()
+        .can_adapter(adapter)
+        .can_rx_capacity(1)
+        .build();
+    let broker = Broker::with_startup_token(runtime, StartupToken::from_bytes(TOKEN));
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    handshake_can(&mut client).await;
+    let session = open_virtual_can(&mut client, Some(v1::CanMode::Classic)).await;
+    let send = client
+        .request(envelope::Payload::CanSendRequest(v1::CanSendRequest {
+            session_id: session.session_id.clone(),
+            lease: session.lease.clone(),
+            frames: vec![classic_can_frame(1), classic_can_frame(2), classic_can_frame(3)],
+        }))
+        .await;
+    assert!(matches!(send.payload, Some(envelope::Payload::CanSendResponse(_))));
+    let lagged = client
+        .request(envelope::Payload::CanReceiveRequest(v1::CanReceiveRequest {
+            session_id: session.session_id.clone(),
+            lease: session.lease.clone(),
+            max_frames: 1,
+            timeout_ms: 100,
+        }))
+        .await;
+    assert_eq!(error_name(&lagged), "can.receive.lagged");
+    let newest = client
+        .request(envelope::Payload::CanReceiveRequest(v1::CanReceiveRequest {
+            session_id: session.session_id,
+            lease: session.lease,
+            max_frames: 1,
+            timeout_ms: 100,
+        }))
+        .await;
+    match newest.payload.unwrap() {
+        envelope::Payload::CanReceiveResponse(response) => {
+            assert_eq!(response.frames[0].frame.as_ref().unwrap().data, [3]);
+        }
+        other => panic!("expected newest CAN frame after lag, got {other:?}"),
+    }
+    drop(client);
+    assert!(server.await.unwrap().cleanup_error().is_none());
 }
 
 #[cfg(unix)]
