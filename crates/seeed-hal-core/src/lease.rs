@@ -164,6 +164,7 @@ impl<'de> Deserialize<'de> for SessionId {
 pub enum LeaseMode {
     Observe,
     Control,
+    Maintenance,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]

@@ -7,6 +7,7 @@ members = [
     "apps/seeed-hal-broker",
     "crates/seeed-hal-client",
     "crates/seeed-hal-broker",
+    "crates/seeed-hal-can",
     "crates/seeed-hal-core",
     "crates/seeed-hal-protocol",
     "crates/seeed-hal-runtime",

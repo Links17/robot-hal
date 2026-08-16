@@ -145,6 +145,7 @@ impl IdentityQuality {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
 pub enum TransportKind {
     Serial,
+    Can,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
