@@ -247,6 +247,11 @@ struct PendingRequest {
     reply: oneshot::Sender<HalResult<envelope::Payload>>,
 }
 
+enum CorrelatedResponse {
+    Pending(PendingRequest),
+    Cancelled(ExpectedResponse),
+}
+
 struct RequestState {
     next_request_id: u64,
     pending: HashMap<u64, PendingRequest>,
@@ -294,7 +299,6 @@ struct Limits {
 struct Shared {
     requests: Mutex<RequestState>,
     limits: Mutex<Limits>,
-    can_resources: Mutex<Vec<ResourceDescriptor>>,
     pending_capacity: usize,
     tombstone_capacity: usize,
     writer: mpsc::Sender<Outbound>,
@@ -440,7 +444,6 @@ impl HalClient {
                 terminal: None,
             }),
             limits: Mutex::new(negotiated),
-            can_resources: Mutex::new(Vec::new()),
             pending_capacity: options.pending_capacity,
             tombstone_capacity: options.pending_capacity,
             writer: writer_tx,
@@ -534,16 +537,8 @@ impl HalClient {
         // The reader already validated this response before correlation. Keep
         // conversion here as the single protobuf-to-public-type mapping.
         let result = enumerate_can_response_from_proto(response);
-        match &result {
-            Ok(resources) => {
-                *self
-                    .inner
-                    .shared
-                    .can_resources
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner()) = resources.clone();
-            }
-            Err(error) => self.fail(error.clone()),
+        if let Err(error) = &result {
+            self.fail(error.clone());
         }
         result
     }
@@ -587,7 +582,8 @@ impl HalClient {
                 || limits.can_error_frames;
             mode_supported && filters_supported
         })?;
-        let descriptor = self.can_descriptor(&selector).await?;
+        let resources = self.enumerate_can().await?;
+        let descriptor = select_can_descriptor(&resources, &selector)?.clone();
         validate_can_open_capabilities(&descriptor, &config, &filters)?;
 
         let request = v1::OpenCanRequest {
@@ -704,20 +700,6 @@ impl HalClient {
             "the negotiated broker protocol does not support this CAN operation",
         );
         Err(resource_id.map_or(error.clone(), |id| error.with_resource_id(id.clone())))
-    }
-
-    async fn can_descriptor(&self, selector: &ResourceSelector) -> HalResult<ResourceDescriptor> {
-        let mut resources = self
-            .inner
-            .shared
-            .can_resources
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        if !resources.iter().any(|resource| resource.id() == selector.id()) {
-            resources = self.enumerate_can().await?;
-        }
-        select_can_descriptor(&resources, selector).cloned()
     }
 
     fn ensure_payload_fits(
@@ -1211,16 +1193,17 @@ where
             continue;
         }
 
-        let pending = {
+        let correlated = {
             let mut state = shared.requests.lock().unwrap_or_else(|p| p.into_inner());
             if state.terminal.is_some() {
                 return;
             }
             if let Some(pending) = state.pending.remove(&envelope.request_id) {
                 remember_completed(&mut state, envelope.request_id, shared.tombstone_capacity);
-                Some(pending)
-            } else if state.cancelled.remove(&envelope.request_id).is_some() {
-                None
+                CorrelatedResponse::Pending(pending)
+            } else if let Some(expected) = state.cancelled.remove(&envelope.request_id) {
+                remember_completed(&mut state, envelope.request_id, shared.tombstone_capacity);
+                CorrelatedResponse::Cancelled(expected)
             } else {
                 let duplicate = state.completed.contains(&envelope.request_id);
                 drop(state);
@@ -1245,8 +1228,25 @@ where
                 return;
             }
         };
-        let Some(pending) = pending else {
-            continue;
+        let pending = match correlated {
+            CorrelatedResponse::Pending(pending) => pending,
+            CorrelatedResponse::Cancelled(expected) => {
+                let validation = match envelope.payload {
+                    Some(envelope::Payload::Error(error)) => error_from_proto(error)
+                        .map(|_| ())
+                        .map_err(|error| attach_expected(error, &expected)),
+                    Some(payload) => validate_response(expected.clone(), &payload),
+                    None => Err(expected.resource_id().map_or_else(
+                        unexpected_response,
+                        |resource_id| unexpected_response().with_resource_id(resource_id.clone()),
+                    )),
+                };
+                if let Err(error) = validation {
+                    terminate(&shared, error);
+                    return;
+                }
+                continue;
+            }
         };
         let result = match envelope.payload {
             Some(envelope::Payload::Error(error)) => error_from_proto(error)
@@ -1633,6 +1633,12 @@ fn validate_received_profile(
 
 fn attach_profile(error: HalError, profile: &CanSessionProfile) -> HalError {
     attach_resource(error, &profile.resource_id)
+}
+
+fn attach_expected(error: HalError, expected: &ExpectedResponse) -> HalError {
+    expected
+        .resource_id()
+        .map_or(error.clone(), |resource_id| attach_resource(error, resource_id))
 }
 
 fn invalid_profile_message(profile: &CanSessionProfile, message: &'static str) -> HalError {
@@ -2460,7 +2466,6 @@ mod tests {
                     can_error_frames: true,
                     can_rx_timestamp: true,
                 }),
-                can_resources: std::sync::Mutex::new(Vec::new()),
                 pending_capacity: 2,
                 tombstone_capacity: 1,
                 writer,
