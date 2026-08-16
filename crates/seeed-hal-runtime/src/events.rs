@@ -11,6 +11,12 @@ const EVENT_QUEUE_CAPACITY: usize = 64;
 pub enum RuntimeEventKind {
     SessionOpened,
     SessionClosed,
+    CanBusActive,
+    CanBusWarning,
+    CanBusPassive,
+    CanBusOff,
+    CanBusStopped,
+    CanBusUnknown,
 }
 
 impl RuntimeEventKind {
@@ -18,6 +24,12 @@ impl RuntimeEventKind {
         match self {
             Self::SessionOpened => "session.opened",
             Self::SessionClosed => "session.closed",
+            Self::CanBusActive => "can.bus.active",
+            Self::CanBusWarning => "can.bus.warning",
+            Self::CanBusPassive => "can.bus.passive",
+            Self::CanBusOff => "can.bus.off",
+            Self::CanBusStopped => "can.bus.stopped",
+            Self::CanBusUnknown => "can.bus.unknown",
         }
     }
 }

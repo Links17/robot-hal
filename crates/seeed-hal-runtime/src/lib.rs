@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
-mod events;
+mod can_actor;
+mod can_manager;
 mod can_lease_table;
+mod events;
 mod lease_table;
 mod registry;
 mod serial_actor;
@@ -10,11 +12,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use can_manager::CanManager;
 pub use events::{EventSubscription, RuntimeEvent, RuntimeEventKind};
 use registry::{CloseAction, Registry};
 use seeed_hal_core::{
-    ErrorCategory, HalError, HalResult, LeaseToken, OwnerId, ResourceDescriptor, ResourceSelector,
-    SessionId,
+    ErrorCategory, HalError, HalResult, LeaseMode, LeaseToken, OwnerId, ResourceDescriptor,
+    ResourceSelector, SessionId,
+};
+use seeed_hal_can::{
+    CanAdapter, CanBatchSendError, CanBusStatus, CanFilterSet, CanFrame, CanOpenConfig,
+    DEFAULT_CAN_RX_CAPACITY, DEFAULT_CAN_TX_CAPACITY, ReceivedCanFrame,
 };
 use seeed_hal_serial::{ControlLines, SerialAdapter, SerialConfig};
 use serial_actor::{ActorMetadata, SerialCommand, spawn_serial_actor};
@@ -24,13 +31,26 @@ use uuid::Uuid;
 pub struct HalRuntimeBuilder {
     serial_adapter: Option<Arc<dyn SerialAdapter>>,
     serial_close_timeout: Duration,
+    can_adapters: Vec<Arc<dyn CanAdapter>>,
+    can_rx_capacity: usize,
+    can_tx_capacity: usize,
+    can_close_timeout: Duration,
 }
+
+/// Maximum configurable frames in one session's software receive ring.
+pub const MAX_RUNTIME_CAN_RX_CAPACITY: usize = 4096;
+/// Maximum configurable frames admitted across one physical channel's TX queue.
+pub const MAX_RUNTIME_CAN_TX_CAPACITY: usize = 4096;
 
 impl Default for HalRuntimeBuilder {
     fn default() -> Self {
         Self {
             serial_adapter: None,
             serial_close_timeout: Duration::from_secs(2),
+            can_adapters: Vec::new(),
+            can_rx_capacity: DEFAULT_CAN_RX_CAPACITY,
+            can_tx_capacity: DEFAULT_CAN_TX_CAPACITY,
+            can_close_timeout: Duration::from_secs(2),
         }
     }
 }
@@ -54,13 +74,54 @@ impl HalRuntimeBuilder {
         self
     }
 
+    /// Registers another CAN adapter. Adapters are queried as one discovery set.
+    pub fn can_adapter<A>(mut self, adapter: A) -> Self
+    where
+        A: CanAdapter + 'static,
+    {
+        self.can_adapters.push(Arc::new(adapter));
+        self
+    }
+
+    /// Sets each CAN session's drop-oldest RX ring capacity.
+    ///
+    /// Values are clamped to `1..=4096`; the default is 256 frames.
+    pub fn can_rx_capacity(mut self, capacity: usize) -> Self {
+        self.can_rx_capacity = capacity.clamp(1, MAX_RUNTIME_CAN_RX_CAPACITY);
+        self
+    }
+
+    /// Sets each physical CAN actor's atomically admitted TX frame capacity.
+    ///
+    /// Values are clamped to `1..=4096`; the default is 64 frames. Individual
+    /// batches remain bounded to 64 frames by the CAN interface contract.
+    pub fn can_tx_capacity(mut self, capacity: usize) -> Self {
+        self.can_tx_capacity = capacity.clamp(1, MAX_RUNTIME_CAN_TX_CAPACITY);
+        self
+    }
+
+    /// Sets the finite deadline for CAN discovery and actor cleanup.
+    pub fn can_close_timeout(mut self, timeout: Duration) -> Self {
+        self.can_close_timeout = timeout;
+        self
+    }
+
     pub fn build(self) -> HalRuntime {
+        let events = events::EventPublisher::new();
+        let can_manager = CanManager::new(
+            self.can_adapters,
+            events.clone(),
+            self.can_rx_capacity,
+            self.can_tx_capacity,
+            self.can_close_timeout,
+        );
         HalRuntime {
             inner: Arc::new(RuntimeInner {
                 serial_adapter: self.serial_adapter,
                 registry: Arc::new(Mutex::new(Registry::default())),
-                events: events::EventPublisher::new(),
+                events,
                 serial_close_timeout: self.serial_close_timeout,
+                can_manager,
             }),
         }
     }
@@ -71,6 +132,7 @@ struct RuntimeInner {
     registry: Arc<Mutex<Registry>>,
     events: events::EventPublisher,
     serial_close_timeout: Duration,
+    can_manager: CanManager,
 }
 
 #[derive(Clone)]
@@ -85,6 +147,93 @@ impl HalRuntime {
 
     pub async fn enumerate_serial(&self) -> HalResult<Vec<ResourceDescriptor>> {
         self.serial_adapter("serial.enumerate")?.enumerate().await
+    }
+
+    pub async fn enumerate_can(&self) -> HalResult<Vec<ResourceDescriptor>> {
+        self.inner.can_manager.enumerate().await
+    }
+
+    pub async fn open_can(
+        &self,
+        owner: OwnerId,
+        selector: ResourceSelector,
+        mode: LeaseMode,
+        config: CanOpenConfig,
+        filters: CanFilterSet,
+    ) -> HalResult<CanHandle> {
+        let (session_id, lease) = self
+            .inner
+            .can_manager
+            .open(owner, selector, mode, config, filters)
+            .await?;
+        Ok(CanHandle {
+            runtime: self.clone(),
+            session_id,
+            lease,
+            closed: false,
+        })
+    }
+
+    pub async fn send_can(
+        &self,
+        session: SessionId,
+        lease: &LeaseToken,
+        frame: CanFrame,
+    ) -> Result<(), CanBatchSendError> {
+        self.send_can_batch(session, lease, vec![frame]).await
+    }
+
+    pub async fn send_can_batch(
+        &self,
+        session: SessionId,
+        lease: &LeaseToken,
+        frames: Vec<CanFrame>,
+    ) -> Result<(), CanBatchSendError> {
+        self.inner
+            .can_manager
+            .send_batch(session, lease, frames)
+            .await
+    }
+
+    pub async fn receive_can(
+        &self,
+        session: SessionId,
+        lease: &LeaseToken,
+        max_frames: usize,
+        timeout: Duration,
+    ) -> HalResult<Vec<ReceivedCanFrame>> {
+        self.inner
+            .can_manager
+            .receive(session, lease, max_frames, timeout)
+            .await
+    }
+
+    pub async fn replace_can_filters(
+        &self,
+        session: SessionId,
+        lease: &LeaseToken,
+        filters: CanFilterSet,
+    ) -> HalResult<()> {
+        self.inner
+            .can_manager
+            .replace_filters(session, lease, filters)
+            .await
+    }
+
+    pub async fn can_bus_status(
+        &self,
+        session: SessionId,
+        lease: &LeaseToken,
+    ) -> HalResult<CanBusStatus> {
+        self.inner.can_manager.bus_status(session, lease).await
+    }
+
+    pub async fn close_can(
+        &self,
+        session: SessionId,
+        lease: &LeaseToken,
+    ) -> HalResult<()> {
+        self.inner.can_manager.close(session, lease).await
     }
 
     pub async fn open_serial(
@@ -232,6 +381,16 @@ impl HalRuntime {
     }
 
     pub async fn revoke_owner(&self, owner: &OwnerId) -> HalResult<()> {
+        let serial_result = self.revoke_serial_owner(owner).await;
+        let can_result = self.inner.can_manager.revoke_owner(owner).await;
+        match (serial_result, can_result) {
+            (Err(error), _) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    async fn revoke_serial_owner(&self, owner: &OwnerId) -> HalResult<()> {
         let targets = {
             let mut registry = self.inner.registry.lock().await;
             let targets = registry.begin_revoke(owner);
@@ -268,6 +427,7 @@ impl HalRuntime {
     /// lease generation is retained for fencing.
     pub async fn retained_generation_count(&self) -> usize {
         self.inner.registry.lock().await.retained_generation_count()
+            + self.inner.can_manager.retained_generation_count()
     }
 
     async fn request_serial<T>(
@@ -344,6 +504,95 @@ impl Drop for PendingOpen {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 registry.lock().await.cancel_open(&session_id);
+            });
+        }
+    }
+}
+
+pub struct CanHandle {
+    runtime: HalRuntime,
+    session_id: SessionId,
+    lease: LeaseToken,
+    closed: bool,
+}
+
+impl CanHandle {
+    pub fn session_id(&self) -> SessionId {
+        self.session_id.clone()
+    }
+
+    pub fn lease_token(&self) -> &LeaseToken {
+        &self.lease
+    }
+
+    /// Transfers the session to a broker-facing caller using ID/token methods.
+    pub fn into_parts(mut self) -> (SessionId, LeaseToken) {
+        self.closed = true;
+        (self.session_id.clone(), self.lease.clone())
+    }
+
+    pub async fn send(&self, frame: CanFrame) -> Result<(), CanBatchSendError> {
+        self.runtime
+            .send_can(self.session_id(), &self.lease, frame)
+            .await
+    }
+
+    pub async fn send_batch(
+        &self,
+        frames: Vec<CanFrame>,
+    ) -> Result<(), CanBatchSendError> {
+        self.runtime
+            .send_can_batch(self.session_id(), &self.lease, frames)
+            .await
+    }
+
+    pub async fn receive(
+        &self,
+        max_frames: usize,
+        timeout: Duration,
+    ) -> HalResult<Vec<ReceivedCanFrame>> {
+        self.runtime
+            .receive_can(self.session_id(), &self.lease, max_frames, timeout)
+            .await
+    }
+
+    pub async fn replace_filters(&self, filters: CanFilterSet) -> HalResult<()> {
+        self.runtime
+            .replace_can_filters(self.session_id(), &self.lease, filters)
+            .await
+    }
+
+    pub async fn bus_status(&self) -> HalResult<CanBusStatus> {
+        self.runtime
+            .can_bus_status(self.session_id(), &self.lease)
+            .await
+    }
+
+    /// Closes the session. A failed local admission leaves this handle open so
+    /// the caller can retry; only a successful close marks it terminal.
+    pub async fn close(&mut self) -> HalResult<()> {
+        let result = self
+            .runtime
+            .close_can(self.session_id(), &self.lease)
+            .await;
+        if result.is_ok() {
+            self.closed = true;
+        }
+        result
+    }
+}
+
+impl Drop for CanHandle {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        let runtime = self.runtime.clone();
+        let session_id = self.session_id.clone();
+        let lease = self.lease.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = runtime.close_can(session_id, &lease).await;
             });
         }
     }
