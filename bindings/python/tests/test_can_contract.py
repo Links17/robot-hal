@@ -33,6 +33,7 @@ from seeed_hal import (
     TransportKind,
 )
 from seeed_hal.can import _CanSessionProfile
+from seeed_hal.client import _decode_can_frame, _decode_descriptor
 from seeed_hal.proto import hal_pb2
 
 
@@ -61,6 +62,18 @@ class ScriptedTransport:
 
     def set_frame_limit(self, frame_limit: int) -> None:
         self.frame_limit = frame_limit
+
+
+class BlockingWriterTransport(ScriptedTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.block = False
+        self.release = asyncio.Event()
+
+    async def send(self, payload: bytes | bytearray | memoryview) -> None:
+        await super().send(payload)
+        if self.block:
+            await self.release.wait()
 
 
 def direct_client(
@@ -210,6 +223,29 @@ def test_all_frame_variants_and_exact_fd_lengths() -> None:
         CanFrame.error(tuple(CanErrorClass) + (CanErrorClass.OTHER,), b"")
 
 
+@pytest.mark.parametrize(
+    ("bitrate_switch", "error_state_indicator"),
+    [(True, False), (False, True), (True, True)],
+)
+def test_classical_peer_frames_reject_fd_only_flags(
+    bitrate_switch: bool, error_state_indicator: bool
+) -> None:
+    for kind in (
+        hal_pb2.CAN_FRAME_KIND_CLASSIC_DATA,
+        hal_pb2.CAN_FRAME_KIND_CLASSIC_REMOTE,
+    ):
+        value = hal_pb2.CanFrame(
+            id=hal_pb2.CanId(value=1, format=hal_pb2.CAN_ID_FORMAT_STANDARD),
+            kind=kind,
+            data=b"x" if kind == hal_pb2.CAN_FRAME_KIND_CLASSIC_DATA else b"",
+            remote_dlc=0,
+            bitrate_switch=bitrate_switch,
+            error_state_indicator=error_state_indicator,
+        )
+        with pytest.raises(HalError):
+            _decode_can_frame(value)
+
+
 def test_timestamp_configuration_and_filter_bounds() -> None:
     CanTimestamp(MAX_U64, CanTimestampSource.HARDWARE, "x" * 255)
     with pytest.raises(HalError):
@@ -225,6 +261,73 @@ def test_timestamp_configuration_and_filter_bounds() -> None:
     with pytest.raises(HalError):
         CanFilterSet([filt] * 65)
     assert CanFilterSet().matches(CanFrame.classic_data(CanId.standard(1), b"x"))
+
+
+def test_descriptor_endpoint_and_capability_exact_boundaries() -> None:
+    maximum_capability = f"n.{'x' * 250}/v1"
+    decoded = _decode_descriptor(
+        hal_pb2.ResourceDescriptor(
+            resource_id="can:virtual:test",
+            endpoint="é" * 2048,
+            identity_quality=hal_pb2.IDENTITY_QUALITY_STRONG,
+            transport=hal_pb2.TRANSPORT_KIND_CAN,
+            capabilities=[maximum_capability],
+        ),
+        expected=TransportKind.CAN,
+    )
+    assert len(decoded.endpoint.encode("utf-8")) == 4096
+    assert decoded.capabilities == (maximum_capability,)
+
+    too_long_endpoint = descriptor(capabilities=["can.classic/v1"])
+    too_long_endpoint.endpoint = "é" * 2049
+    with pytest.raises(HalError):
+        _decode_descriptor(too_long_endpoint, expected=TransportKind.CAN)
+
+
+@pytest.mark.parametrize(
+    "capability",
+    [
+        "",
+        "can/v1",
+        "can.classic",
+        "can.classic/v0",
+        "can.classic/v",
+        "can.classic/v18446744073709551616",
+        "can.classic.extra/v1",
+        "can.classic/v1/extra",
+        "é.classic/v1",
+        f"n.{'x' * 251}/v1",
+    ],
+)
+def test_descriptor_rejects_invalid_capability_syntax(capability: str) -> None:
+    value = descriptor(capabilities=["can.classic/v1"])
+    del value.capabilities[:]
+    value.capabilities.append(capability)
+    with pytest.raises(HalError) as caught:
+        _decode_descriptor(value, expected=TransportKind.CAN)
+    assert caught.value.name == "runtime.protocol.invalid_message"
+
+
+@pytest.mark.asyncio
+async def test_malformed_descriptor_terminates_and_closes_transport() -> None:
+    transport = ScriptedTransport()
+    client = direct_client(transport)
+    enumerating = asyncio.create_task(client.enumerate_can())
+    request = await next_request(transport)
+    invalid = descriptor(capabilities=["can.classic/v1"])
+    invalid.endpoint = "é" * 2049
+    transport.inbound.put_nowait(
+        response(
+            request.request_id,
+            "enumerate_can_response",
+            hal_pb2.EnumerateCanResponse(resources=[invalid]),
+        )
+    )
+    with pytest.raises(HalError) as caught:
+        await enumerating
+    assert caught.value.name == "runtime.protocol.invalid_message"
+    await asyncio.sleep(0)
+    assert transport.closed
 
 
 @pytest.mark.asyncio
@@ -246,12 +349,178 @@ async def test_minor_and_capability_gates_reject_before_wire() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("negotiated", "advertised", "config", "filters"),
+    [
+        (
+            {"can.classic/v1"},
+            {"can.classic/v1", "can.fd/v1"},
+            CanOpenConfig(attach=CanLinkExpectation(mode=CanMode.FD)),
+            CanFilterSet(),
+        ),
+        (
+            {"can.classic/v1", "can.fd/v1"},
+            {"can.classic/v1"},
+            CanOpenConfig(attach=CanLinkExpectation(mode=CanMode.FD)),
+            CanFilterSet(),
+        ),
+        (
+            {"can.classic/v1"},
+            {"can.classic/v1", "can.configure/v1"},
+            CanOpenConfig(
+                configure=CanConfigureConfig(
+                    CanMode.CLASSIC, CanBitTiming(500_000)
+                )
+            ),
+            CanFilterSet(),
+        ),
+        (
+            {"can.classic/v1"},
+            {"can.classic/v1", "can.error-frames/v1"},
+            CanOpenConfig(attach=CanLinkExpectation(mode=CanMode.CLASSIC)),
+            CanFilterSet(
+                [
+                    CanFilter(
+                        0,
+                        0,
+                        CanIdFormat.EITHER,
+                        CanFrameClasses(error=True),
+                    )
+                ]
+            ),
+        ),
+    ],
+)
+async def test_open_intersects_negotiated_and_descriptor_capabilities(
+    negotiated: set[str],
+    advertised: set[str],
+    config: CanOpenConfig,
+    filters: CanFilterSet,
+) -> None:
+    transport = ScriptedTransport()
+    client = direct_client(
+        transport,
+        capabilities=frozenset({"serial.bytes/v1", *negotiated}),
+    )
+    opening = asyncio.create_task(
+        client.open_can(
+            ResourceSelector(
+                "can:virtual:test", IdentityQuality.STRONG, TransportKind.CAN
+            ),
+            LeaseMode.CONTROL,
+            config,
+            filters,
+        )
+    )
+    request = await next_request(transport)
+    transport.inbound.put_nowait(
+        response(
+            request.request_id,
+            "enumerate_can_response",
+            hal_pb2.EnumerateCanResponse(
+                resources=[descriptor(capabilities=sorted(advertised))]
+            ),
+        )
+    )
+    with pytest.raises(HalError) as caught:
+        await opening
+    assert caught.value.name == "runtime.protocol.capability_unsupported"
+    assert caught.value.resource_id == "can:virtual:test"
+    assert transport.sent.empty()
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_session_operations_use_effective_capability_profile() -> None:
+    transport = ScriptedTransport()
+    client = direct_client(
+        transport,
+        capabilities=frozenset({"serial.bytes/v1", "can.classic/v1"}),
+    )
+    session = await open_session(client, transport)
+    with pytest.raises(CanBatchSendError) as fd:
+        await session.send(CanFrame.fd_data(CanId.standard(1), b""))
+    assert fd.value.error.name == "runtime.protocol.capability_unsupported"
+    with pytest.raises(CanBatchSendError) as error_frame:
+        await session.send(CanFrame.error([CanErrorClass.BUS_OFF]))
+    assert error_frame.value.error.name == "runtime.protocol.capability_unsupported"
+    with pytest.raises(HalError) as filters:
+        await session.replace_filters(
+            CanFilterSet(
+                [
+                    CanFilter(
+                        0,
+                        0,
+                        CanIdFormat.EITHER,
+                        CanFrameClasses(error=True),
+                    )
+                ]
+            )
+        )
+    assert filters.value.name == "runtime.protocol.capability_unsupported"
+    assert transport.sent.empty()
+    await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unadvertised", ["error_frame", "timestamp"])
+async def test_receive_rejects_unnegotiated_operation_capabilities(
+    unadvertised: str,
+) -> None:
+    transport = ScriptedTransport()
+    client = direct_client(
+        transport,
+        capabilities=frozenset({"serial.bytes/v1", "can.classic/v1"}),
+    )
+    session = await open_session(client, transport)
+    receiving = asyncio.create_task(session.receive(1, 10))
+    request = await next_request(transport)
+    if unadvertised == "error_frame":
+        frame = hal_pb2.CanFrame(
+            kind=hal_pb2.CAN_FRAME_KIND_ERROR,
+            error_classes=[hal_pb2.CAN_ERROR_CLASS_BUS_OFF],
+        )
+        received = hal_pb2.ReceivedCanFrame(frame=frame)
+    else:
+        frame = hal_pb2.CanFrame(
+            id=hal_pb2.CanId(value=1, format=hal_pb2.CAN_ID_FORMAT_STANDARD),
+            kind=hal_pb2.CAN_FRAME_KIND_CLASSIC_DATA,
+        )
+        received = hal_pb2.ReceivedCanFrame(
+            frame=frame,
+            timestamp=hal_pb2.CanTimestamp(
+                timestamp_ns=1,
+                source=hal_pb2.CAN_TIMESTAMP_SOURCE_KERNEL,
+                clock_domain="kernel",
+            ),
+        )
+    transport.inbound.put_nowait(
+        response(
+            request.request_id,
+            "can_receive_response",
+            hal_pb2.CanReceiveResponse(frames=[received]),
+        )
+    )
+    with pytest.raises(HalError) as caught:
+        await receiving
+    assert caught.value.name == "runtime.protocol.invalid_message"
+    assert caught.value.resource_id == "can:virtual:test"
+    await asyncio.sleep(0)
+    assert transport.closed
+
+
+@pytest.mark.asyncio
 async def test_partial_batch_preserves_typed_error_and_prefix() -> None:
     transport = ScriptedTransport()
     client = direct_client(transport)
     session = await open_session(client, transport)
     sending = asyncio.create_task(
-        session.send_batch([CanFrame.classic_data(CanId.standard(1), b"a")])
+        session.send_batch(
+            [
+                CanFrame.classic_data(CanId.standard(1), b"a"),
+                CanFrame.classic_data(CanId.standard(2), b"b"),
+            ]
+        )
     )
     request = await next_request(transport)
     transport.inbound.put_nowait(
@@ -259,7 +528,7 @@ async def test_partial_batch_preserves_typed_error_and_prefix() -> None:
             request.request_id,
             "can_send_response",
             hal_pb2.CanSendResponse(
-                committed_count=0,
+                committed_count=1,
                 error=hal_pb2.Error(
                     name="can.bus.off",
                     category=hal_pb2.ERROR_CATEGORY_UNAVAILABLE,
@@ -272,7 +541,7 @@ async def test_partial_batch_preserves_typed_error_and_prefix() -> None:
     )
     with pytest.raises(CanBatchSendError) as caught:
         await sending
-    assert caught.value.committed == 0
+    assert caught.value.committed == 1
     assert caught.value.error.category is ErrorCategory.UNAVAILABLE
     await client.close()
 
@@ -382,7 +651,8 @@ async def test_malformed_peer_terminates_and_fans_out_fresh_errors() -> None:
     assert send_error.error.name == "runtime.protocol.invalid_message"
     assert status_error.name == "runtime.protocol.invalid_message"
     assert send_error.error is not status_error
-    await client.close()
+    await asyncio.sleep(0)
+    assert transport.closed
 
 
 @pytest.mark.asyncio
@@ -415,6 +685,64 @@ async def test_cancelled_receive_tombstone_keeps_following_request_correlated() 
     )
     assert (await status).state is CanBusState.ACTIVE
     await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", ["classic_brs", "remote_esi", "wrong_kind"])
+async def test_cancelled_malformed_responses_terminate_and_close_transport(
+    malformed: str,
+) -> None:
+    transport = ScriptedTransport()
+    client = direct_client(transport)
+    session = await open_session(client, transport)
+    receive = asyncio.create_task(session.receive(1, 1))
+    receive_request = await next_request(transport)
+    receive.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await receive
+
+    status = asyncio.create_task(session.bus_status())
+    await next_request(transport)
+    if malformed == "wrong_kind":
+        payload = response(
+            receive_request.request_id,
+            "can_send_response",
+            hal_pb2.CanSendResponse(committed_count=0),
+        )
+    else:
+        remote = malformed == "remote_esi"
+        payload = response(
+            receive_request.request_id,
+            "can_receive_response",
+            hal_pb2.CanReceiveResponse(
+                frames=[
+                    hal_pb2.ReceivedCanFrame(
+                        frame=hal_pb2.CanFrame(
+                            id=hal_pb2.CanId(
+                                value=1, format=hal_pb2.CAN_ID_FORMAT_STANDARD
+                            ),
+                            kind=(
+                                hal_pb2.CAN_FRAME_KIND_CLASSIC_REMOTE
+                                if remote
+                                else hal_pb2.CAN_FRAME_KIND_CLASSIC_DATA
+                            ),
+                            data=b"" if remote else b"x",
+                            bitrate_switch=not remote,
+                            error_state_indicator=remote,
+                        )
+                    )
+                ]
+            ),
+        )
+    transport.inbound.put_nowait(payload)
+    result = await asyncio.gather(status, return_exceptions=True)
+    assert isinstance(result[0], HalError)
+    assert result[0].name in {
+        "runtime.protocol.invalid_message",
+        "runtime.protocol.unexpected_response",
+    }
+    await asyncio.sleep(0)
+    assert transport.closed
 
 
 @pytest.mark.asyncio
@@ -480,6 +808,30 @@ async def test_pending_queue_saturation_rejects_without_losing_session() -> None
     )
     assert (await status).state is CanBusState.ACTIVE
     await client.close()
+
+
+@pytest.mark.asyncio
+async def test_writer_queue_saturation_is_retryable_and_resource_scoped() -> None:
+    transport = BlockingWriterTransport()
+    client = direct_client(transport, writer_capacity=1)
+    session = await open_session(client, transport)
+    transport.block = True
+
+    first = asyncio.create_task(session.bus_status())
+    await next_request(transport)
+    second = asyncio.create_task(session.bus_status())
+    await asyncio.sleep(0)
+    assert client._writer_queue.qsize() == 1
+    with pytest.raises(HalError) as caught:
+        await session.bus_status()
+    assert caught.value.name == "runtime.queue.full"
+    assert caught.value.retryable
+    assert caught.value.resource_id == "can:virtual:test"
+
+    await client.close()
+    results = await asyncio.gather(first, second, return_exceptions=True)
+    assert all(isinstance(result, HalError) for result in results)
+    assert transport.closed
 
 
 @pytest.mark.asyncio

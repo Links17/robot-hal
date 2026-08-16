@@ -74,9 +74,9 @@ async def fake_broker(
     frame=HARD_FRAME_BYTES,
     read=64 * 1024,
     write=64 * 1024,
-    selected_minor=0,
+    selected_minor=1,
     minimum_minor=0,
-    maximum_minor=0,
+    maximum_minor=1,
 ):
     if os.name == "nt":
         pytest.skip("Unix socket protocol fault injection is covered on Unix CI")
@@ -164,19 +164,19 @@ async def test_python_client_accepts_overlap_selection_and_rejects_no_shared_min
 
     async with fake_broker(handler, minimum_minor=0, maximum_minor=3) as endpoint:
         client = await HalClient.connect(endpoint, TOKEN)
-        assert client.protocol_minor == 0
+        assert client.protocol_minor == 1
         await client.close()
         release.set()
 
     release = asyncio.Event()
     async with fake_broker(
         handler,
-        selected_minor=1,
+        selected_minor=0,
         minimum_minor=0,
-        maximum_minor=1,
+        maximum_minor=0,
     ) as endpoint:
         client = await HalClient.connect(endpoint, TOKEN)
-        assert client.protocol_minor == 1
+        assert client.protocol_minor == 0
         await client.close()
         release.set()
 
@@ -211,7 +211,7 @@ async def test_invalid_python_arguments_use_stable_hal_errors() -> None:
 @pytest.mark.asyncio
 async def test_python_client_round_trips_complete_serial_contract(broker) -> None:
     client = await HalClient.connect(broker.endpoint, broker.token)
-    assert client.protocol_minor == 0
+    assert client.protocol_minor == 1
     events = client.subscribe()
     resources = await client.enumerate_serial()
     assert resources[0].identity_quality is IdentityQuality.STRONG

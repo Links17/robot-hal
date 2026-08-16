@@ -1194,7 +1194,8 @@ async def test_malformed_can_status_uses_shared_terminal_fanout() -> None:
     assert first.name == "runtime.protocol.invalid_message"
     assert second.name == "runtime.protocol.invalid_message"
     assert first is not second
-    await client.close()
+    await asyncio.sleep(0)
+    assert transport.closed
 
 
 @pytest.mark.asyncio

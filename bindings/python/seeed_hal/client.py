@@ -232,6 +232,7 @@ class HalClient:
         "_event_capacity",
         "_writer_task",
         "_reader_task",
+        "_transport_close_task",
         "_close_lock",
     )
 
@@ -276,6 +277,7 @@ class HalClient:
         self._reader_task = asyncio.create_task(
             self._reader_loop(), name="seeed-hal-reader"
         )
+        self._transport_close_task: asyncio.Task[None] | None = None
         self._close_lock = asyncio.Lock()
 
     @classmethod
@@ -486,7 +488,10 @@ class HalClient:
         # identities or capabilities cannot weaken fail-closed selection.
         resources = await self.enumerate_can()
         descriptor = _select_can_descriptor(resources, selector)
-        profile_mode = _validate_can_open_capabilities(descriptor, config, filters)
+        effective_capabilities = _effective_can_capabilities(descriptor, self)
+        profile_mode = _validate_can_open_capabilities(
+            descriptor, config, filters, effective_capabilities
+        )
         request = hal_pb2.OpenCanRequest(
             selector=_selector_to_proto(selector, "can.open"),
             mode=_LEASE_MODE_TO_PROTO[mode],
@@ -510,7 +515,7 @@ class HalClient:
         session_id, lease_id, generation, lease_mode = _decode_open_can_response(
             response, mode
         )
-        capabilities = frozenset(descriptor.capabilities)
+        capabilities = effective_capabilities
         profile = _CanSessionProfile(
             profile_mode,
             CAN_CLASSIC_CAPABILITY in capabilities,
@@ -551,8 +556,9 @@ class HalClient:
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+            close_task = self._start_transport_close()
             try:
-                await asyncio.wait_for(self._transport.close(), timeout=0.1)
+                await asyncio.wait_for(asyncio.shield(close_task), timeout=0.1)
             except TimeoutError:
                 pass
 
@@ -1103,7 +1109,17 @@ class HalClient:
     ) -> None:
         field = response.WhichOneof("payload")
         if field == "error":
-            _decode_error(response.error)
+            try:
+                _decode_error(response.error)
+            except HalError as error:
+                resource_id = (
+                    pending.profile.resource_id
+                    if pending.profile is not None
+                    else pending.resource_id
+                )
+                if resource_id is not None:
+                    error = _attach_resource(error, resource_id)
+                raise error
             return
         if field != pending.expected:
             error = client_error(
@@ -1113,8 +1129,13 @@ class HalClient:
                 False,
                 "response payload does not match its request",
             )
-            if pending.resource_id is not None:
-                error = _attach_resource(error, pending.resource_id)
+            resource_id = (
+                pending.profile.resource_id
+                if pending.profile is not None
+                else pending.resource_id
+            )
+            if resource_id is not None:
+                error = _attach_resource(error, resource_id)
             raise error
         _validate_response_payload(getattr(response, field), pending)
 
@@ -1170,6 +1191,22 @@ class HalClient:
         for task in (self._writer_task, self._reader_task):
             if task is not current and not task.done():
                 task.cancel()
+        self._start_transport_close()
+
+    def _start_transport_close(self) -> asyncio.Task[None]:
+        if self._transport_close_task is None:
+            self._transport_close_task = asyncio.create_task(
+                self._close_transport(), name="seeed-hal-transport-close"
+            )
+        return self._transport_close_task
+
+    async def _close_transport(self) -> None:
+        try:
+            await self._transport.close()
+        except Exception:
+            # Terminal state and fresh fan-out errors are already fixed before
+            # cleanup starts; transport close failures cannot replace them.
+            pass
 
     def _remove_subscription(self, subscription: EventSubscription) -> None:
         try:
@@ -1516,7 +1553,11 @@ def _decode_descriptor(
     expected: TransportKind | None = None,
 ) -> ResourceDescriptor:
     resource_id = _valid_identifier(value.resource_id, "resource.id")
-    if not value.endpoint or len(value.endpoint) > 4096:
+    try:
+        endpoint_bytes = value.endpoint.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise _invalid_message("broker resource endpoint is invalid") from error
+    if not endpoint_bytes or len(endpoint_bytes) > 4096:
         raise _invalid_message("broker resource endpoint is invalid")
     qualities = {
         hal_pb2.IDENTITY_QUALITY_WEAK: IdentityQuality.WEAK,
@@ -1534,7 +1575,9 @@ def _decode_descriptor(
     ):
         raise _invalid_message("broker resource descriptor enum is invalid")
     if value.capabilities:
-        capabilities = tuple(value.capabilities)
+        capabilities = tuple(
+            _valid_capability(capability) for capability in value.capabilities
+        )
     elif transport is TransportKind.SERIAL:
         capabilities = (SERIAL_CAPABILITY,)
     else:
@@ -1547,6 +1590,41 @@ def _decode_descriptor(
         dict(value.properties),
         capabilities,
     )
+
+
+def _valid_capability(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 255
+        or not value.isascii()
+    ):
+        raise _invalid_message("resource descriptor has an invalid capability")
+    try:
+        contract, version = value.split("/")
+        namespace, name = contract.split(".")
+    except ValueError as error:
+        raise _invalid_message(
+            "resource descriptor has an invalid capability"
+        ) from error
+    number = version[1:] if version.startswith("v") else ""
+    if (
+        not namespace
+        or not name
+        or not number
+        or not number.isascii()
+        or not number.isdigit()
+    ):
+        raise _invalid_message("resource descriptor has an invalid capability")
+    try:
+        parsed = int(number, 10)
+    except ValueError as error:
+        raise _invalid_message(
+            "resource descriptor has an invalid capability"
+        ) from error
+    if parsed <= 0 or parsed > MAX_U64:
+        raise _invalid_message("resource descriptor has an invalid capability")
+    return value
 
 
 def _valid_identifier(value: str, field: str) -> str:
@@ -1846,11 +1924,23 @@ def _decode_can_frame(value: hal_pb2.CanFrame) -> CanFrame:
     try:
         kind = value.kind
         if kind == hal_pb2.CAN_FRAME_KIND_CLASSIC_DATA:
-            if not value.HasField("id") or value.remote_dlc or value.error_classes:
+            if (
+                not value.HasField("id")
+                or value.remote_dlc
+                or value.error_classes
+                or value.bitrate_switch
+                or value.error_state_indicator
+            ):
                 raise ValueError
             return ClassicDataFrame(_decode_can_id(value.id), bytes(value.data))
         if kind == hal_pb2.CAN_FRAME_KIND_CLASSIC_REMOTE:
-            if not value.HasField("id") or value.data or value.error_classes:
+            if (
+                not value.HasField("id")
+                or value.data
+                or value.error_classes
+                or value.bitrate_switch
+                or value.error_state_indicator
+            ):
                 raise ValueError
             return ClassicRemoteFrame(_decode_can_id(value.id), value.remote_dlc)
         if kind == hal_pb2.CAN_FRAME_KIND_FD_DATA:
@@ -2107,8 +2197,8 @@ def _validate_can_open_capabilities(
     descriptor: ResourceDescriptor,
     config: CanOpenConfig,
     filters: CanFilterSet,
+    capabilities: frozenset[str],
 ) -> CanMode:
-    capabilities = frozenset(descriptor.capabilities)
     if config.attach is not None:
         requested_mode = config.attach.mode
         if requested_mode is None:
@@ -2147,6 +2237,14 @@ def _validate_can_open_capabilities(
         "the selected CAN resource does not support the requested configuration or filters",
         resource_id=descriptor.resource_id,
     )
+
+
+def _effective_can_capabilities(
+    descriptor: ResourceDescriptor, client: HalClient
+) -> frozenset[str]:
+    """Capabilities usable by both the selected resource and connection."""
+
+    return frozenset(descriptor.capabilities).intersection(client._capabilities)
 
 
 def _attach_resource(error: HalError, resource_id: str) -> HalError:
