@@ -127,32 +127,44 @@ pub struct EventSubscription {
 impl EventSubscription {
     pub async fn recv(&mut self) -> HalResult<ClientEvent> {
         loop {
+            match self.receiver.try_recv() {
+                Ok(result) => return result,
+                Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                    return Err(event_lagged_error(skipped));
+                }
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    return Err(event_closed_error());
+                }
+                Err(broadcast::error::TryRecvError::Empty) => {}
+            }
             if *self.shutdown.borrow() {
                 return Err(event_closed_error());
             }
             tokio::select! {
                 biased;
-                changed = self.shutdown.changed() => {
-                    if changed.is_err() || *self.shutdown.borrow() {
-                        return Err(event_closed_error());
-                    }
-                }
                 event = self.receiver.recv() => {
                     return match event {
                         Ok(result) => result,
                         Err(broadcast::error::RecvError::Closed) => Err(event_closed_error()),
-                        Err(broadcast::error::RecvError::Lagged(skipped)) => Err(client_error(
-                            "runtime.event.lagged",
-                            ErrorCategory::Unavailable,
-                            "runtime.event.receive",
-                            true,
-                            format!("event subscriber fell behind by {skipped} events"),
-                        )),
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            Err(event_lagged_error(skipped))
+                        }
                     };
                 }
+                _ = self.shutdown.changed() => {}
             }
         }
     }
+}
+
+fn event_lagged_error(skipped: u64) -> HalError {
+    client_error(
+        "runtime.event.lagged",
+        ErrorCategory::Unavailable,
+        "runtime.event.receive",
+        true,
+        format!("event subscriber fell behind by {skipped} events"),
+    )
 }
 
 fn event_closed_error() -> HalError {
