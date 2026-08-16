@@ -8,9 +8,12 @@ use prost::Message;
 use seeed_hal_can::{
     CAN_CLASSIC_CAPABILITY, CAN_CONFIGURE_CAPABILITY, CAN_ERROR_FRAMES_CAPABILITY,
     CAN_FD_CAPABILITY, CAN_RX_TIMESTAMP_CAPABILITY, CanFilterSet, CanMode, CanOpenConfig,
+    can_classic_capability, can_configure_capability, can_error_frames_capability,
+    can_fd_capability,
 };
 use seeed_hal_core::{
-    ErrorCategory, HalError, HalResult, LeaseMode, ResourceDescriptor, ResourceSelector,
+    ErrorCategory, HalError, HalResult, LeaseMode, ResourceDescriptor, ResourceId,
+    ResourceSelector, SessionId,
 };
 use seeed_hal_protocol::v1::{self, envelope};
 use seeed_hal_protocol::{
@@ -186,7 +189,18 @@ fn event_closed_error() -> HalError {
     )
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanSessionProfile {
+    pub(crate) mode: CanMode,
+    pub(crate) classic_frames: bool,
+    pub(crate) fd_frames: bool,
+    pub(crate) error_frames: bool,
+    pub(crate) timestamps: bool,
+    pub(crate) resource_id: ResourceId,
+    pub(crate) session_id: SessionId,
+}
+
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) enum ExpectedResponse {
     EnumerateSerial,
     OpenSerial,
@@ -195,16 +209,37 @@ pub(crate) enum ExpectedResponse {
     SerialFlush,
     SetControlLines,
     CloseSession,
+    CloseCan { profile: CanSessionProfile },
     EnumerateCan,
-    OpenCan { mode: LeaseMode },
-    CanSend { input_count: usize },
+    OpenCan {
+        mode: LeaseMode,
+        resource_id: ResourceId,
+    },
+    CanSend {
+        input_count: usize,
+        profile: CanSessionProfile,
+    },
     CanReceive {
         max_frames: usize,
         max_read_bytes: usize,
-        allow_timestamp: bool,
+        profile: CanSessionProfile,
     },
-    ReplaceCanFilters,
-    CanBusStatus,
+    ReplaceCanFilters { profile: CanSessionProfile },
+    CanBusStatus { profile: CanSessionProfile },
+}
+
+impl ExpectedResponse {
+    fn resource_id(&self) -> Option<&ResourceId> {
+        match self {
+            Self::OpenCan { resource_id, .. } => Some(resource_id),
+            Self::CanSend { profile, .. }
+            | Self::CanReceive { profile, .. }
+            | Self::ReplaceCanFilters { profile }
+            | Self::CanBusStatus { profile }
+            | Self::CloseCan { profile } => Some(&profile.resource_id),
+            _ => None,
+        }
+    }
 }
 
 struct PendingRequest {
@@ -259,6 +294,7 @@ struct Limits {
 struct Shared {
     requests: Mutex<RequestState>,
     limits: Mutex<Limits>,
+    can_resources: Mutex<Vec<ResourceDescriptor>>,
     pending_capacity: usize,
     tombstone_capacity: usize,
     writer: mpsc::Sender<Outbound>,
@@ -404,6 +440,7 @@ impl HalClient {
                 terminal: None,
             }),
             limits: Mutex::new(negotiated),
+            can_resources: Mutex::new(Vec::new()),
             pending_capacity: options.pending_capacity,
             tombstone_capacity: options.pending_capacity,
             writer: writer_tx,
@@ -497,8 +534,16 @@ impl HalClient {
         // The reader already validated this response before correlation. Keep
         // conversion here as the single protobuf-to-public-type mapping.
         let result = enumerate_can_response_from_proto(response);
-        if let Err(error) = &result {
-            self.fail(error.clone());
+        match &result {
+            Ok(resources) => {
+                *self
+                    .inner
+                    .shared
+                    .can_resources
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = resources.clone();
+            }
+            Err(error) => self.fail(error.clone()),
         }
         result
     }
@@ -542,6 +587,8 @@ impl HalClient {
                 || limits.can_error_frames;
             mode_supported && filters_supported
         })?;
+        let descriptor = self.can_descriptor(&selector).await?;
+        validate_can_open_capabilities(&descriptor, &config, &filters)?;
 
         let request = v1::OpenCanRequest {
             selector: Some((&selector).into()),
@@ -557,7 +604,10 @@ impl HalClient {
         let payload = self
             .request(
                 envelope::Payload::OpenCanRequest(request),
-                ExpectedResponse::OpenCan { mode },
+                ExpectedResponse::OpenCan {
+                    mode,
+                    resource_id: selector.id().clone(),
+                },
             )
             .await
             .map_err(|error| attach_resource(error, selector.id()))?;
@@ -569,6 +619,7 @@ impl HalClient {
             selector.id().clone(),
             mode,
             &config,
+            &descriptor,
             response,
         );
         if let Err(error) = &result {
@@ -607,21 +658,6 @@ impl HalClient {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         (limits.frame, limits.read, limits.write)
-    }
-
-    pub(crate) fn can_capabilities(&self) -> (bool, bool, bool, bool) {
-        let limits = *self
-            .inner
-            .shared
-            .limits
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        (
-            limits.can_classic,
-            limits.can_fd,
-            limits.can_error_frames,
-            limits.can_rx_timestamp,
-        )
     }
 
     pub(crate) fn ensure_can_payload_fits(
@@ -668,6 +704,20 @@ impl HalClient {
             "the negotiated broker protocol does not support this CAN operation",
         );
         Err(resource_id.map_or(error.clone(), |id| error.with_resource_id(id.clone())))
+    }
+
+    async fn can_descriptor(&self, selector: &ResourceSelector) -> HalResult<ResourceDescriptor> {
+        let mut resources = self
+            .inner
+            .shared
+            .can_resources
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if !resources.iter().any(|resource| resource.id() == selector.id()) {
+            resources = self.enumerate_can().await?;
+        }
+        select_can_descriptor(&resources, selector).cloned()
     }
 
     fn ensure_payload_fits(
@@ -1199,8 +1249,14 @@ where
             continue;
         };
         let result = match envelope.payload {
-            Some(envelope::Payload::Error(error)) => error_from_proto(error).and_then(Err),
-            Some(payload) => validate_response(pending.expected, &payload).map(|()| payload),
+            Some(envelope::Payload::Error(error)) => error_from_proto(error)
+                .map(|error| {
+                    pending.expected.resource_id().map_or(error.clone(), |resource_id| {
+                        attach_resource(error, resource_id)
+                    })
+                })
+                .and_then(Err),
+            Some(payload) => validate_response(pending.expected.clone(), &payload).map(|()| payload),
             None => Err(unexpected_response()),
         };
         let terminal = result
@@ -1252,11 +1308,11 @@ fn preflight_inbound(frame: &[u8], shared: &Shared) -> HalResult<()> {
         state
             .pending
             .get(&request_id)
-            .map(|pending| pending.expected)
-            .or_else(|| state.cancelled.get(&request_id).copied())
+            .map(|pending| pending.expected.clone())
+            .or_else(|| state.cancelled.get(&request_id).cloned())
     };
-    let requested_read = expected.and_then(|expected| match expected {
-        ExpectedResponse::SerialRead { max_bytes } => Some(max_bytes),
+    let requested_read = expected.as_ref().and_then(|expected| match expected {
+        ExpectedResponse::SerialRead { max_bytes } => Some(*max_bytes),
         _ => None,
     });
     visit_fields(frame, |field, wire| {
@@ -1277,12 +1333,12 @@ fn preflight_inbound(frame: &[u8], shared: &Shared) -> HalResult<()> {
         Ok(())
     })?;
 
-    let requested_can = expected.and_then(|expected| match expected {
+    let requested_can = expected.as_ref().and_then(|expected| match expected {
         ExpectedResponse::CanReceive {
             max_frames,
             max_read_bytes,
-            allow_timestamp,
-        } => Some((max_frames, max_read_bytes, allow_timestamp)),
+            profile,
+        } => Some((*max_frames, *max_read_bytes, profile)),
         _ => None,
     });
     visit_fields(frame, |field, wire| {
@@ -1319,15 +1375,19 @@ fn preflight_inbound(frame: &[u8], shared: &Shared) -> HalResult<()> {
                 }
                 Ok(())
             })?;
-            if let Some((max_frames, max_read_bytes, allow_timestamp)) = requested_can {
+            if let Some((max_frames, max_read_bytes, profile)) = requested_can {
                 if frame_count > max_frames || payload_bytes > max_read_bytes {
-                    return Err(invalid_wire(
-                        "CAN receive response exceeds the requested frame or byte bound",
+                    return Err(attach_profile(
+                        invalid_wire(
+                            "CAN receive response exceeds the requested frame or byte bound",
+                        ),
+                        profile,
                     ));
                 }
-                if has_timestamp && !allow_timestamp {
-                    return Err(invalid_wire(
-                        "CAN receive response contains an unadvertised timestamp",
+                if has_timestamp && !profile.timestamps {
+                    return Err(attach_profile(
+                        invalid_wire("CAN receive response contains an unadvertised timestamp"),
+                        profile,
                     ));
                 }
             }
@@ -1466,6 +1526,7 @@ fn invalid_wire(message: &'static str) -> HalError {
 }
 
 fn validate_response(expected: ExpectedResponse, payload: &envelope::Payload) -> HalResult<()> {
+    let resource_id = expected.resource_id().cloned();
     match (expected, payload) {
         (ExpectedResponse::EnumerateSerial, envelope::Payload::EnumerateSerialResponse(_))
         | (ExpectedResponse::OpenSerial, envelope::Payload::OpenSerialResponse(_))
@@ -1476,56 +1537,112 @@ fn validate_response(expected: ExpectedResponse, payload: &envelope::Payload) ->
             ExpectedResponse::SetControlLines,
             envelope::Payload::SetSerialControlLinesResponse(_),
         )
-        | (ExpectedResponse::CloseSession, envelope::Payload::CloseSessionResponse(_))
+        | (ExpectedResponse::CloseSession, envelope::Payload::CloseSessionResponse(_)) => Ok(()),
+        (
+            ExpectedResponse::CloseCan { .. },
+            envelope::Payload::CloseSessionResponse(_),
+        )
         | (
-            ExpectedResponse::ReplaceCanFilters,
+            ExpectedResponse::ReplaceCanFilters { .. },
             envelope::Payload::ReplaceCanFiltersResponse(_),
         ) => Ok(()),
         (ExpectedResponse::EnumerateCan, envelope::Payload::EnumerateCanResponse(response)) => {
             enumerate_can_response_from_proto(response.clone()).map(|_| ())
         }
         (
-            ExpectedResponse::OpenCan { mode },
+            ExpectedResponse::OpenCan { mode, resource_id },
             envelope::Payload::OpenCanResponse(response),
-        ) => open_can_response_from_proto(response.clone(), mode).map(|_| ()),
+        ) => open_can_response_from_proto(response.clone(), mode)
+            .map(|_| ())
+            .map_err(|error| attach_resource(error, &resource_id)),
         (
-            ExpectedResponse::CanSend { input_count },
+            ExpectedResponse::CanSend {
+                input_count,
+                profile,
+            },
             envelope::Payload::CanSendResponse(response),
-        ) => can_send_response_from_proto(response.clone(), input_count).map(|_| ()),
+        ) => can_send_response_from_proto(response.clone(), input_count)
+            .map(|_| ())
+            .map_err(|error| attach_profile(error, &profile)),
         (
             ExpectedResponse::CanReceive {
                 max_frames,
                 max_read_bytes,
-                allow_timestamp,
+                profile,
             },
             envelope::Payload::CanReceiveResponse(response),
         ) => {
-            let frames = can_receive_response_from_proto(response.clone(), max_frames)?;
+            let frames = can_receive_response_from_proto(response.clone(), max_frames)
+                .map_err(|error| attach_profile(error, &profile))?;
             let payload_bytes = frames.iter().try_fold(0_usize, |total, received| {
                 total.checked_add(received.frame().data().len()).ok_or_else(|| {
-                    seeed_hal_protocol::invalid_message(
+                    invalid_profile_message(
+                        &profile,
                         "CAN receive response payload byte count overflows usize",
                     )
                 })
             })?;
             if payload_bytes > max_read_bytes {
-                return Err(seeed_hal_protocol::invalid_message(
+                return Err(invalid_profile_message(
+                    &profile,
                     "CAN receive response exceeds the negotiated read maximum",
                 ));
             }
-            if !allow_timestamp && frames.iter().any(|frame| frame.timestamp().is_some()) {
-                return Err(seeed_hal_protocol::invalid_message(
-                    "CAN receive response contains an unadvertised timestamp",
-                ));
-            }
-            Ok(())
+            validate_received_profile(&frames, &profile)
         }
         (
-            ExpectedResponse::CanBusStatus,
+            ExpectedResponse::CanBusStatus { profile },
             envelope::Payload::GetCanBusStatusResponse(response),
-        ) => get_can_bus_status_response_from_proto(response.clone()).map(|_| ()),
-        _ => Err(unexpected_response()),
+        ) => get_can_bus_status_response_from_proto(response.clone())
+            .map(|_| ())
+            .map_err(|error| attach_profile(error, &profile)),
+        _ => Err(resource_id.map_or_else(unexpected_response, |resource_id| {
+            unexpected_response().with_resource_id(resource_id)
+        })),
     }
+}
+
+fn validate_received_profile(
+    frames: &[seeed_hal_can::ReceivedCanFrame],
+    profile: &CanSessionProfile,
+) -> HalResult<()> {
+    for received in frames {
+        let frame_allowed = match received.frame() {
+            seeed_hal_can::CanFrame::ClassicData { .. }
+            | seeed_hal_can::CanFrame::ClassicRemote { .. } => profile.classic_frames,
+            seeed_hal_can::CanFrame::FdData { .. } => {
+                profile.fd_frames && profile.mode == CanMode::Fd
+            }
+            seeed_hal_can::CanFrame::Error { .. } => profile.error_frames,
+        };
+        if !frame_allowed {
+            return Err(invalid_profile_message(
+                profile,
+                "CAN receive response contains a frame outside the active session profile",
+            ));
+        }
+        if received.timestamp().is_some() && !profile.timestamps {
+            return Err(invalid_profile_message(
+                profile,
+                "CAN receive response contains an unadvertised timestamp",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn attach_profile(error: HalError, profile: &CanSessionProfile) -> HalError {
+    attach_resource(error, &profile.resource_id)
+}
+
+fn invalid_profile_message(profile: &CanSessionProfile, message: &'static str) -> HalError {
+    attach_profile(
+        seeed_hal_protocol::invalid_message(format!(
+            "{message} for correlated session {}",
+            profile.session_id.as_str()
+        )),
+        profile,
+    )
 }
 
 fn unexpected_response() -> HalError {
@@ -1703,6 +1820,81 @@ fn attach_resource(error: HalError, resource_id: &seeed_hal_core::ResourceId) ->
     } else {
         error.with_resource_id(resource_id.clone())
     }
+}
+
+fn select_can_descriptor<'a>(
+    resources: &'a [ResourceDescriptor],
+    selector: &ResourceSelector,
+) -> HalResult<&'a ResourceDescriptor> {
+    let mut matches = resources.iter().filter(|resource| {
+        resource.id() == selector.id()
+            && resource.transport() == seeed_hal_core::TransportKind::Can
+            && resource
+                .minimum_identity_quality()
+                .satisfies(selector.minimum_identity_quality())
+    });
+    let Some(selected) = matches.next() else {
+        return Err(client_error(
+            "runtime.resource.not_found",
+            ErrorCategory::NotFound,
+            "can.open",
+            false,
+            "CAN resource selector did not match an enumerated descriptor",
+        )
+        .with_resource_id(selector.id().clone()));
+    };
+    if matches.next().is_some() {
+        return Err(client_error(
+            "runtime.resource.ambiguous",
+            ErrorCategory::Conflict,
+            "can.open",
+            false,
+            "CAN resource selector matched more than one enumerated descriptor",
+        )
+        .with_resource_id(selector.id().clone()));
+    }
+    Ok(selected)
+}
+
+fn validate_can_open_capabilities(
+    descriptor: &ResourceDescriptor,
+    config: &CanOpenConfig,
+    filters: &CanFilterSet,
+) -> HalResult<()> {
+    let capabilities = descriptor.capabilities();
+    let mode_supported = match config {
+        CanOpenConfig::Attach(expectation) => match expectation.mode() {
+            Some(CanMode::Classic) => capabilities.contains(&can_classic_capability()),
+            Some(CanMode::Fd) => capabilities.contains(&can_fd_capability()),
+            None => {
+                capabilities.contains(&can_classic_capability())
+                    || capabilities.contains(&can_fd_capability())
+            }
+        },
+        CanOpenConfig::Configure(config) => {
+            capabilities.contains(&can_configure_capability())
+                && match config.mode() {
+                    CanMode::Classic => capabilities.contains(&can_classic_capability()),
+                    CanMode::Fd => capabilities.contains(&can_fd_capability()),
+                }
+        }
+    };
+    let filters_supported = !filters
+        .as_slice()
+        .iter()
+        .any(|filter| filter.classes().error())
+        || capabilities.contains(&can_error_frames_capability());
+    if mode_supported && filters_supported {
+        return Ok(());
+    }
+    Err(client_error(
+        "runtime.protocol.capability_unsupported",
+        ErrorCategory::Conflict,
+        "can.open",
+        false,
+        "the selected CAN resource does not support the requested configuration or filters",
+    )
+    .with_resource_id(descriptor.id().clone()))
 }
 
 fn disconnected_error(operation: &'static str, message: impl Into<String>) -> HalError {
@@ -2268,6 +2460,7 @@ mod tests {
                     can_error_frames: true,
                     can_rx_timestamp: true,
                 }),
+                can_resources: std::sync::Mutex::new(Vec::new()),
                 pending_capacity: 2,
                 tombstone_capacity: 1,
                 writer,

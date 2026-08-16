@@ -5,9 +5,12 @@ use seeed_hal_can::{
     CanBatchSendError, CanBusStatus, CanFilterSet, CanFrame, CanMode,
     CanOpenConfig, ReceivedCanFrame, MAX_CAN_BATCH_FRAMES,
     MAX_CAN_ERROR_CLASSES, MAX_CLASSIC_DATA_BYTES, MAX_FD_DATA_BYTES,
+    can_classic_capability, can_error_frames_capability, can_fd_capability,
+    can_rx_timestamp_capability,
 };
 use seeed_hal_core::{
-    ErrorCategory, HalError, HalResult, LeaseMode, LeaseToken, ResourceId, SessionId,
+    ErrorCategory, HalError, HalResult, LeaseMode, LeaseToken, ResourceDescriptor, ResourceId,
+    SessionId,
 };
 use seeed_hal_protocol::v1::{self, envelope};
 use seeed_hal_protocol::{
@@ -15,7 +18,7 @@ use seeed_hal_protocol::{
     get_can_bus_status_response_from_proto, open_can_response_from_proto,
 };
 
-use crate::connection::ExpectedResponse;
+use crate::connection::{CanSessionProfile, ExpectedResponse};
 use crate::HalClient;
 
 /// A broker-owned CAN session. Dropping the handle never leaks a native CAN
@@ -26,15 +29,8 @@ pub struct RemoteCanHandle {
     resource_id: ResourceId,
     session_id: SessionId,
     lease: LeaseToken,
-    receive_profile: ReceiveProfile,
+    profile: CanSessionProfile,
     closed: bool,
-}
-
-#[derive(Clone, Copy)]
-struct ReceiveProfile {
-    fd: bool,
-    error_frames: bool,
-    timestamps: bool,
 }
 
 impl RemoteCanHandle {
@@ -43,27 +39,35 @@ impl RemoteCanHandle {
         resource_id: ResourceId,
         expected_mode: LeaseMode,
         config: &CanOpenConfig,
+        descriptor: &ResourceDescriptor,
         response: v1::OpenCanResponse,
     ) -> HalResult<Self> {
         let (session_id, lease) = open_can_response_from_proto(response, expected_mode)
             .map_err(|error| attach_resource(error, &resource_id))?;
-        let (_, can_fd, error_frames, timestamps) = client.can_capabilities();
-        let fd = match config {
-            CanOpenConfig::Attach(expectation) => {
-                expectation.mode() == Some(CanMode::Fd)
-                    || (expectation.mode().is_none() && can_fd)
-            }
-            CanOpenConfig::Configure(config) => config.mode() == CanMode::Fd,
+        let capabilities = descriptor.capabilities();
+        let mode = match config {
+            CanOpenConfig::Attach(expectation) => expectation.mode().unwrap_or_else(|| {
+                if capabilities.contains(&can_fd_capability()) {
+                    CanMode::Fd
+                } else {
+                    CanMode::Classic
+                }
+            }),
+            CanOpenConfig::Configure(config) => config.mode(),
         };
         Ok(Self {
             client,
-            resource_id,
-            session_id,
+            resource_id: resource_id.clone(),
+            session_id: session_id.clone(),
             lease,
-            receive_profile: ReceiveProfile {
-                fd,
-                error_frames,
-                timestamps,
+            profile: CanSessionProfile {
+                mode,
+                classic_frames: capabilities.contains(&can_classic_capability()),
+                fd_frames: capabilities.contains(&can_fd_capability()),
+                error_frames: capabilities.contains(&can_error_frames_capability()),
+                timestamps: capabilities.contains(&can_rx_timestamp_capability()),
+                resource_id,
+                session_id,
             },
             closed: false,
         })
@@ -85,16 +89,19 @@ impl RemoteCanHandle {
             )));
         }
 
-        let (can_classic, can_fd, can_error_frames, _) = self.client.can_capabilities();
         let mut payload_bytes = 0_usize;
         for frame in &frames {
             frame
                 .validate()
                 .map_err(|error| CanBatchSendError::new(self.resource_error(error)))?;
             let supported = match frame {
-                CanFrame::ClassicData { .. } | CanFrame::ClassicRemote { .. } => can_classic,
-                CanFrame::FdData { .. } => can_fd,
-                CanFrame::Error { .. } => can_error_frames,
+                CanFrame::ClassicData { .. } | CanFrame::ClassicRemote { .. } => {
+                    self.profile.classic_frames
+                }
+                CanFrame::FdData { .. } => {
+                    self.profile.fd_frames && self.profile.mode == CanMode::Fd
+                }
+                CanFrame::Error { .. } => self.profile.error_frames,
             };
             if !supported {
                 return Err(CanBatchSendError::new(self.local_error(
@@ -138,7 +145,13 @@ impl RemoteCanHandle {
             .map_err(CanBatchSendError::new)?;
         let response = self
             .client
-            .send(payload, ExpectedResponse::CanSend { input_count })
+            .send(
+                payload,
+                ExpectedResponse::CanSend {
+                    input_count,
+                    profile: self.profile.clone(),
+                },
+            )
             .await
             .map_err(|error| CanBatchSendError::new(self.resource_error(error)))?;
         let envelope::Payload::CanSendResponse(response) = response else {
@@ -182,7 +195,7 @@ impl RemoteCanHandle {
             )
         })?;
         let (_, max_read, _) = self.client.limits();
-        let max_data_bytes = if self.receive_profile.fd {
+        let max_data_bytes = if self.profile.mode == CanMode::Fd {
             MAX_FD_DATA_BYTES
         } else {
             MAX_CLASSIC_DATA_BYTES
@@ -199,7 +212,7 @@ impl RemoteCanHandle {
                 "CAN receive payload bound exceeds the negotiated read maximum",
             ));
         }
-        if maximum_receive_envelope_len(max_frames, self.receive_profile) > self.client.limits().0 {
+        if maximum_receive_envelope_len(max_frames, &self.profile) > self.client.limits().0 {
             return Err(self.local_error(
                 "runtime.protocol.frame_too_large",
                 ErrorCategory::InvalidArgument,
@@ -225,7 +238,7 @@ impl RemoteCanHandle {
                 ExpectedResponse::CanReceive {
                     max_frames,
                     max_read_bytes: max_read,
-                    allow_timestamp: self.receive_profile.timestamps,
+                    profile: self.profile.clone(),
                 },
             )
             .await
@@ -246,7 +259,7 @@ impl RemoteCanHandle {
             .as_slice()
             .iter()
             .any(|filter| filter.classes().error())
-            && !self.client.can_capabilities().2
+            && !self.profile.error_frames
         {
             return Err(self.local_error(
                 "runtime.protocol.capability_unsupported",
@@ -268,7 +281,12 @@ impl RemoteCanHandle {
             &self.resource_id,
         )?;
         self.client
-            .send(payload, ExpectedResponse::ReplaceCanFilters)
+            .send(
+                payload,
+                ExpectedResponse::ReplaceCanFilters {
+                    profile: self.profile.clone(),
+                },
+            )
             .await
             .map_err(|error| self.resource_error(error))?;
         Ok(())
@@ -285,7 +303,12 @@ impl RemoteCanHandle {
             .ensure_can_payload_fits(&payload, "can.status", &self.resource_id)?;
         let response = self
             .client
-            .send(payload, ExpectedResponse::CanBusStatus)
+            .send(
+                payload,
+                ExpectedResponse::CanBusStatus {
+                    profile: self.profile.clone(),
+                },
+            )
             .await
             .map_err(|error| self.resource_error(error))?;
         let envelope::Payload::GetCanBusStatusResponse(response) = response else {
@@ -310,7 +333,12 @@ impl RemoteCanHandle {
         self.client
             .ensure_can_payload_fits(&payload, "can.close", &self.resource_id)?;
         self.client
-            .send(payload, ExpectedResponse::CloseSession)
+            .send(
+                payload,
+                ExpectedResponse::CloseCan {
+                    profile: self.profile.clone(),
+                },
+            )
             .await
             .map_err(|error| self.resource_error(error))?;
         self.closed = true;
@@ -356,7 +384,7 @@ fn attach_resource(error: HalError, resource_id: &ResourceId) -> HalError {
     }
 }
 
-fn maximum_receive_envelope_len(max_frames: usize, profile: ReceiveProfile) -> usize {
+fn maximum_receive_envelope_len(max_frames: usize, profile: &CanSessionProfile) -> usize {
     let fd = v1::CanFrame {
         id: Some(v1::CanId {
             value: 0x1fff_ffff,
@@ -383,7 +411,7 @@ fn maximum_receive_envelope_len(max_frames: usize, profile: ReceiveProfile) -> u
         data: vec![0; MAX_CLASSIC_DATA_BYTES],
         ..Default::default()
     };
-    let frame = if profile.fd {
+    let frame = if profile.mode == CanMode::Fd {
         fd
     } else if profile.error_frames && error.encoded_len() > classic.encoded_len() {
         error
