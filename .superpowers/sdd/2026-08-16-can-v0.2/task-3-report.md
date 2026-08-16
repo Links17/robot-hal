@@ -49,3 +49,9 @@ Per the deferred-verification requirement, no tests, builds/checks, Clippy, rust
 - Expanded the mode permission lattice: Maintenance authorizes Observe, Control, and Maintenance operations; Control authorizes Observe and Control; Observe authorizes Observe only.
 - Added active Maintenance blocking/restoration coverage, pending and duplicate Control conflicts, stale fencing after release and newer exposure, failed reopen cancellation rollback, full-token mismatch, canonical structured conflict attribution across two owners, and explicit receive/send/status/configure mode checks.
 - Tests were written but intentionally not executed. No tests, builds/checks, Clippy, rustfmt, or protocol verification commands were run; only static inspection and `git diff --check` are permitted.
+
+## Fix round 2
+
+- Extended Maintenance permission coverage to validate Observe-mode `can.status` in addition to receive/send/configure.
+- Added active Control-versus-new-Control conflict coverage with canonical `runtime.lease.conflict` resource attribution and explicit cleanup.
+- Tests remain intentionally unexecuted; only static inspection and `git diff --check` were run.

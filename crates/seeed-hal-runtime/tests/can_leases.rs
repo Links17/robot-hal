@@ -68,6 +68,17 @@ fn pending_control_rejects_duplicate_control_but_allows_observe() {
 }
 
 #[test]
+fn active_control_rejects_new_control_with_canonical_conflict() {
+    let (resource, session_id, owner_id) = ids();
+    let mut table = CanLeaseTable::default();
+    let active = table.commit(table.reserve(resource.clone(), session_id.clone(), owner_id.clone(), LeaseMode::Control).unwrap()).unwrap();
+    let error = table.reserve(resource.clone(), session("control-2"), owner("owner-2"), LeaseMode::Control).unwrap_err();
+    assert_eq!(error.name().as_str(), "runtime.lease.conflict");
+    assert_eq!(error.resource_id(), Some(&resource));
+    assert!(table.release(&resource, &session_id, &active));
+}
+
+#[test]
 fn generations_are_monotonic_and_cancel_does_not_advance() {
     let (resource, session_id, owner_id) = ids();
     let mut table = CanLeaseTable::default();
@@ -111,6 +122,7 @@ fn maintenance_authorizes_receive_send_status_and_configure_modes() {
     let token = table.commit(table.reserve(resource.clone(), session_id.clone(), owner_id.clone(), LeaseMode::Maintenance).unwrap()).unwrap();
     for (required, operation) in [
         (LeaseMode::Observe, "can.receive"),
+        (LeaseMode::Observe, "can.status"),
         (LeaseMode::Control, "can.send"),
         (LeaseMode::Maintenance, "can.configure"),
     ] {
