@@ -1,0 +1,25 @@
+[package]
+name = "seeed-hal-adapter-pcan"
+version = "0.2.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Dependency audit (2026-08-16): can-hal-pcan 0.4.2 is MIT OR Apache-2.0,
+# declares Rust 1.81, has no feature flags, and loads PCANBasic.dll or
+# libpcanbasic.so with libloading instead of linking PCAN-Basic at build time.
+[dependencies]
+async-trait = { workspace = true }
+percent-encoding = { workspace = true }
+seeed-hal-can = { path = "../../crates/seeed-hal-can" }
+seeed-hal-core = { path = "../../crates/seeed-hal-core" }
+
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+can-hal-rs = { workspace = true }
+can-hal-pcan = { workspace = true }
+libloading = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+seeed-hal-testkit = { path = "../../crates/seeed-hal-testkit" }
+tokio = { workspace = true }

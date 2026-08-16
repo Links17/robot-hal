@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "adapters/pcan",
     "adapters/socketcan",
     "adapters/serialport",
     "adapters/windows-file",
@@ -25,11 +26,13 @@ license = "Apache-2.0"
 async-trait = "0.1"
 bytes = "1"
 can-hal-rs = { version = "=0.4.2", default-features = false, features = ["std"] }
+can-hal-pcan = { version = "=0.4.2", default-features = false }
 can-hal-socketcan = { version = "=0.4.2", default-features = false }
 futures-util = { version = "0.3", features = ["sink"] }
 getrandom = "0.3"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
+libloading = "0.8"
 percent-encoding = "2"
 prost = "0.14"
 prost-build = "0.14"
