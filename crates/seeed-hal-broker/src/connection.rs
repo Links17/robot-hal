@@ -11,7 +11,7 @@ use seeed_hal_protocol::v1::{self, envelope};
 use seeed_hal_protocol::{
     MAX_FRAME_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR_MAXIMUM, PROTOCOL_MINOR_MINIMUM,
     SERIAL_CAPABILITY, handshake_minor_range, invalid_message, negotiate_protocol_minor,
-    parse_session_lease,
+    open_serial_request_from_proto, parse_serial_session_lease, parse_session_lease,
 };
 use seeed_hal_runtime::{HalRuntime, RuntimeEvent, RuntimeEventKind};
 use seeed_hal_serial::ControlLines;
@@ -760,14 +760,7 @@ async fn dispatch_operation_inner(
             ))
         }
         Some(envelope::Payload::OpenSerialRequest(request)) => {
-            let selector = request
-                .selector
-                .ok_or_else(|| invalid_message("open request is missing selector"))?
-                .try_into()?;
-            let config = request
-                .config
-                .ok_or_else(|| invalid_message("open request is missing config"))?
-                .try_into()?;
+            let (selector, config) = open_serial_request_from_proto(request)?;
             let handle = runtime.open_serial(owner, selector, config).await?;
             let (session_id, lease) = handle.into_parts();
             Ok(envelope::Payload::OpenSerialResponse(
@@ -784,7 +777,7 @@ async fn dispatch_operation_inner(
                     "serial read byte limit exceeds the negotiated maximum",
                 ));
             }
-            let (session, lease) = parse_session_lease(request.session_id, request.lease)?;
+            let (session, lease) = parse_serial_session_lease(request.session_id, request.lease)?;
             let data = runtime.read_serial(session, &lease, max_bytes).await?;
             Ok(envelope::Payload::SerialReadResponse(
                 v1::SerialReadResponse {
@@ -798,19 +791,19 @@ async fn dispatch_operation_inner(
                     "serial write byte limit exceeds the negotiated maximum",
                 ));
             }
-            let (session, lease) = parse_session_lease(request.session_id, request.lease)?;
+            let (session, lease) = parse_serial_session_lease(request.session_id, request.lease)?;
             runtime
                 .write_serial(session, &lease, Bytes::from(request.data))
                 .await?;
             Ok(envelope::Payload::SerialWriteResponse(v1::Empty {}))
         }
         Some(envelope::Payload::SerialFlushRequest(request)) => {
-            let (session, lease) = parse_session_lease(request.session_id, request.lease)?;
+            let (session, lease) = parse_serial_session_lease(request.session_id, request.lease)?;
             runtime.flush_serial(session, &lease).await?;
             Ok(envelope::Payload::SerialFlushResponse(v1::Empty {}))
         }
         Some(envelope::Payload::SetSerialControlLinesRequest(request)) => {
-            let (session, lease) = parse_session_lease(request.session_id, request.lease)?;
+            let (session, lease) = parse_serial_session_lease(request.session_id, request.lease)?;
             runtime
                 .set_serial_control_lines(
                     session,

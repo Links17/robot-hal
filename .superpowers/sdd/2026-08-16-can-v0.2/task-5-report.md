@@ -132,3 +132,27 @@ completed successfully.
   it and the brief excludes it; the later Cargo verification gate may add the
   already-present `seeed-hal-can` package to the protocol package's dependency
   list in the lockfile.
+
+## Fix round 1
+
+- Added explicit Serial operation decoders and migrated the broker/client paths:
+  Serial enumeration rejects CAN descriptors, Serial open rejects CAN
+  selectors, Serial request leases require Control, and Serial open responses
+  reject Observe/Maintenance or otherwise incompatible leases.
+- Kept generic selector/descriptor/lease conversions capable of both Serial
+  and CAN for shared Close/CAN contexts.
+- Removed the empty-capability CAN fallback. Empty capabilities remain the
+  legacy Serial-only fallback; empty CAN descriptors now fail with
+  `runtime.protocol.invalid_message`.
+- Added regression tests for cross-transport selectors/descriptors,
+  Maintenance Serial responses, empty CAN capabilities, all enum numeric
+  values (including RuntimeEventKind 4..7 and CanErrorClass 2..9), and both
+  Attach=1 and Configure=2 oneof tags.
+- Fix-round changes additionally touch
+  `crates/seeed-hal-client/src/serial.rs`,
+  `crates/seeed-hal-client/src/connection.rs`, and
+  `crates/seeed-hal-broker/src/connection.rs` to migrate the existing Serial
+  call sites. No protobuf generator was needed because the schema is unchanged.
+- Tests, builds, lint, formatting, generated-code checks, and Python tests
+  remain intentionally unexecuted; only static inspection and
+  `git diff --check` are permitted.

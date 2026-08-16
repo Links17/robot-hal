@@ -15,7 +15,11 @@ pub use can_conversion::{
     open_can_response_from_proto, received_can_frames_from_proto,
     replace_can_filters_request_from_proto, send_can_frames_from_proto,
 };
-pub use conversion::{error_from_proto, invalid_message, parse_session_lease};
+pub use conversion::{
+    enumerate_serial_response_from_proto, error_from_proto, invalid_message,
+    open_serial_request_from_proto, open_serial_response_from_proto, parse_serial_session_lease,
+    parse_session_lease, serial_selector_from_proto,
+};
 
 pub const PROTOCOL_MAJOR: u32 = 1;
 pub const PROTOCOL_MINOR_MINIMUM: u32 = 0;

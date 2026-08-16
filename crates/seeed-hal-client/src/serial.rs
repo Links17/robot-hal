@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use prost::Message;
 use seeed_hal_core::{ErrorCategory, HalError, HalResult, LeaseToken, ResourceId, SessionId};
-use seeed_hal_protocol::parse_session_lease;
+use seeed_hal_protocol::open_serial_response_from_proto;
 use seeed_hal_protocol::v1::{self, envelope};
 use seeed_hal_serial::ControlLines;
 
@@ -27,7 +27,7 @@ impl RemoteSerialHandle {
         resource_id: ResourceId,
         response: v1::OpenSerialResponse,
     ) -> HalResult<Self> {
-        let (session_id, lease) = parse_session_lease(response.session_id, response.lease)
+        let (session_id, lease) = open_serial_response_from_proto(response)
             .map_err(|error| error.with_resource_id(resource_id.clone()))?;
         Ok(Self {
             client,

@@ -76,12 +76,13 @@ impl TryFrom<v1::ResourceDescriptor> for ResourceDescriptor {
         let endpoint = Endpoint::new(value.endpoint)
             .map_err(|_| invalid_message("resource descriptor has an invalid endpoint"))?;
         let capabilities = if value.capabilities.is_empty() {
-            let implied = match selector.transport() {
-                TransportKind::Serial => crate::SERIAL_CAPABILITY,
-                TransportKind::Can => seeed_hal_can::CAN_CLASSIC_CAPABILITY,
-            };
-            vec![CapabilityId::parse(implied)
-                .expect("the static transport capability identifier is valid")]
+            if selector.transport() != TransportKind::Serial {
+                return Err(invalid_message(
+                    "CAN resource descriptor requires explicit capabilities",
+                ));
+            }
+            vec![CapabilityId::parse(crate::SERIAL_CAPABILITY)
+                .expect("the static Serial capability identifier is valid")]
         } else {
             value
                 .capabilities
@@ -249,6 +250,65 @@ pub fn parse_session_lease(
         .map_err(|_| invalid_message("request has an invalid session_id"))?;
     let lease = lease.ok_or_else(|| invalid_message("request is missing lease"))?;
     Ok((session, lease.try_into()?))
+}
+
+pub fn serial_selector_from_proto(value: v1::ResourceSelector) -> HalResult<ResourceSelector> {
+    let selector = ResourceSelector::try_from(value)?;
+    if selector.transport() != TransportKind::Serial {
+        return Err(invalid_message(
+            "serial resource selector transport must be Serial",
+        ));
+    }
+    Ok(selector)
+}
+
+pub fn enumerate_serial_response_from_proto(
+    value: v1::EnumerateSerialResponse,
+) -> HalResult<Vec<ResourceDescriptor>> {
+    value
+        .resources
+        .into_iter()
+        .map(|value| {
+            let descriptor = ResourceDescriptor::try_from(value)?;
+            if descriptor.transport() != TransportKind::Serial {
+                return Err(invalid_message(
+                    "enumerate_serial resource transport must be Serial",
+                ));
+            }
+            Ok(descriptor)
+        })
+        .collect()
+}
+
+pub fn open_serial_request_from_proto(
+    value: v1::OpenSerialRequest,
+) -> HalResult<(ResourceSelector, SerialConfig)> {
+    let selector = value
+        .selector
+        .ok_or_else(|| invalid_message("open_serial selector is required"))?;
+    let config = value
+        .config
+        .ok_or_else(|| invalid_message("open_serial config is required"))?;
+    Ok((serial_selector_from_proto(selector)?, config.try_into()?))
+}
+
+pub fn parse_serial_session_lease(
+    session_id: String,
+    lease: Option<v1::LeaseToken>,
+) -> HalResult<(SessionId, LeaseToken)> {
+    let (session, lease) = parse_session_lease(session_id, lease)?;
+    if lease.mode() != LeaseMode::Control {
+        return Err(invalid_message(
+            "Serial session lease mode must be Control",
+        ));
+    }
+    Ok((session, lease))
+}
+
+pub fn open_serial_response_from_proto(
+    value: v1::OpenSerialResponse,
+) -> HalResult<(SessionId, LeaseToken)> {
+    parse_serial_session_lease(value.session_id, value.lease)
 }
 
 impl From<&HalError> for v1::Error {

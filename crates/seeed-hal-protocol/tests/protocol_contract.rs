@@ -470,29 +470,76 @@ fn wire_minor_one_range_and_additive_enum_values_are_locked() {
     assert_eq!(seeed_hal_protocol::PROTOCOL_MINOR_MINIMUM, 0);
     assert_eq!(seeed_hal_protocol::PROTOCOL_MINOR_MAXIMUM, 1);
     assert_eq!(seeed_hal_protocol::PROTOCOL_MINOR, 1);
+    assert_eq!(v1::IdentityQuality::Unspecified as i32, 0);
+    assert_eq!(v1::IdentityQuality::Weak as i32, 1);
+    assert_eq!(v1::IdentityQuality::Medium as i32, 2);
+    assert_eq!(v1::IdentityQuality::Strong as i32, 3);
+    assert_eq!(v1::TransportKind::Unspecified as i32, 0);
     assert_eq!(v1::TransportKind::Serial as i32, 1);
     assert_eq!(v1::TransportKind::Can as i32, 2);
+    assert_eq!(v1::DataBits::Unspecified as i32, 0);
+    assert_eq!(v1::DataBits::Five as i32, 1);
+    assert_eq!(v1::DataBits::Six as i32, 2);
+    assert_eq!(v1::DataBits::Seven as i32, 3);
+    assert_eq!(v1::DataBits::Eight as i32, 4);
+    assert_eq!(v1::Parity::Unspecified as i32, 0);
+    assert_eq!(v1::Parity::None as i32, 1);
+    assert_eq!(v1::Parity::Odd as i32, 2);
+    assert_eq!(v1::Parity::Even as i32, 3);
+    assert_eq!(v1::StopBits::Unspecified as i32, 0);
+    assert_eq!(v1::StopBits::One as i32, 1);
+    assert_eq!(v1::StopBits::Two as i32, 2);
+    assert_eq!(v1::FlowControl::Unspecified as i32, 0);
+    assert_eq!(v1::FlowControl::None as i32, 1);
+    assert_eq!(v1::FlowControl::Software as i32, 2);
+    assert_eq!(v1::FlowControl::Hardware as i32, 3);
+    assert_eq!(v1::LeaseMode::Unspecified as i32, 0);
     assert_eq!(v1::LeaseMode::Observe as i32, 1);
     assert_eq!(v1::LeaseMode::Control as i32, 2);
     assert_eq!(v1::LeaseMode::Maintenance as i32, 3);
+    assert_eq!(v1::ErrorCategory::Unspecified as i32, 0);
+    assert_eq!(v1::ErrorCategory::InvalidArgument as i32, 1);
+    assert_eq!(v1::ErrorCategory::NotFound as i32, 2);
+    assert_eq!(v1::ErrorCategory::Conflict as i32, 3);
+    assert_eq!(v1::ErrorCategory::Unavailable as i32, 4);
+    assert_eq!(v1::ErrorCategory::Internal as i32, 5);
+    assert_eq!(v1::RuntimeEventKind::Unspecified as i32, 0);
     assert_eq!(v1::RuntimeEventKind::SessionOpened as i32, 1);
     assert_eq!(v1::RuntimeEventKind::SessionClosed as i32, 2);
     assert_eq!(v1::RuntimeEventKind::CanBusActive as i32, 3);
+    assert_eq!(v1::RuntimeEventKind::CanBusWarning as i32, 4);
+    assert_eq!(v1::RuntimeEventKind::CanBusPassive as i32, 5);
+    assert_eq!(v1::RuntimeEventKind::CanBusOff as i32, 6);
+    assert_eq!(v1::RuntimeEventKind::CanBusStopped as i32, 7);
     assert_eq!(v1::RuntimeEventKind::CanBusUnknown as i32, 8);
+    assert_eq!(v1::CanIdFormat::Unspecified as i32, 0);
     assert_eq!(v1::CanIdFormat::Standard as i32, 1);
     assert_eq!(v1::CanIdFormat::Extended as i32, 2);
     assert_eq!(v1::CanIdFormat::Either as i32, 3);
+    assert_eq!(v1::CanFrameKind::Unspecified as i32, 0);
     assert_eq!(v1::CanFrameKind::ClassicData as i32, 1);
     assert_eq!(v1::CanFrameKind::ClassicRemote as i32, 2);
     assert_eq!(v1::CanFrameKind::FdData as i32, 3);
     assert_eq!(v1::CanFrameKind::Error as i32, 4);
+    assert_eq!(v1::CanErrorClass::Unspecified as i32, 0);
     assert_eq!(v1::CanErrorClass::TxTimeout as i32, 1);
+    assert_eq!(v1::CanErrorClass::LostArbitration as i32, 2);
+    assert_eq!(v1::CanErrorClass::Controller as i32, 3);
+    assert_eq!(v1::CanErrorClass::Protocol as i32, 4);
+    assert_eq!(v1::CanErrorClass::Transceiver as i32, 5);
+    assert_eq!(v1::CanErrorClass::NoAcknowledgement as i32, 6);
+    assert_eq!(v1::CanErrorClass::BusOff as i32, 7);
+    assert_eq!(v1::CanErrorClass::BusError as i32, 8);
+    assert_eq!(v1::CanErrorClass::Restarted as i32, 9);
     assert_eq!(v1::CanErrorClass::Other as i32, 10);
+    assert_eq!(v1::CanTimestampSource::Unspecified as i32, 0);
     assert_eq!(v1::CanTimestampSource::Hardware as i32, 1);
     assert_eq!(v1::CanTimestampSource::Kernel as i32, 2);
     assert_eq!(v1::CanTimestampSource::HostMonotonic as i32, 3);
     assert_eq!(v1::CanMode::Classic as i32, 1);
     assert_eq!(v1::CanMode::Fd as i32, 2);
+    assert_eq!(v1::CanMode::Unspecified as i32, 0);
+    assert_eq!(v1::CanBusState::Unspecified as i32, 0);
     assert_eq!(v1::CanBusState::Active as i32, 1);
     assert_eq!(v1::CanBusState::Warning as i32, 2);
     assert_eq!(v1::CanBusState::Passive as i32, 3);
@@ -503,6 +550,9 @@ fn wire_minor_one_range_and_additive_enum_values_are_locked() {
 
 #[test]
 fn every_nested_wire_field_number_is_locked() {
+    assert_tags(&v1::Empty {}, &[]);
+    assert_tags(&v1::EnumerateSerialRequest {}, &[]);
+    assert_tags(&v1::EnumerateCanRequest {}, &[]);
     assert_tags(
         &v1::HandshakeRequest {
             startup_token: vec![1],
@@ -690,6 +740,14 @@ fn every_nested_wire_field_number_is_locked() {
         restart_ms: Some(1),
     };
     assert_tags(&configure, &[1, 2, 3, 4, 5, 6]);
+    assert_tags(
+        &v1::CanOpenConfig {
+            config: Some(v1::can_open_config::Config::Attach(
+                v1::CanLinkExpectation::default(),
+            )),
+        },
+        &[1],
+    );
     assert_tags(
         &v1::CanOpenConfig {
             config: Some(v1::can_open_config::Config::Configure(configure.clone())),
@@ -951,6 +1009,61 @@ fn can_transport_and_maintenance_lease_round_trip_through_legacy_types() {
     assert_eq!(
         LeaseToken::try_from(v1::LeaseToken::from(&lease)).unwrap(),
         lease,
+    );
+}
+
+#[test]
+fn serial_operation_decoders_reject_can_and_maintenance_values() {
+    let can_selector = v1::ResourceSelector {
+        resource_id: "can:test".to_owned(),
+        minimum_identity_quality: v1::IdentityQuality::Strong as i32,
+        transport: v1::TransportKind::Can as i32,
+    };
+    assert_invalid_message(
+        seeed_hal_protocol::serial_selector_from_proto(can_selector).unwrap_err(),
+        "serial resource selector",
+    );
+
+    let can_descriptor = v1::ResourceDescriptor {
+        resource_id: "can:test".to_owned(),
+        endpoint: "virtual:can".to_owned(),
+        identity_quality: v1::IdentityQuality::Strong as i32,
+        transport: v1::TransportKind::Can as i32,
+        capabilities: vec!["can.classic/v1".to_owned()],
+        ..Default::default()
+    };
+    assert_invalid_message(
+        seeed_hal_protocol::enumerate_serial_response_from_proto(
+            v1::EnumerateSerialResponse {
+                resources: vec![can_descriptor],
+            },
+        )
+        .unwrap_err(),
+        "enumerate_serial resource",
+    );
+
+    let empty_can_descriptor = v1::ResourceDescriptor {
+        resource_id: "can:test".to_owned(),
+        endpoint: "virtual:can".to_owned(),
+        identity_quality: v1::IdentityQuality::Strong as i32,
+        transport: v1::TransportKind::Can as i32,
+        ..Default::default()
+    };
+    assert_invalid_message(
+        seeed_hal_core::ResourceDescriptor::try_from(empty_can_descriptor).unwrap_err(),
+        "CAN resource descriptor",
+    );
+
+    let maintenance = v1::OpenSerialResponse {
+        session_id: "session".to_owned(),
+        lease: Some(v1::LeaseToken {
+            mode: v1::LeaseMode::Maintenance as i32,
+            ..valid_lease()
+        }),
+    };
+    assert_invalid_message(
+        seeed_hal_protocol::open_serial_response_from_proto(maintenance).unwrap_err(),
+        "Serial session lease",
     );
 }
 

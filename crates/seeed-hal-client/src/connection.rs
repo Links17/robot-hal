@@ -8,7 +8,8 @@ use prost::Message;
 use seeed_hal_core::{ErrorCategory, HalError, HalResult, ResourceDescriptor, ResourceSelector};
 use seeed_hal_protocol::v1::{self, envelope};
 use seeed_hal_protocol::{
-    MAX_FRAME_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR, SERIAL_CAPABILITY, error_from_proto,
+    MAX_FRAME_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR, SERIAL_CAPABILITY,
+    enumerate_serial_response_from_proto, error_from_proto, invalid_message,
 };
 use seeed_hal_protocol::{
     PROTOCOL_MINOR_MAXIMUM, PROTOCOL_MINOR_MINIMUM, handshake_response_minor_range,
@@ -410,11 +411,7 @@ impl HalClient {
         let envelope::Payload::EnumerateSerialResponse(response) = payload else {
             unreachable!()
         };
-        let result: HalResult<Vec<ResourceDescriptor>> = response
-            .resources
-            .into_iter()
-            .map(TryInto::try_into)
-            .collect();
+        let result = enumerate_serial_response_from_proto(response);
         if let Err(error) = &result {
             terminate(&self.inner.shared, error.clone());
         }
@@ -426,6 +423,11 @@ impl HalClient {
         selector: ResourceSelector,
         config: SerialConfig,
     ) -> HalResult<RemoteSerialHandle> {
+        if selector.transport() != seeed_hal_core::TransportKind::Serial {
+            return Err(invalid_message(
+                "serial resource selector transport must be Serial",
+            ));
+        }
         let payload = self
             .request(
                 envelope::Payload::OpenSerialRequest(v1::OpenSerialRequest {
