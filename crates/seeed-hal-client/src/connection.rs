@@ -121,28 +121,48 @@ impl ClientEvent {
 
 pub struct EventSubscription {
     receiver: broadcast::Receiver<HalResult<ClientEvent>>,
+    shutdown: watch::Receiver<bool>,
 }
 
 impl EventSubscription {
     pub async fn recv(&mut self) -> HalResult<ClientEvent> {
-        match self.receiver.recv().await {
-            Ok(result) => result,
-            Err(broadcast::error::RecvError::Closed) => Err(client_error(
-                "runtime.event.closed",
-                ErrorCategory::Unavailable,
-                "runtime.event.receive",
-                false,
-                "the client event stream is closed",
-            )),
-            Err(broadcast::error::RecvError::Lagged(skipped)) => Err(client_error(
-                "runtime.event.lagged",
-                ErrorCategory::Unavailable,
-                "runtime.event.receive",
-                true,
-                format!("event subscriber fell behind by {skipped} events"),
-            )),
+        loop {
+            if *self.shutdown.borrow() {
+                return Err(event_closed_error());
+            }
+            tokio::select! {
+                biased;
+                changed = self.shutdown.changed() => {
+                    if changed.is_err() || *self.shutdown.borrow() {
+                        return Err(event_closed_error());
+                    }
+                }
+                event = self.receiver.recv() => {
+                    return match event {
+                        Ok(result) => result,
+                        Err(broadcast::error::RecvError::Closed) => Err(event_closed_error()),
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => Err(client_error(
+                            "runtime.event.lagged",
+                            ErrorCategory::Unavailable,
+                            "runtime.event.receive",
+                            true,
+                            format!("event subscriber fell behind by {skipped} events"),
+                        )),
+                    };
+                }
+            }
         }
     }
+}
+
+fn event_closed_error() -> HalError {
+    client_error(
+        "runtime.event.closed",
+        ErrorCategory::Unavailable,
+        "runtime.event.receive",
+        false,
+        "the client event stream is closed",
+    )
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -416,6 +436,7 @@ impl HalClient {
     pub fn subscribe(&self) -> EventSubscription {
         EventSubscription {
             receiver: self.inner.shared.events.subscribe(),
+            shutdown: self.inner.shared.shutdown.subscribe(),
         }
     }
 

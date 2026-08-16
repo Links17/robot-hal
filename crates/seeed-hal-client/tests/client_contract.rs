@@ -1,7 +1,7 @@
 #[cfg(unix)]
 use bytes::Bytes;
 #[cfg(unix)]
-use seeed_hal_client::{ConnectionOptions, HalClient};
+use seeed_hal_client::{ConnectionOptions, EventSubscription, HalClient};
 #[cfg(unix)]
 use seeed_hal_serial::SerialConfig;
 
@@ -16,6 +16,14 @@ async fn test_deadline<T>(
     tokio::time::timeout(std::time::Duration::from_secs(1), future)
         .await
         .expect(message)
+}
+
+#[cfg(unix)]
+async fn assert_event_stream_closed(mut events: EventSubscription, message: &'static str) {
+    let error = test_deadline(events.recv(), message).await.unwrap_err();
+    assert_eq!(error.name().as_str(), "runtime.event.closed");
+    assert_eq!(error.operation().as_str(), "runtime.event.receive");
+    assert!(!error.retryable());
 }
 
 #[cfg(unix)]
@@ -322,6 +330,7 @@ async fn malformed_normal_error_terminates_and_fans_out_to_pending_requests() {
     let client = HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN))
         .await
         .unwrap();
+    let events = client.subscribe();
     let first_client = client.clone();
     let second_client = client.clone();
     let first = tokio::spawn(async move { first_client.enumerate_serial().await });
@@ -332,6 +341,16 @@ async fn malformed_normal_error_terminates_and_fans_out_to_pending_requests() {
             "runtime.protocol.invalid_message"
         );
     }
+    assert_event_stream_closed(
+        events,
+        "malformed response must wake an existing event subscriber",
+    )
+    .await;
+    assert_event_stream_closed(
+        client.subscribe(),
+        "subscription after malformed response must be immediately terminal",
+    )
+    .await;
     client.close().await.unwrap();
     server.await.unwrap();
     std::fs::remove_file(endpoint).unwrap();
@@ -367,6 +386,7 @@ async fn malformed_unsolicited_error_terminates_and_fans_out_to_pending_requests
     let client = HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN))
         .await
         .unwrap();
+    let events = client.subscribe();
     let first_client = client.clone();
     let second_client = client.clone();
     let first = tokio::spawn(async move { first_client.enumerate_serial().await });
@@ -377,6 +397,16 @@ async fn malformed_unsolicited_error_terminates_and_fans_out_to_pending_requests
             "runtime.protocol.invalid_message"
         );
     }
+    assert_event_stream_closed(
+        events,
+        "malformed unsolicited error must wake an existing event subscriber",
+    )
+    .await;
+    assert_event_stream_closed(
+        client.subscribe(),
+        "subscription after malformed unsolicited error must be immediately terminal",
+    )
+    .await;
     client.close().await.unwrap();
     server.await.unwrap();
     std::fs::remove_file(endpoint).unwrap();
@@ -1143,10 +1173,17 @@ async fn disconnect_fans_out_to_multiple_pending_requests() {
     let client = HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN))
         .await
         .unwrap();
+    let events = client.subscribe();
     let (first, second) = tokio::join!(client.enumerate_serial(), client.enumerate_serial());
     for error in [first.unwrap_err(), second.unwrap_err()] {
         assert_eq!(error.name().as_str(), "runtime.broker.disconnected");
     }
+    assert_event_stream_closed(events, "EOF must wake an existing event subscriber").await;
+    assert_event_stream_closed(
+        client.subscribe(),
+        "subscription after EOF must be immediately terminal",
+    )
+    .await;
     client.close().await.unwrap();
     server.await.unwrap();
     std::fs::remove_file(endpoint).unwrap();
@@ -1174,6 +1211,7 @@ async fn client_close_fans_out_to_multiple_pending_requests() {
     let client = HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN))
         .await
         .unwrap();
+    let events = client.subscribe();
     let first_client = client.clone();
     let second_client = client.clone();
     let first = tokio::spawn(async move { first_client.enumerate_serial().await });
@@ -1196,10 +1234,20 @@ async fn client_close_fans_out_to_multiple_pending_requests() {
         .unwrap(),
         0
     );
-    client.close().await.unwrap();
+    client.clone().close().await.unwrap();
     for result in [first.await.unwrap(), second.await.unwrap()] {
         assert_eq!(result.unwrap_err().name().as_str(), "runtime.client.closed");
     }
+    assert_event_stream_closed(
+        events,
+        "explicit close must wake an existing event subscriber",
+    )
+    .await;
+    assert_event_stream_closed(
+        client.subscribe(),
+        "subscription after explicit close must be immediately terminal",
+    )
+    .await;
     release_tx.send(()).unwrap();
     server.await.unwrap();
     std::fs::remove_file(endpoint).unwrap();
