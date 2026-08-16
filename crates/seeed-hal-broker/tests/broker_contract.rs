@@ -584,6 +584,56 @@ where
     }
 }
 
+async fn open_configured_fd_can<T>(client: &mut Client<T>) -> v1::OpenCanResponse
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let enumerate = client
+        .request(envelope::Payload::EnumerateCanRequest(v1::EnumerateCanRequest {}))
+        .await;
+    let descriptor = match enumerate.payload.unwrap() {
+        envelope::Payload::EnumerateCanResponse(response) => {
+            response.resources.into_iter().next().unwrap()
+        }
+        other => panic!("expected CAN enumerate response, got {other:?}"),
+    };
+    let response = client
+        .request(envelope::Payload::OpenCanRequest(v1::OpenCanRequest {
+            selector: Some(v1::ResourceSelector {
+                resource_id: descriptor.resource_id,
+                minimum_identity_quality: descriptor.identity_quality,
+                transport: descriptor.transport,
+            }),
+            mode: v1::LeaseMode::Maintenance as i32,
+            config: Some(v1::CanOpenConfig {
+                config: Some(v1::can_open_config::Config::Configure(
+                    v1::CanConfigureConfig {
+                        mode: v1::CanMode::Fd as i32,
+                        nominal: Some(v1::CanBitTiming {
+                            bitrate: 500_000,
+                            sample_point_permill: None,
+                            sjw: None,
+                        }),
+                        data: Some(v1::CanBitTiming {
+                            bitrate: 2_000_000,
+                            sample_point_permill: None,
+                            sjw: None,
+                        }),
+                        listen_only: false,
+                        loopback: true,
+                        restart_ms: None,
+                    },
+                )),
+            }),
+            filters: Some(can_filter_data()),
+        }))
+        .await;
+    match response.payload.unwrap() {
+        envelope::Payload::OpenCanResponse(response) => response,
+        other => panic!("expected configured CAN FD open response, got {other:?}"),
+    }
+}
+
 fn serial_config(read_timeout_ms: u64) -> v1::SerialConfig {
     v1::SerialConfig {
         baud_rate: 115_200,
@@ -2068,7 +2118,7 @@ async fn can_fd_configuration_and_frames_use_resource_capabilities() {
 }
 
 #[tokio::test]
-async fn can_response_frame_limit_rejects_before_dequeue() {
+async fn can_fd_timestamp_response_frame_limit_rejects_before_dequeue() {
     let can_adapter = VirtualCanAdapter::loopback("can:virtual:broker-cleanup");
     let runtime = HalRuntime::builder()
         .can_adapter(can_adapter.clone())
@@ -2088,11 +2138,16 @@ async fn can_response_frame_limit_rejects_before_dequeue() {
         accepted.payload,
         Some(envelope::Payload::HandshakeResponse(_))
     ));
-    let can_session = open_virtual_can(&mut client, Some(v1::CanMode::Classic)).await;
+    let can_session = open_configured_fd_can(&mut client).await;
     can_adapter
         .inject_received(
-            CanFrame::classic_data(CanId::standard(0x123).unwrap(), Bytes::from_static(&[7]))
-                .unwrap(),
+            CanFrame::fd_data(
+                CanId::standard(0x123).unwrap(),
+                Bytes::from(vec![7; 64]),
+                true,
+                true,
+            )
+            .unwrap(),
             None,
         )
         .unwrap();
@@ -2127,6 +2182,116 @@ async fn can_response_frame_limit_rejects_before_dequeue() {
     drop(client);
     let outcome = server.await.unwrap();
     assert!(outcome.cleanup_error().is_none());
+}
+
+#[tokio::test]
+async fn tight_classic_without_timestamp_receive_limits_are_admitted() {
+    let adapter = MaskedCanAdapter::classic_only("can:virtual:broker-classic-tight");
+    let injector = adapter.inner.clone();
+    let runtime = HalRuntime::builder().can_adapter(adapter).build();
+    let broker = Broker::with_startup_token(runtime, StartupToken::from_bytes(TOKEN));
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    let mut handshake = can_handshake();
+    handshake.max_frame_bytes = 256;
+    handshake.max_read_bytes = 8;
+    handshake.max_write_bytes = 8;
+    let accepted = client
+        .request(envelope::Payload::HandshakeRequest(handshake))
+        .await;
+    assert!(matches!(
+        accepted.payload,
+        Some(envelope::Payload::HandshakeResponse(_))
+    ));
+    let session = open_virtual_can(&mut client, Some(v1::CanMode::Classic)).await;
+    injector
+        .inject_received(
+            CanFrame::classic_data(
+                CanId::standard(0x123).unwrap(),
+                Bytes::from(vec![7; 8]),
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+
+    let receive = client
+        .request(envelope::Payload::CanReceiveRequest(v1::CanReceiveRequest {
+            session_id: session.session_id,
+            lease: session.lease,
+            max_frames: 1,
+            timeout_ms: 0,
+        }))
+        .await;
+    match receive.payload.unwrap() {
+        envelope::Payload::CanReceiveResponse(response) => {
+            assert_eq!(response.frames.len(), 1);
+            assert_eq!(response.frames[0].frame.as_ref().unwrap().data.len(), 8);
+            assert!(response.frames[0].timestamp.is_none());
+        }
+        other => panic!("expected tight Classical CAN response, got {other:?}"),
+    }
+
+    drop(client);
+    assert!(server.await.unwrap().cleanup_error().is_none());
+}
+
+#[tokio::test]
+async fn nonconforming_direct_variant_from_adapter_is_rejected_before_wire_response() {
+    let adapter = VirtualCanAdapter::loopback("can:virtual:broker-invalid-direct-frame");
+    let runtime = can_runtime(adapter.clone());
+    let broker = Broker::with_startup_token(runtime, StartupToken::from_bytes(TOKEN));
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    handshake_can(&mut client).await;
+    let session = open_virtual_can(&mut client, Some(v1::CanMode::Classic)).await;
+    adapter
+        .inject_received(
+            CanFrame::ClassicData {
+                id: CanId::Standard(0x800),
+                data: Bytes::from(vec![0xa5; 9]),
+            },
+            None,
+        )
+        .unwrap();
+
+    let rejected = client
+        .request(envelope::Payload::CanReceiveRequest(v1::CanReceiveRequest {
+            session_id: session.session_id.clone(),
+            lease: session.lease.clone(),
+            max_frames: 1,
+            timeout_ms: 100,
+        }))
+        .await;
+    assert_eq!(error_name(&rejected), "can.frame.invalid");
+
+    adapter
+        .inject_received(
+            CanFrame::classic_data(CanId::standard(0x123).unwrap(), Bytes::from_static(&[7]))
+                .unwrap(),
+            None,
+        )
+        .unwrap();
+    let valid = client
+        .request(envelope::Payload::CanReceiveRequest(v1::CanReceiveRequest {
+            session_id: session.session_id,
+            lease: session.lease,
+            max_frames: 1,
+            timeout_ms: 100,
+        }))
+        .await;
+    match valid.payload.unwrap() {
+        envelope::Payload::CanReceiveResponse(response) => {
+            assert_eq!(response.frames.len(), 1);
+            assert_eq!(response.frames[0].frame.as_ref().unwrap().data, [7]);
+        }
+        other => panic!("expected valid frame after rejected adapter frame, got {other:?}"),
+    }
+
+    drop(client);
+    assert!(server.await.unwrap().cleanup_error().is_none());
 }
 
 #[tokio::test]

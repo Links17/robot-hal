@@ -58,6 +58,53 @@ fn frame_limits_and_flags_are_enforced() {
 }
 
 #[test]
+fn public_frame_variants_still_require_canonical_validation() {
+    let invalid_frames = [
+        CanFrame::ClassicData {
+            id: CanId::Standard(0x800),
+            data: Bytes::new(),
+        },
+        CanFrame::ClassicData {
+            id: CanId::Standard(1),
+            data: Bytes::from(vec![0; MAX_CLASSIC_DATA_BYTES + 1]),
+        },
+        CanFrame::ClassicRemote {
+            id: CanId::Standard(1),
+            dlc: 9,
+        },
+        CanFrame::FdData {
+            id: CanId::Extended(1),
+            data: Bytes::from(vec![0; 9]),
+            bitrate_switch: false,
+            error_state_indicator: false,
+        },
+        CanFrame::Error {
+            classes: Vec::new(),
+            data: Bytes::new(),
+        },
+        CanFrame::Error {
+            classes: vec![CanErrorClass::Other; MAX_CAN_ERROR_CLASSES + 1],
+            data: Bytes::new(),
+        },
+        CanFrame::Error {
+            classes: vec![CanErrorClass::Other],
+            data: Bytes::from(vec![0; MAX_CLASSIC_DATA_BYTES + 1]),
+        },
+    ];
+    for frame in invalid_frames {
+        assert_eq!(frame.validate().unwrap_err().name().as_str(), "can.frame.invalid");
+    }
+    assert!(CanFrame::FdData {
+        id: CanId::Extended(0x1fff_ffff),
+        data: Bytes::from(vec![0; MAX_FD_DATA_BYTES]),
+        bitrate_switch: true,
+        error_state_indicator: true,
+    }
+    .validate()
+    .is_ok());
+}
+
+#[test]
 fn timestamp_reuses_bounded_ascii_domain_invariant() {
     assert!(CanTimestamp::new(1, CanTimestampSource::Kernel, "host-clock").is_ok());
     for domain in [String::new(), "é".to_owned(), "x".repeat(256)] {

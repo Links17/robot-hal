@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use seeed_hal_can::{
     CAN_CLASSIC_CAPABILITY, CAN_CONFIGURE_CAPABILITY, CAN_ERROR_FRAMES_CAPABILITY,
     CAN_FD_CAPABILITY, CAN_RX_TIMESTAMP_CAPABILITY, CanFilterSet, CanFrame, CanMode,
-    CanOpenConfig, MAX_CAN_BATCH_FRAMES, MAX_CAN_ERROR_CLASSES, MAX_FD_DATA_BYTES,
-    can_classic_capability,
+    CanOpenConfig, MAX_CAN_BATCH_FRAMES, MAX_CAN_ERROR_CLASSES, MAX_CLASSIC_DATA_BYTES,
+    MAX_FD_DATA_BYTES, can_classic_capability,
     can_configure_capability, can_error_frames_capability, can_fd_capability,
     can_rx_timestamp_capability,
 };
@@ -32,26 +32,34 @@ pub(crate) struct CanDispatchLimits {
 }
 
 const CLOSED_CAN_SESSION_RETENTION: usize = 256;
-// Exact prost maxima under the canonical CAN model: FD frame (82), timestamp
-// with a 255-byte clock domain (271), and their two nested message fields
-// (358). Error frames are smaller because their class list is bounded by
-// MAX_CAN_ERROR_CLASSES in seeed-hal-can.
-const MAX_CAN_FRAME_PROTO_BYTES: usize = 82;
+// Exact prost maxima under the canonical CAN model. These are selected per
+// authenticated session profile before runtime receive admission.
+const MAX_CLASSIC_CAN_FRAME_PROTO_BYTES: usize = 22;
+const MAX_FD_CAN_FRAME_PROTO_BYTES: usize = 82;
 const MAX_ERROR_CAN_FRAME_PROTO_BYTES: usize = 2 + 10 + 2 + MAX_CAN_ERROR_CLASSES;
 const MAX_CAN_TIMESTAMP_PROTO_BYTES: usize = 271;
-const MAX_RECEIVED_CAN_FRAME_PROTO_BYTES: usize = 358;
 const CAN_RECEIVE_RESPONSE_FIELD_NUMBER: u32 = 57;
+
+#[derive(Clone, Copy)]
+struct CanReceiveWireProfile {
+    mode: CanMode,
+    max_data_bytes: usize,
+    max_frame_proto_bytes: usize,
+    timestamp: bool,
+}
 
 struct CanSessionRecord {
     resource_id: ResourceId,
     capabilities: CapabilitySet,
     lease: LeaseToken,
+    receive_profile: CanReceiveWireProfile,
     closed: bool,
 }
 
 struct CanSessionContext {
     resource_id: ResourceId,
     capabilities: CapabilitySet,
+    receive_profile: CanReceiveWireProfile,
     closed: bool,
 }
 
@@ -195,6 +203,7 @@ async fn open(
     validate_open_capabilities(selected, &config, &filters)?;
     let resource_id = selected.id().clone();
     let capabilities = selected.capabilities().clone();
+    let receive_profile = receive_wire_profile(&config, &capabilities);
     let handle = runtime
         .open_can(owner, selector, mode, config, filters)
         .await?;
@@ -209,6 +218,7 @@ async fn open(
                 resource_id,
                 capabilities,
                 lease: lease.clone(),
+                receive_profile,
                 closed: false,
             },
         );
@@ -253,22 +263,6 @@ async fn receive(
     limits: CanDispatchLimits,
     sessions: CanSessions,
 ) -> HalResult<envelope::Payload> {
-    let requested_frames = usize::try_from(request.max_frames).unwrap_or(usize::MAX);
-    let maximum_payload = requested_frames
-        .checked_mul(MAX_FD_DATA_BYTES)
-        .ok_or_else(|| invalid_message("CAN receive payload bound overflows usize"))?;
-    if maximum_payload > limits.max_read_bytes {
-        return Err(invalid_message(
-            "CAN receive payload bound exceeds the negotiated read maximum",
-        ));
-    }
-    let maximum_response = can_receive_response_envelope_bound(requested_frames)
-        .ok_or_else(|| invalid_message("CAN receive response bound overflows usize"))?;
-    if maximum_response > limits.max_frame_bytes {
-        return Err(invalid_message(
-            "CAN receive response bound exceeds the negotiated frame maximum",
-        ));
-    }
     let (session, lease, max_frames, timeout) = can_receive_request_from_proto(request)?;
     let context = validate_session(
         &sessions,
@@ -278,6 +272,23 @@ async fn receive(
         "can.receive",
         false,
     )?;
+    let requested_frames = max_frames;
+    let maximum_payload = requested_frames
+        .checked_mul(context.receive_profile.max_data_bytes)
+        .ok_or_else(|| invalid_message("CAN receive payload bound overflows usize"))?;
+    if maximum_payload > limits.max_read_bytes {
+        return Err(invalid_message(
+            "CAN receive payload bound exceeds the negotiated read maximum",
+        ));
+    }
+    let maximum_response =
+        can_receive_response_envelope_bound(requested_frames, context.receive_profile)
+        .ok_or_else(|| invalid_message("CAN receive response bound overflows usize"))?;
+    if maximum_response > limits.max_frame_bytes {
+        return Err(invalid_message(
+            "CAN receive response bound exceeds the negotiated frame maximum",
+        ));
+    }
     let frames = runtime
         .receive_can(session.clone(), &lease, max_frames, timeout)
         .await?;
@@ -285,6 +296,7 @@ async fn receive(
         &frames,
         &context.capabilities,
         &context.resource_id,
+        context.receive_profile,
     )?;
     Ok(envelope::Payload::CanReceiveResponse(
         v1::CanReceiveResponse {
@@ -359,18 +371,59 @@ fn validate_send_bounds(request: &v1::CanSendRequest, max_write_bytes: usize) ->
     Ok(())
 }
 
-fn can_receive_response_envelope_bound(frame_count: usize) -> Option<usize> {
-    debug_assert!(MAX_ERROR_CAN_FRAME_PROTO_BYTES <= MAX_CAN_FRAME_PROTO_BYTES);
-    let frame_field = length_delimited_field_len(1, MAX_CAN_FRAME_PROTO_BYTES);
-    let timestamp_field = length_delimited_field_len(2, MAX_CAN_TIMESTAMP_PROTO_BYTES);
+fn can_receive_response_envelope_bound(
+    frame_count: usize,
+    profile: CanReceiveWireProfile,
+) -> Option<usize> {
+    let frame_field = length_delimited_field_len(1, profile.max_frame_proto_bytes);
+    let timestamp_field = profile
+        .timestamp
+        .then_some(length_delimited_field_len(
+            2,
+            MAX_CAN_TIMESTAMP_PROTO_BYTES,
+        ))
+        .unwrap_or(0);
     let received_frame = frame_field.checked_add(timestamp_field)?;
-    debug_assert_eq!(received_frame, MAX_RECEIVED_CAN_FRAME_PROTO_BYTES);
     let repeated_frame = length_delimited_field_len(1, received_frame);
     let response_payload = repeated_frame.checked_mul(frame_count)?;
     Some(envelope_encoded_len(
         CAN_RECEIVE_RESPONSE_FIELD_NUMBER,
         response_payload,
     ))
+}
+
+fn receive_wire_profile(
+    config: &CanOpenConfig,
+    capabilities: &CapabilitySet,
+) -> CanReceiveWireProfile {
+    let mode = match config {
+        CanOpenConfig::Configure(config) => config.mode(),
+        CanOpenConfig::Attach(expectation) => expectation.mode().unwrap_or_else(|| {
+            if capabilities.contains(&can_fd_capability()) {
+                CanMode::Fd
+            } else {
+                CanMode::Classic
+            }
+        }),
+    };
+    let mode_frame_bytes = match mode {
+        CanMode::Classic => MAX_CLASSIC_CAN_FRAME_PROTO_BYTES,
+        CanMode::Fd => MAX_FD_CAN_FRAME_PROTO_BYTES,
+    };
+    let max_frame_proto_bytes = if capabilities.contains(&can_error_frames_capability()) {
+        mode_frame_bytes.max(MAX_ERROR_CAN_FRAME_PROTO_BYTES)
+    } else {
+        mode_frame_bytes
+    };
+    CanReceiveWireProfile {
+        mode,
+        max_data_bytes: match mode {
+            CanMode::Classic => MAX_CLASSIC_DATA_BYTES,
+            CanMode::Fd => MAX_FD_DATA_BYTES,
+        },
+        max_frame_proto_bytes,
+        timestamp: capabilities.contains(&can_rx_timestamp_capability()),
+    }
 }
 
 fn envelope_encoded_len(payload_field_number: u32, payload_len: usize) -> usize {
@@ -465,6 +518,12 @@ fn validate_frame_capabilities(
     resource_id: Option<&ResourceId>,
 ) -> HalResult<()> {
     for frame in frames {
+        if let Err(error) = frame.validate() {
+            return Err(match resource_id {
+                Some(resource_id) => error.with_resource_id(resource_id.clone()),
+                None => error,
+            });
+        }
         let (capability, name) = match frame {
             CanFrame::ClassicData { .. } | CanFrame::ClassicRemote { .. } => {
                 (can_classic_capability(), CAN_CLASSIC_CAPABILITY)
@@ -484,8 +543,17 @@ fn validate_received_capabilities(
     frames: &[seeed_hal_can::ReceivedCanFrame],
     capabilities: &CapabilitySet,
     resource_id: &ResourceId,
+    profile: CanReceiveWireProfile,
 ) -> HalResult<()> {
     for received in frames {
+        if profile.mode == CanMode::Classic
+            && matches!(received.frame(), CanFrame::FdData { .. })
+        {
+            return Err(capability_unsupported(
+                "Classical CAN session received a CAN FD frame",
+                Some(resource_id),
+            ));
+        }
         validate_frame_capabilities(
             std::slice::from_ref(received.frame()),
             capabilities,
@@ -580,6 +648,7 @@ fn validate_session(
             return Ok(CanSessionContext {
                 resource_id: record.resource_id.clone(),
                 capabilities: record.capabilities.clone(),
+                receive_profile: record.receive_profile,
                 closed: true,
             });
         }
@@ -599,6 +668,7 @@ fn validate_session(
     Ok(CanSessionContext {
         resource_id: record.resource_id.clone(),
         capabilities: record.capabilities.clone(),
+        receive_profile: record.receive_profile,
         closed: false,
     })
 }
@@ -704,21 +774,92 @@ fn resource_selection_error(
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+    use prost::Message;
+    use seeed_hal_can::{
+        CanErrorClass, CanFrame, CanId, CanMode, CanTimestamp, CanTimestampSource,
+        ReceivedCanFrame,
+    };
+    use seeed_hal_protocol::v1::{self, envelope};
+
     use super::{
-        MAX_CAN_FRAME_PROTO_BYTES, MAX_CAN_TIMESTAMP_PROTO_BYTES,
-        MAX_ERROR_CAN_FRAME_PROTO_BYTES, MAX_RECEIVED_CAN_FRAME_PROTO_BYTES,
-        can_receive_response_envelope_bound, length_delimited_field_len,
+        CanReceiveWireProfile, MAX_CAN_TIMESTAMP_PROTO_BYTES,
+        MAX_CLASSIC_CAN_FRAME_PROTO_BYTES, MAX_ERROR_CAN_FRAME_PROTO_BYTES,
+        MAX_FD_CAN_FRAME_PROTO_BYTES, can_receive_response_envelope_bound,
+        length_delimited_field_len,
     };
 
     #[test]
-    fn canonical_can_bounds_derive_the_exact_receive_envelope_maximum() {
-        assert!(MAX_ERROR_CAN_FRAME_PROTO_BYTES <= MAX_CAN_FRAME_PROTO_BYTES);
+    fn canonical_can_bounds_derive_exact_session_receive_envelope_maxima() {
+        assert_eq!(MAX_CLASSIC_CAN_FRAME_PROTO_BYTES, 22);
+        assert_eq!(MAX_ERROR_CAN_FRAME_PROTO_BYTES, 24);
+        assert_eq!(MAX_FD_CAN_FRAME_PROTO_BYTES, 82);
         assert_eq!(
-            length_delimited_field_len(1, MAX_CAN_FRAME_PROTO_BYTES)
+            length_delimited_field_len(1, MAX_FD_CAN_FRAME_PROTO_BYTES)
                 + length_delimited_field_len(2, MAX_CAN_TIMESTAMP_PROTO_BYTES),
-            MAX_RECEIVED_CAN_FRAME_PROTO_BYTES
+            358
         );
-        assert_eq!(can_receive_response_envelope_bound(1), Some(376));
-        assert_eq!(can_receive_response_envelope_bound(64), Some(23_120));
+        let classic = CanReceiveWireProfile {
+            mode: CanMode::Classic,
+            max_data_bytes: 8,
+            max_frame_proto_bytes: MAX_CLASSIC_CAN_FRAME_PROTO_BYTES,
+            timestamp: false,
+        };
+        let fd_timestamp = CanReceiveWireProfile {
+            mode: CanMode::Fd,
+            max_data_bytes: 64,
+            max_frame_proto_bytes: MAX_FD_CAN_FRAME_PROTO_BYTES,
+            timestamp: true,
+        };
+        assert_eq!(
+            can_receive_response_envelope_bound(1, classic),
+            Some(40)
+        );
+        assert_eq!(
+            can_receive_response_envelope_bound(1, fd_timestamp),
+            Some(376)
+        );
+        assert_eq!(
+            can_receive_response_envelope_bound(64, fd_timestamp),
+            Some(23_120)
+        );
+    }
+
+    #[test]
+    fn canonical_values_reach_the_proven_protobuf_maxima() {
+        let fd = CanFrame::fd_data(
+            CanId::extended(0x1fff_ffff).unwrap(),
+            Bytes::from(vec![0xff; 64]),
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(v1::CanFrame::from(&fd).encoded_len(), 82);
+
+        let error = CanFrame::error(
+            vec![CanErrorClass::Other; seeed_hal_can::MAX_CAN_ERROR_CLASSES],
+            Bytes::from(vec![0xff; 8]),
+        )
+        .unwrap();
+        assert_eq!(v1::CanFrame::from(&error).encoded_len(), 24);
+
+        let timestamp = CanTimestamp::new(
+            u64::MAX,
+            CanTimestampSource::HostMonotonic,
+            "x".repeat(255),
+        )
+        .unwrap();
+        assert_eq!(v1::CanTimestamp::from(&timestamp).encoded_len(), 271);
+
+        let received = ReceivedCanFrame::new(fd, Some(timestamp));
+        let response = v1::CanReceiveResponse {
+            frames: vec![v1::ReceivedCanFrame::from(&received)],
+        };
+        assert_eq!(response.frames[0].encoded_len(), 358);
+        let response = v1::Envelope {
+            request_id: u64::MAX,
+            payload: Some(envelope::Payload::CanReceiveResponse(response)),
+        };
+        assert_eq!(response.encoded_len(), 376);
     }
 }

@@ -15,6 +15,19 @@ fn invalid_frame(message: &'static str) -> HalError {
     .expect("static CAN frame error metadata is valid")
 }
 
+fn validate_id(id: &CanId) -> HalResult<()> {
+    match id {
+        CanId::Standard(value) if *value <= 0x7ff => Ok(()),
+        CanId::Extended(value) if *value <= 0x1fff_ffff => Ok(()),
+        CanId::Standard(_) => Err(invalid_frame("standard CAN identifier exceeds 11 bits")),
+        CanId::Extended(_) => Err(invalid_frame("extended CAN identifier exceeds 29 bits")),
+    }
+}
+
+fn valid_fd_data_length(length: usize) -> bool {
+    matches!(length, 0..=8 | 12 | 16 | 20 | 24 | 32 | 48 | 64)
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CanId {
     Standard(u16),
@@ -81,6 +94,7 @@ pub enum CanFrame {
 
 impl CanFrame {
     pub fn classic_data(id: CanId, data: impl Into<Bytes>) -> HalResult<Self> {
+        validate_id(&id)?;
         let data = data.into();
         if data.len() > MAX_CLASSIC_DATA_BYTES {
             return Err(invalid_frame("Classical CAN data exceeds 8 bytes"));
@@ -89,6 +103,7 @@ impl CanFrame {
     }
 
     pub fn classic_remote(id: CanId, dlc: u8) -> HalResult<Self> {
+        validate_id(&id)?;
         if usize::from(dlc) > MAX_CLASSIC_DATA_BYTES {
             return Err(invalid_frame("Classical CAN remote DLC exceeds 8"));
         }
@@ -101,8 +116,9 @@ impl CanFrame {
         bitrate_switch: bool,
         error_state_indicator: bool,
     ) -> HalResult<Self> {
+        validate_id(&id)?;
         let data = data.into();
-        if !matches!(data.len(), 0..=8 | 12 | 16 | 20 | 24 | 32 | 48 | 64) {
+        if !valid_fd_data_length(data.len()) {
             return Err(invalid_frame(
                 "CAN FD data length must be one of 0..=8, 12, 16, 20, 24, 32, 48, or 64",
             ));
@@ -126,6 +142,47 @@ impl CanFrame {
             return Err(invalid_frame("CAN error diagnostics exceed 8 bytes"));
         }
         Ok(Self::Error { classes, data })
+    }
+
+    /// Validates invariants that public enum variants can bypass.
+    ///
+    /// Adapters and runtime ingress must call this before retaining or
+    /// serializing a received frame. Constructors perform the same checks so
+    /// normal callers receive early, canonical errors.
+    pub fn validate(&self) -> HalResult<()> {
+        match self {
+            Self::ClassicData { id, data } => {
+                validate_id(id)?;
+                if data.len() > MAX_CLASSIC_DATA_BYTES {
+                    return Err(invalid_frame("Classical CAN data exceeds 8 bytes"));
+                }
+            }
+            Self::ClassicRemote { id, dlc } => {
+                validate_id(id)?;
+                if usize::from(*dlc) > MAX_CLASSIC_DATA_BYTES {
+                    return Err(invalid_frame("Classical CAN remote DLC exceeds 8"));
+                }
+            }
+            Self::FdData { id, data, .. } => {
+                validate_id(id)?;
+                if !valid_fd_data_length(data.len()) {
+                    return Err(invalid_frame(
+                        "CAN FD data length must be one of 0..=8, 12, 16, 20, 24, 32, 48, or 64",
+                    ));
+                }
+            }
+            Self::Error { classes, data } => {
+                if classes.is_empty() || classes.len() > MAX_CAN_ERROR_CLASSES {
+                    return Err(invalid_frame(
+                        "CAN error frame must contain 1..=10 classes",
+                    ));
+                }
+                if data.len() > MAX_CLASSIC_DATA_BYTES {
+                    return Err(invalid_frame("CAN error diagnostics exceed 8 bytes"));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn id(&self) -> Option<&CanId> {

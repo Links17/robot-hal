@@ -453,6 +453,11 @@ impl CanManager {
                 "a CAN send batch must contain 1..=64 frames",
             ).with_resource_id(resource_id)));
         }
+        for frame in &frames {
+            frame.validate().map_err(|error| {
+                CanBatchSendError::new(error.with_resource_id(resource_id.clone()))
+            })?;
+        }
         let (reply_tx, reply_rx) = oneshot::channel();
         let count = frames.len();
         actor

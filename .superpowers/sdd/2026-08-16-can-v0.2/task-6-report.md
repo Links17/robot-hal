@@ -88,3 +88,32 @@ Static inspection confirmed the receive-bound arithmetic against
 `proto/seeed/hal/v1/hal.proto`, including envelope field 57 and the canonical variant invariants.
 Per the fix-round instruction, compile, test, lint, format, generated-protocol, and Python gates
 remain deliberately deferred.
+
+## Fix round 2/5
+
+Review fixes applied on top of `e13b193`:
+
+- Added public `CanFrame::validate()` covering directly constructed IDs, Classic payload/DLC,
+  CAN FD legal lengths, error diagnostics, and the bounded error-class list. Constructors retain
+  their early checks and now validate IDs as well. Runtime send admission and CAN actor receive
+  ingress call the canonical validator; invalid received frames become structured resource-scoped
+  receive errors before session fan-out or protobuf response allocation, and broker dispatch
+  validates again before serialization.
+- Added CAN contract coverage for every invalid public variant class plus a maximal valid FD
+  variant. Broker coverage injects a directly constructed invalid adapter frame, asserts the
+  structured rejection, then confirms a subsequent valid frame remains deliverable.
+- Retained an authenticated session receive wire profile derived from requested/effective
+  Classic-vs-FD configuration and selected resource capabilities. Receive admission now resolves
+  the local session and exact lease before calculating data/read and encoded-response bounds.
+  Classic sessions use the 8-byte data/22-byte frame maxima, FD sessions use 64-byte/82-byte
+  maxima, error-frame capability raises Classic frames to 24 bytes, and timestamp overhead is
+  included only when the session resource advertises timestamp delivery. Classic sessions also
+  fail closed if a nonconforming FD frame reaches broker validation.
+- Replaced the previous universal FD-plus-timestamp admission test with explicit FD/timestamp
+  rejection coverage and added a tight Classic/no-timestamp session whose 8-byte read limit is
+  admitted. Added protobuf encoded-length assertions for the exact 82/24/271/358/376 maxima.
+
+This round intentionally tightens the public CAN model contract because direct enum construction
+otherwise bypasses the bounded IPC invariant; the additive validator and ingress checks keep that
+contract enforceable without removing the public variants. Compile, test, lint, format,
+generated-protocol, and Python verification remain deliberately deferred.

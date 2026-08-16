@@ -426,7 +426,15 @@ fn run_actor(
         }
 
         match channel.receive(RECEIVE_POLL_SLICE) {
-            Ok(Some(frame)) => fan_out(frame, &mut sessions, rx_capacity, &resource_id),
+            Ok(Some(frame)) => match frame.frame().validate() {
+                Ok(()) => fan_out(frame, &mut sessions, rx_capacity, &resource_id),
+                Err(error) => {
+                    for session in sessions.values_mut() {
+                        session.receive_error =
+                            Some(error.clone().with_resource_id(resource_id.clone()));
+                    }
+                }
+            },
             Ok(None) => {}
             Err(error) if error.name().as_str() == "can.receive.lagged" => {
                 let dropped = error
