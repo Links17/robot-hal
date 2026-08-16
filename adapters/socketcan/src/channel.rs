@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use can_hal::{
     CanFdFrame as BackendFdFrame, CanFrame as BackendClassicFrame, CanId as BackendId,
-    Transmit, TransmitFd,
+    ReceiveFd, Transmit, TransmitFd,
 };
 use can_hal_socketcan::{SocketCanChannel as BackendChannel, SocketCanDriver, SocketCanError};
 use socketcan::{CanAnyFrame, CanFdSocket, CanRemoteFrame, EmbeddedFrame, ExtendedId, Id,
@@ -31,17 +31,44 @@ pub(crate) struct NativeSocketCanChannel {
 impl NativeSocketCanChannel {
     pub(crate) fn open(
         descriptor: ResourceDescriptor,
-        link: LinkLease,
+        mut link: LinkLease,
     ) -> HalResult<Self> {
-        let interface = descriptor.endpoint().as_str();
-        let backend = SocketCanDriver::new()
-            .channel_by_name(interface)
+        let interface = descriptor.endpoint().as_str().to_owned();
+        let mut backend = match SocketCanDriver::new()
+            .channel_by_name(&interface)
             .connect()
-            .map_err(|error| map_backend_error("can.open", error, &descriptor))?;
-        let receiver = CanFdSocket::open(interface)
-            .map_err(|error| map_io_error("can.open", error).with_resource_id(descriptor.id().clone()))?;
-        let remote_sender = CanFdSocket::open(interface)
-            .map_err(|error| map_io_error("can.open", error).with_resource_id(descriptor.id().clone()))?;
+        {
+            Ok(backend) => backend,
+            Err(error) => {
+                let primary = map_backend_error("can.open", error, &descriptor);
+                return Err(link.rollback_after_open_failure(&descriptor, primary));
+            }
+        };
+        if let Err(error) = backend.try_receive_fd() {
+            let primary = map_backend_error("can.open", error, &descriptor);
+            return Err(link.rollback_after_open_failure(&descriptor, primary));
+        }
+        let receiver = match CanFdSocket::open(&interface) {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                let primary = map_io_error("can.open", error)
+                    .with_resource_id(descriptor.id().clone());
+                return Err(link.rollback_after_open_failure(&descriptor, primary));
+            }
+        };
+        let remote_sender = match CanFdSocket::open(&interface) {
+            Ok(sender) => sender,
+            Err(error) => {
+                let primary = map_io_error("can.open", error)
+                    .with_resource_id(descriptor.id().clone());
+                return Err(link.rollback_after_open_failure(&descriptor, primary));
+            }
+        };
+        if let Err(error) = remote_sender.set_nonblocking(true) {
+            let primary =
+                map_io_error("can.open", error).with_resource_id(descriptor.id().clone());
+            return Err(link.rollback_after_open_failure(&descriptor, primary));
+        }
         Ok(Self {
             descriptor,
             backend: Some(backend),
@@ -102,15 +129,22 @@ impl CanChannel for NativeSocketCanChannel {
     }
 
     fn receive(&mut self, timeout: Duration) -> HalResult<Option<ReceivedCanFrame>> {
+        let descriptor = self.descriptor.clone();
         let poll = timeout.min(MAX_RECEIVE_POLL);
         let frame = if poll.is_zero() {
             let receiver = self.receiver("can.receive")?;
             receiver
                 .set_nonblocking(true)
-                .map_err(|error| map_io_error("can.receive", error))?;
+                .map_err(|error| {
+                    map_io_error("can.receive", error)
+                        .with_resource_id(descriptor.id().clone())
+                })?;
             let result = receiver.read_frame();
             let restore = receiver.set_nonblocking(false);
-            restore.map_err(|error| map_io_error("can.receive", error))?;
+            restore.map_err(|error| {
+                map_io_error("can.receive", error)
+                    .with_resource_id(descriptor.id().clone())
+            })?;
             result
         } else {
             self.receiver("can.receive")?.read_frame_timeout(poll)
@@ -118,10 +152,10 @@ impl CanChannel for NativeSocketCanChannel {
         match frame {
             Ok(frame) => from_socketcan_frame(frame)
                 .map(|frame| Some(ReceivedCanFrame::new(frame, None)))
-                .map_err(|error| error.with_resource_id(self.descriptor.id().clone())),
+                .map_err(|error| error.with_resource_id(descriptor.id().clone())),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock || error.kind() == io::ErrorKind::TimedOut => Ok(None),
             Err(error) => Err(map_io_error("can.receive", error)
-                .with_resource_id(self.descriptor.id().clone())),
+                .with_resource_id(descriptor.id().clone())),
         }
     }
 
@@ -134,10 +168,11 @@ impl CanChannel for NativeSocketCanChannel {
             CanFrame::ClassicData { id, data } => {
                 let frame = BackendClassicFrame::new(to_backend_id(*id), data).ok_or_else(|| {
                     invalid_frame("can.send", "failed to convert a validated Classical CAN frame")
+                        .with_resource_id(descriptor.id().clone())
                 })?;
                 self.backend("can.send")?
                     .transmit(&frame)
-                    .map_err(|error| map_backend_error("can.send", error, &descriptor))
+                    .map_err(|error| map_send_backend_error(error, &descriptor))
             }
             CanFrame::FdData {
                 id,
@@ -160,10 +195,11 @@ impl CanChannel for NativeSocketCanChannel {
                 )
                 .ok_or_else(|| {
                     invalid_frame("can.send", "failed to convert a validated CAN FD frame")
+                        .with_resource_id(descriptor.id().clone())
                 })?;
                 self.backend("can.send")?
                     .transmit_fd(&frame)
-                    .map_err(|error| map_backend_error("can.send", error, &descriptor))
+                    .map_err(|error| map_send_backend_error(error, &descriptor))
             }
             CanFrame::ClassicRemote { .. } => {
                 let CanFrame::ClassicRemote { id, dlc } = frame else {
@@ -171,13 +207,13 @@ impl CanChannel for NativeSocketCanChannel {
                 };
                 let remote_id = to_socketcan_id(*id);
                 let remote = CanRemoteFrame::new_remote(remote_id, usize::from(*dlc))
-                    .ok_or_else(|| invalid_frame("can.send", "failed to convert remote frame"))?;
+                    .ok_or_else(|| {
+                        invalid_frame("can.send", "failed to convert remote frame")
+                            .with_resource_id(descriptor.id().clone())
+                    })?;
                 self.remote_sender("can.send")?
                     .write_frame(&remote)
-                    .map_err(|error| {
-                        map_io_error("can.send", error)
-                            .with_resource_id(descriptor.id().clone())
-                    })
+                    .map_err(|error| map_send_io_error(error, &descriptor))
             }
             CanFrame::Error { .. } => {
                 return Err(unsupported_frame(
@@ -204,7 +240,9 @@ impl CanChannel for NativeSocketCanChannel {
         self.receiver.take();
         self.remote_sender.take();
         let result = self.link.close(&self.descriptor);
-        self.closed = true;
+        if result.is_ok() {
+            self.closed = true;
+        }
         result
     }
 }
@@ -279,9 +317,15 @@ fn map_backend_error(
 ) -> HalError {
     let mapped = match error {
         SocketCanError::Io(error) => map_io_error(operation, error),
-        SocketCanError::InvalidFrame(message) | SocketCanError::InvalidInterface(message) => {
-            invalid_frame(operation, message)
-        }
+        SocketCanError::InvalidFrame(message) => invalid_frame(operation, message),
+        SocketCanError::InvalidInterface(message) => HalError::new(
+            "runtime.resource.not_found",
+            ErrorCategory::NotFound,
+            operation,
+            false,
+            format!("SocketCAN interface is unavailable: {message}"),
+        )
+        .expect("static SocketCAN error metadata is valid"),
         _ => HalError::new(
             "runtime.transport.unavailable",
             ErrorCategory::Unavailable,
@@ -294,40 +338,85 @@ fn map_backend_error(
     mapped.with_resource_id(descriptor.id().clone())
 }
 
+fn map_send_backend_error(error: SocketCanError, descriptor: &ResourceDescriptor) -> HalError {
+    match error {
+        SocketCanError::Io(error) => map_send_io_error(error, descriptor),
+        error => map_backend_error("can.send", error, descriptor),
+    }
+}
+
+fn map_send_io_error(error: io::Error, descriptor: &ResourceDescriptor) -> HalError {
+    if error.kind() == io::ErrorKind::WouldBlock
+        || error.raw_os_error() == Some(libc::ENOBUFS)
+    {
+        return queue_full(error.raw_os_error(), descriptor);
+    }
+    map_io_error("can.send", error).with_resource_id(descriptor.id().clone())
+}
+
 fn map_io_error(operation: &'static str, error: io::Error) -> HalError {
-    let (name, category, retryable) = match error.kind() {
-        io::ErrorKind::NotFound => ("runtime.resource.not_found", ErrorCategory::NotFound, false),
-        io::ErrorKind::PermissionDenied => (
+    let raw_code = error.raw_os_error();
+    let (name, category, retryable) = match raw_code {
+        Some(libc::ENODEV | libc::ENOENT | libc::ENXIO) => {
+            ("runtime.resource.not_found", ErrorCategory::NotFound, false)
+        }
+        Some(libc::EPERM | libc::EACCES) => (
             "runtime.transport.permission_denied",
             ErrorCategory::Conflict,
             false,
         ),
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => (
-            "runtime.transport.timeout",
-            ErrorCategory::Unavailable,
-            true,
-        ),
-        io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => (
+        Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ERANGE | libc::EMSGSIZE) => (
             "runtime.transport.unsupported_configuration",
             ErrorCategory::InvalidArgument,
             false,
         ),
-        io::ErrorKind::BrokenPipe
-        | io::ErrorKind::ConnectionAborted
-        | io::ErrorKind::ConnectionReset
-        | io::ErrorKind::NotConnected
-        | io::ErrorKind::UnexpectedEof => (
+        Some(
+            libc::ENETDOWN
+            | libc::ENETUNREACH
+            | libc::ENOTCONN
+            | libc::EPIPE
+            | libc::ECONNABORTED
+            | libc::ECONNRESET,
+        ) => (
             "runtime.transport.disconnected",
             ErrorCategory::Unavailable,
             true,
         ),
-        _ => (
-            "runtime.transport.unavailable",
-            ErrorCategory::Unavailable,
-            true,
-        ),
+        _ => match error.kind() {
+            io::ErrorKind::NotFound => {
+                ("runtime.resource.not_found", ErrorCategory::NotFound, false)
+            }
+            io::ErrorKind::PermissionDenied => (
+                "runtime.transport.permission_denied",
+                ErrorCategory::Conflict,
+                false,
+            ),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => (
+                "runtime.transport.timeout",
+                ErrorCategory::Unavailable,
+                true,
+            ),
+            io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => (
+                "runtime.transport.unsupported_configuration",
+                ErrorCategory::InvalidArgument,
+                false,
+            ),
+            io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::UnexpectedEof => (
+                "runtime.transport.disconnected",
+                ErrorCategory::Unavailable,
+                true,
+            ),
+            _ => (
+                "runtime.transport.unavailable",
+                ErrorCategory::Unavailable,
+                true,
+            ),
+        },
     };
-    let raw_code = error.raw_os_error();
     let mut mapped = HalError::new(
         name,
         category,
@@ -373,6 +462,24 @@ fn unsupported_frame(
     )
     .expect("static SocketCAN error metadata is valid")
     .with_resource_id(descriptor.id().clone())
+}
+
+fn queue_full(raw_code: Option<i32>, descriptor: &ResourceDescriptor) -> HalError {
+    let error = HalError::new(
+        "runtime.queue.full",
+        ErrorCategory::Unavailable,
+        "can.send",
+        true,
+        "SocketCAN transmit queue is full",
+    )
+    .expect("static SocketCAN error metadata is valid")
+    .with_resource_id(descriptor.id().clone());
+    match raw_code {
+        Some(raw_code) => error
+            .with_platform_code(raw_code.to_string())
+            .expect("decimal OS error code is a valid platform code"),
+        None => error,
+    }
 }
 
 fn closed(operation: &'static str, descriptor: &ResourceDescriptor) -> HalError {

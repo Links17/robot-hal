@@ -50,11 +50,14 @@ impl CanAdapter for SocketCanAdapter {
         selector: &ResourceSelector,
         config: &CanOpenConfig,
     ) -> HalResult<Box<dyn CanChannel>> {
+        let resource_id = selector.id().clone();
         let selector = selector.clone();
         let config = config.clone();
         tokio::task::spawn_blocking(move || open_sync(&selector, &config))
             .await
-            .map_err(|error| join_error("can.open", error))?
+            .map_err(|error| {
+                join_error("can.open", error).with_resource_id(resource_id)
+            })?
     }
 }
 
@@ -71,10 +74,10 @@ impl CanAdapter for SocketCanAdapter {
 
     async fn open(
         &self,
-        _selector: &ResourceSelector,
+        selector: &ResourceSelector,
         _config: &CanOpenConfig,
     ) -> HalResult<Box<dyn CanChannel>> {
-        Err(unavailable("can.open"))
+        Err(unavailable("can.open").with_resource_id(selector.id().clone()))
     }
 }
 
@@ -94,8 +97,12 @@ fn descriptor_from_interface(interface: &str) -> HalResult<ResourceDescriptor> {
     let identity = identity_from_metadata(&metadata)?;
     let details = link::details_for_descriptor(interface)
         .map_err(|error| discovery_error("can.enumerate", error))?;
-    let (supports_fd, supports_configure) =
-        link::capabilities_for_details(&details, metadata.virtual_interface);
+    let nonvirtual_sysfs_evidence =
+        !metadata.virtual_interface && metadata.stable_path.is_some();
+    let (supports_fd, supports_configure) = link::capabilities_for_details(
+        &details,
+        nonvirtual_sysfs_evidence,
+    );
     let mut capabilities = vec![can_classic_capability()];
     if supports_fd {
         capabilities.push(can_fd_capability());
@@ -121,7 +128,7 @@ fn descriptor_from_interface(interface: &str) -> HalResult<ResourceDescriptor> {
     );
     properties.insert(
         "mode".to_owned(),
-        if supports_fd {
+        if link::is_fd_active(&details) {
             "fd".to_owned()
         } else {
             "classic".to_owned()
@@ -142,7 +149,8 @@ fn open_sync(
     selector: &ResourceSelector,
     config: &CanOpenConfig,
 ) -> HalResult<Box<dyn CanChannel>> {
-    let descriptors = enumerate_sync()?;
+    let descriptors = enumerate_sync()
+        .map_err(|error| error.with_resource_id(selector.id().clone()))?;
     let descriptor = resolve_resource(
         &descriptors,
         selector,

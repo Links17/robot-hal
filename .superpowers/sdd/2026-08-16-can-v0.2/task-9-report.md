@@ -95,3 +95,44 @@ Native compile/lint/test confirmation, non-Linux cross-build confirmation,
 `vcan` lifecycle/configuration execution, real-controller timing and bus-state
 behavior, and hardware timestamp/error-frame qualification remain deliberately
 deferred to the owning integration gate.
+
+## Fix round 1
+
+- Made Configure transactional across netlink apply, post-apply query,
+  active-state conversion, configuration verification, and channel socket open.
+  Every failure path attempts a verified restore; a failed restore is returned as
+  resource-scoped `can.configuration.rollback_failed` with the primary and
+  rollback error names in structured context.
+- Kept the link snapshot and applied fingerprint until restore and re-query both
+  succeed. Failed close remains retryable by the caller, and drop performs a
+  conflict-checked best-effort retry without overwriting externally changed link
+  state.
+- Forced both backend data transmission and the raw remote-frame sender into
+  nonblocking mode before channel exposure. `EAGAIN`/`WouldBlock` and `ENOBUFS`
+  now return retryable, resource-scoped `runtime.queue.full` instead of allowing
+  an unbounded write or misclassifying backpressure as a timeout.
+- Removed the fabricated 500 kbit/s fallback. Attach and Configure now fail with
+  a structured, resource-scoped error when the kernel omits required nominal or
+  FD data timing. Post-config verification checks exact requested bitrate,
+  optional sample point, optional SJW, restart delay, mode, listen-only, and
+  loopback state.
+- Expanded compare/restore state to include raw nominal and data timing, all nine
+  SocketCAN control modes, restart delay, MTU/up state, and termination. Restore
+  always takes the current link down before applying writable snapshot state and
+  preserves exact errno classification.
+- Removed interface-name-prefix virtual detection. Virtual classification now
+  comes only from the canonical sysfs path. Configure is advertised only with
+  affirmative nonvirtual sysfs evidence and kernel nominal timing constants; FD
+  requires consistent active FD state or kernel data-timing constants. The
+  descriptor `mode` property now describes active state rather than capability.
+- Replaced placeholder native tests with ignored, uniquely named netlink-created
+  `vcan` fixtures covering sysfs-only virtual classification, Weak identity,
+  conservative capabilities, missing-timing Attach errors, and deletion errors.
+  Shared conformance now filters to the explicitly selected real interface from
+  `SEEED_HAL_SOCKETCAN_CONFORMANCE_INTERFACE`. Added focused static unit coverage
+  for Classic data-timing absence, sample point/SJW/restart verification, full
+  control-mode/termination fingerprints, and evidence-gated capabilities.
+
+Per instruction, no tests, builds, Clippy, rustfmt, cross-builds, or dependency
+resolution were run in this fix round. Static inspection and `git diff --check`
+were the only verification performed before staging.

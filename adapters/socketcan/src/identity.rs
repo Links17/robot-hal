@@ -100,10 +100,9 @@ pub(crate) fn metadata_from_sysfs(interface: &str) -> CanInterfaceMetadata {
         .filter(|path| !path.starts_with("/sys/devices/virtual"))
         .and_then(|path| path.to_str().map(ToOwned::to_owned));
     let topology = read_trimmed(device_path.join("devpath"));
-    let virtual_interface = interface.starts_with("vcan")
-        || fs::canonicalize(&network_path)
-            .ok()
-            .is_some_and(|path| path.starts_with("/sys/devices/virtual"));
+    let virtual_interface = fs::canonicalize(&network_path)
+        .ok()
+        .is_some_and(|path| path.starts_with("/sys/devices/virtual"));
 
     CanInterfaceMetadata {
         interface: interface.to_owned(),

@@ -4,17 +4,17 @@ use seeed_hal_can::{
     CanActiveConfig, CanBitTiming, CanBusState, CanBusStatus, CanConfigureConfig,
     CanLinkExpectation, CanMode,
 };
-use seeed_hal_core::{ErrorCategory, HalError, HalResult, ResourceDescriptor};
+use seeed_hal_core::{ErrorCategory, ErrorContext, HalError, HalResult, ResourceDescriptor};
 use socketcan::nl::{
     CanCtrlMode, CanCtrlModes, CanInterface, CanState, InterfaceCanParams, InterfaceDetails, Mtu,
 };
 
 const CLOCK_DOMAIN: &str = "host-monotonic";
-const DEFAULT_BITRATE: u32 = 500_000;
 
 #[derive(Debug)]
 pub(crate) struct LinkLease {
     interface: CanInterface,
+    descriptor: ResourceDescriptor,
     snapshot: Option<LinkSnapshot>,
     applied: Option<LinkFingerprint>,
     pub(crate) active: CanActiveConfig,
@@ -32,9 +32,8 @@ struct LinkFingerprint {
     nominal: Option<TimingFingerprint>,
     data: Option<TimingFingerprint>,
     restart_ms: Option<u32>,
-    mode: CanMode,
-    listen_only: bool,
-    loopback: bool,
+    control_modes: [bool; 9],
+    termination: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,14 +50,15 @@ impl LinkLease {
         descriptor: &ResourceDescriptor,
     ) -> HalResult<Self> {
         let interface_handle = CanInterface::open(interface)
-            .map_err(|error| map_link_error("can.open", error, descriptor))?;
+            .map_err(|error| map_link_io_error("can.open", error.into(), descriptor))?;
         let details = interface_handle
             .details()
             .map_err(|error| map_nl_error("can.open", error, descriptor))?;
-        let active = active_config(&details, descriptor)?;
+        let active = active_config(&details, descriptor, "can.open")?;
         verify_expectation(expectation, &active, descriptor)?;
         Ok(Self {
             interface: interface_handle,
+            descriptor: descriptor.clone(),
             snapshot: None,
             applied: None,
             active,
@@ -71,7 +71,7 @@ impl LinkLease {
         descriptor: &ResourceDescriptor,
     ) -> HalResult<Self> {
         let interface_handle = CanInterface::open(interface)
-            .map_err(|error| map_link_error("can.configure", error, descriptor))?;
+            .map_err(|error| map_link_io_error("can.configure", error.into(), descriptor))?;
         let before = interface_handle
             .details()
             .map_err(|error| map_nl_error("can.configure", error, descriptor))?;
@@ -79,20 +79,50 @@ impl LinkLease {
             details: before.clone(),
         };
 
-        let result = configure_link(&interface_handle, &before, request, descriptor);
-        if let Err(error) = result {
-            let _ = restore_snapshot(&interface_handle, &snapshot.details);
-            return Err(error);
+        if let Err(error) = configure_link(&interface_handle, &before, request, descriptor) {
+            return Err(rollback_after_failure(
+                &interface_handle,
+                &snapshot.details,
+                descriptor,
+                error,
+            ));
         }
 
-        let after = interface_handle
-            .details()
-            .map_err(|error| map_nl_error("can.configure", error, descriptor))?;
-        let active = active_config(&after, descriptor)?;
-        verify_config(request, &active, descriptor)?;
-        let applied = fingerprint(&after, &active);
+        let after = match interface_handle.details() {
+            Ok(details) => details,
+            Err(error) => {
+                let error = map_nl_error("can.configure", error, descriptor);
+                return Err(rollback_after_failure(
+                    &interface_handle,
+                    &snapshot.details,
+                    descriptor,
+                    error,
+                ));
+            }
+        };
+        let active = match active_config(&after, descriptor, "can.configure") {
+            Ok(active) => active,
+            Err(error) => {
+                return Err(rollback_after_failure(
+                    &interface_handle,
+                    &snapshot.details,
+                    descriptor,
+                    error,
+                ));
+            }
+        };
+        if let Err(error) = verify_config(request, &after, &active, descriptor) {
+            return Err(rollback_after_failure(
+                &interface_handle,
+                &snapshot.details,
+                descriptor,
+                error,
+            ));
+        }
+        let applied = fingerprint(&after);
         Ok(Self {
             interface: interface_handle,
+            descriptor: descriptor.clone(),
             snapshot: Some(snapshot),
             applied: Some(applied),
             active,
@@ -121,7 +151,11 @@ impl LinkLease {
     }
 
     pub(crate) fn close(&mut self, descriptor: &ResourceDescriptor) -> HalResult<()> {
-        let Some(snapshot) = self.snapshot.take() else {
+        let Some(snapshot) = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.details.clone())
+        else {
             return Ok(());
         };
 
@@ -129,11 +163,10 @@ impl LinkLease {
             .interface
             .details()
             .map_err(|error| map_nl_error("can.close", error, descriptor))?;
-        let current_active = active_config(&current, descriptor)?;
         if self
             .applied
             .as_ref()
-            .is_some_and(|applied| fingerprint(&current, &current_active) != *applied)
+            .is_some_and(|applied| fingerprint(&current) != *applied)
         {
             return Err(HalError::new(
                 "can.configuration.conflict",
@@ -144,8 +177,30 @@ impl LinkLease {
             )?
             .with_resource_id(descriptor.id().clone()));
         }
-        restore_snapshot(&self.interface, &snapshot.details)
-            .map_err(|error| error.with_resource_id(descriptor.id().clone()))
+        restore_and_verify(&self.interface, &snapshot, descriptor)?;
+        self.snapshot = None;
+        self.applied = None;
+        Ok(())
+    }
+
+    pub(crate) fn rollback_after_open_failure(
+        &mut self,
+        descriptor: &ResourceDescriptor,
+        primary: HalError,
+    ) -> HalError {
+        match self.close(descriptor) {
+            Ok(()) => primary,
+            Err(rollback) => rollback_failure(primary, rollback, descriptor),
+        }
+    }
+}
+
+impl Drop for LinkLease {
+    fn drop(&mut self) {
+        if self.snapshot.is_some() {
+            let descriptor = self.descriptor.clone();
+            let _ = self.close(&descriptor);
+        }
     }
 }
 
@@ -158,11 +213,19 @@ pub(crate) fn details_for_descriptor(
 
 pub(crate) fn capabilities_for_details(
     details: &InterfaceDetails,
-    virtual_interface: bool,
+    nonvirtual_sysfs_evidence: bool,
 ) -> (bool, bool) {
-    let fd = details.mtu == Some(Mtu::Fd);
-    let configure = !virtual_interface;
+    let fd = is_fd_active(details) || details.can.data_bit_timing_const.is_some();
+    let configure = nonvirtual_sysfs_evidence && details.can.bit_timing_const.is_some();
     (fd, configure)
+}
+
+pub(crate) fn is_fd_active(details: &InterfaceDetails) -> bool {
+    details.mtu == Some(Mtu::Fd)
+        && details
+            .can
+            .ctrl_mode
+            .is_some_and(|modes| modes.has_mode(CanCtrlMode::Fd))
 }
 
 fn configure_link(
@@ -209,70 +272,184 @@ fn configure_link(
 fn restore_snapshot(
     interface: &CanInterface,
     details: &InterfaceDetails,
+    descriptor: &ResourceDescriptor,
 ) -> HalResult<()> {
-    if details.is_up {
-        interface
-            .bring_down()
-            .map_err(|error| generic_link_error("can.close", error))?;
-    }
+    interface
+        .bring_down()
+        .map_err(|error| map_nl_error("can.close", error, descriptor))?;
     if let Some(mtu) = details.mtu {
         interface
             .set_mtu(mtu)
-            .map_err(|error| generic_link_error("can.close", error))?;
+            .map_err(|error| map_nl_error("can.close", error, descriptor))?;
     }
+
+    let ctrl_mode = details.can.ctrl_mode.map(|snapshot_modes| {
+        let mut modes = CanCtrlModes::default();
+        for mode in control_modes() {
+            modes.add(mode, snapshot_modes.has_mode(mode));
+        }
+        modes
+    });
+    let params = InterfaceCanParams {
+        bit_timing: details.can.bit_timing,
+        data_bit_timing: details.can.data_bit_timing,
+        ctrl_mode,
+        restart_ms: details.can.restart_ms,
+        termination: details.can.termination,
+        ..InterfaceCanParams::default()
+    };
     if details.can.bit_timing.is_some()
         || details.can.data_bit_timing.is_some()
         || details.can.ctrl_mode.is_some()
         || details.can.restart_ms.is_some()
+        || details.can.termination.is_some()
     {
         interface
-            .set_can_params(&details.can)
-            .map_err(|error| generic_link_error("can.close", error))?;
+            .set_can_params(&params)
+            .map_err(|error| map_nl_error("can.close", error, descriptor))?;
     }
     if details.is_up {
         interface
             .bring_up()
-            .map_err(|error| generic_link_error("can.close", error))?;
+            .map_err(|error| map_nl_error("can.close", error, descriptor))?;
     }
     Ok(())
 }
 
-fn active_config(details: &InterfaceDetails, descriptor: &ResourceDescriptor) -> HalResult<CanActiveConfig> {
-    let mode = if details.mtu == Some(Mtu::Fd) {
-        CanMode::Fd
-    } else {
-        CanMode::Classic
-    };
-    let nominal = details
-        .can
-        .bit_timing
-        .map(from_socketcan_timing)
-        .transpose()?
-        .unwrap_or(CanBitTiming::new(DEFAULT_BITRATE, None, None)?);
-    let data = if mode == CanMode::Fd {
-        Some(
-            details
-                .can
-                .data_bit_timing
-                .map(from_socketcan_timing)
-                .transpose()?
-                .unwrap_or(nominal),
-        )
-    } else {
-        None
-    };
-    let (listen_only, loopback) = details
-        .can
-        .ctrl_mode
-        .map(|modes| {
-            (
-                modes.has_mode(CanCtrlMode::ListenOnly),
-                modes.has_mode(CanCtrlMode::Loopback),
+fn restore_and_verify(
+    interface: &CanInterface,
+    snapshot: &InterfaceDetails,
+    descriptor: &ResourceDescriptor,
+) -> HalResult<()> {
+    restore_snapshot(interface, snapshot, descriptor)?;
+    let restored = interface
+        .details()
+        .map_err(|error| map_nl_error("can.close", error, descriptor))?;
+    if fingerprint(&restored) != fingerprint(snapshot) {
+        return Err(HalError::new(
+            "can.configuration.rollback_failed",
+            ErrorCategory::Internal,
+            "can.close",
+            true,
+            "SocketCAN link did not match its snapshot after restore",
+        )?
+        .with_resource_id(descriptor.id().clone()));
+    }
+    Ok(())
+}
+
+fn rollback_after_failure(
+    interface: &CanInterface,
+    snapshot: &InterfaceDetails,
+    descriptor: &ResourceDescriptor,
+    primary: HalError,
+) -> HalError {
+    match restore_and_verify(interface, snapshot, descriptor) {
+        Ok(()) => primary,
+        Err(rollback) => rollback_failure(primary, rollback, descriptor),
+    }
+}
+
+fn rollback_failure(
+    primary: HalError,
+    rollback: HalError,
+    descriptor: &ResourceDescriptor,
+) -> HalError {
+    let context = ErrorContext::new([
+        ("primary_error", primary.name().as_str().to_owned()),
+        ("rollback_error", rollback.name().as_str().to_owned()),
+    ])
+    .expect("static rollback context keys are valid");
+    HalError::new(
+        "can.configuration.rollback_failed",
+        ErrorCategory::Internal,
+        primary.operation().as_str(),
+        true,
+        format!(
+            "SocketCAN rollback failed after {}: {}",
+            primary.name().as_str(),
+            rollback.name().as_str()
+        ),
+    )
+    .expect("static rollback error metadata is valid")
+    .with_context(context)
+    .with_resource_id(descriptor.id().clone())
+}
+
+fn active_config(
+    details: &InterfaceDetails,
+    descriptor: &ResourceDescriptor,
+    operation: &'static str,
+) -> HalResult<CanActiveConfig> {
+    let result = (|| {
+        let fd_mtu = details.mtu == Some(Mtu::Fd);
+        let fd_control_mode = details
+            .can
+            .ctrl_mode
+            .is_some_and(|modes| modes.has_mode(CanCtrlMode::Fd));
+        let mode = match (fd_mtu, fd_control_mode) {
+            (true, true) => CanMode::Fd,
+            (false, false) => CanMode::Classic,
+            _ => {
+                return Err(HalError::new(
+                    "runtime.transport.unavailable",
+                    ErrorCategory::Unavailable,
+                    operation,
+                    true,
+                    "SocketCAN MTU and FD control mode disagree",
+                )
+                .expect("static SocketCAN error metadata is valid"));
+            }
+        };
+        let nominal = details
+            .can
+            .bit_timing
+            .map(|timing| from_socketcan_timing(timing, operation, "nominal"))
+            .transpose()?
+            .ok_or_else(|| {
+                HalError::new(
+                    "runtime.transport.unsupported_configuration",
+                    ErrorCategory::InvalidArgument,
+                    operation,
+                    false,
+                    "SocketCAN did not report nominal bit timing; no active timing is fabricated",
+                )
+                .expect("static timing error metadata is valid")
+            })?;
+        let data = if mode == CanMode::Fd {
+            Some(
+                details
+                    .can
+                    .data_bit_timing
+                    .map(|timing| from_socketcan_timing(timing, operation, "data"))
+                    .transpose()?
+                    .ok_or_else(|| {
+                        HalError::new(
+                            "runtime.transport.unsupported_configuration",
+                            ErrorCategory::InvalidArgument,
+                            operation,
+                            false,
+                            "SocketCAN FD link did not report data bit timing",
+                        )
+                        .expect("static timing error metadata is valid")
+                    })?,
             )
-        })
-        .unwrap_or((false, false));
-    CanActiveConfig::new(mode, nominal, data, listen_only, loopback, CLOCK_DOMAIN)
-        .map_err(|error| error.with_resource_id(descriptor.id().clone()))
+        } else {
+            None
+        };
+        let (listen_only, loopback) = details
+            .can
+            .ctrl_mode
+            .map(|modes| {
+                (
+                    modes.has_mode(CanCtrlMode::ListenOnly),
+                    modes.has_mode(CanCtrlMode::Loopback),
+                )
+            })
+            .unwrap_or((false, false));
+        CanActiveConfig::new(mode, nominal, data, listen_only, loopback, CLOCK_DOMAIN)
+    })();
+    result.map_err(|error| error.with_resource_id(descriptor.id().clone()))
 }
 
 fn verify_expectation(
@@ -308,17 +485,11 @@ fn verify_expectation(
 
 fn verify_config(
     request: &CanConfigureConfig,
+    details: &InterfaceDetails,
     active: &CanActiveConfig,
     descriptor: &ResourceDescriptor,
 ) -> HalResult<()> {
-    let mismatch = request.mode() != active.mode()
-        || request.nominal().bitrate() != active.nominal().bitrate()
-        || request
-            .data()
-            .is_some_and(|timing| active.data().is_none_or(|actual| timing.bitrate() != actual.bitrate()))
-        || request.listen_only() != active.listen_only()
-        || request.loopback() != active.loopback();
-    if mismatch {
+    if !config_matches(request, details, active) {
         return Err(HalError::new(
             "can.configuration.mismatch",
             ErrorCategory::Conflict,
@@ -331,17 +502,190 @@ fn verify_config(
     Ok(())
 }
 
-fn fingerprint(details: &InterfaceDetails, active: &CanActiveConfig) -> LinkFingerprint {
+fn config_matches(
+    request: &CanConfigureConfig,
+    details: &InterfaceDetails,
+    active: &CanActiveConfig,
+) -> bool {
+    let nominal = details.can.bit_timing;
+    let data = details.can.data_bit_timing;
+    let data_mismatch = match request.data() {
+        Some(expected) => !data.is_some_and(|actual| timing_matches(expected, actual)),
+        None => data.is_some(),
+    };
+    request.mode() == active.mode()
+        && nominal.is_some_and(|actual| timing_matches(request.nominal(), actual))
+        && !data_mismatch
+        && details
+            .can
+            .ctrl_mode
+            .is_some_and(|modes| modes.has_mode(CanCtrlMode::Fd))
+            == (request.mode() == CanMode::Fd)
+        && request.listen_only() == active.listen_only()
+        && request.loopback() == active.loopback()
+        && details.can.restart_ms == Some(request.restart_ms().unwrap_or(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request() -> CanConfigureConfig {
+        CanConfigureConfig::new_with_restart(
+            CanMode::Classic,
+            CanBitTiming::new(500_000, Some(875), Some(2)).expect("valid timing"),
+            None,
+            false,
+            false,
+            Some(100),
+        )
+        .expect("valid Classical CAN configuration")
+    }
+
+    fn configured_details(request: &CanConfigureConfig) -> InterfaceDetails {
+        InterfaceDetails {
+            is_up: true,
+            mtu: Some(Mtu::Standard),
+            can: InterfaceCanParams {
+                bit_timing: Some(to_socketcan_timing(request.nominal())),
+                ctrl_mode: Some(CanCtrlModes::default()),
+                restart_ms: Some(request.restart_ms().unwrap_or(0)),
+                ..InterfaceCanParams::default()
+            },
+            ..InterfaceDetails::default()
+        }
+    }
+
+    fn active(request: &CanConfigureConfig) -> CanActiveConfig {
+        CanActiveConfig::new(
+            request.mode(),
+            *request.nominal(),
+            request.data().copied(),
+            request.listen_only(),
+            request.loopback(),
+            CLOCK_DOMAIN,
+        )
+        .expect("valid active configuration")
+    }
+
+    #[test]
+    fn classic_verification_accepts_absent_data_timing() {
+        let request = request();
+        let details = configured_details(&request);
+        assert!(config_matches(
+            &request,
+            &details,
+            &active(&request)
+        ));
+
+        let mut unexpected_data = details;
+        unexpected_data.can.data_bit_timing = Some(to_socketcan_timing(request.nominal()));
+        assert!(!config_matches(
+            &request,
+            &unexpected_data,
+            &active(&request)
+        ));
+    }
+
+    #[test]
+    fn verification_checks_sample_point_sjw_and_restart_delay() {
+        let request = request();
+        let active = active(&request);
+
+        let mut wrong_sample_point = configured_details(&request);
+        wrong_sample_point
+            .can
+            .bit_timing
+            .as_mut()
+            .expect("nominal timing")
+            .sample_point = 874;
+        assert!(!config_matches(&request, &wrong_sample_point, &active));
+
+        let mut wrong_sjw = configured_details(&request);
+        wrong_sjw
+            .can
+            .bit_timing
+            .as_mut()
+            .expect("nominal timing")
+            .sjw = 1;
+        assert!(!config_matches(&request, &wrong_sjw, &active));
+
+        let mut wrong_restart = configured_details(&request);
+        wrong_restart.can.restart_ms = Some(99);
+        assert!(!config_matches(&request, &wrong_restart, &active));
+    }
+
+    #[test]
+    fn fingerprint_tracks_every_control_mode_and_termination() {
+        let details = InterfaceDetails::default();
+        let baseline = fingerprint(&details);
+
+        for mode in control_modes() {
+            let mut changed = details.clone();
+            let mut modes = CanCtrlModes::default();
+            modes.add(mode, true);
+            changed.can.ctrl_mode = Some(modes);
+            assert_ne!(fingerprint(&changed), baseline);
+        }
+
+        let mut changed = details;
+        changed.can.termination = Some(120);
+        assert_ne!(fingerprint(&changed), baseline);
+    }
+
+    #[test]
+    fn capabilities_require_kernel_and_nonvirtual_sysfs_evidence() {
+        let mut details = InterfaceDetails::default();
+        assert_eq!(capabilities_for_details(&details, false), (false, false));
+
+        details.can.bit_timing_const = Some(Default::default());
+        assert_eq!(capabilities_for_details(&details, false), (false, false));
+        assert_eq!(capabilities_for_details(&details, true), (false, true));
+
+        details.can.data_bit_timing_const = Some(Default::default());
+        assert_eq!(capabilities_for_details(&details, true), (true, true));
+    }
+}
+
+fn fingerprint(details: &InterfaceDetails) -> LinkFingerprint {
     LinkFingerprint {
         is_up: details.is_up,
         mtu: details.mtu,
         nominal: details.can.bit_timing.map(timing_fingerprint),
         data: details.can.data_bit_timing.map(timing_fingerprint),
         restart_ms: details.can.restart_ms,
-        mode: active.mode(),
-        listen_only: active.listen_only(),
-        loopback: active.loopback(),
+        control_modes: control_fingerprint(details.can.ctrl_mode),
+        termination: details.can.termination,
     }
+}
+
+fn timing_matches(expected: &CanBitTiming, actual: socketcan::nl::CanBitTiming) -> bool {
+    actual.bitrate == expected.bitrate()
+        && expected
+            .sample_point_permill()
+            .is_none_or(|sample_point| actual.sample_point == u32::from(sample_point))
+        && expected
+            .sjw()
+            .is_none_or(|sjw| actual.sjw == u32::from(sjw))
+}
+
+fn control_fingerprint(modes: Option<CanCtrlModes>) -> [bool; 9] {
+    let modes = modes.unwrap_or_default();
+    control_modes().map(|mode| modes.has_mode(mode))
+}
+
+fn control_modes() -> [CanCtrlMode; 9] {
+    [
+        CanCtrlMode::Loopback,
+        CanCtrlMode::ListenOnly,
+        CanCtrlMode::TripleSampling,
+        CanCtrlMode::OneShot,
+        CanCtrlMode::BerrReporting,
+        CanCtrlMode::Fd,
+        CanCtrlMode::PresumeAck,
+        CanCtrlMode::NonIso,
+        CanCtrlMode::CcLen8Dlc,
+    ]
 }
 
 fn timing_fingerprint(timing: socketcan::nl::CanBitTiming) -> TimingFingerprint {
@@ -361,14 +705,40 @@ fn to_socketcan_timing(timing: &CanBitTiming) -> socketcan::nl::CanBitTiming {
     }
 }
 
-fn from_socketcan_timing(timing: socketcan::nl::CanBitTiming) -> HalResult<CanBitTiming> {
-    let sample_point = u16::try_from(timing.sample_point).ok().filter(|value| *value != 0);
-    let sjw = u16::try_from(timing.sjw).ok().filter(|value| *value != 0);
-    CanBitTiming::new(
-        timing.bitrate,
-        sample_point,
-        sjw,
+fn from_socketcan_timing(
+    timing: socketcan::nl::CanBitTiming,
+    operation: &'static str,
+    timing_kind: &'static str,
+) -> HalResult<CanBitTiming> {
+    let sample_point = nonzero_u16(timing.sample_point).ok_or_else(|| {
+        invalid_kernel_timing(operation, timing_kind, "sample point exceeds u16")
+    })?;
+    let sjw = nonzero_u16(timing.sjw)
+        .ok_or_else(|| invalid_kernel_timing(operation, timing_kind, "SJW exceeds u16"))?;
+    CanBitTiming::new(timing.bitrate, sample_point, sjw).map_err(|error| {
+        invalid_kernel_timing(operation, timing_kind, error.debug_message())
+    })
+}
+
+fn nonzero_u16(value: u32) -> Option<Option<u16>> {
+    u16::try_from(value)
+        .ok()
+        .map(|value| (value != 0).then_some(value))
+}
+
+fn invalid_kernel_timing(
+    operation: &'static str,
+    timing_kind: &'static str,
+    reason: impl std::fmt::Display,
+) -> HalError {
+    HalError::new(
+        "runtime.transport.unavailable",
+        ErrorCategory::Unavailable,
+        operation,
+        true,
+        format!("SocketCAN reported invalid {timing_kind} timing: {reason}"),
     )
+    .expect("static SocketCAN error metadata is valid")
 }
 
 fn map_bus_state(state: CanState) -> CanBusState {
@@ -381,12 +751,18 @@ fn map_bus_state(state: CanState) -> CanBusState {
     }
 }
 
-fn map_link_error(
+fn map_link_io_error(
     operation: &'static str,
-    error: impl std::error::Error,
+    error: std::io::Error,
     descriptor: &ResourceDescriptor,
 ) -> HalError {
-    generic_link_error(operation, error).with_resource_id(descriptor.id().clone())
+    match error.raw_os_error() {
+        Some(raw_code) => {
+            os_link_error(operation, raw_code, error.to_string())
+                .with_resource_id(descriptor.id().clone())
+        }
+        None => generic_link_error(operation, error).with_resource_id(descriptor.id().clone()),
+    }
 }
 
 fn map_nl_error<T: std::fmt::Debug, P: std::fmt::Debug>(
@@ -394,11 +770,17 @@ fn map_nl_error<T: std::fmt::Debug, P: std::fmt::Debug>(
     error: neli::err::NlError<T, P>,
     descriptor: &ResourceDescriptor,
 ) -> HalError {
+    map_nl_error_unscoped(operation, error).with_resource_id(descriptor.id().clone())
+}
+
+fn map_nl_error_unscoped<T: std::fmt::Debug, P: std::fmt::Debug>(
+    operation: &'static str,
+    error: neli::err::NlError<T, P>,
+) -> HalError {
     match error {
         neli::err::NlError::Nlmsgerr(message) => {
             let raw_code = message.error.saturating_neg();
             os_link_error(operation, raw_code, message.to_string())
-                .with_resource_id(descriptor.id().clone())
         }
         neli::err::NlError::Wrapped(neli::err::WrappedError::IOError(error)) => {
             let raw_code = error.raw_os_error();
@@ -406,9 +788,9 @@ fn map_nl_error<T: std::fmt::Debug, P: std::fmt::Debug>(
                 || generic_link_error(operation, error),
                 |raw_code| os_link_error(operation, raw_code, error.to_string()),
             );
-            mapped.with_resource_id(descriptor.id().clone())
+            mapped
         }
-        error => generic_link_error(operation, error).with_resource_id(descriptor.id().clone()),
+        error => generic_link_error(operation, error),
     }
 }
 
