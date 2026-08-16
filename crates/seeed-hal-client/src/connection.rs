@@ -1757,7 +1757,10 @@ mod tests {
                         })
                     }
                     envelope::Payload::OpenSerialRequest(_) => {
-                        assert!(!open, "resource cannot reopen until close reaches the broker");
+                        assert!(
+                            !open,
+                            "resource cannot reopen until close reaches the broker"
+                        );
                         open = true;
                         generation += 1;
                         envelope::Payload::OpenSerialResponse(v1::OpenSerialResponse {
@@ -1790,7 +1793,10 @@ mod tests {
                     break;
                 }
             }
-            assert!(!open, "test must close the reopened resource before disconnect");
+            assert!(
+                !open,
+                "test must close the reopened resource before disconnect"
+            );
         });
         let client = HalClient::from_io(
             client_io,
