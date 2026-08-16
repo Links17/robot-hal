@@ -43,3 +43,9 @@ Per the deferred-verification requirement, no tests, builds/checks, Clippy, rust
 ## Concerns
 
 - Verification is intentionally deferred; compile and test issues, if any, must be found by the owning integration task.
+
+## Fix round 1
+
+- Expanded the mode permission lattice: Maintenance authorizes Observe, Control, and Maintenance operations; Control authorizes Observe and Control; Observe authorizes Observe only.
+- Added active Maintenance blocking/restoration coverage, pending and duplicate Control conflicts, stale fencing after release and newer exposure, failed reopen cancellation rollback, full-token mismatch, canonical structured conflict attribution across two owners, and explicit receive/send/status/configure mode checks.
+- Tests were written but intentionally not executed. No tests, builds/checks, Clippy, rustfmt, or protocol verification commands were run; only static inspection and `git diff --check` are permitted.

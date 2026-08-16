@@ -170,7 +170,14 @@ impl CanLeaseTable {
     pub(crate) fn pending_count(&self) -> usize { self.resources.values().map(|l| l.pending.len()).sum() }
 }
 
-fn mode_allows(actual: LeaseMode, required: LeaseMode) -> bool { actual == required || (required == LeaseMode::Observe && actual == LeaseMode::Control) }
+fn mode_allows(actual: LeaseMode, required: LeaseMode) -> bool {
+    matches!(
+        (actual, required),
+        (LeaseMode::Observe, LeaseMode::Observe)
+            | (LeaseMode::Control, LeaseMode::Observe | LeaseMode::Control)
+            | (LeaseMode::Maintenance, LeaseMode::Observe | LeaseMode::Control | LeaseMode::Maintenance)
+    )
+}
 
 fn conflict(resource_id: ResourceId, message: &'static str) -> seeed_hal_core::HalError {
     HalError::new("runtime.lease.conflict", ErrorCategory::Conflict, "can.open", false, message).expect("static CAN lease error metadata is valid").with_resource_id(resource_id)

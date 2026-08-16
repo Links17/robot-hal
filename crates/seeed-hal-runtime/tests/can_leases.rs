@@ -2,7 +2,7 @@
 mod can_lease_table;
 
 use can_lease_table::CanLeaseTable;
-use seeed_hal_core::{LeaseMode, OwnerId, ResourceId, SessionId};
+use seeed_hal_core::{ErrorCategory, LeaseId, LeaseMode, LeaseToken, OwnerId, ResourceId, SessionId};
 
 fn ids() -> (ResourceId, SessionId, OwnerId) {
     (
@@ -44,6 +44,30 @@ fn compatibility_matrix_includes_provisional_leases() {
 }
 
 #[test]
+fn active_maintenance_blocks_every_other_open_and_restores_after_release() {
+    let (resource, session_id, owner_id) = ids();
+    let mut table = CanLeaseTable::default();
+    let maintenance = table.commit(table.reserve(resource.clone(), session_id.clone(), owner_id.clone(), LeaseMode::Maintenance).unwrap()).unwrap();
+    for mode in [LeaseMode::Observe, LeaseMode::Control, LeaseMode::Maintenance] {
+        assert!(table.reserve(resource.clone(), session("blocked"), owner("other"), mode).is_err());
+    }
+    assert!(table.release(&resource, &session_id, &maintenance));
+    let reopened = table.commit(table.reserve(resource.clone(), session("other"), owner("other"), LeaseMode::Observe).unwrap()).unwrap();
+    assert_eq!(reopened.generation(), 2);
+}
+
+#[test]
+fn pending_control_rejects_duplicate_control_but_allows_observe() {
+    let (resource, session_id, owner_id) = ids();
+    let mut table = CanLeaseTable::default();
+    let pending_control = table.reserve(resource.clone(), session_id, owner_id, LeaseMode::Control).unwrap();
+    assert!(table.reserve(resource.clone(), session("control-2"), owner("owner-2"), LeaseMode::Control).is_err());
+    let observer = table.reserve(resource.clone(), session("observer"), owner("observer"), LeaseMode::Observe).unwrap();
+    assert!(table.cancel(&observer));
+    assert!(table.cancel(&pending_control));
+}
+
+#[test]
 fn generations_are_monotonic_and_cancel_does_not_advance() {
     let (resource, session_id, owner_id) = ids();
     let mut table = CanLeaseTable::default();
@@ -73,7 +97,62 @@ fn validation_checks_owner_token_and_operation_mode() {
     let token = table.commit(table.reserve(resource.clone(), session_id.clone(), owner_id.clone(), LeaseMode::Observe).unwrap()).unwrap();
     assert!(table.validate(&resource, &session_id, &owner("wrong"), &token, LeaseMode::Observe, "can.receive").is_err());
     assert!(table.validate(&resource, &session_id, &owner_id, &token, LeaseMode::Control, "can.send").is_err());
+    let forged = LeaseToken::new(LeaseId::new(), token.generation(), LeaseMode::Observe);
+    let token_error = table.validate(&resource, &session_id, &owner_id, &forged, LeaseMode::Observe, "can.receive").unwrap_err();
+    assert_eq!(token_error.name().as_str(), "runtime.lease.invalid_token");
+    assert_eq!(token_error.resource_id(), Some(&resource));
     assert!(table.validate(&resource, &session_id, &owner_id, &token, LeaseMode::Observe, "can.receive").is_ok());
+}
+
+#[test]
+fn maintenance_authorizes_receive_send_status_and_configure_modes() {
+    let (resource, session_id, owner_id) = ids();
+    let mut table = CanLeaseTable::default();
+    let token = table.commit(table.reserve(resource.clone(), session_id.clone(), owner_id.clone(), LeaseMode::Maintenance).unwrap()).unwrap();
+    for (required, operation) in [
+        (LeaseMode::Observe, "can.receive"),
+        (LeaseMode::Control, "can.send"),
+        (LeaseMode::Maintenance, "can.configure"),
+    ] {
+        assert!(table.validate(&resource, &session_id, &owner_id, &token, required, operation).is_ok());
+    }
+}
+
+#[test]
+fn stale_generation_after_release_and_newer_open_is_fenced() {
+    let (resource, session_id, owner_id) = ids();
+    let mut table = CanLeaseTable::default();
+    let old = table.commit(table.reserve(resource.clone(), session_id.clone(), owner_id.clone(), LeaseMode::Observe).unwrap()).unwrap();
+    assert!(table.release(&resource, &session_id, &old));
+    let newer = table.commit(table.reserve(resource.clone(), session("new"), owner("new"), LeaseMode::Observe).unwrap()).unwrap();
+    assert_eq!(newer.generation(), old.generation() + 1);
+    let stale = table.validate(&resource, &session_id, &owner_id, &old, LeaseMode::Observe, "can.receive").unwrap_err();
+    assert_eq!(stale.name().as_str(), "runtime.lease.stale_generation");
+    assert_eq!(stale.category(), ErrorCategory::Conflict);
+    assert_eq!(stale.resource_id(), Some(&resource));
+}
+
+#[test]
+fn failed_reopen_cancellation_does_not_consume_generation() {
+    let (resource, session_id, owner_id) = ids();
+    let mut table = CanLeaseTable::default();
+    let first = table.commit(table.reserve(resource.clone(), session_id.clone(), owner_id.clone(), LeaseMode::Control).unwrap()).unwrap();
+    assert!(table.release(&resource, &session_id, &first));
+    let failed_reopen = table.reserve(resource.clone(), session_id.clone(), owner_id.clone(), LeaseMode::Control).unwrap();
+    assert!(table.cancel(&failed_reopen));
+    let reopened = table.commit(table.reserve(resource, session_id, owner_id, LeaseMode::Control).unwrap()).unwrap();
+    assert_eq!(reopened.generation(), 2);
+}
+
+#[test]
+fn conflicts_include_canonical_resource_and_distinguish_two_owners() {
+    let (resource, session_id, owner_id) = ids();
+    let mut table = CanLeaseTable::default();
+    let _active = table.commit(table.reserve(resource.clone(), session_id, owner_id, LeaseMode::Control).unwrap()).unwrap();
+    let error = table.reserve(resource.clone(), session("other-session"), owner("other-owner"), LeaseMode::Control).unwrap_err();
+    assert_eq!(error.name().as_str(), "runtime.lease.conflict");
+    assert_eq!(error.category(), ErrorCategory::Conflict);
+    assert_eq!(error.resource_id(), Some(&resource));
 }
 
 #[test]
