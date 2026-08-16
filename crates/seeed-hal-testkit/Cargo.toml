@@ -9,5 +9,6 @@ license.workspace = true
 async-trait = { workspace = true }
 bytes = { workspace = true }
 seeed-hal-core = { path = "../seeed-hal-core" }
+seeed-hal-can = { path = "../seeed-hal-can" }
 seeed-hal-serial = { path = "../seeed-hal-serial" }
 tokio = { workspace = true }
