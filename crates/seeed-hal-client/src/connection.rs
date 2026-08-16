@@ -5,11 +5,19 @@ use std::sync::{Arc, Mutex};
 use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
-use seeed_hal_core::{ErrorCategory, HalError, HalResult, ResourceDescriptor, ResourceSelector};
+use seeed_hal_can::{
+    CAN_CLASSIC_CAPABILITY, CAN_CONFIGURE_CAPABILITY, CAN_ERROR_FRAMES_CAPABILITY,
+    CAN_FD_CAPABILITY, CAN_RX_TIMESTAMP_CAPABILITY, CanFilterSet, CanMode, CanOpenConfig,
+};
+use seeed_hal_core::{
+    ErrorCategory, HalError, HalResult, LeaseMode, ResourceDescriptor, ResourceSelector,
+};
 use seeed_hal_protocol::v1::{self, envelope};
 use seeed_hal_protocol::{
     MAX_FRAME_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR, SERIAL_CAPABILITY,
-    enumerate_serial_response_from_proto, error_from_proto,
+    can_receive_response_from_proto, can_send_response_from_proto,
+    enumerate_can_response_from_proto, enumerate_serial_response_from_proto, error_from_proto,
+    get_can_bus_status_response_from_proto, open_can_response_from_proto,
 };
 use seeed_hal_protocol::{
     PROTOCOL_MINOR_MAXIMUM, PROTOCOL_MINOR_MINIMUM, handshake_response_minor_range,
@@ -21,7 +29,7 @@ use tokio::task::JoinHandle;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::RemoteSerialHandle;
+use crate::{RemoteCanHandle, RemoteSerialHandle};
 
 const DEFAULT_IO_CAPACITY: usize = 32;
 const DEFAULT_EVENT_CAPACITY: usize = 64;
@@ -187,6 +195,16 @@ pub(crate) enum ExpectedResponse {
     SerialFlush,
     SetControlLines,
     CloseSession,
+    EnumerateCan,
+    OpenCan { mode: LeaseMode },
+    CanSend { input_count: usize },
+    CanReceive {
+        max_frames: usize,
+        max_read_bytes: usize,
+        allow_timestamp: bool,
+    },
+    ReplaceCanFilters,
+    CanBusStatus,
 }
 
 struct PendingRequest {
@@ -231,6 +249,11 @@ struct Limits {
     frame: usize,
     read: usize,
     write: usize,
+    can_classic: bool,
+    can_fd: bool,
+    can_configure: bool,
+    can_error_frames: bool,
+    can_rx_timestamp: bool,
 }
 
 struct Shared {
@@ -358,6 +381,11 @@ impl HalClient {
             frame: options.max_frame_bytes,
             read: options.max_read_bytes,
             write: options.max_write_bytes,
+            can_classic: false,
+            can_fd: false,
+            can_configure: false,
+            can_error_frames: false,
+            can_rx_timestamp: false,
         };
         let mut framed = Framed::new(io, frame_codec(requested.frame));
         let negotiated = perform_handshake(&mut framed, &options, requested).await?;
@@ -453,6 +481,102 @@ impl HalClient {
         result
     }
 
+    pub async fn enumerate_can(&self) -> HalResult<Vec<ResourceDescriptor>> {
+        self.require_can_capability("can.enumerate", None, |limits| {
+            limits.can_classic || limits.can_fd
+        })?;
+        let payload = self
+            .request(
+                envelope::Payload::EnumerateCanRequest(v1::EnumerateCanRequest {}),
+                ExpectedResponse::EnumerateCan,
+            )
+            .await?;
+        let envelope::Payload::EnumerateCanResponse(response) = payload else {
+            unreachable!()
+        };
+        // The reader already validated this response before correlation. Keep
+        // conversion here as the single protobuf-to-public-type mapping.
+        let result = enumerate_can_response_from_proto(response);
+        if let Err(error) = &result {
+            self.fail(error.clone());
+        }
+        result
+    }
+
+    pub async fn open_can(
+        &self,
+        selector: ResourceSelector,
+        mode: LeaseMode,
+        config: CanOpenConfig,
+        filters: CanFilterSet,
+    ) -> HalResult<RemoteCanHandle> {
+        if selector.transport() != seeed_hal_core::TransportKind::Can {
+            return Err(client_error(
+                "runtime.argument.invalid",
+                ErrorCategory::InvalidArgument,
+                "can.open",
+                false,
+                "CAN resource selector transport must be Can",
+            )
+            .with_resource_id(selector.id().clone()));
+        }
+        self.require_can_capability("can.open", Some(selector.id()), |limits| {
+            let mode_supported = match &config {
+                CanOpenConfig::Attach(expectation) => match expectation.mode() {
+                    Some(CanMode::Classic) => limits.can_classic,
+                    Some(CanMode::Fd) => limits.can_fd,
+                    None => limits.can_classic || limits.can_fd,
+                },
+                CanOpenConfig::Configure(config) => {
+                    limits.can_configure
+                        && match config.mode() {
+                            CanMode::Classic => limits.can_classic,
+                            CanMode::Fd => limits.can_fd,
+                        }
+                }
+            };
+            let filters_supported = !filters
+                .as_slice()
+                .iter()
+                .any(|filter| filter.classes().error())
+                || limits.can_error_frames;
+            mode_supported && filters_supported
+        })?;
+
+        let request = v1::OpenCanRequest {
+            selector: Some((&selector).into()),
+            mode: lease_mode_to_proto(mode) as i32,
+            config: Some((&config).into()),
+            filters: Some((&filters).into()),
+        };
+        self.ensure_payload_fits(
+            &envelope::Payload::OpenCanRequest(request.clone()),
+            "can.open",
+            Some(selector.id()),
+        )?;
+        let payload = self
+            .request(
+                envelope::Payload::OpenCanRequest(request),
+                ExpectedResponse::OpenCan { mode },
+            )
+            .await
+            .map_err(|error| attach_resource(error, selector.id()))?;
+        let envelope::Payload::OpenCanResponse(response) = payload else {
+            unreachable!()
+        };
+        let result = RemoteCanHandle::from_response(
+            self.clone(),
+            selector.id().clone(),
+            mode,
+            &config,
+            response,
+        );
+        if let Err(error) = &result {
+            self.fail(error.clone());
+        }
+        result
+    }
+
     pub fn subscribe(&self) -> EventSubscription {
         EventSubscription {
             receiver: self.inner.shared.events.subscribe(),
@@ -485,6 +609,30 @@ impl HalClient {
         (limits.frame, limits.read, limits.write)
     }
 
+    pub(crate) fn can_capabilities(&self) -> (bool, bool, bool, bool) {
+        let limits = *self
+            .inner
+            .shared
+            .limits
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        (
+            limits.can_classic,
+            limits.can_fd,
+            limits.can_error_frames,
+            limits.can_rx_timestamp,
+        )
+    }
+
+    pub(crate) fn ensure_can_payload_fits(
+        &self,
+        payload: &envelope::Payload,
+        operation: &'static str,
+        resource_id: &seeed_hal_core::ResourceId,
+    ) -> HalResult<()> {
+        self.ensure_payload_fits(payload, operation, Some(resource_id))
+    }
+
     pub(crate) async fn send(
         &self,
         payload: envelope::Payload,
@@ -495,6 +643,55 @@ impl HalClient {
 
     pub(crate) fn fail(&self, error: HalError) {
         terminate(&self.inner.shared, error);
+    }
+
+    fn require_can_capability(
+        &self,
+        operation: &'static str,
+        resource_id: Option<&seeed_hal_core::ResourceId>,
+        supported: impl FnOnce(Limits) -> bool,
+    ) -> HalResult<()> {
+        let limits = *self
+            .inner
+            .shared
+            .limits
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if limits.protocol_minor >= 1 && supported(limits) {
+            return Ok(());
+        }
+        let error = client_error(
+            "runtime.protocol.capability_unsupported",
+            ErrorCategory::Conflict,
+            operation,
+            false,
+            "the negotiated broker protocol does not support this CAN operation",
+        );
+        Err(resource_id.map_or(error.clone(), |id| error.with_resource_id(id.clone())))
+    }
+
+    fn ensure_payload_fits(
+        &self,
+        payload: &envelope::Payload,
+        operation: &'static str,
+        resource_id: Option<&seeed_hal_core::ResourceId>,
+    ) -> HalResult<()> {
+        let frame_limit = self.limits().0;
+        let envelope = v1::Envelope {
+            request_id: u64::MAX,
+            payload: Some(payload.clone()),
+        };
+        if envelope.encoded_len() <= frame_limit && envelope.encoded_len() <= MAX_FRAME_BYTES {
+            return Ok(());
+        }
+        let error = client_error(
+            "runtime.protocol.frame_too_large",
+            ErrorCategory::InvalidArgument,
+            operation,
+            false,
+            "CAN request envelope exceeds the negotiated frame maximum",
+        );
+        Err(resource_id.map_or(error.clone(), |id| error.with_resource_id(id.clone())))
     }
 
     async fn request(
@@ -781,6 +978,26 @@ where
                 frame: response.max_frame_bytes as usize,
                 read: response.max_read_bytes as usize,
                 write: response.max_write_bytes as usize,
+                can_classic: response
+                    .capabilities
+                    .iter()
+                    .any(|value| value == CAN_CLASSIC_CAPABILITY),
+                can_fd: response
+                    .capabilities
+                    .iter()
+                    .any(|value| value == CAN_FD_CAPABILITY),
+                can_configure: response
+                    .capabilities
+                    .iter()
+                    .any(|value| value == CAN_CONFIGURE_CAPABILITY),
+                can_error_frames: response
+                    .capabilities
+                    .iter()
+                    .any(|value| value == CAN_ERROR_FRAMES_CAPABILITY),
+                can_rx_timestamp: response
+                    .capabilities
+                    .iter()
+                    .any(|value| value == CAN_RX_TIMESTAMP_CAPABILITY),
             })
         }
         Some(envelope::Payload::Error(error)) => Err(error_from_proto(error)?),
@@ -983,14 +1200,8 @@ where
         };
         let result = match envelope.payload {
             Some(envelope::Payload::Error(error)) => error_from_proto(error).and_then(Err),
-            Some(payload) if response_matches(pending.expected, &payload) => Ok(payload),
-            _ => Err(client_error(
-                "runtime.protocol.unexpected_response",
-                ErrorCategory::InvalidArgument,
-                "runtime.protocol.read",
-                false,
-                "response payload does not match its request",
-            )),
+            Some(payload) => validate_response(pending.expected, &payload).map(|()| payload),
+            None => Err(unexpected_response()),
         };
         let terminal = result
             .as_ref()
@@ -1033,7 +1244,7 @@ fn preflight_inbound(frame: &[u8], shared: &Shared) -> HalResult<()> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .read;
-    let requested_read = {
+    let expected = {
         let state = shared
             .requests
             .lock()
@@ -1043,11 +1254,11 @@ fn preflight_inbound(frame: &[u8], shared: &Shared) -> HalResult<()> {
             .get(&request_id)
             .map(|pending| pending.expected)
             .or_else(|| state.cancelled.get(&request_id).copied())
-            .and_then(|expected| match expected {
-                ExpectedResponse::SerialRead { max_bytes } => Some(max_bytes),
-                _ => None,
-            })
     };
+    let requested_read = expected.and_then(|expected| match expected {
+        ExpectedResponse::SerialRead { max_bytes } => Some(max_bytes),
+        _ => None,
+    });
     visit_fields(frame, |field, wire| {
         if let (25, WireValue::Bytes(read_response)) = (field, wire) {
             visit_fields(read_response, |field, wire| {
@@ -1062,6 +1273,64 @@ fn preflight_inbound(frame: &[u8], shared: &Shared) -> HalResult<()> {
                 }
                 Ok(())
             })?;
+        }
+        Ok(())
+    })?;
+
+    let requested_can = expected.and_then(|expected| match expected {
+        ExpectedResponse::CanReceive {
+            max_frames,
+            max_read_bytes,
+            allow_timestamp,
+        } => Some((max_frames, max_read_bytes, allow_timestamp)),
+        _ => None,
+    });
+    visit_fields(frame, |field, wire| {
+        if let (57, WireValue::Bytes(receive_response)) = (field, wire) {
+            let mut frame_count = 0_usize;
+            let mut payload_bytes = 0_usize;
+            let mut has_timestamp = false;
+            visit_fields(receive_response, |field, wire| {
+                if let (1, WireValue::Bytes(received)) = (field, wire) {
+                    frame_count = frame_count.checked_add(1).ok_or_else(|| {
+                        invalid_wire("CAN receive response frame count overflows usize")
+                    })?;
+                    visit_fields(received, |field, wire| {
+                        match (field, wire) {
+                            (1, WireValue::Bytes(can_frame)) => {
+                                visit_fields(can_frame, |field, wire| {
+                                    if let (3, WireValue::Bytes(data)) = (field, wire) {
+                                        payload_bytes = payload_bytes
+                                            .checked_add(data.len())
+                                            .ok_or_else(|| {
+                                                invalid_wire(
+                                                    "CAN receive response payload overflows usize",
+                                                )
+                                            })?;
+                                    }
+                                    Ok(())
+                                })?;
+                            }
+                            (2, WireValue::Bytes(_)) => has_timestamp = true,
+                            _ => {}
+                        }
+                        Ok(())
+                    })?;
+                }
+                Ok(())
+            })?;
+            if let Some((max_frames, max_read_bytes, allow_timestamp)) = requested_can {
+                if frame_count > max_frames || payload_bytes > max_read_bytes {
+                    return Err(invalid_wire(
+                        "CAN receive response exceeds the requested frame or byte bound",
+                    ));
+                }
+                if has_timestamp && !allow_timestamp {
+                    return Err(invalid_wire(
+                        "CAN receive response contains an unadvertised timestamp",
+                    ));
+                }
+            }
         }
         Ok(())
     })
@@ -1196,31 +1465,76 @@ fn invalid_wire(message: &'static str) -> HalError {
     )
 }
 
-fn response_matches(expected: ExpectedResponse, payload: &envelope::Payload) -> bool {
-    matches!(
-        (expected, payload),
-        (
-            ExpectedResponse::EnumerateSerial,
-            envelope::Payload::EnumerateSerialResponse(_)
-        ) | (
-            ExpectedResponse::OpenSerial,
-            envelope::Payload::OpenSerialResponse(_)
-        ) | (
-            ExpectedResponse::SerialRead { .. },
-            envelope::Payload::SerialReadResponse(_)
-        ) | (
-            ExpectedResponse::SerialWrite,
-            envelope::Payload::SerialWriteResponse(_)
-        ) | (
-            ExpectedResponse::SerialFlush,
-            envelope::Payload::SerialFlushResponse(_)
-        ) | (
+fn validate_response(expected: ExpectedResponse, payload: &envelope::Payload) -> HalResult<()> {
+    match (expected, payload) {
+        (ExpectedResponse::EnumerateSerial, envelope::Payload::EnumerateSerialResponse(_))
+        | (ExpectedResponse::OpenSerial, envelope::Payload::OpenSerialResponse(_))
+        | (ExpectedResponse::SerialRead { .. }, envelope::Payload::SerialReadResponse(_))
+        | (ExpectedResponse::SerialWrite, envelope::Payload::SerialWriteResponse(_))
+        | (ExpectedResponse::SerialFlush, envelope::Payload::SerialFlushResponse(_))
+        | (
             ExpectedResponse::SetControlLines,
-            envelope::Payload::SetSerialControlLinesResponse(_)
-        ) | (
-            ExpectedResponse::CloseSession,
-            envelope::Payload::CloseSessionResponse(_)
+            envelope::Payload::SetSerialControlLinesResponse(_),
         )
+        | (ExpectedResponse::CloseSession, envelope::Payload::CloseSessionResponse(_))
+        | (
+            ExpectedResponse::ReplaceCanFilters,
+            envelope::Payload::ReplaceCanFiltersResponse(_),
+        ) => Ok(()),
+        (ExpectedResponse::EnumerateCan, envelope::Payload::EnumerateCanResponse(response)) => {
+            enumerate_can_response_from_proto(response.clone()).map(|_| ())
+        }
+        (
+            ExpectedResponse::OpenCan { mode },
+            envelope::Payload::OpenCanResponse(response),
+        ) => open_can_response_from_proto(response.clone(), mode).map(|_| ()),
+        (
+            ExpectedResponse::CanSend { input_count },
+            envelope::Payload::CanSendResponse(response),
+        ) => can_send_response_from_proto(response.clone(), input_count).map(|_| ()),
+        (
+            ExpectedResponse::CanReceive {
+                max_frames,
+                max_read_bytes,
+                allow_timestamp,
+            },
+            envelope::Payload::CanReceiveResponse(response),
+        ) => {
+            let frames = can_receive_response_from_proto(response.clone(), max_frames)?;
+            let payload_bytes = frames.iter().try_fold(0_usize, |total, received| {
+                total.checked_add(received.frame().data().len()).ok_or_else(|| {
+                    seeed_hal_protocol::invalid_message(
+                        "CAN receive response payload byte count overflows usize",
+                    )
+                })
+            })?;
+            if payload_bytes > max_read_bytes {
+                return Err(seeed_hal_protocol::invalid_message(
+                    "CAN receive response exceeds the negotiated read maximum",
+                ));
+            }
+            if !allow_timestamp && frames.iter().any(|frame| frame.timestamp().is_some()) {
+                return Err(seeed_hal_protocol::invalid_message(
+                    "CAN receive response contains an unadvertised timestamp",
+                ));
+            }
+            Ok(())
+        }
+        (
+            ExpectedResponse::CanBusStatus,
+            envelope::Payload::GetCanBusStatusResponse(response),
+        ) => get_can_bus_status_response_from_proto(response.clone()).map(|_| ()),
+        _ => Err(unexpected_response()),
+    }
+}
+
+fn unexpected_response() -> HalError {
+    client_error(
+        "runtime.protocol.unexpected_response",
+        ErrorCategory::InvalidArgument,
+        "runtime.protocol.read",
+        false,
+        "response payload does not match its request",
     )
 }
 
@@ -1373,6 +1687,22 @@ fn client_error(
 ) -> HalError {
     HalError::new(name, category, operation, retryable, message)
         .expect("static client error metadata is valid")
+}
+
+fn lease_mode_to_proto(mode: LeaseMode) -> v1::LeaseMode {
+    match mode {
+        LeaseMode::Observe => v1::LeaseMode::Observe,
+        LeaseMode::Control => v1::LeaseMode::Control,
+        LeaseMode::Maintenance => v1::LeaseMode::Maintenance,
+    }
+}
+
+fn attach_resource(error: HalError, resource_id: &seeed_hal_core::ResourceId) -> HalError {
+    if error.resource_id().is_some() {
+        error
+    } else {
+        error.with_resource_id(resource_id.clone())
+    }
 }
 
 fn disconnected_error(operation: &'static str, message: impl Into<String>) -> HalError {
@@ -1932,6 +2262,11 @@ mod tests {
                     frame: 512,
                     read: 16,
                     write: 16,
+                    can_classic: true,
+                    can_fd: true,
+                    can_configure: true,
+                    can_error_frames: true,
+                    can_rx_timestamp: true,
                 }),
                 pending_capacity: 2,
                 tombstone_capacity: 1,

@@ -64,7 +64,7 @@ mod fake {
         };
         assert_eq!(handshake.startup_token, super::TOKEN);
         assert_eq!(handshake.protocol_minor_minimum, 0);
-        assert_eq!(handshake.protocol_minor_maximum, 0);
+        assert_eq!(handshake.protocol_minor_maximum, 1);
         send(
             &mut wire,
             v1::Envelope {
@@ -85,6 +85,101 @@ mod fake {
         )
         .await;
         wire
+    }
+
+    pub async fn accept_and_handshake_can(listener: UnixListener) -> Wire {
+        let (io, _) = super::test_deadline(listener.accept(), "fake broker must accept the client")
+            .await
+            .unwrap();
+        let mut wire = Framed::new(io, codec());
+        let request = recv(&mut wire).await;
+        let handshake = match request.payload.unwrap() {
+            envelope::Payload::HandshakeRequest(request) => request,
+            _ => panic!("expected handshake request"),
+        };
+        assert_eq!(handshake.startup_token, super::TOKEN);
+        assert_eq!(handshake.protocol_minor_minimum, 0);
+        assert_eq!(handshake.protocol_minor_maximum, 1);
+        send(
+            &mut wire,
+            v1::Envelope {
+                request_id: request.request_id,
+                payload: Some(envelope::Payload::HandshakeResponse(
+                    v1::HandshakeResponse {
+                        protocol_major: 1,
+                        protocol_minor: 1,
+                        capabilities: vec![
+                            "serial.bytes/v1".to_owned(),
+                            "can.classic/v1".to_owned(),
+                            "can.fd/v1".to_owned(),
+                            "can.configure/v1".to_owned(),
+                            "can.error-frames/v1".to_owned(),
+                            "can.rx-timestamp/v1".to_owned(),
+                        ],
+                        max_frame_bytes: handshake.max_frame_bytes,
+                        max_read_bytes: handshake.max_read_bytes,
+                        max_write_bytes: handshake.max_write_bytes,
+                        protocol_minor_minimum: 0,
+                        protocol_minor_maximum: 1,
+                    },
+                )),
+            },
+        )
+        .await;
+        wire
+    }
+
+    pub fn enumerate_can_response(request_id: u64, resource_id: &str) -> v1::Envelope {
+        v1::Envelope {
+            request_id,
+            payload: Some(envelope::Payload::EnumerateCanResponse(
+                v1::EnumerateCanResponse {
+                    resources: vec![v1::ResourceDescriptor {
+                        resource_id: resource_id.to_owned(),
+                        endpoint: format!("virtual://{resource_id}"),
+                        identity_quality: v1::IdentityQuality::Strong as i32,
+                        transport: v1::TransportKind::Can as i32,
+                        properties: Default::default(),
+                        capabilities: vec![
+                            "can.classic/v1".to_owned(),
+                            "can.fd/v1".to_owned(),
+                            "can.configure/v1".to_owned(),
+                            "can.error-frames/v1".to_owned(),
+                            "can.rx-timestamp/v1".to_owned(),
+                        ],
+                    }],
+                },
+            )),
+        }
+    }
+
+    pub async fn respond_can_enumerate_and_open(
+        wire: &mut Wire,
+        resource_id: &str,
+        mode: v1::LeaseMode,
+    ) {
+        let enumerate = recv(wire).await;
+        send(
+            wire,
+            enumerate_can_response(enumerate.request_id, resource_id),
+        )
+        .await;
+        let open = recv(wire).await;
+        send(
+            wire,
+            v1::Envelope {
+                request_id: open.request_id,
+                payload: Some(envelope::Payload::OpenCanResponse(v1::OpenCanResponse {
+                    session_id: format!("session-{resource_id}"),
+                    lease: Some(v1::LeaseToken {
+                        lease_id: format!("lease-{resource_id}"),
+                        generation: 1,
+                        mode: mode as i32,
+                    }),
+                })),
+            },
+        )
+        .await;
     }
 
     pub async fn recv(wire: &mut Wire) -> v1::Envelope {
@@ -185,7 +280,7 @@ async fn rust_client_round_trips_serial_through_broker() {
     let server = tokio::spawn(async move { broker.serve_one().await.unwrap() });
 
     let client = HalClient::connect(options).await.unwrap();
-    assert_eq!(client.protocol_minor(), 0);
+    assert_eq!(client.protocol_minor(), 1);
     let descriptor = client.enumerate_serial().await.unwrap().remove(0);
     let mut serial = client
         .open_serial(descriptor.selector(), SerialConfig::default())
@@ -1302,6 +1397,547 @@ async fn client_close_fans_out_to_multiple_pending_requests() {
     )
     .await;
     release_tx.send(()).unwrap();
+    server.await.unwrap();
+    std::fs::remove_file(endpoint).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rust_client_round_trips_can_through_virtual_broker_and_closes_locally() {
+    use seeed_hal_broker::{Broker, StartupToken, listener::UnixBroker};
+    use seeed_hal_can::{
+        CanFilterSet, CanFrame, CanId, CanLinkExpectation, CanMode, CanOpenConfig,
+    };
+    use seeed_hal_core::LeaseMode;
+    use seeed_hal_runtime::HalRuntime;
+    use seeed_hal_testkit::VirtualCanAdapter;
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::path::PathBuf::from(format!(
+        "/tmp/shc-can-{}-{nonce}",
+        std::process::id()
+    ));
+    let adapter = VirtualCanAdapter::loopback("can:virtual:client");
+    let runtime = HalRuntime::builder().can_adapter(adapter.clone()).build();
+    let broker = UnixBroker::bind(
+        Broker::with_startup_token(runtime, StartupToken::from_bytes(TOKEN)),
+        &directory,
+    )
+    .await
+    .unwrap();
+    let options = ConnectionOptions::new(broker.socket_path(), TOKEN);
+    let server = tokio::spawn(async move { broker.serve_one().await.unwrap() });
+    let client = HalClient::connect(options).await.unwrap();
+    assert_eq!(client.protocol_minor(), 1);
+
+    let descriptor = client.enumerate_can().await.unwrap().remove(0);
+    let attach = CanOpenConfig::Attach(
+        CanLinkExpectation::new(Some(CanMode::Classic), None, None, None, None).unwrap(),
+    );
+    let mut can = client
+        .open_can(
+            descriptor.selector(),
+            LeaseMode::Control,
+            attach,
+            CanFilterSet::new(Vec::new()).unwrap(),
+        )
+        .await
+        .unwrap();
+    let frame = CanFrame::classic_data(
+        CanId::standard(0x321).unwrap(),
+        Bytes::from_static(&[1, 2, 3]),
+    )
+    .unwrap();
+    can.send(frame.clone()).await.unwrap();
+    assert_eq!(
+        can.receive(1, std::time::Duration::from_millis(100))
+            .await
+            .unwrap()[0]
+            .frame(),
+        &frame
+    );
+    assert_eq!(adapter.transmitted_frames(), vec![frame]);
+    can.bus_status().await.unwrap();
+    can.replace_filters(CanFilterSet::new(Vec::new()).unwrap())
+        .await
+        .unwrap();
+    can.close().await.unwrap();
+
+    let closed = can.bus_status().await.unwrap_err();
+    assert_eq!(closed.name().as_str(), "runtime.session.closed");
+    assert_eq!(closed.resource_id(), Some(descriptor.id()));
+    let closed_send = can
+        .send(CanFrame::classic_data(CanId::standard(1).unwrap(), Bytes::new()).unwrap())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        closed_send.error().name().as_str(),
+        "runtime.session.closed"
+    );
+    assert_eq!(closed_send.committed(), 0);
+
+    client.close().await.unwrap();
+    assert!(server.await.unwrap().cleanup_error().is_none());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn legacy_minor_zero_rejects_can_before_writer_admission() {
+    use futures_util::StreamExt;
+
+    let endpoint = fake::endpoint("legacy-can");
+    let listener = fake::bind(&endpoint);
+    let server = tokio::spawn(async move {
+        let mut wire = fake::accept_and_handshake(listener).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), wire.next())
+                .await
+                .is_err(),
+            "a minor-zero CAN call must not reach the writer"
+        );
+    });
+    let client = HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN))
+        .await
+        .unwrap();
+    let error = client.enumerate_can().await.unwrap_err();
+    assert_eq!(
+        error.name().as_str(),
+        "runtime.protocol.capability_unsupported"
+    );
+    assert_eq!(error.operation().as_str(), "can.enumerate");
+    server.await.unwrap();
+    client.close().await.unwrap();
+    std::fs::remove_file(endpoint).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn real_broker_owner_disconnect_revokes_remote_can_session() {
+    use seeed_hal_broker::{Broker, StartupToken, listener::UnixBroker};
+    use seeed_hal_can::{CanFilterSet, CanLinkExpectation, CanMode, CanOpenConfig};
+    use seeed_hal_core::{LeaseMode, OwnerId};
+    use seeed_hal_runtime::HalRuntime;
+    use seeed_hal_testkit::VirtualCanAdapter;
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::path::PathBuf::from(format!(
+        "/tmp/shc-can-owner-{}-{nonce}",
+        std::process::id()
+    ));
+    let adapter = VirtualCanAdapter::loopback("can:virtual:owner-disconnect");
+    let runtime = HalRuntime::builder().can_adapter(adapter).build();
+    let broker = UnixBroker::bind(
+        Broker::with_startup_token(runtime.clone(), StartupToken::from_bytes(TOKEN)),
+        &directory,
+    )
+    .await
+    .unwrap();
+    let options = ConnectionOptions::new(broker.socket_path(), TOKEN);
+    let server = tokio::spawn(async move { broker.serve_one().await.unwrap() });
+    let client = HalClient::connect(options).await.unwrap();
+    let descriptor = client.enumerate_can().await.unwrap().remove(0);
+    let attach = || {
+        CanOpenConfig::Attach(
+            CanLinkExpectation::new(Some(CanMode::Classic), None, None, None, None).unwrap(),
+        )
+    };
+    let remote = client
+        .open_can(
+            descriptor.selector(),
+            LeaseMode::Control,
+            attach(),
+            CanFilterSet::new(Vec::new()).unwrap(),
+        )
+        .await
+        .unwrap();
+    client.close().await.unwrap();
+    assert!(server.await.unwrap().cleanup_error().is_none());
+    drop(remote);
+
+    let mut reopened = runtime
+        .open_can(
+            OwnerId::parse("owner-after-disconnect").unwrap(),
+            descriptor.selector(),
+            LeaseMode::Control,
+            attach(),
+            CanFilterSet::new(Vec::new()).unwrap(),
+        )
+        .await
+        .unwrap();
+    reopened.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn can_partial_send_preserves_nested_error_and_unsolicited_event() {
+    use seeed_hal_can::{
+        CanFilterSet, CanFrame, CanId, CanLinkExpectation, CanMode, CanOpenConfig,
+    };
+    use seeed_hal_core::LeaseMode;
+    use seeed_hal_protocol::v1::{self, envelope};
+
+    let endpoint = fake::endpoint("can-partial");
+    let listener = fake::bind(&endpoint);
+    let server = tokio::spawn(async move {
+        let mut wire = fake::accept_and_handshake_can(listener).await;
+        fake::respond_can_enumerate_and_open(
+            &mut wire,
+            "can:fake:partial",
+            v1::LeaseMode::Control,
+        )
+        .await;
+        let send = fake::recv(&mut wire).await;
+        let input_count = match send.payload.as_ref().unwrap() {
+            envelope::Payload::CanSendRequest(request) => request.frames.len(),
+            payload => panic!("expected CAN send request, got {payload:?}"),
+        };
+        assert_eq!(input_count, 3);
+        fake::send(
+            &mut wire,
+            v1::Envelope {
+                request_id: 0,
+                payload: Some(envelope::Payload::RuntimeEvent(v1::RuntimeEvent {
+                    sequence: 9,
+                    kind: v1::RuntimeEventKind::CanBusWarning as i32,
+                    name: "can.bus.warning".to_owned(),
+                    resource_id: "can:fake:partial".to_owned(),
+                    session_id: "session-can:fake:partial".to_owned(),
+                    owner_id: "owner-can-partial".to_owned(),
+                    lease_generation: 1,
+                })),
+            },
+        )
+        .await;
+        fake::send(
+            &mut wire,
+            v1::Envelope {
+                request_id: send.request_id,
+                payload: Some(envelope::Payload::CanSendResponse(v1::CanSendResponse {
+                    committed_count: 1,
+                    error: Some(v1::Error {
+                        name: "can.backend.partial".to_owned(),
+                        category: v1::ErrorCategory::Unavailable as i32,
+                        operation: "can.send_batch".to_owned(),
+                        retryable: true,
+                        debug_message: "backend accepted a strict prefix".to_owned(),
+                        resource_id: String::new(),
+                        platform_code: "EAGAIN".to_owned(),
+                        vendor_code: "VENDOR_BUSY".to_owned(),
+                        context: [("queue".to_owned(), "tx".to_owned())]
+                            .into_iter()
+                            .collect(),
+                    }),
+                })),
+            },
+        )
+        .await;
+        let close = fake::recv(&mut wire).await;
+        fake::send(
+            &mut wire,
+            v1::Envelope {
+                request_id: close.request_id,
+                payload: Some(envelope::Payload::CloseSessionResponse(v1::Empty {})),
+            },
+        )
+        .await;
+    });
+    let client = HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN))
+        .await
+        .unwrap();
+    let mut events = client.subscribe();
+    let descriptor = client.enumerate_can().await.unwrap().remove(0);
+    let mut can = client
+        .open_can(
+            descriptor.selector(),
+            LeaseMode::Control,
+            CanOpenConfig::Attach(
+                CanLinkExpectation::new(Some(CanMode::Classic), None, None, None, None).unwrap(),
+            ),
+            CanFilterSet::new(Vec::new()).unwrap(),
+        )
+        .await
+        .unwrap();
+    let frames = [1, 2, 3]
+        .map(|id| {
+            CanFrame::classic_data(
+                CanId::standard(id).unwrap(),
+                Bytes::from(vec![id as u8]),
+            )
+            .unwrap()
+        })
+        .to_vec();
+    let partial = can.send_batch(frames).await.unwrap_err();
+    assert_eq!(partial.committed(), 1);
+    assert_eq!(partial.error().name().as_str(), "can.backend.partial");
+    assert_eq!(partial.error().platform_code(), Some("EAGAIN"));
+    assert_eq!(partial.error().vendor_code(), Some("VENDOR_BUSY"));
+    assert_eq!(partial.error().resource_id(), Some(descriptor.id()));
+    assert_eq!(events.recv().await.unwrap().name(), "can.bus.warning");
+    can.close().await.unwrap();
+    client.close().await.unwrap();
+    server.await.unwrap();
+    std::fs::remove_file(endpoint).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn malformed_can_prefix_fails_closed_and_fans_out_other_can_requests() {
+    use seeed_hal_can::{
+        CanFilterSet, CanFrame, CanId, CanLinkExpectation, CanMode, CanOpenConfig,
+    };
+    use seeed_hal_core::LeaseMode;
+    use seeed_hal_protocol::v1::{self, envelope};
+    use std::sync::Arc;
+
+    let endpoint = fake::endpoint("can-malformed-prefix");
+    let listener = fake::bind(&endpoint);
+    let server = tokio::spawn(async move {
+        let mut wire = fake::accept_and_handshake_can(listener).await;
+        fake::respond_can_enumerate_and_open(
+            &mut wire,
+            "can:fake:malformed",
+            v1::LeaseMode::Control,
+        )
+        .await;
+        let first = fake::recv(&mut wire).await;
+        let second = fake::recv(&mut wire).await;
+        let send_id = [first, second]
+            .into_iter()
+            .find_map(|request| {
+                matches!(
+                    request.payload,
+                    Some(envelope::Payload::CanSendRequest(_))
+                )
+                .then_some(request.request_id)
+            })
+            .unwrap();
+        fake::send(
+            &mut wire,
+            v1::Envelope {
+                request_id: send_id,
+                payload: Some(envelope::Payload::CanSendResponse(v1::CanSendResponse {
+                    committed_count: 2,
+                    error: Some(v1::Error {
+                        name: "can.backend.invalid-prefix".to_owned(),
+                        category: v1::ErrorCategory::Unavailable as i32,
+                        operation: "can.send_batch".to_owned(),
+                        retryable: true,
+                        debug_message: "not a strict prefix".to_owned(),
+                        resource_id: String::new(),
+                        platform_code: String::new(),
+                        vendor_code: String::new(),
+                        context: Default::default(),
+                    }),
+                })),
+            },
+        )
+        .await;
+    });
+    let client = HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN))
+        .await
+        .unwrap();
+    let descriptor = client.enumerate_can().await.unwrap().remove(0);
+    let can = Arc::new(
+        client
+            .open_can(
+                descriptor.selector(),
+                LeaseMode::Control,
+                CanOpenConfig::Attach(
+                    CanLinkExpectation::new(Some(CanMode::Classic), None, None, None, None)
+                        .unwrap(),
+                ),
+                CanFilterSet::new(Vec::new()).unwrap(),
+            )
+            .await
+            .unwrap(),
+    );
+    let send_can = can.clone();
+    let send = tokio::spawn(async move {
+        send_can
+            .send_batch(vec![
+                CanFrame::classic_data(CanId::standard(1).unwrap(), Bytes::new()).unwrap(),
+                CanFrame::classic_data(CanId::standard(2).unwrap(), Bytes::new()).unwrap(),
+            ])
+            .await
+    });
+    let status_can = can.clone();
+    let status = tokio::spawn(async move { status_can.bus_status().await });
+    let send_error = send.await.unwrap().unwrap_err();
+    let status_error = status.await.unwrap().unwrap_err();
+    assert_eq!(
+        send_error.error().name().as_str(),
+        "runtime.protocol.invalid_message"
+    );
+    assert_eq!(
+        status_error.name().as_str(),
+        "runtime.protocol.invalid_message"
+    );
+    assert_eq!(send_error.error().resource_id(), Some(descriptor.id()));
+    assert_eq!(status_error.resource_id(), Some(descriptor.id()));
+    client.close().await.unwrap();
+    server.await.unwrap();
+    std::fs::remove_file(endpoint).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelled_can_receive_tombstone_discards_response_without_consuming_status() {
+    use seeed_hal_can::{
+        CanFilterSet, CanFrame, CanId, CanLinkExpectation, CanMode, CanOpenConfig,
+    };
+    use seeed_hal_core::LeaseMode;
+    use seeed_hal_protocol::v1::{self, envelope};
+    use std::sync::Arc;
+
+    let endpoint = fake::endpoint("can-cancel");
+    let listener = fake::bind(&endpoint);
+    let (admitted_tx, admitted_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut wire = fake::accept_and_handshake_can(listener).await;
+        fake::respond_can_enumerate_and_open(
+            &mut wire,
+            "can:fake:cancel",
+            v1::LeaseMode::Observe,
+        )
+        .await;
+        let receive = fake::recv(&mut wire).await;
+        admitted_tx.send(()).unwrap();
+        let status = fake::recv(&mut wire).await;
+        fake::send(
+            &mut wire,
+            v1::Envelope {
+                request_id: receive.request_id,
+                payload: Some(envelope::Payload::CanReceiveResponse(
+                    v1::CanReceiveResponse { frames: Vec::new() },
+                )),
+            },
+        )
+        .await;
+        fake::send(
+            &mut wire,
+            v1::Envelope {
+                request_id: status.request_id,
+                payload: Some(envelope::Payload::GetCanBusStatusResponse(
+                    v1::GetCanBusStatusResponse {
+                        status: Some(v1::CanBusStatus {
+                            state: v1::CanBusState::Active as i32,
+                            tx_error_counter: Some(0),
+                            rx_error_counter: Some(0),
+                        }),
+                    },
+                )),
+            },
+        )
+        .await;
+    });
+    let client = HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN))
+        .await
+        .unwrap();
+    let descriptor = client.enumerate_can().await.unwrap().remove(0);
+    let can = Arc::new(
+        client
+            .open_can(
+                descriptor.selector(),
+                LeaseMode::Observe,
+                CanOpenConfig::Attach(
+                    CanLinkExpectation::new(Some(CanMode::Classic), None, None, None, None)
+                        .unwrap(),
+                ),
+                CanFilterSet::new(Vec::new()).unwrap(),
+            )
+            .await
+            .unwrap(),
+    );
+    let cancelled_can = can.clone();
+    let cancelled = tokio::spawn(async move {
+        cancelled_can
+            .receive(1, std::time::Duration::from_secs(1))
+            .await
+    });
+    test_deadline(admitted_rx, "cancelled CAN receive must reach the writer")
+        .await
+        .unwrap();
+    cancelled.abort();
+    assert!(cancelled.await.unwrap_err().is_cancelled());
+    assert!(can.bus_status().await.is_ok());
+    client.close().await.unwrap();
+    server.await.unwrap();
+    std::fs::remove_file(endpoint).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn can_local_batch_and_frame_bounds_reject_before_writer_admission() {
+    use seeed_hal_can::{
+        CanFilterSet, CanFrame, CanId, CanLinkExpectation, CanMode, CanOpenConfig,
+    };
+    use seeed_hal_core::LeaseMode;
+    use seeed_hal_protocol::v1;
+
+    let endpoint = fake::endpoint("can-local-bounds");
+    let listener = fake::bind(&endpoint);
+    let server = tokio::spawn(async move {
+        let mut wire = fake::accept_and_handshake_can(listener).await;
+        fake::respond_can_enumerate_and_open(
+            &mut wire,
+            "can:fake:bounds",
+            v1::LeaseMode::Control,
+        )
+        .await;
+        let close = fake::recv(&mut wire).await;
+        assert!(matches!(
+            close.payload,
+            Some(v1::envelope::Payload::CloseSessionRequest(_))
+        ));
+        fake::send(
+            &mut wire,
+            v1::Envelope {
+                request_id: close.request_id,
+                payload: Some(v1::envelope::Payload::CloseSessionResponse(v1::Empty {})),
+            },
+        )
+        .await;
+    });
+    let client = HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN))
+        .await
+        .unwrap();
+    let descriptor = client.enumerate_can().await.unwrap().remove(0);
+    let mut can = client
+        .open_can(
+            descriptor.selector(),
+            LeaseMode::Control,
+            CanOpenConfig::Attach(
+                CanLinkExpectation::new(Some(CanMode::Classic), None, None, None, None).unwrap(),
+            ),
+            CanFilterSet::new(Vec::new()).unwrap(),
+        )
+        .await
+        .unwrap();
+    let empty = can.send_batch(Vec::new()).await.unwrap_err();
+    assert_eq!(empty.committed(), 0);
+    assert_eq!(empty.error().name().as_str(), "runtime.argument.invalid");
+    let oversized = CanFrame::ClassicData {
+        id: CanId::standard(1).unwrap(),
+        data: Bytes::from(vec![0; 9]),
+    };
+    let error = can.send(oversized).await.unwrap_err();
+    assert_eq!(error.committed(), 0);
+    assert_eq!(error.error().name().as_str(), "can.frame.invalid");
+    let receive = can
+        .receive(65, std::time::Duration::ZERO)
+        .await
+        .unwrap_err();
+    assert_eq!(receive.name().as_str(), "runtime.argument.invalid");
+    can.close().await.unwrap();
+    client.close().await.unwrap();
     server.await.unwrap();
     std::fs::remove_file(endpoint).unwrap();
 }
