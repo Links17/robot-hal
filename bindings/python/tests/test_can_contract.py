@@ -37,6 +37,7 @@ from seeed_hal.client import _decode_can_frame, _decode_descriptor
 from seeed_hal.proto import hal_pb2
 
 
+MAX_U16 = (1 << 16) - 1
 MAX_U32 = (1 << 32) - 1
 MAX_U64 = (1 << 64) - 1
 
@@ -186,9 +187,6 @@ def test_models_are_immutable_and_defensively_copy_bytes() -> None:
     assert frame.data == b"12345678"
     with pytest.raises(FrozenInstanceError):
         frame.data = b"x"
-    with pytest.raises(HalError) as caught:
-        CanFrame.classic_data(CanId.standard(0), b"123456789")
-    assert caught.value.name == "can.frame.invalid"
 
 
 @pytest.mark.parametrize(
@@ -204,9 +202,23 @@ def test_identifier_exact_bounds(factory, good: int, bad: int) -> None:
         factory(bad)
 
 
+def test_classical_dlc_and_data_exact_boundaries_and_types() -> None:
+    can_id = CanId.standard(0)
+    for data in (b"", bytes(8), bytearray(b"x"), memoryview(b"x")):
+        assert isinstance(CanFrame.classic_data(can_id, data).data, bytes)
+    for data in (bytes(9), "x", object(), None):
+        with pytest.raises(HalError):
+            CanFrame.classic_data(can_id, data)
+
+    for dlc in (0, 8):
+        assert CanFrame.classic_remote(can_id, dlc).dlc == dlc
+    for dlc in (-1, 9, True, 1.0, "1", None):
+        with pytest.raises(HalError):
+            CanFrame.classic_remote(can_id, dlc)
+
+
 def test_all_frame_variants_and_exact_fd_lengths() -> None:
     can_id = CanId.extended(1)
-    CanFrame.classic_remote(can_id, 8)
     for length in (0, 1, 8, 12, 16, 20, 24, 32, 48, 64):
         CanFrame.fd_data(can_id, bytes(length))
     rejected = (
@@ -216,11 +228,30 @@ def test_all_frame_variants_and_exact_fd_lengths() -> None:
     for length in rejected:
         with pytest.raises(HalError):
             CanFrame.fd_data(can_id, bytes(length))
-    CanFrame.error(tuple(CanErrorClass)[:10], b"12345678")
-    with pytest.raises(HalError):
-        CanFrame.error((), b"")
-    with pytest.raises(HalError):
-        CanFrame.error(tuple(CanErrorClass) + (CanErrorClass.OTHER,), b"")
+
+
+def test_error_frame_diagnostics_and_classes_exact_boundaries_and_types() -> None:
+    one_class = (CanErrorClass.BUS_OFF,)
+    all_classes = tuple(CanErrorClass)
+    assert len(all_classes) == 10
+    for classes in (one_class, all_classes):
+        for diagnostics in (b"", bytes(8), bytearray(b"x")):
+            frame = CanFrame.error(classes, diagnostics)
+            assert isinstance(frame.data, bytes)
+            assert frame.classes == classes
+
+    for classes in (
+        (),
+        all_classes + (CanErrorClass.OTHER,),
+        (CanErrorClass.BUS_OFF, object()),
+        None,
+        1,
+    ):
+        with pytest.raises(HalError):
+            CanFrame.error(classes, b"")
+    for diagnostics in (bytes(9), "x", object(), None):
+        with pytest.raises(HalError):
+            CanFrame.error(one_class, diagnostics)
 
 
 @pytest.mark.parametrize(
@@ -246,21 +277,156 @@ def test_classical_peer_frames_reject_fd_only_flags(
             _decode_can_frame(value)
 
 
-def test_timestamp_configuration_and_filter_bounds() -> None:
-    CanTimestamp(MAX_U64, CanTimestampSource.HARDWARE, "x" * 255)
+def test_timestamp_exact_boundaries_and_types() -> None:
+    for timestamp_ns in (0, MAX_U64):
+        for clock_domain in ("x", "x" * 255):
+            timestamp = CanTimestamp(
+                timestamp_ns, CanTimestampSource.HARDWARE, clock_domain
+            )
+            assert timestamp.timestamp_ns == timestamp_ns
+    for timestamp_ns in (-1, MAX_U64 + 1, True, 1.0, "0", None):
+        with pytest.raises(HalError):
+            CanTimestamp(timestamp_ns, CanTimestampSource.KERNEL, "kernel")
     with pytest.raises(HalError):
-        CanTimestamp(0, CanTimestampSource.KERNEL, "")
-    nominal = CanBitTiming(MAX_U32, 999, MAX_U32 & 0xFFFF)
-    CanConfigureConfig(CanMode.CLASSIC, nominal)
+        CanTimestamp(0, object(), "kernel")
+    for clock_domain in ("", "x" * 256, "é", object(), None):
+        with pytest.raises(HalError):
+            CanTimestamp(0, CanTimestampSource.KERNEL, clock_domain)
+
+
+def test_bit_timing_exact_boundaries_and_types() -> None:
+    CanBitTiming(1, 1, 1)
+    CanBitTiming(MAX_U32, 999, MAX_U16)
+    CanBitTiming(1, None, None)
+
+    for bitrate in (0, MAX_U32 + 1, -1, True, 1.0, "1", None):
+        with pytest.raises(HalError):
+            CanBitTiming(bitrate)
+    for sample_point in (0, 1000, -1, True, 1.0, "1"):
+        with pytest.raises(HalError):
+            CanBitTiming(1, sample_point_permill=sample_point)
+    for sjw in (0, MAX_U16 + 1, -1, True, 1.0, "1"):
+        with pytest.raises(HalError):
+            CanBitTiming(1, sjw=sjw)
+
+
+def test_nominal_data_timing_restart_and_configuration_types() -> None:
+    minimum_timing = CanBitTiming(1, 1, 1)
+    maximum_timing = CanBitTiming(MAX_U32, 999, MAX_U16)
+    for nominal in (minimum_timing, maximum_timing):
+        CanConfigureConfig(CanMode.CLASSIC, nominal)
+        for data in (minimum_timing, maximum_timing):
+            CanConfigureConfig(CanMode.FD, nominal, data)
+    for restart_ms in (None, 1, MAX_U32):
+        CanConfigureConfig(
+            CanMode.FD,
+            minimum_timing,
+            maximum_timing,
+            listen_only=False,
+            loopback=True,
+            restart_ms=restart_ms,
+        )
+
     with pytest.raises(HalError):
-        CanConfigureConfig(CanMode.CLASSIC, nominal, nominal)
+        CanConfigureConfig(CanMode.CLASSIC, minimum_timing, maximum_timing)
     with pytest.raises(HalError):
-        CanConfigureConfig(CanMode.FD, nominal)
-    filt = CanFilter(0x7FF, 0x7FF, CanIdFormat.STANDARD, CanFrameClasses.data_only())
-    CanFilterSet([filt] * 64)
+        CanConfigureConfig(CanMode.FD, minimum_timing)
+    for arguments in (
+        (object(), minimum_timing, None, False, False),
+        (CanMode.CLASSIC, object(), None, False, False),
+        (CanMode.FD, minimum_timing, object(), False, False),
+        (CanMode.CLASSIC, minimum_timing, None, 0, False),
+        (CanMode.CLASSIC, minimum_timing, None, False, 0),
+    ):
+        with pytest.raises(HalError):
+            CanConfigureConfig(*arguments)
+    for restart_ms in (0, MAX_U32 + 1, -1, True, 1.0, "1"):
+        with pytest.raises(HalError):
+            CanConfigureConfig(
+                CanMode.CLASSIC, minimum_timing, restart_ms=restart_ms
+            )
+
+
+def test_link_expectation_exact_boundaries_and_types() -> None:
+    CanLinkExpectation()
+    for mode in (None, CanMode.CLASSIC, CanMode.FD):
+        for nominal_bitrate in (None, 1, MAX_U32):
+            CanLinkExpectation(mode=mode, nominal_bitrate=nominal_bitrate)
+    for data_bitrate in (None, 1, MAX_U32):
+        CanLinkExpectation(mode=CanMode.FD, data_bitrate=data_bitrate)
+    for listen_only in (None, False, True):
+        for loopback in (None, False, True):
+            CanLinkExpectation(listen_only=listen_only, loopback=loopback)
+
     with pytest.raises(HalError):
-        CanFilterSet([filt] * 65)
-    assert CanFilterSet().matches(CanFrame.classic_data(CanId.standard(1), b"x"))
+        CanLinkExpectation(mode=object())
+    with pytest.raises(HalError):
+        CanLinkExpectation(mode=CanMode.CLASSIC, data_bitrate=1)
+    for field in ("nominal_bitrate", "data_bitrate"):
+        for value in (0, MAX_U32 + 1, -1, True, 1.0, "1"):
+            with pytest.raises(HalError):
+                CanLinkExpectation(**{field: value})
+    for field in ("listen_only", "loopback"):
+        for value in (0, 1, "false", object()):
+            with pytest.raises(HalError):
+                CanLinkExpectation(**{field: value})
+
+
+def test_filter_exact_boundaries_and_types() -> None:
+    data_only = CanFrameClasses.data_only()
+    standard_lower = CanFilter(0, 0, CanIdFormat.STANDARD, data_only)
+    for id_format, maximum in (
+        (CanIdFormat.STANDARD, 0x7FF),
+        (CanIdFormat.EXTENDED, 0x1FFF_FFFF),
+        (CanIdFormat.EITHER, 0x1FFF_FFFF),
+    ):
+        CanFilter(0, 0, id_format, data_only)
+        CanFilter(maximum, maximum, id_format, data_only)
+        for field in ("id", "mask"):
+            for value in (-1, maximum + 1, True, 1.0, "0", None):
+                arguments = {"id": 0, "mask": 0}
+                arguments[field] = value
+                with pytest.raises(HalError):
+                    CanFilter(
+                        arguments["id"],
+                        arguments["mask"],
+                        id_format,
+                        data_only,
+                    )
+
+    for field in ("data", "remote", "error"):
+        with pytest.raises(HalError):
+            CanFrameClasses(**{field: 1})
+    with pytest.raises(HalError):
+        CanFilter(0, 0, CanIdFormat.STANDARD, CanFrameClasses())
+    with pytest.raises(HalError):
+        CanFilter(0, 0, object(), data_only)
+    with pytest.raises(HalError):
+        CanFilter(0, 0, CanIdFormat.STANDARD, object())
+
+    assert CanFilterSet().matches(
+        CanFrame.classic_data(CanId.standard(1), b"x")
+    )
+    assert len(CanFilterSet([standard_lower] * 64).filters) == 64
+    with pytest.raises(HalError):
+        CanFilterSet([standard_lower] * 65)
+    for filters in (None, 1, [standard_lower, object()]):
+        with pytest.raises(HalError):
+            CanFilterSet(filters)
+    with pytest.raises(HalError):
+        standard_lower.matches(object())
+
+
+def test_bus_status_counter_exact_boundaries_and_types() -> None:
+    for tx_counter in (None, 0, MAX_U32):
+        for rx_counter in (None, 0, MAX_U32):
+            CanBusStatus(CanBusState.ACTIVE, tx_counter, rx_counter)
+    with pytest.raises(HalError):
+        CanBusStatus(object())
+    for field in ("tx_error_counter", "rx_error_counter"):
+        for value in (-1, MAX_U32 + 1, True, 1.0, "0"):
+            with pytest.raises(HalError):
+                CanBusStatus(CanBusState.ACTIVE, **{field: value})
 
 
 def test_descriptor_endpoint_and_capability_exact_boundaries() -> None:
@@ -350,23 +516,15 @@ async def test_minor_and_capability_gates_reject_before_wire() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("negotiated", "advertised", "config", "filters"),
+    ("negotiated", "config", "filters"),
     [
         (
             {"can.classic/v1"},
-            {"can.classic/v1", "can.fd/v1"},
-            CanOpenConfig(attach=CanLinkExpectation(mode=CanMode.FD)),
-            CanFilterSet(),
-        ),
-        (
-            {"can.classic/v1", "can.fd/v1"},
-            {"can.classic/v1"},
             CanOpenConfig(attach=CanLinkExpectation(mode=CanMode.FD)),
             CanFilterSet(),
         ),
         (
             {"can.classic/v1"},
-            {"can.classic/v1", "can.configure/v1"},
             CanOpenConfig(
                 configure=CanConfigureConfig(
                     CanMode.CLASSIC, CanBitTiming(500_000)
@@ -376,7 +534,71 @@ async def test_minor_and_capability_gates_reject_before_wire() -> None:
         ),
         (
             {"can.classic/v1"},
+            CanOpenConfig(attach=CanLinkExpectation(mode=CanMode.CLASSIC)),
+            CanFilterSet(
+                [
+                    CanFilter(
+                        0,
+                        0,
+                        CanIdFormat.EITHER,
+                        CanFrameClasses(error=True),
+                    )
+                ]
+            ),
+        ),
+    ],
+)
+async def test_open_rejects_known_unnegotiated_capabilities_before_enumeration(
+    negotiated: set[str],
+    config: CanOpenConfig,
+    filters: CanFilterSet,
+) -> None:
+    transport = ScriptedTransport()
+    client = direct_client(
+        transport,
+        capabilities=frozenset({"serial.bytes/v1", *negotiated}),
+    )
+    opening = asyncio.create_task(
+        client.open_can(
+            ResourceSelector(
+                "can:virtual:test", IdentityQuality.STRONG, TransportKind.CAN
+            ),
+            LeaseMode.CONTROL,
+            config,
+            filters,
+        )
+    )
+    with pytest.raises(HalError) as caught:
+        await opening
+    assert caught.value.name == "runtime.protocol.capability_unsupported"
+    assert caught.value.resource_id == "can:virtual:test"
+    assert transport.sent.empty()
+    await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("negotiated", "advertised", "config", "filters"),
+    [
+        (
+            {"can.classic/v1", "can.fd/v1"},
+            {"can.classic/v1"},
+            CanOpenConfig(attach=CanLinkExpectation(mode=CanMode.FD)),
+            CanFilterSet(),
+        ),
+        (
+            {"can.classic/v1", "can.configure/v1"},
+            {"can.classic/v1"},
+            CanOpenConfig(
+                configure=CanConfigureConfig(
+                    CanMode.CLASSIC, CanBitTiming(500_000)
+                )
+            ),
+            CanFilterSet(),
+        ),
+        (
             {"can.classic/v1", "can.error-frames/v1"},
+            {"can.classic/v1"},
             CanOpenConfig(attach=CanLinkExpectation(mode=CanMode.CLASSIC)),
             CanFilterSet(
                 [

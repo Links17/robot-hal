@@ -483,6 +483,9 @@ class HalClient:
                 "can.open", "filters must be CanFilterSet", selector.resource_id
             )
         self._require_can_capability("can.open", selector.resource_id)
+        _validate_can_open_capabilities(
+            selector.resource_id, config, filters, self._capabilities
+        )
 
         # Every open resolves against a fresh authoritative snapshot so stale
         # identities or capabilities cannot weaken fail-closed selection.
@@ -490,7 +493,7 @@ class HalClient:
         descriptor = _select_can_descriptor(resources, selector)
         effective_capabilities = _effective_can_capabilities(descriptor, self)
         profile_mode = _validate_can_open_capabilities(
-            descriptor, config, filters, effective_capabilities
+            descriptor.resource_id, config, filters, effective_capabilities
         )
         request = hal_pb2.OpenCanRequest(
             selector=_selector_to_proto(selector, "can.open"),
@@ -2194,7 +2197,7 @@ def _select_can_descriptor(
 
 
 def _validate_can_open_capabilities(
-    descriptor: ResourceDescriptor,
+    resource_id: str,
     config: CanOpenConfig,
     filters: CanFilterSet,
     capabilities: frozenset[str],
@@ -2234,8 +2237,9 @@ def _validate_can_open_capabilities(
         ErrorCategory.CONFLICT,
         "can.open",
         False,
-        "the selected CAN resource does not support the requested configuration or filters",
-        resource_id=descriptor.resource_id,
+        "the active CAN capability profile does not support the requested "
+        "configuration or filters",
+        resource_id=resource_id,
     )
 
 
