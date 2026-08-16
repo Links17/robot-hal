@@ -22,6 +22,18 @@ message Envelope {
     CloseSessionRequest close_session_request = 32;
     Empty close_session_response = 33;
     RuntimeEvent runtime_event = 40;
+    EnumerateCanRequest enumerate_can_request = 50;
+    EnumerateCanResponse enumerate_can_response = 51;
+    OpenCanRequest open_can_request = 52;
+    OpenCanResponse open_can_response = 53;
+    CanSendRequest can_send_request = 54;
+    CanSendResponse can_send_response = 55;
+    CanReceiveRequest can_receive_request = 56;
+    CanReceiveResponse can_receive_response = 57;
+    ReplaceCanFiltersRequest replace_can_filters_request = 58;
+    Empty replace_can_filters_response = 59;
+    GetCanBusStatusRequest get_can_bus_status_request = 60;
+    GetCanBusStatusResponse get_can_bus_status_response = 61;
     Error error = 100;
   }
 }
@@ -82,6 +94,7 @@ enum IdentityQuality {
 enum TransportKind {
   TRANSPORT_KIND_UNSPECIFIED = 0;
   TRANSPORT_KIND_SERIAL = 1;
+  TRANSPORT_KIND_CAN = 2;
 }
 
 message SerialConfig {
@@ -131,6 +144,202 @@ enum LeaseMode {
   LEASE_MODE_UNSPECIFIED = 0;
   LEASE_MODE_OBSERVE = 1;
   LEASE_MODE_CONTROL = 2;
+  LEASE_MODE_MAINTENANCE = 3;
+}
+
+message CanId {
+  uint32 value = 1;
+  CanIdFormat format = 2;
+}
+
+enum CanIdFormat {
+  CAN_ID_FORMAT_UNSPECIFIED = 0;
+  CAN_ID_FORMAT_STANDARD = 1;
+  CAN_ID_FORMAT_EXTENDED = 2;
+  CAN_ID_FORMAT_EITHER = 3;
+}
+
+message CanFrame {
+  CanId id = 1;
+  CanFrameKind kind = 2;
+  bytes data = 3;
+  uint32 remote_dlc = 4;
+  bool bitrate_switch = 5;
+  bool error_state_indicator = 6;
+  repeated CanErrorClass error_classes = 7;
+}
+
+enum CanFrameKind {
+  CAN_FRAME_KIND_UNSPECIFIED = 0;
+  CAN_FRAME_KIND_CLASSIC_DATA = 1;
+  CAN_FRAME_KIND_CLASSIC_REMOTE = 2;
+  CAN_FRAME_KIND_FD_DATA = 3;
+  CAN_FRAME_KIND_ERROR = 4;
+}
+
+enum CanErrorClass {
+  CAN_ERROR_CLASS_UNSPECIFIED = 0;
+  CAN_ERROR_CLASS_TX_TIMEOUT = 1;
+  CAN_ERROR_CLASS_LOST_ARBITRATION = 2;
+  CAN_ERROR_CLASS_CONTROLLER = 3;
+  CAN_ERROR_CLASS_PROTOCOL = 4;
+  CAN_ERROR_CLASS_TRANSCEIVER = 5;
+  CAN_ERROR_CLASS_NO_ACKNOWLEDGEMENT = 6;
+  CAN_ERROR_CLASS_BUS_OFF = 7;
+  CAN_ERROR_CLASS_BUS_ERROR = 8;
+  CAN_ERROR_CLASS_RESTARTED = 9;
+  CAN_ERROR_CLASS_OTHER = 10;
+}
+
+message CanTimestamp {
+  uint64 timestamp_ns = 1;
+  CanTimestampSource source = 2;
+  string clock_domain = 3;
+}
+
+enum CanTimestampSource {
+  CAN_TIMESTAMP_SOURCE_UNSPECIFIED = 0;
+  CAN_TIMESTAMP_SOURCE_HARDWARE = 1;
+  CAN_TIMESTAMP_SOURCE_KERNEL = 2;
+  CAN_TIMESTAMP_SOURCE_HOST_MONOTONIC = 3;
+}
+
+message ReceivedCanFrame {
+  CanFrame frame = 1;
+  CanTimestamp timestamp = 2;
+}
+
+message CanBitTiming {
+  uint32 bitrate = 1;
+  optional uint32 sample_point_permill = 2;
+  optional uint32 sjw = 3;
+}
+
+enum CanMode {
+  CAN_MODE_UNSPECIFIED = 0;
+  CAN_MODE_CLASSIC = 1;
+  CAN_MODE_FD = 2;
+}
+
+message CanLinkExpectation {
+  optional CanMode mode = 1;
+  optional uint32 nominal_bitrate = 2;
+  optional uint32 data_bitrate = 3;
+  optional bool listen_only = 4;
+  optional bool loopback = 5;
+}
+
+message CanConfigureConfig {
+  CanMode mode = 1;
+  CanBitTiming nominal = 2;
+  CanBitTiming data = 3;
+  bool listen_only = 4;
+  bool loopback = 5;
+  optional uint32 restart_ms = 6;
+}
+
+message CanOpenConfig {
+  oneof config {
+    CanLinkExpectation attach = 1;
+    CanConfigureConfig configure = 2;
+  }
+}
+
+message CanActiveConfig {
+  CanMode mode = 1;
+  CanBitTiming nominal = 2;
+  CanBitTiming data = 3;
+  bool listen_only = 4;
+  bool loopback = 5;
+  string clock_domain = 6;
+}
+
+message CanFrameClasses {
+  bool data = 1;
+  bool remote = 2;
+  bool error = 3;
+}
+
+message CanFilter {
+  uint32 id = 1;
+  uint32 mask = 2;
+  CanIdFormat format = 3;
+  CanFrameClasses classes = 4;
+}
+
+message CanFilterSet {
+  repeated CanFilter filters = 1;
+}
+
+enum CanBusState {
+  CAN_BUS_STATE_UNSPECIFIED = 0;
+  CAN_BUS_STATE_ACTIVE = 1;
+  CAN_BUS_STATE_WARNING = 2;
+  CAN_BUS_STATE_PASSIVE = 3;
+  CAN_BUS_STATE_BUS_OFF = 4;
+  CAN_BUS_STATE_STOPPED = 5;
+  CAN_BUS_STATE_UNKNOWN = 6;
+}
+
+message CanBusStatus {
+  CanBusState state = 1;
+  optional uint32 tx_error_counter = 2;
+  optional uint32 rx_error_counter = 3;
+}
+
+message EnumerateCanRequest {}
+
+message EnumerateCanResponse {
+  repeated ResourceDescriptor resources = 1;
+}
+
+message OpenCanRequest {
+  ResourceSelector selector = 1;
+  LeaseMode mode = 2;
+  CanOpenConfig config = 3;
+  CanFilterSet filters = 4;
+}
+
+message OpenCanResponse {
+  string session_id = 1;
+  LeaseToken lease = 2;
+}
+
+message CanSendRequest {
+  string session_id = 1;
+  LeaseToken lease = 2;
+  repeated CanFrame frames = 3;
+}
+
+message CanSendResponse {
+  uint32 committed_count = 1;
+  Error error = 2;
+}
+
+message CanReceiveRequest {
+  string session_id = 1;
+  LeaseToken lease = 2;
+  uint32 max_frames = 3;
+  uint64 timeout_ms = 4;
+}
+
+message CanReceiveResponse {
+  repeated ReceivedCanFrame frames = 1;
+}
+
+message ReplaceCanFiltersRequest {
+  string session_id = 1;
+  LeaseToken lease = 2;
+  CanFilterSet filters = 3;
+}
+
+message GetCanBusStatusRequest {
+  string session_id = 1;
+  LeaseToken lease = 2;
+}
+
+message GetCanBusStatusResponse {
+  CanBusStatus status = 1;
 }
 
 message EnumerateSerialRequest {}
@@ -196,6 +405,12 @@ enum RuntimeEventKind {
   RUNTIME_EVENT_KIND_UNSPECIFIED = 0;
   RUNTIME_EVENT_KIND_SESSION_OPENED = 1;
   RUNTIME_EVENT_KIND_SESSION_CLOSED = 2;
+  RUNTIME_EVENT_KIND_CAN_BUS_ACTIVE = 3;
+  RUNTIME_EVENT_KIND_CAN_BUS_WARNING = 4;
+  RUNTIME_EVENT_KIND_CAN_BUS_PASSIVE = 5;
+  RUNTIME_EVENT_KIND_CAN_BUS_OFF = 6;
+  RUNTIME_EVENT_KIND_CAN_BUS_STOPPED = 7;
+  RUNTIME_EVENT_KIND_CAN_BUS_UNKNOWN = 8;
 }
 
 message Error {

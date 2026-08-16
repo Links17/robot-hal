@@ -4,13 +4,22 @@ pub mod v1 {
     include!(concat!(env!("OUT_DIR"), "/seeed.hal.v1.rs"));
 }
 
+mod can_conversion;
 mod conversion;
 
+pub use can_conversion::{
+    can_receive_parameters, can_receive_request_from_proto, can_receive_response_from_proto,
+    can_send_request_from_proto, can_send_response_from_proto, can_send_response_to_proto,
+    enumerate_can_response_from_proto, get_can_bus_status_request_from_proto,
+    get_can_bus_status_response_from_proto, open_can_request_from_proto,
+    open_can_response_from_proto, received_can_frames_from_proto,
+    replace_can_filters_request_from_proto, send_can_frames_from_proto,
+};
 pub use conversion::{error_from_proto, invalid_message, parse_session_lease};
 
 pub const PROTOCOL_MAJOR: u32 = 1;
 pub const PROTOCOL_MINOR_MINIMUM: u32 = 0;
-pub const PROTOCOL_MINOR_MAXIMUM: u32 = 0;
+pub const PROTOCOL_MINOR_MAXIMUM: u32 = 1;
 /// Legacy exact-minor field value sent to peers that predate range fields.
 pub const PROTOCOL_MINOR: u32 = PROTOCOL_MINOR_MAXIMUM;
 pub const SERIAL_CAPABILITY: &str = "serial.bytes/v1";

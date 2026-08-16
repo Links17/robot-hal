@@ -22,7 +22,7 @@ pub fn invalid_message(debug_message: impl Into<String>) -> HalError {
     .expect("static protocol error metadata is valid")
 }
 
-fn required_enum<T: TryFrom<i32>>(value: i32, field: &'static str) -> HalResult<T> {
+pub(crate) fn required_enum<T: TryFrom<i32>>(value: i32, field: &'static str) -> HalResult<T> {
     T::try_from(value).map_err(|_| invalid_message(format!("{field} has an unknown value")))
 }
 
@@ -45,6 +45,7 @@ impl TryFrom<v1::ResourceSelector> for ResourceSelector {
         };
         let transport = match required_enum::<v1::TransportKind>(value.transport, "transport")? {
             v1::TransportKind::Serial => TransportKind::Serial,
+            v1::TransportKind::Can => TransportKind::Can,
             v1::TransportKind::Unspecified => {
                 return Err(invalid_message("transport is required"));
             }
@@ -75,10 +76,12 @@ impl TryFrom<v1::ResourceDescriptor> for ResourceDescriptor {
         let endpoint = Endpoint::new(value.endpoint)
             .map_err(|_| invalid_message("resource descriptor has an invalid endpoint"))?;
         let capabilities = if value.capabilities.is_empty() {
-            vec![
-                CapabilityId::parse(crate::SERIAL_CAPABILITY)
-                    .expect("the static Serial capability identifier is valid"),
-            ]
+            let implied = match selector.transport() {
+                TransportKind::Serial => crate::SERIAL_CAPABILITY,
+                TransportKind::Can => seeed_hal_can::CAN_CLASSIC_CAPABILITY,
+            };
+            vec![CapabilityId::parse(implied)
+                .expect("the static transport capability identifier is valid")]
         } else {
             value
                 .capabilities
@@ -217,6 +220,7 @@ impl TryFrom<v1::LeaseToken> for LeaseToken {
         let mode = match required_enum::<v1::LeaseMode>(value.mode, "lease mode")? {
             v1::LeaseMode::Observe => LeaseMode::Observe,
             v1::LeaseMode::Control => LeaseMode::Control,
+            v1::LeaseMode::Maintenance => LeaseMode::Maintenance,
             v1::LeaseMode::Unspecified => return Err(invalid_message("lease mode is required")),
         };
         Ok(Self::new(lease_id, value.generation, mode))
@@ -231,6 +235,7 @@ impl From<&LeaseToken> for v1::LeaseToken {
             mode: match value.mode() {
                 LeaseMode::Observe => v1::LeaseMode::Observe,
                 LeaseMode::Control => v1::LeaseMode::Control,
+                LeaseMode::Maintenance => v1::LeaseMode::Maintenance,
             } as i32,
         }
     }
@@ -329,6 +334,12 @@ impl From<&RuntimeEvent> for v1::RuntimeEvent {
             kind: match value.kind() {
                 RuntimeEventKind::SessionOpened => v1::RuntimeEventKind::SessionOpened,
                 RuntimeEventKind::SessionClosed => v1::RuntimeEventKind::SessionClosed,
+                RuntimeEventKind::CanBusActive => v1::RuntimeEventKind::CanBusActive,
+                RuntimeEventKind::CanBusWarning => v1::RuntimeEventKind::CanBusWarning,
+                RuntimeEventKind::CanBusPassive => v1::RuntimeEventKind::CanBusPassive,
+                RuntimeEventKind::CanBusOff => v1::RuntimeEventKind::CanBusOff,
+                RuntimeEventKind::CanBusStopped => v1::RuntimeEventKind::CanBusStopped,
+                RuntimeEventKind::CanBusUnknown => v1::RuntimeEventKind::CanBusUnknown,
             } as i32,
             name: value.name().to_owned(),
             resource_id: value.resource_id().as_str().to_owned(),
@@ -350,5 +361,6 @@ fn quality_to_proto(value: IdentityQuality) -> v1::IdentityQuality {
 fn transport_to_proto(value: TransportKind) -> v1::TransportKind {
     match value {
         TransportKind::Serial => v1::TransportKind::Serial,
+        TransportKind::Can => v1::TransportKind::Can,
     }
 }
