@@ -172,3 +172,31 @@ hotplug races, and `vcan` FD behavior. Per the task ruling, no tests, builds,
 Clippy, rustfmt, cross-builds, Cargo metadata, or dependency resolution were run
 in this fix round; verification was limited to source/diff inspection and the
 allowed whitespace/staged-diff checks.
+
+## Fix round 3
+
+- Narrowed control-mode restoration from the round-2 all-nine-bit mask to
+  per-bit evidence for the three modes Configure can write: FD, listen-only,
+  and loopback. A bit is restorable only when its snapshot value differs from
+  the requested value, and that restore evidence becomes active only after the
+  atomic `set_can_params` call succeeds. Unchanged false or unreported modes
+  are omitted rather than sent as unsupported clear-mask bits that can produce
+  `EOPNOTSUPP`; fingerprint conflict detection still observes all nine modes.
+- Revalidated the current interface name through canonical sysfs identity on
+  every bus-status query before returning normalized state or error counters.
+  A stale descriptor therefore fails with the selected resource ID instead of
+  exposing status from a renamed, reused, or hotplug-replaced endpoint.
+- Expanded the ignored selected-real-interface close-retry qualification to
+  compare all eight raw fields for both nominal and data timing, restart delay,
+  all nine observable control-mode flags, and termination, in addition to link
+  up/down state and MTU. The adapter-private `vcan` coverage now also checks
+  that status rejects a mismatched canonical identity.
+- Added focused static unit coverage for absent support evidence, per-bit
+  changed-mode evidence, and omission of every control mode outside the
+  evidenced restore mask.
+
+This round remains confined to the SocketCAN adapter and its tests. Per task
+instruction, no tests, builds, Clippy, rustfmt, cross-builds, Cargo metadata, or
+dependency resolution were run. The TDD red/green execution observations are
+therefore intentionally unavailable; verification is limited to source/diff
+inspection and the allowed whitespace and staged-diff checks.

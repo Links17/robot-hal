@@ -238,6 +238,63 @@ fn configure_from_kernel(details: &InterfaceDetails) -> CanConfigureConfig {
     .expect("selected real interface reports a valid active configuration")
 }
 
+fn assert_timing_restored(
+    kind: &str,
+    expected: Option<socketcan::nl::CanBitTiming>,
+    actual: Option<socketcan::nl::CanBitTiming>,
+) {
+    match (expected, actual) {
+        (Some(expected), Some(actual)) => {
+            assert_eq!(actual.bitrate, expected.bitrate, "{kind} bitrate");
+            assert_eq!(
+                actual.sample_point, expected.sample_point,
+                "{kind} sample point"
+            );
+            assert_eq!(actual.tq, expected.tq, "{kind} time quantum");
+            assert_eq!(actual.prop_seg, expected.prop_seg, "{kind} prop segment");
+            assert_eq!(
+                actual.phase_seg1, expected.phase_seg1,
+                "{kind} phase segment 1"
+            );
+            assert_eq!(
+                actual.phase_seg2, expected.phase_seg2,
+                "{kind} phase segment 2"
+            );
+            assert_eq!(actual.sjw, expected.sjw, "{kind} SJW");
+            assert_eq!(actual.brp, expected.brp, "{kind} prescaler");
+        }
+        (None, None) => {}
+        (expected, actual) => {
+            panic!("{kind} timing presence differs: expected={expected:?} actual={actual:?}")
+        }
+    }
+}
+
+fn assert_control_modes_restored(
+    expected: Option<socketcan::nl::CanCtrlModes>,
+    actual: Option<socketcan::nl::CanCtrlModes>,
+) {
+    let expected = expected.unwrap_or_default();
+    let actual = actual.unwrap_or_default();
+    for mode in [
+        CanCtrlMode::Loopback,
+        CanCtrlMode::ListenOnly,
+        CanCtrlMode::TripleSampling,
+        CanCtrlMode::OneShot,
+        CanCtrlMode::BerrReporting,
+        CanCtrlMode::Fd,
+        CanCtrlMode::PresumeAck,
+        CanCtrlMode::NonIso,
+        CanCtrlMode::CcLen8Dlc,
+    ] {
+        assert_eq!(
+            actual.has_mode(mode),
+            expected.has_mode(mode),
+            "control mode {mode:?}",
+        );
+    }
+}
+
 struct UpStateRestore<'a> {
     interface: &'a CanInterface,
     restore_up: bool,
@@ -342,4 +399,17 @@ async fn selected_real_configure_reports_permission_or_close_retries_after_confl
         .expect("query restored CAN interface");
     assert_eq!(restored.is_up, baseline.is_up);
     assert_eq!(restored.mtu, baseline.mtu);
+    assert_timing_restored(
+        "nominal",
+        baseline.can.bit_timing,
+        restored.can.bit_timing,
+    );
+    assert_timing_restored(
+        "data",
+        baseline.can.data_bit_timing,
+        restored.can.data_bit_timing,
+    );
+    assert_eq!(restored.can.restart_ms, baseline.can.restart_ms);
+    assert_control_modes_restored(baseline.can.ctrl_mode, restored.can.ctrl_mode);
+    assert_eq!(restored.can.termination, baseline.can.termination);
 }

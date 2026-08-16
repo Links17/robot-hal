@@ -28,6 +28,7 @@ pub(crate) struct LinkLease {
 struct LinkSnapshot {
     details: InterfaceDetails,
     fingerprint: LinkFingerprint,
+    restore_evidence: RestoreEvidence,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,6 +60,12 @@ struct TimingFingerprint {
 struct ConfigureFailure {
     error: HalError,
     rollback_required: bool,
+    restore_evidence: RestoreEvidence,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RestoreEvidence {
+    control_modes: [bool; 3],
 }
 
 impl LinkLease {
@@ -97,21 +104,26 @@ impl LinkLease {
             .map_err(|error| map_nl_error("can.configure", error, descriptor))?;
         let snapshot_fingerprint = fingerprint(&before, "can.configure", descriptor)?;
         verify_physical_identity(&snapshot_fingerprint, descriptor, "can.configure")?;
-        let snapshot = LinkSnapshot {
+        let mut snapshot = LinkSnapshot {
             details: before.clone(),
             fingerprint: snapshot_fingerprint,
+            restore_evidence: RestoreEvidence::default(),
         };
 
-        if let Err(failure) = configure_link(&interface_handle, &before, request, descriptor) {
-            if failure.rollback_required {
-                return Err(rollback_after_failure(
-                    &interface_handle,
-                    &snapshot,
-                    descriptor,
-                    failure.error,
-                ));
+        match configure_link(&interface_handle, &before, request, descriptor) {
+            Ok(restore_evidence) => snapshot.restore_evidence = restore_evidence,
+            Err(failure) => {
+                snapshot.restore_evidence = failure.restore_evidence;
+                if failure.rollback_required {
+                    return Err(rollback_after_failure(
+                        &interface_handle,
+                        &snapshot,
+                        descriptor,
+                        failure.error,
+                    ));
+                }
+                return Err(failure.error);
             }
-            return Err(failure.error);
         }
 
         let after = match interface_handle.details() {
@@ -255,6 +267,8 @@ fn bus_status(
     let details = interface
         .details()
         .map_err(|error| map_nl_error("can.status", error, descriptor))?;
+    let current = fingerprint(&details, "can.status", descriptor)?;
+    verify_physical_identity(&current, descriptor, "can.status")?;
     let state = details
         .can
         .state
@@ -290,22 +304,28 @@ fn configure_link(
     before: &InterfaceDetails,
     request: &CanConfigureConfig,
     descriptor: &ResourceDescriptor,
-) -> Result<(), ConfigureFailure> {
+) -> Result<RestoreEvidence, ConfigureFailure> {
     let mut rollback_required = false;
+    let mut restore_evidence = RestoreEvidence::default();
+    let pending_restore_evidence = restore_evidence_for_configure(before, request);
     if before.is_up {
         if let Err(error) = interface.bring_down() {
             return Err(ConfigureFailure {
                 error: map_nl_error("can.configure", error, descriptor),
                 rollback_required,
+                restore_evidence,
             });
         }
         rollback_required = true;
     }
 
     let mut modes = CanCtrlModes::default();
-    modes.add(CanCtrlMode::Fd, request.mode() == CanMode::Fd);
-    modes.add(CanCtrlMode::ListenOnly, request.listen_only());
-    modes.add(CanCtrlMode::Loopback, request.loopback());
+    for (mode, enabled) in configured_control_modes()
+        .into_iter()
+        .zip(requested_control_modes(request))
+    {
+        modes.add(mode, enabled);
+    }
     let params = InterfaceCanParams {
         bit_timing: Some(to_socketcan_timing(request.nominal())),
         data_bit_timing: request.data().map(to_socketcan_timing),
@@ -317,8 +337,10 @@ fn configure_link(
         return Err(ConfigureFailure {
             error: map_nl_error("can.configure", error, descriptor),
             rollback_required,
+            restore_evidence,
         });
     }
+    restore_evidence = pending_restore_evidence;
     rollback_required = true;
     let mtu = if request.mode() == CanMode::Fd {
         Mtu::Fd
@@ -329,6 +351,7 @@ fn configure_link(
         return Err(ConfigureFailure {
             error: map_nl_error("can.configure", error, descriptor),
             rollback_required,
+            restore_evidence,
         });
     }
     if before.is_up {
@@ -336,17 +359,19 @@ fn configure_link(
             return Err(ConfigureFailure {
                 error: map_nl_error("can.configure", error, descriptor),
                 rollback_required,
+                restore_evidence,
             });
         }
     }
-    Ok(())
+    Ok(restore_evidence)
 }
 
 fn restore_snapshot(
     interface: &CanInterface,
-    details: &InterfaceDetails,
+    snapshot: &LinkSnapshot,
     descriptor: &ResourceDescriptor,
 ) -> HalResult<()> {
+    let details = &snapshot.details;
     interface
         .bring_down()
         .map_err(|error| map_nl_error("can.close", error, descriptor))?;
@@ -356,7 +381,7 @@ fn restore_snapshot(
             .map_err(|error| map_nl_error("can.close", error, descriptor))?;
     }
 
-    let params = restore_params(details);
+    let params = restore_params(details, snapshot.restore_evidence);
     interface
         .set_can_params(&params)
         .map_err(|error| map_nl_error("can.close", error, descriptor))?;
@@ -368,16 +393,31 @@ fn restore_snapshot(
     Ok(())
 }
 
-fn restore_params(details: &InterfaceDetails) -> InterfaceCanParams {
-    let snapshot_modes = details.can.ctrl_mode.unwrap_or_default();
-    let mut modes = CanCtrlModes::default();
-    for mode in control_modes() {
-        modes.add(mode, snapshot_modes.has_mode(mode));
-    }
+fn restore_params(
+    details: &InterfaceDetails,
+    restore_evidence: RestoreEvidence,
+) -> InterfaceCanParams {
+    let ctrl_mode = restore_evidence
+        .control_modes
+        .iter()
+        .any(|restore| *restore)
+        .then(|| {
+            let snapshot_modes = details.can.ctrl_mode.unwrap_or_default();
+            let mut modes = CanCtrlModes::default();
+            for (mode, restore) in configured_control_modes()
+                .into_iter()
+                .zip(restore_evidence.control_modes)
+            {
+                if restore {
+                    modes.add(mode, snapshot_modes.has_mode(mode));
+                }
+            }
+            modes
+        });
     InterfaceCanParams {
         bit_timing: details.can.bit_timing,
         data_bit_timing: details.can.data_bit_timing,
-        ctrl_mode: Some(modes),
+        ctrl_mode,
         restart_ms: details.can.restart_ms,
         termination: details.can.termination,
         ..InterfaceCanParams::default()
@@ -389,7 +429,7 @@ fn restore_and_verify(
     snapshot: &LinkSnapshot,
     descriptor: &ResourceDescriptor,
 ) -> HalResult<()> {
-    restore_snapshot(interface, &snapshot.details, descriptor)?;
+    restore_snapshot(interface, snapshot, descriptor)?;
     let restored = interface
         .details()
         .map_err(|error| map_nl_error("can.close", error, descriptor))?;
@@ -761,14 +801,58 @@ mod tests {
     }
 
     #[test]
-    fn restore_explicitly_clears_absent_control_modes() {
+    fn restore_omits_control_modes_without_successful_write_evidence() {
         let details = InterfaceDetails::default();
-        let modes = restore_params(&details)
-            .ctrl_mode
-            .expect("restore always sends a control-mode mask");
+        let params = restore_params(&details, RestoreEvidence::default());
 
+        assert!(params.ctrl_mode.is_none());
+    }
+
+    #[test]
+    fn configure_restore_evidence_only_marks_changed_control_modes() {
+        let mut details = InterfaceDetails::default();
+        let mut snapshot_modes = CanCtrlModes::default();
+        snapshot_modes.add(CanCtrlMode::Loopback, true);
+        details.can.ctrl_mode = Some(snapshot_modes);
+        let restore_evidence = restore_evidence_for_configure(&details, &request());
+
+        assert_eq!(restore_evidence.control_modes, [false, false, true]);
+    }
+
+    #[test]
+    fn restore_only_targets_control_modes_with_support_evidence() {
+        let mut details = InterfaceDetails::default();
+        let mut snapshot_modes = CanCtrlModes::default();
         for mode in control_modes() {
-            assert!(!modes.has_mode(mode));
+            snapshot_modes.add(mode, true);
+        }
+        details.can.ctrl_mode = Some(snapshot_modes);
+
+        let modes = restore_params(
+            &details,
+            RestoreEvidence {
+                control_modes: [false, false, true],
+            },
+        )
+        .ctrl_mode
+        .expect("changed control mode supplies support evidence");
+
+        for (mode, expected) in [
+            (CanCtrlMode::Loopback, true),
+            (CanCtrlMode::ListenOnly, false),
+            (CanCtrlMode::TripleSampling, false),
+            (CanCtrlMode::OneShot, false),
+            (CanCtrlMode::BerrReporting, false),
+            (CanCtrlMode::Fd, false),
+            (CanCtrlMode::PresumeAck, false),
+            (CanCtrlMode::NonIso, false),
+            (CanCtrlMode::CcLen8Dlc, false),
+        ] {
+            assert_eq!(
+                modes.has_mode(mode),
+                expected,
+                "restore must not target control modes Configure did not mutate",
+            );
         }
     }
 
@@ -866,6 +950,36 @@ fn timing_matches(expected: &CanBitTiming, actual: socketcan::nl::CanBitTiming) 
 fn control_fingerprint(modes: Option<CanCtrlModes>) -> [bool; 9] {
     let modes = modes.unwrap_or_default();
     control_modes().map(|mode| modes.has_mode(mode))
+}
+
+fn configured_control_modes() -> [CanCtrlMode; 3] {
+    [
+        CanCtrlMode::Fd,
+        CanCtrlMode::ListenOnly,
+        CanCtrlMode::Loopback,
+    ]
+}
+
+fn restore_evidence_for_configure(
+    before: &InterfaceDetails,
+    request: &CanConfigureConfig,
+) -> RestoreEvidence {
+    let before_modes = before.can.ctrl_mode.unwrap_or_default();
+    let configured_modes = configured_control_modes();
+    let requested = requested_control_modes(request);
+    RestoreEvidence {
+        control_modes: std::array::from_fn(|index| {
+            before_modes.has_mode(configured_modes[index]) != requested[index]
+        }),
+    }
+}
+
+fn requested_control_modes(request: &CanConfigureConfig) -> [bool; 3] {
+    [
+        request.mode() == CanMode::Fd,
+        request.listen_only(),
+        request.loopback(),
+    ]
 }
 
 fn control_modes() -> [CanCtrlMode; 9] {

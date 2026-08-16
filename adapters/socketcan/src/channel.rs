@@ -652,6 +652,16 @@ mod tests {
         assert!(status.tx_error_counter().is_none_or(|value| value == 0));
         assert!(status.rx_error_counter().is_none_or(|value| value == 0));
 
+        let wrong_descriptor = descriptor("identity-mismatch", false);
+        let identity_error = crate::link::bus_status_for_interface(
+            &fixture.name,
+            &wrong_descriptor,
+        )
+        .expect_err("status must reject a stale canonical resource identity");
+        assert_eq!(identity_error.name().as_str(), "runtime.resource.not_found");
+        assert_eq!(identity_error.operation().as_str(), "can.status");
+        assert_eq!(identity_error.resource_id(), Some(wrong_descriptor.id()));
+
         fixture.delete().expect("delete vcan interface");
         let error = send_with_mode(&mut sockets, &accepted, CanMode::Classic, &descriptor)
             .expect_err("send after interface deletion must fail");
