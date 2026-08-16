@@ -23,6 +23,12 @@ pub const MAX_CLASSIC_DATA_BYTES: usize = 8;
 pub const MAX_FD_DATA_BYTES: usize = 64;
 pub const MAX_CAN_FILTERS: usize = 64;
 pub const MAX_CAN_BATCH_FRAMES: usize = 64;
+/// Maximum number of diagnostic classes carried by one CAN error frame.
+///
+/// The bound is the number of stable wire error-class values. It keeps the
+/// public model and every protocol adapter bounded without deduplicating or
+/// otherwise normalizing caller-provided class order.
+pub const MAX_CAN_ERROR_CLASSES: usize = 10;
 pub const DEFAULT_CAN_RX_CAPACITY: usize = 256;
 pub const DEFAULT_CAN_TX_CAPACITY: usize = 64;
 

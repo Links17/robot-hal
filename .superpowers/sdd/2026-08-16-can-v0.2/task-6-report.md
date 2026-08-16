@@ -61,3 +61,30 @@ Cargo build/check, Clippy, rustfmt, protobuf generation/checks, and Python verif
 - The receive admission check uses a conservative pre-dispatch encoded-response bound so an
   impossible negotiated frame cannot dequeue runtime frames. Full compile/lint/test verification
   remains intentionally pending.
+
+## Fix round 1/5
+
+Review fixes applied on top of `592a18b`:
+
+- Exhaustively owner-gated session and all six CAN bus-health runtime event kinds. Ordinary CAN
+  frames and diagnostics remain correlated responses only.
+- Added the canonical `MAX_CAN_ERROR_CLASSES = 10` model bound, preserving caller class order and
+  duplicates, with exact-limit and one-over-limit CAN/protocol contract coverage.
+- Replaced the approximate receive-response admission constant with schema-derived protobuf
+  maxima: 82 bytes per canonical CAN frame, 271 per timestamp, 358 per received frame, and 376 or
+  23,120 bytes for one- or 64-frame response envelopes.
+- Made CAN dispatch fail closed from a connection-local registry containing resource identity,
+  exact lease token, capabilities, and closed state. Send, receive, filter replacement, status,
+  and close now reject unknown, foreign, stale, invalid-mode, and closed sessions before runtime
+  dispatch as applicable.
+- Preserved idempotent CAN close replay with bounded 256-entry retention and added direct replay
+  coverage. Added a similarly bounded Serial session registry so the shared close envelope cannot
+  reach the Serial runtime for a foreign or unknown session.
+- Added broker coverage for response-frame admission without dequeue, configured-CAN restoration
+  plus CAN/Serial resource reuse after disconnect, usable advertised error-frame/filter
+  capabilities, cross-connection fail-closed dispatch, and owner-scoped CAN health events.
+
+Static inspection confirmed the receive-bound arithmetic against
+`proto/seeed/hal/v1/hal.proto`, including envelope field 57 and the canonical variant invariants.
+Per the fix-round instruction, compile, test, lint, format, generated-protocol, and Python gates
+remain deliberately deferred.

@@ -8,6 +8,7 @@ fn constants_and_capabilities_are_stable() {
     assert_eq!(MAX_FD_DATA_BYTES, 64);
     assert_eq!(MAX_CAN_FILTERS, 64);
     assert_eq!(MAX_CAN_BATCH_FRAMES, 64);
+    assert_eq!(MAX_CAN_ERROR_CLASSES, 10);
     assert_eq!(DEFAULT_CAN_RX_CAPACITY, 256);
     assert_eq!(DEFAULT_CAN_TX_CAPACITY, 64);
     assert_eq!(can_classic_capability().as_str(), CAN_CLASSIC_CAPABILITY);
@@ -39,6 +40,20 @@ fn frame_limits_and_flags_are_enforced() {
     }
     assert!(CanFrame::error(vec![CanErrorClass::BusError], Bytes::new()).is_ok());
     assert!(CanFrame::error(Vec::new(), Bytes::new()).is_err());
+    assert!(
+        CanFrame::error(
+            vec![CanErrorClass::Other; MAX_CAN_ERROR_CLASSES],
+            Bytes::new()
+        )
+        .is_ok()
+    );
+    assert!(
+        CanFrame::error(
+            vec![CanErrorClass::Other; MAX_CAN_ERROR_CLASSES + 1],
+            Bytes::new()
+        )
+        .is_err()
+    );
     assert!(CanFrame::error(vec![CanErrorClass::Other], Bytes::from(vec![0; 9])).is_err());
 }
 

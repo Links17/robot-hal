@@ -1203,6 +1203,27 @@ fn exact_can_wire_bounds_accept_limits_and_reject_every_fd_gap() {
             "can_frame.data",
         );
     }
+    assert!(CanFrame::try_from(v1::CanFrame {
+        kind: v1::CanFrameKind::Error as i32,
+        error_classes: vec![
+            v1::CanErrorClass::Other as i32;
+            seeed_hal_can::MAX_CAN_ERROR_CLASSES
+        ],
+        ..Default::default()
+    })
+    .is_ok());
+    assert_invalid_message(
+        CanFrame::try_from(v1::CanFrame {
+            kind: v1::CanFrameKind::Error as i32,
+            error_classes: vec![
+                v1::CanErrorClass::Other as i32;
+                seeed_hal_can::MAX_CAN_ERROR_CLASSES + 1
+            ],
+            ..Default::default()
+        })
+        .unwrap_err(),
+        "can_frame.error_classes/data",
+    );
     assert!(CanTimestamp::try_from(v1::CanTimestamp {
         timestamp_ns: u64::MAX,
         source: v1::CanTimestampSource::Hardware as i32,

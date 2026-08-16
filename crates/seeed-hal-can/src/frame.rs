@@ -2,7 +2,7 @@ use bytes::Bytes;
 use seeed_hal_core::{ErrorCategory, HalError, HalResult};
 use std::fmt;
 
-use crate::MAX_CLASSIC_DATA_BYTES;
+use crate::{MAX_CAN_ERROR_CLASSES, MAX_CLASSIC_DATA_BYTES};
 
 fn invalid_frame(message: &'static str) -> HalError {
     HalError::new(
@@ -117,8 +117,10 @@ impl CanFrame {
 
     pub fn error(classes: Vec<CanErrorClass>, data: impl Into<Bytes>) -> HalResult<Self> {
         let data = data.into();
-        if classes.is_empty() {
-            return Err(invalid_frame("CAN error frame must contain a class"));
+        if classes.is_empty() || classes.len() > MAX_CAN_ERROR_CLASSES {
+            return Err(invalid_frame(
+                "CAN error frame must contain 1..=10 classes",
+            ));
         }
         if data.len() > MAX_CLASSIC_DATA_BYTES {
             return Err(invalid_frame("CAN error diagnostics exceed 8 bytes"));

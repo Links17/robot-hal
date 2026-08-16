@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -6,7 +6,7 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
-use seeed_hal_core::{ErrorCategory, HalError, HalResult, OwnerId};
+use seeed_hal_core::{ErrorCategory, HalError, HalResult, OwnerId, SessionId};
 use seeed_hal_protocol::v1::{self, envelope};
 use seeed_hal_protocol::{
     MAX_FRAME_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR_MAXIMUM, PROTOCOL_MINOR_MINIMUM,
@@ -32,6 +32,16 @@ const DEFAULT_REQUEST_QUEUE_CAPACITY: usize = 32;
 const DEFAULT_RESPONSE_QUEUE_CAPACITY: usize = 64;
 const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 32;
 const CONNECTION_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
+const CLOSED_SERIAL_SESSION_RETENTION: usize = 256;
+
+#[derive(Default)]
+struct SerialSessionRegistry {
+    active: HashSet<SessionId>,
+    closed: HashSet<SessionId>,
+    closed_order: VecDeque<SessionId>,
+}
+
+type SerialSessions = Arc<Mutex<SerialSessionRegistry>>;
 
 /// Bounded broker admission settings.
 ///
@@ -172,6 +182,7 @@ impl Broker {
         let (sink, stream) = framed.split();
         let active = Arc::new(Mutex::new(HashSet::new()));
         let can_sessions = new_session_registry();
+        let serial_sessions = Arc::new(Mutex::new(SerialSessionRegistry::default()));
         let (frame_limit_tx, frame_limit_rx) = watch::channel(None::<usize>);
         let (request_tx, request_rx) = mpsc::channel(self.config.request_queue_capacity);
         let (response_tx, response_rx) = mpsc::channel(self.config.response_queue_capacity);
@@ -203,6 +214,7 @@ impl Broker {
             response_tx.clone(),
             active,
             can_sessions,
+            serial_sessions,
             frame_limit_tx,
             cancel_rx,
         ));
@@ -426,6 +438,7 @@ async fn dispatch_requests(
     responses: mpsc::Sender<OutboundEnvelope>,
     active: Arc<Mutex<HashSet<u64>>>,
     can_sessions: CanSessions,
+    serial_sessions: SerialSessions,
     frame_limit: watch::Sender<Option<usize>>,
     mut cancel: watch::Receiver<bool>,
 ) -> Option<HalError> {
@@ -593,6 +606,7 @@ async fn dispatch_requests(
                 let runtime = runtime.clone();
                 let owner = owner.clone();
                 let can_sessions = can_sessions.clone();
+                let serial_sessions = serial_sessions.clone();
                 let limits = limits.expect("successful handshake sets negotiated limits");
                 let payload = request.envelope.payload.take();
                 tasks.spawn(async move {
@@ -603,6 +617,7 @@ async fn dispatch_requests(
                         payload,
                         limits,
                         can_sessions,
+                        serial_sessions,
                     ).await;
                     (request_id, response)
                 });
@@ -617,7 +632,14 @@ async fn dispatch_requests(
 
 fn event_is_visible_to_owner(event: &RuntimeEvent, owner: &OwnerId) -> bool {
     match event.kind() {
-        RuntimeEventKind::SessionOpened | RuntimeEventKind::SessionClosed => {
+        RuntimeEventKind::SessionOpened
+        | RuntimeEventKind::SessionClosed
+        | RuntimeEventKind::CanBusActive
+        | RuntimeEventKind::CanBusWarning
+        | RuntimeEventKind::CanBusPassive
+        | RuntimeEventKind::CanBusOff
+        | RuntimeEventKind::CanBusStopped
+        | RuntimeEventKind::CanBusUnknown => {
             event.owner_id() == owner
         }
     }
@@ -749,6 +771,7 @@ async fn dispatch_operation(
     payload: Option<envelope::Payload>,
     limits: NegotiatedLimits,
     can_sessions: CanSessions,
+    serial_sessions: SerialSessions,
 ) -> v1::Envelope {
     let result = match payload {
         Some(payload) if is_can_payload(&payload) => {
@@ -767,7 +790,15 @@ async fn dispatch_operation(
             .await
         }
         payload => {
-            dispatch_operation_inner(runtime, owner, payload, limits, can_sessions).await
+            dispatch_operation_inner(
+                runtime,
+                owner,
+                payload,
+                limits,
+                can_sessions,
+                serial_sessions,
+            )
+            .await
         }
     };
     match result {
@@ -785,6 +816,7 @@ async fn dispatch_operation_inner(
     payload: Option<envelope::Payload>,
     limits: NegotiatedLimits,
     can_sessions: CanSessions,
+    serial_sessions: SerialSessions,
 ) -> HalResult<envelope::Payload> {
     match payload {
         Some(envelope::Payload::EnumerateSerialRequest(_)) => {
@@ -802,6 +834,7 @@ async fn dispatch_operation_inner(
             let (selector, config) = open_serial_request_from_proto(request)?;
             let handle = runtime.open_serial(owner, selector, config).await?;
             let (session_id, lease) = handle.into_parts();
+            register_serial_session(&serial_sessions, session_id.clone());
             Ok(envelope::Payload::OpenSerialResponse(
                 v1::OpenSerialResponse {
                     session_id: session_id.as_str().to_owned(),
@@ -862,13 +895,55 @@ async fn dispatch_operation_inner(
                 return can_dispatch::close(runtime, request, can_sessions).await;
             }
             let (session, lease) = parse_session_lease(request.session_id, request.lease)?;
-            runtime.close_serial(session, &lease).await?;
+            if !is_serial_session(&serial_sessions, &session) {
+                return Err(protocol_error(
+                    "runtime.session.not_found",
+                    "serial.close",
+                    ErrorCategory::NotFound,
+                    false,
+                    "the Serial session is not owned by this broker connection",
+                ));
+            }
+            runtime.close_serial(session.clone(), &lease).await?;
+            record_serial_closed(&serial_sessions, &session);
             Ok(envelope::Payload::CloseSessionResponse(v1::Empty {}))
         }
         None => Err(invalid_message("envelope payload is required")),
         _ => Err(invalid_message(
             "response and event payloads are not valid client requests",
         )),
+    }
+}
+
+fn register_serial_session(sessions: &SerialSessions, session: SessionId) {
+    sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .active
+        .insert(session);
+}
+
+fn is_serial_session(sessions: &SerialSessions, session: &SessionId) -> bool {
+    let sessions = sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    sessions.active.contains(session) || sessions.closed.contains(session)
+}
+
+fn record_serial_closed(sessions: &SerialSessions, session: &SessionId) {
+    let mut sessions = sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !sessions.active.remove(session) || !sessions.closed.insert(session.clone()) {
+        return;
+    }
+    sessions.closed_order.push_back(session.clone());
+    while sessions.closed_order.len() > CLOSED_SERIAL_SESSION_RETENTION {
+        let evicted = sessions
+            .closed_order
+            .pop_front()
+            .expect("closed Serial session retention is non-empty");
+        sessions.closed.remove(&evicted);
     }
 }
 

@@ -9,8 +9,8 @@ use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use seeed_hal_broker::{Broker, BrokerConfig, StartupToken};
 use seeed_hal_can::{
-    CanAdapter, CanBitTiming, CanChannel, CanConfigureConfig, CanFrame, CanId, CanMode,
-    CanOpenConfig,
+    CanAdapter, CanBusState, CanBusStatus, CanChannel, CanFrame, CanId, CanLinkExpectation,
+    CanMode, CanOpenConfig,
 };
 use seeed_hal_core::{
     CapabilityId, CapabilitySet, HalResult, OwnerId, ResourceDescriptor, ResourceSelector,
@@ -535,6 +535,52 @@ where
     match response.payload.unwrap() {
         envelope::Payload::OpenCanResponse(response) => response,
         other => panic!("expected CAN open response, got {other:?}"),
+    }
+}
+
+async fn open_configured_classic_can<T>(client: &mut Client<T>) -> v1::OpenCanResponse
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let enumerate = client
+        .request(envelope::Payload::EnumerateCanRequest(v1::EnumerateCanRequest {}))
+        .await;
+    let descriptor = match enumerate.payload.unwrap() {
+        envelope::Payload::EnumerateCanResponse(response) => {
+            response.resources.into_iter().next().unwrap()
+        }
+        other => panic!("expected CAN enumerate response, got {other:?}"),
+    };
+    let response = client
+        .request(envelope::Payload::OpenCanRequest(v1::OpenCanRequest {
+            selector: Some(v1::ResourceSelector {
+                resource_id: descriptor.resource_id,
+                minimum_identity_quality: descriptor.identity_quality,
+                transport: descriptor.transport,
+            }),
+            mode: v1::LeaseMode::Maintenance as i32,
+            config: Some(v1::CanOpenConfig {
+                config: Some(v1::can_open_config::Config::Configure(
+                    v1::CanConfigureConfig {
+                        mode: v1::CanMode::Classic as i32,
+                        nominal: Some(v1::CanBitTiming {
+                            bitrate: 250_000,
+                            sample_point_permill: None,
+                            sjw: None,
+                        }),
+                        data: None,
+                        listen_only: true,
+                        loopback: false,
+                        restart_ms: None,
+                    },
+                )),
+            }),
+            filters: Some(can_filter_data()),
+        }))
+        .await;
+    match response.payload.unwrap() {
+        envelope::Payload::OpenCanResponse(response) => response,
+        other => panic!("expected configured CAN open response, got {other:?}"),
     }
 }
 
@@ -1741,16 +1787,24 @@ async fn minor_one_handshake_enumerates_and_opens_can_with_exact_capabilities() 
         v1::LeaseMode::Control as i32
     );
 
+    let close_request = v1::CloseSessionRequest {
+        session_id: session.session_id,
+        lease: session.lease,
+    };
     let close = client
         .request(envelope::Payload::CloseSessionRequest(
-            v1::CloseSessionRequest {
-                session_id: session.session_id,
-                lease: session.lease,
-            },
+            close_request.clone(),
         ))
         .await;
     assert!(matches!(
         close.payload,
+        Some(envelope::Payload::CloseSessionResponse(_))
+    ));
+    let replay = client
+        .request(envelope::Payload::CloseSessionRequest(close_request))
+        .await;
+    assert!(matches!(
+        replay.payload,
         Some(envelope::Payload::CloseSessionResponse(_))
     ));
     drop(client);
@@ -2014,10 +2068,9 @@ async fn can_fd_configuration_and_frames_use_resource_capabilities() {
 }
 
 #[tokio::test]
-async fn can_receive_limit_is_rejected_before_dequeue_and_disconnect_releases_resources() {
+async fn can_response_frame_limit_rejects_before_dequeue() {
     let can_adapter = VirtualCanAdapter::loopback("can:virtual:broker-cleanup");
     let runtime = HalRuntime::builder()
-        .serial_adapter(VirtualSerialAdapter::loopback("serial:virtual:broker-cleanup"))
         .can_adapter(can_adapter.clone())
         .build();
     let broker = Broker::with_startup_token(runtime.clone(), StartupToken::from_bytes(TOKEN));
@@ -2026,7 +2079,7 @@ async fn can_receive_limit_is_rejected_before_dequeue_and_disconnect_releases_re
     let mut client = Client::new(client_io);
     let mut handshake = can_handshake();
     handshake.max_frame_bytes = 512;
-    handshake.max_read_bytes = 64;
+    handshake.max_read_bytes = 128;
     handshake.max_write_bytes = 64;
     let accepted = client
         .request(envelope::Payload::HandshakeRequest(handshake))
@@ -2036,7 +2089,6 @@ async fn can_receive_limit_is_rejected_before_dequeue_and_disconnect_releases_re
         Some(envelope::Payload::HandshakeResponse(_))
     ));
     let can_session = open_virtual_can(&mut client, Some(v1::CanMode::Classic)).await;
-    let _serial_session = open_virtual_serial(&mut client, 1_000).await;
     can_adapter
         .inject_received(
             CanFrame::classic_data(CanId::standard(0x123).unwrap(), Bytes::from_static(&[7]))
@@ -2048,8 +2100,8 @@ async fn can_receive_limit_is_rejected_before_dequeue_and_disconnect_releases_re
     let oversized = client
         .request(envelope::Payload::CanReceiveRequest(
             v1::CanReceiveRequest {
-                session_id: can_session.session_id,
-                lease: can_session.lease,
+                session_id: can_session.session_id.clone(),
+                lease: can_session.lease.clone(),
                 max_frames: 2,
                 timeout_ms: 0,
             },
@@ -2057,28 +2109,77 @@ async fn can_receive_limit_is_rejected_before_dequeue_and_disconnect_releases_re
         .await;
     assert_eq!(error_name(&oversized), "runtime.protocol.invalid_message");
 
+    let still_queued = client
+        .request(envelope::Payload::CanReceiveRequest(
+            v1::CanReceiveRequest {
+                session_id: can_session.session_id,
+                lease: can_session.lease,
+                max_frames: 1,
+                timeout_ms: 0,
+            },
+        ))
+        .await;
+    assert!(matches!(
+        still_queued.payload,
+        Some(envelope::Payload::CanReceiveResponse(_))
+    ));
+
+    drop(client);
+    let outcome = server.await.unwrap();
+    assert!(outcome.cleanup_error().is_none());
+}
+
+#[tokio::test]
+async fn disconnect_restores_configured_can_and_releases_can_and_serial() {
+    let can_adapter = VirtualCanAdapter::loopback("can:virtual:broker-disconnect-configure");
+    let runtime = HalRuntime::builder()
+        .serial_adapter(VirtualSerialAdapter::loopback(
+            "serial:virtual:broker-disconnect-configure",
+        ))
+        .can_adapter(can_adapter)
+        .build();
+    let broker = Broker::with_startup_token(runtime.clone(), StartupToken::from_bytes(TOKEN));
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    handshake_can(&mut client).await;
+    let _configured_can = open_configured_classic_can(&mut client).await;
+    let _serial = open_virtual_serial(&mut client, 1_000).await;
+
     drop(client);
     let outcome = server.await.unwrap();
     assert!(outcome.cleanup_error().is_none());
 
-    let descriptor = runtime.enumerate_can().await.unwrap().remove(0);
-    let config = CanOpenConfig::Configure(
-        CanConfigureConfig::new(
-            CanMode::Classic,
-            CanBitTiming::new(500_000, None, None).unwrap(),
-            None,
-            false,
-            true,
-        )
-        .unwrap(),
-    );
+    let can_descriptor = runtime.enumerate_can().await.unwrap().remove(0);
     runtime
         .open_can(
-            OwnerId::parse("broker-contract:cleanup-reuse").unwrap(),
-            descriptor.selector(),
-            seeed_hal_core::LeaseMode::Maintenance,
-            config,
+            OwnerId::parse("broker-contract:disconnect-can-reuse").unwrap(),
+            can_descriptor.selector(),
+            seeed_hal_core::LeaseMode::Control,
+            CanOpenConfig::Attach(
+                CanLinkExpectation::new(
+                    Some(CanMode::Classic),
+                    Some(500_000),
+                    None,
+                    Some(false),
+                    Some(true),
+                )
+                .unwrap(),
+            ),
             seeed_hal_can::CanFilterSet::new(vec![]).unwrap(),
+        )
+        .await
+        .unwrap()
+        .close()
+        .await
+        .unwrap();
+
+    let serial_descriptor = runtime.enumerate_serial().await.unwrap().remove(0);
+    runtime
+        .open_serial(
+            OwnerId::parse("broker-contract:disconnect-serial-reuse").unwrap(),
+            serial_descriptor.selector(),
+            SerialConfig::default(),
         )
         .await
         .unwrap()
@@ -2155,8 +2256,8 @@ async fn broker_uses_selected_descriptor_capabilities_without_normalizing_them()
     let session = open_virtual_can(&mut client, Some(v1::CanMode::Classic)).await;
     let error_send = client
         .request(envelope::Payload::CanSendRequest(v1::CanSendRequest {
-            session_id: session.session_id,
-            lease: session.lease,
+            session_id: session.session_id.clone(),
+            lease: session.lease.clone(),
             frames: vec![v1::CanFrame {
                 kind: v1::CanFrameKind::Error as i32,
                 data: vec![1],
@@ -2218,6 +2319,230 @@ async fn broker_uses_selected_descriptor_capabilities_without_normalizing_them()
 
     drop(client);
     assert!(server.await.unwrap().cleanup_error().is_none());
+}
+
+#[tokio::test]
+async fn advertised_error_frame_and_filter_capabilities_are_usable() {
+    let adapter = VirtualCanAdapter::loopback("can:virtual:broker-error-frames");
+    let broker = Broker::with_startup_token(
+        can_runtime(adapter),
+        StartupToken::from_bytes(TOKEN),
+    );
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    handshake_can(&mut client).await;
+    let session = open_virtual_can(&mut client, Some(v1::CanMode::Classic)).await;
+    let filters = client
+        .request(envelope::Payload::ReplaceCanFiltersRequest(
+            v1::ReplaceCanFiltersRequest {
+                session_id: session.session_id.clone(),
+                lease: session.lease.clone(),
+                filters: Some(v1::CanFilterSet {
+                    filters: vec![v1::CanFilter {
+                        id: 0,
+                        mask: 0,
+                        format: v1::CanIdFormat::Either as i32,
+                        classes: Some(v1::CanFrameClasses {
+                            data: false,
+                            remote: false,
+                            error: true,
+                        }),
+                    }],
+                }),
+            },
+        ))
+        .await;
+    assert!(matches!(
+        filters.payload,
+        Some(envelope::Payload::ReplaceCanFiltersResponse(_))
+    ));
+    let send = client
+        .request(envelope::Payload::CanSendRequest(v1::CanSendRequest {
+            session_id: session.session_id.clone(),
+            lease: session.lease.clone(),
+            frames: vec![v1::CanFrame {
+                kind: v1::CanFrameKind::Error as i32,
+                data: vec![0xa5],
+                error_classes: vec![v1::CanErrorClass::BusError as i32],
+                ..Default::default()
+            }],
+        }))
+        .await;
+    assert!(matches!(
+        send.payload,
+        Some(envelope::Payload::CanSendResponse(v1::CanSendResponse {
+            committed_count: 1,
+            error: None,
+        }))
+    ));
+    let receive = client
+        .request(envelope::Payload::CanReceiveRequest(v1::CanReceiveRequest {
+            session_id: session.session_id,
+            lease: session.lease,
+            max_frames: 1,
+            timeout_ms: 100,
+        }))
+        .await;
+    match receive.payload.unwrap() {
+        envelope::Payload::CanReceiveResponse(response) => {
+            assert_eq!(
+                response.frames[0].frame.as_ref().unwrap().kind,
+                v1::CanFrameKind::Error as i32
+            );
+        }
+        other => panic!("expected error-frame receive response, got {other:?}"),
+    }
+    drop(client);
+    assert!(server.await.unwrap().cleanup_error().is_none());
+}
+
+#[tokio::test]
+async fn can_sessions_from_another_connection_fail_closed_before_runtime() {
+    let adapter = VirtualCanAdapter::loopback("can:virtual:broker-owner-registry");
+    let runtime = can_runtime(adapter.clone());
+    let broker = Broker::with_startup_token(runtime, StartupToken::from_bytes(TOKEN));
+    let (server_one_io, client_one_io) = tokio::io::duplex(64 * 1024);
+    let (server_two_io, client_two_io) = tokio::io::duplex(64 * 1024);
+    let broker_one = broker.clone();
+    let server_one = tokio::spawn(async move { broker_one.serve_connection(server_one_io).await });
+    let server_two = tokio::spawn(async move { broker.serve_connection(server_two_io).await });
+    let mut client_one = Client::new(client_one_io);
+    let mut client_two = Client::new(client_two_io);
+    handshake_can(&mut client_one).await;
+    handshake_can(&mut client_two).await;
+    let foreign = open_virtual_can(&mut client_one, Some(v1::CanMode::Classic)).await;
+
+    let requests = [
+        envelope::Payload::CanSendRequest(v1::CanSendRequest {
+            session_id: foreign.session_id.clone(),
+            lease: foreign.lease.clone(),
+            frames: vec![classic_can_frame(1)],
+        }),
+        envelope::Payload::CanReceiveRequest(v1::CanReceiveRequest {
+            session_id: foreign.session_id.clone(),
+            lease: foreign.lease.clone(),
+            max_frames: 1,
+            timeout_ms: 0,
+        }),
+        envelope::Payload::ReplaceCanFiltersRequest(v1::ReplaceCanFiltersRequest {
+            session_id: foreign.session_id.clone(),
+            lease: foreign.lease.clone(),
+            filters: Some(can_filter_data()),
+        }),
+        envelope::Payload::GetCanBusStatusRequest(v1::GetCanBusStatusRequest {
+            session_id: foreign.session_id.clone(),
+            lease: foreign.lease.clone(),
+        }),
+    ];
+    for request in requests {
+        let rejected = client_two.request(request).await;
+        assert_eq!(error_name(&rejected), "runtime.session.not_found");
+    }
+    assert!(
+        adapter.transmitted_frames().is_empty(),
+        "foreign broker sessions must not reach the CAN adapter"
+    );
+    let foreign_close = client_two
+        .request(envelope::Payload::CloseSessionRequest(
+            v1::CloseSessionRequest {
+                session_id: foreign.session_id.clone(),
+                lease: foreign.lease.clone(),
+            },
+        ))
+        .await;
+    assert_eq!(error_name(&foreign_close), "runtime.session.not_found");
+    let owner_status = client_one
+        .request(envelope::Payload::GetCanBusStatusRequest(
+            v1::GetCanBusStatusRequest {
+                session_id: foreign.session_id,
+                lease: foreign.lease,
+            },
+        ))
+        .await;
+    assert!(matches!(
+        owner_status.payload,
+        Some(envelope::Payload::GetCanBusStatusResponse(_))
+    ));
+
+    drop(client_one);
+    drop(client_two);
+    assert!(server_one.await.unwrap().cleanup_error().is_none());
+    assert!(server_two.await.unwrap().cleanup_error().is_none());
+}
+
+#[tokio::test]
+async fn can_health_events_are_exhaustively_owner_scoped() {
+    let adapter = VirtualCanAdapter::loopback("can:virtual:broker-health-events");
+    let runtime = can_runtime(adapter.clone());
+    let broker = Broker::with_startup_token(runtime, StartupToken::from_bytes(TOKEN));
+    let (server_one_io, client_one_io) = tokio::io::duplex(64 * 1024);
+    let (server_two_io, client_two_io) = tokio::io::duplex(64 * 1024);
+    let broker_one = broker.clone();
+    let server_one = tokio::spawn(async move { broker_one.serve_connection(server_one_io).await });
+    let server_two = tokio::spawn(async move { broker.serve_connection(server_two_io).await });
+    let mut client_one = Client::new(client_one_io);
+    let mut client_two = Client::new(client_two_io);
+    handshake_can(&mut client_one).await;
+    handshake_can(&mut client_two).await;
+    let session = open_virtual_can(&mut client_one, Some(v1::CanMode::Classic)).await;
+    let baseline = client_one
+        .request(envelope::Payload::GetCanBusStatusRequest(
+            v1::GetCanBusStatusRequest {
+                session_id: session.session_id.clone(),
+                lease: session.lease.clone(),
+            },
+        ))
+        .await;
+    assert!(matches!(
+        baseline.payload,
+        Some(envelope::Payload::GetCanBusStatusResponse(_))
+    ));
+    adapter.set_bus_status(CanBusStatus::new(
+        CanBusState::Warning,
+        Some(1),
+        Some(2),
+    ));
+    client_one
+        .send(
+            700,
+            envelope::Payload::GetCanBusStatusRequest(v1::GetCanBusStatusRequest {
+                session_id: session.session_id,
+                lease: session.lease,
+            }),
+        )
+        .await;
+    let mut saw_response = false;
+    let mut saw_health = false;
+    while !saw_response || !saw_health {
+        let response = client_one.recv().await;
+        match response.payload.unwrap() {
+            envelope::Payload::GetCanBusStatusResponse(_) => {
+                assert_eq!(response.request_id, 700);
+                saw_response = true;
+            }
+            envelope::Payload::RuntimeEvent(event) => {
+                assert_eq!(response.request_id, 0);
+                assert_eq!(event.name, "can.bus.warning");
+                saw_health = true;
+            }
+            other => panic!("unexpected health-event payload: {other:?}"),
+        }
+    }
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            client_two.framed.next(),
+        )
+        .await
+        .is_err(),
+        "CAN health events must not leak to another connection owner"
+    );
+
+    drop(client_one);
+    drop(client_two);
+    assert!(server_one.await.unwrap().cleanup_error().is_none());
+    assert!(server_two.await.unwrap().cleanup_error().is_none());
 }
 
 #[tokio::test]

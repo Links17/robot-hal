@@ -4,13 +4,14 @@ use std::sync::{Arc, Mutex};
 use seeed_hal_can::{
     CAN_CLASSIC_CAPABILITY, CAN_CONFIGURE_CAPABILITY, CAN_ERROR_FRAMES_CAPABILITY,
     CAN_FD_CAPABILITY, CAN_RX_TIMESTAMP_CAPABILITY, CanFilterSet, CanFrame, CanMode,
-    CanOpenConfig, MAX_CAN_BATCH_FRAMES, MAX_FD_DATA_BYTES, can_classic_capability,
+    CanOpenConfig, MAX_CAN_BATCH_FRAMES, MAX_CAN_ERROR_CLASSES, MAX_FD_DATA_BYTES,
+    can_classic_capability,
     can_configure_capability, can_error_frames_capability, can_fd_capability,
     can_rx_timestamp_capability,
 };
 use seeed_hal_core::{
-    CapabilityId, CapabilitySet, ErrorCategory, HalError, HalResult, OwnerId, ResourceDescriptor,
-    ResourceId, ResourceSelector, SessionId,
+    CapabilityId, CapabilitySet, ErrorCategory, HalError, HalResult, LeaseMode, LeaseToken, OwnerId,
+    ResourceDescriptor, ResourceId, ResourceSelector, SessionId,
 };
 use seeed_hal_protocol::v1::{self, envelope};
 use seeed_hal_protocol::{
@@ -31,11 +32,25 @@ pub(crate) struct CanDispatchLimits {
 }
 
 const CLOSED_CAN_SESSION_RETENTION: usize = 256;
-// Maximum encoded bytes for one fully populated CAN frame plus timestamp and
-// protobuf field overhead. Used only for pre-dispatch admission.
-const MAX_RECEIVED_CAN_WIRE_BYTES: usize = 400;
+// Exact prost maxima under the canonical CAN model: FD frame (82), timestamp
+// with a 255-byte clock domain (271), and their two nested message fields
+// (358). Error frames are smaller because their class list is bounded by
+// MAX_CAN_ERROR_CLASSES in seeed-hal-can.
+const MAX_CAN_FRAME_PROTO_BYTES: usize = 82;
+const MAX_ERROR_CAN_FRAME_PROTO_BYTES: usize = 2 + 10 + 2 + MAX_CAN_ERROR_CLASSES;
+const MAX_CAN_TIMESTAMP_PROTO_BYTES: usize = 271;
+const MAX_RECEIVED_CAN_FRAME_PROTO_BYTES: usize = 358;
+const CAN_RECEIVE_RESPONSE_FIELD_NUMBER: u32 = 57;
 
 struct CanSessionRecord {
+    resource_id: ResourceId,
+    capabilities: CapabilitySet,
+    lease: LeaseToken,
+    closed: bool,
+}
+
+struct CanSessionContext {
+    resource_id: ResourceId,
     capabilities: CapabilitySet,
     closed: bool,
 }
@@ -125,7 +140,9 @@ pub(crate) async fn dispatch(
         envelope::Payload::ReplaceCanFiltersRequest(request) => {
             replace_filters(runtime, request, sessions).await
         }
-        envelope::Payload::GetCanBusStatusRequest(request) => status(runtime, request).await,
+        envelope::Payload::GetCanBusStatusRequest(request) => {
+            status(runtime, request, sessions).await
+        }
         _ => Err(invalid_message(
             "CAN response payloads are not valid client requests",
         )),
@@ -138,6 +155,17 @@ pub(crate) async fn close(
     sessions: CanSessions,
 ) -> HalResult<envelope::Payload> {
     let (session, lease) = parse_session_lease(request.session_id, request.lease)?;
+    let context = validate_session(
+        &sessions,
+        &session,
+        &lease,
+        LeaseMode::Observe,
+        "can.close",
+        true,
+    )?;
+    if context.closed {
+        return Ok(envelope::Payload::CloseSessionResponse(v1::Empty {}));
+    }
     runtime.close_can(session.clone(), &lease).await?;
     record_closed(&sessions, &session);
     Ok(envelope::Payload::CloseSessionResponse(v1::Empty {}))
@@ -165,6 +193,7 @@ async fn open(
     let descriptors = runtime.enumerate_can().await?;
     let selected = select_descriptor(&descriptors, &selector)?;
     validate_open_capabilities(selected, &config, &filters)?;
+    let resource_id = selected.id().clone();
     let capabilities = selected.capabilities().clone();
     let handle = runtime
         .open_can(owner, selector, mode, config, filters)
@@ -177,7 +206,9 @@ async fn open(
         .insert(
             session_id.clone(),
             CanSessionRecord {
+                resource_id,
                 capabilities,
+                lease: lease.clone(),
                 closed: false,
             },
         );
@@ -195,9 +226,19 @@ async fn send(
 ) -> HalResult<envelope::Payload> {
     validate_send_bounds(&request, limits.max_write_bytes)?;
     let (session, lease, frames) = can_send_request_from_proto(request)?;
-    if let Some(capabilities) = session_capabilities(&sessions, &session) {
-        validate_frame_capabilities(&frames, &capabilities, None)?;
-    }
+    let context = validate_session(
+        &sessions,
+        &session,
+        &lease,
+        LeaseMode::Control,
+        "can.send_batch",
+        false,
+    )?;
+    validate_frame_capabilities(
+        &frames,
+        &context.capabilities,
+        Some(&context.resource_id),
+    )?;
     let input_count = frames.len();
     let response = match runtime.send_can_batch(session, &lease, frames).await {
         Ok(()) => can_send_response_to_proto(Ok(()), input_count)?,
@@ -221,9 +262,7 @@ async fn receive(
             "CAN receive payload bound exceeds the negotiated read maximum",
         ));
     }
-    let maximum_response = requested_frames
-        .checked_mul(MAX_RECEIVED_CAN_WIRE_BYTES)
-        .and_then(|frames| frames.checked_add(32))
+    let maximum_response = can_receive_response_envelope_bound(requested_frames)
         .ok_or_else(|| invalid_message("CAN receive response bound overflows usize"))?;
     if maximum_response > limits.max_frame_bytes {
         return Err(invalid_message(
@@ -231,12 +270,22 @@ async fn receive(
         ));
     }
     let (session, lease, max_frames, timeout) = can_receive_request_from_proto(request)?;
+    let context = validate_session(
+        &sessions,
+        &session,
+        &lease,
+        LeaseMode::Observe,
+        "can.receive",
+        false,
+    )?;
     let frames = runtime
         .receive_can(session.clone(), &lease, max_frames, timeout)
         .await?;
-    if let Some(capabilities) = session_capabilities(&sessions, &session) {
-        validate_received_capabilities(&frames, &capabilities)?;
-    }
+    validate_received_capabilities(
+        &frames,
+        &context.capabilities,
+        &context.resource_id,
+    )?;
     Ok(envelope::Payload::CanReceiveResponse(
         v1::CanReceiveResponse {
             frames: frames.iter().map(Into::into).collect(),
@@ -250,9 +299,19 @@ async fn replace_filters(
     sessions: CanSessions,
 ) -> HalResult<envelope::Payload> {
     let (session, lease, filters) = replace_can_filters_request_from_proto(request)?;
-    if let Some(capabilities) = session_capabilities(&sessions, &session) {
-        validate_filter_capabilities(&filters, &capabilities, None)?;
-    }
+    let context = validate_session(
+        &sessions,
+        &session,
+        &lease,
+        LeaseMode::Observe,
+        "can.replace_filters",
+        false,
+    )?;
+    validate_filter_capabilities(
+        &filters,
+        &context.capabilities,
+        Some(&context.resource_id),
+    )?;
     runtime
         .replace_can_filters(session, &lease, filters)
         .await?;
@@ -262,8 +321,17 @@ async fn replace_filters(
 async fn status(
     runtime: HalRuntime,
     request: v1::GetCanBusStatusRequest,
+    sessions: CanSessions,
 ) -> HalResult<envelope::Payload> {
     let (session, lease) = get_can_bus_status_request_from_proto(request)?;
+    validate_session(
+        &sessions,
+        &session,
+        &lease,
+        LeaseMode::Observe,
+        "can.status",
+        false,
+    )?;
     let status = runtime.can_bus_status(session, &lease).await?;
     Ok(envelope::Payload::GetCanBusStatusResponse(
         v1::GetCanBusStatusResponse {
@@ -289,6 +357,42 @@ fn validate_send_bounds(request: &v1::CanSendRequest, max_write_bytes: usize) ->
         ));
     }
     Ok(())
+}
+
+fn can_receive_response_envelope_bound(frame_count: usize) -> Option<usize> {
+    debug_assert!(MAX_ERROR_CAN_FRAME_PROTO_BYTES <= MAX_CAN_FRAME_PROTO_BYTES);
+    let frame_field = length_delimited_field_len(1, MAX_CAN_FRAME_PROTO_BYTES);
+    let timestamp_field = length_delimited_field_len(2, MAX_CAN_TIMESTAMP_PROTO_BYTES);
+    let received_frame = frame_field.checked_add(timestamp_field)?;
+    debug_assert_eq!(received_frame, MAX_RECEIVED_CAN_FRAME_PROTO_BYTES);
+    let repeated_frame = length_delimited_field_len(1, received_frame);
+    let response_payload = repeated_frame.checked_mul(frame_count)?;
+    Some(envelope_encoded_len(
+        CAN_RECEIVE_RESPONSE_FIELD_NUMBER,
+        response_payload,
+    ))
+}
+
+fn envelope_encoded_len(payload_field_number: u32, payload_len: usize) -> usize {
+    1 + 10
+        + prost_varint_len((u64::from(payload_field_number) << 3) | 2)
+        + prost_varint_len(payload_len as u64)
+        + payload_len
+}
+
+fn length_delimited_field_len(field_number: u32, value_len: usize) -> usize {
+    prost_varint_len((u64::from(field_number) << 3) | 2)
+        + prost_varint_len(value_len as u64)
+        + value_len
+}
+
+fn prost_varint_len(mut value: u64) -> usize {
+    let mut len = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        len += 1;
+    }
+    len
 }
 
 fn validate_open_capabilities(
@@ -379,15 +483,20 @@ fn validate_frame_capabilities(
 fn validate_received_capabilities(
     frames: &[seeed_hal_can::ReceivedCanFrame],
     capabilities: &CapabilitySet,
+    resource_id: &ResourceId,
 ) -> HalResult<()> {
     for received in frames {
-        validate_frame_capabilities(std::slice::from_ref(received.frame()), capabilities, None)?;
+        validate_frame_capabilities(
+            std::slice::from_ref(received.frame()),
+            capabilities,
+            Some(resource_id),
+        )?;
         if received.timestamp().is_some() {
             require_capability(
                 capabilities,
                 &can_rx_timestamp_capability(),
                 CAN_RX_TIMESTAMP_CAPABILITY,
-                None,
+                Some(resource_id),
             )?;
         }
     }
@@ -439,13 +548,105 @@ fn select_descriptor<'a>(
     Ok(selected)
 }
 
-fn session_capabilities(sessions: &CanSessions, session: &SessionId) -> Option<CapabilitySet> {
-    sessions
+fn validate_session(
+    sessions: &CanSessions,
+    session: &SessionId,
+    supplied: &LeaseToken,
+    required_mode: LeaseMode,
+    operation: &'static str,
+    allow_closed: bool,
+) -> HalResult<CanSessionContext> {
+    let sessions = sessions
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .sessions
-        .get(session)
-        .map(|record| record.capabilities.clone())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(record) = sessions.sessions.get(session) else {
+        return Err(session_error(
+            "runtime.session.not_found",
+            operation,
+            "the CAN session is not owned by this broker connection",
+            None,
+        ));
+    };
+    if record.closed {
+        if supplied == &record.lease {
+            if !allow_closed {
+                return Err(session_error(
+                    "runtime.session.closed",
+                    operation,
+                    "the CAN session is closed",
+                    Some(&record.resource_id),
+                ));
+            }
+            return Ok(CanSessionContext {
+                resource_id: record.resource_id.clone(),
+                capabilities: record.capabilities.clone(),
+                closed: true,
+            });
+        }
+        return Err(session_token_error(record, supplied, operation));
+    }
+    if supplied != &record.lease {
+        return Err(session_token_error(record, supplied, operation));
+    }
+    if !lease_mode_allows(record.lease.mode(), required_mode) {
+        return Err(session_error(
+            "runtime.lease.mode_denied",
+            operation,
+            "the CAN lease mode does not permit this operation",
+            Some(&record.resource_id),
+        ));
+    }
+    Ok(CanSessionContext {
+        resource_id: record.resource_id.clone(),
+        capabilities: record.capabilities.clone(),
+        closed: false,
+    })
+}
+
+fn lease_mode_allows(actual: LeaseMode, required: LeaseMode) -> bool {
+    matches!(
+        (actual, required),
+        (LeaseMode::Observe, LeaseMode::Observe)
+            | (LeaseMode::Control, LeaseMode::Observe | LeaseMode::Control)
+            | (LeaseMode::Maintenance, LeaseMode::Observe | LeaseMode::Control | LeaseMode::Maintenance)
+    )
+}
+
+fn session_token_error(
+    record: &CanSessionRecord,
+    supplied: &LeaseToken,
+    operation: &'static str,
+) -> HalError {
+    let name = if supplied.generation() < record.lease.generation() {
+        "runtime.lease.stale_generation"
+    } else {
+        "runtime.lease.invalid_token"
+    };
+    session_error(
+        name,
+        operation,
+        "the CAN lease token does not match the connection-owned session",
+        Some(&record.resource_id),
+    )
+}
+
+fn session_error(
+    name: &'static str,
+    operation: &'static str,
+    message: &'static str,
+    resource_id: Option<&ResourceId>,
+) -> HalError {
+    let category = if name == "runtime.session.not_found" {
+        ErrorCategory::NotFound
+    } else {
+        ErrorCategory::Conflict
+    };
+    let error = HalError::new(name, category, operation, false, message)
+        .expect("static CAN broker session error metadata is valid");
+    match resource_id {
+        Some(resource_id) => error.with_resource_id(resource_id.clone()),
+        None => error,
+    }
 }
 
 fn record_closed(sessions: &CanSessions, session: &SessionId) {
@@ -499,4 +700,25 @@ fn resource_selection_error(
     HalError::new(name, category, "can.open", false, message)
         .expect("static CAN broker error metadata is valid")
         .with_resource_id(resource_id.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MAX_CAN_FRAME_PROTO_BYTES, MAX_CAN_TIMESTAMP_PROTO_BYTES,
+        MAX_ERROR_CAN_FRAME_PROTO_BYTES, MAX_RECEIVED_CAN_FRAME_PROTO_BYTES,
+        can_receive_response_envelope_bound, length_delimited_field_len,
+    };
+
+    #[test]
+    fn canonical_can_bounds_derive_the_exact_receive_envelope_maximum() {
+        assert!(MAX_ERROR_CAN_FRAME_PROTO_BYTES <= MAX_CAN_FRAME_PROTO_BYTES);
+        assert_eq!(
+            length_delimited_field_len(1, MAX_CAN_FRAME_PROTO_BYTES)
+                + length_delimited_field_len(2, MAX_CAN_TIMESTAMP_PROTO_BYTES),
+            MAX_RECEIVED_CAN_FRAME_PROTO_BYTES
+        );
+        assert_eq!(can_receive_response_envelope_bound(1), Some(376));
+        assert_eq!(can_receive_response_envelope_bound(64), Some(23_120));
+    }
 }
