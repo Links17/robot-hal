@@ -592,7 +592,11 @@ impl Drop for CanHandle {
         let lease = self.lease.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                let _ = runtime.close_can(session_id, &lease).await;
+                let _ = runtime
+                    .inner
+                    .can_manager
+                    .close_reliably(session_id, &lease)
+                    .await;
             });
         }
     }

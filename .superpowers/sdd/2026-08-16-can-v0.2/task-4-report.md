@@ -82,3 +82,18 @@ No build, test, lint, format, protocol check, or dependency-generation command w
 
 - The task's explicit deferred-verification constraint means syntax, type checking, formatting, Clippy, and runtime behavior are not yet evidenced by executed tooling.
 - Synchronous `CanChannel::send` has no API deadline parameter. Exact physical-prefix reporting requires awaiting the backend result; therefore finite send completion depends on adapters honoring their nonblocking/bounded send contract. Receive, discovery, management operations, and cleanup have explicit runtime deadlines.
+
+## Fix round 1
+
+Addressed the three Critical and five Important review findings without running the deferred verification gate:
+
+- Added a monotonically increasing actor epoch and recorded it on pending and active sessions. Finished actors are reconciled before reservation, admission, commit, session operations, and close: matching leases are released, sessions are retained in the closed replay cache, pending opens are cancelled, and terminal health/close events are emitted before a replacement actor can be installed. Actor removal after close now also compares the captured epoch so an old close cannot remove a newer actor.
+- Split lifecycle removal onto a dedicated bounded 64-command cleanup queue. Cleanup admission uses a finite retry deadline, while the actor checks cancellation flags before admitting delayed provisional sessions and prunes cancelled, unactivated sessions on every tick. Per-session cleanup completion watches allow owner revocation and failed-open rollback to wait for actor-side removal without sharing the saturable management queue.
+- Made `CanHandle` drop use the reliable cleanup path. Explicit close and owner revocation use the same dedicated cleanup admission behavior.
+- Limited each actor tick to 16 cleanup commands and 16 management commands before backend receive polling and pending-receive servicing, preventing sustained command traffic from starving receive deadlines.
+- Wrapped adapter `enumerate` and `open` futures in worker-local Tokio timeouts. The timeout drops a hung adapter future on its owning worker rather than merely abandoning the outer reply wait.
+- Rejected duplicate selected `ResourceId` values across the complete discovery result before capability filtering, including capability-mismatched duplicates within one adapter or across adapters.
+- Made lease commit, active-session insertion, `SessionOpened` publication, and activation visibility one manager-locked transition. `SessionOpened` is published before the actor-visible activation token, so health events cannot precede the open event; owner revocation can observe only the wholly pending or wholly active state.
+- Strengthened concurrency coverage with actor gates and barriers: true concurrent whole-batch FIFO, contended atomic TX admission, failed-actor reuse, provisional rollback and handle-drop cleanup under proven management-queue saturation, bounded receive progress under pressure, duplicate-ID capability mismatches, worker-local hung-future drops, open/revoke event ordering, CAN health event ordering, and mixed Serial/CAN owner cleanup after an injected Serial close error.
+
+Per the task execution rule, no build, test, lint, formatting, protocol, or generated-code check was run in this fix round. Static inspection and `git diff --check` were the only permitted verification steps. The final unstaged `git diff --check` exited 0 with no output.

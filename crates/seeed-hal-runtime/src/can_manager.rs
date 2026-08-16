@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -33,6 +34,8 @@ struct PendingSession {
     reservation: CanReservation,
     cancellation: watch::Sender<bool>,
     done: watch::Sender<bool>,
+    cancelled: Arc<AtomicBool>,
+    actor_epoch: Option<u64>,
 }
 
 struct ActiveSession {
@@ -40,7 +43,13 @@ struct ActiveSession {
     owner_id: OwnerId,
     token: LeaseToken,
     actor: CanActorHandle,
+    actor_epoch: u64,
     closing: bool,
+}
+
+struct ActorEntry {
+    handle: CanActorHandle,
+    epoch: u64,
 }
 
 struct ClosedSession {
@@ -53,7 +62,8 @@ struct ManagerState {
     leases: CanLeaseTable,
     pending: HashMap<SessionId, PendingSession>,
     active: HashMap<SessionId, ActiveSession>,
-    actors: HashMap<ResourceId, CanActorHandle>,
+    actors: HashMap<ResourceId, ActorEntry>,
+    next_actor_epoch: u64,
     closed: HashMap<SessionId, ClosedSession>,
     closed_order: VecDeque<SessionId>,
 }
@@ -104,6 +114,22 @@ impl CanManager {
     ) -> HalResult<(SessionId, LeaseToken)> {
         validate_open_mode(mode, &config, selector.id())?;
         let records = self.discovery_records("can.open").await?;
+        if records
+            .iter()
+            .filter(|record| record.descriptor.id() == selector.id())
+            .take(2)
+            .count()
+            > 1
+        {
+            return Err(runtime_error(
+                "runtime.resource.ambiguous",
+                ErrorCategory::Conflict,
+                "can.open",
+                false,
+                "the selected CAN resource ID is duplicated across combined discovery",
+            )
+            .with_resource_id(selector.id().clone()));
+        }
         let descriptors: Vec<_> = records
             .iter()
             .map(|record| record.descriptor.clone())
@@ -122,8 +148,11 @@ impl CanManager {
         let record = &records[selected_index];
         let resource_id = record.descriptor.id().clone();
         let session_id = SessionId::parse(Uuid::new_v4().to_string())?;
+        let activation = Arc::new(Mutex::new(None));
+        let cancelled = Arc::new(AtomicBool::new(false));
         let (cancellation, done) = {
             let mut state = lock_state(&self.state);
+            self.reconcile_finished_actor(&mut state, &resource_id);
             let reservation = state.leases.reserve(
                 resource_id.clone(),
                 session_id.clone(),
@@ -138,16 +167,19 @@ impl CanManager {
                     reservation,
                     cancellation: cancel_tx,
                     done: done_tx.clone(),
+                    cancelled: Arc::clone(&cancelled),
+                    actor_epoch: None,
                 },
             );
             (cancel_rx, done_tx)
         };
-        let activation = Arc::new(Mutex::new(None));
         let mut guard = PendingCanOpen::new(
             Arc::clone(&self.state),
             session_id.clone(),
             Arc::clone(&activation),
+            Arc::clone(&cancelled),
             done,
+            self.close_timeout,
         );
         let session_spec = ActorSessionSpec {
             session_id: session_id.clone(),
@@ -155,18 +187,16 @@ impl CanManager {
             config: config.clone(),
             filters,
             activation,
+            cancelled,
+            cleanup_done: guard.done.clone(),
         };
 
         let (actor, added) = {
             let mut state = lock_state(&self.state);
-            if state
-                .actors
-                .get(&resource_id)
-                .is_some_and(CanActorHandle::is_finished)
-            {
-                state.actors.remove(&resource_id);
-            }
-            if let Some(actor) = state.actors.get(&resource_id).cloned() {
+            self.reconcile_finished_actor(&mut state, &resource_id);
+            let (actor, epoch, reply_rx) = if let Some(entry) = state.actors.get(&resource_id) {
+                let actor = entry.handle.clone();
+                let epoch = entry.epoch;
                 let (reply_tx, reply_rx) = oneshot::channel();
                 actor.try_command(
                     CanCommand::AddSession {
@@ -175,9 +205,19 @@ impl CanManager {
                     },
                     "can.open",
                 )?;
-                (actor, reply_rx)
+                (actor, epoch, reply_rx)
             } else {
                 let adapter = Arc::clone(&self.adapters[record.adapter_index]);
+                let epoch = state.next_actor_epoch.checked_add(1).ok_or_else(|| {
+                    runtime_error(
+                        "runtime.actor.epoch_exhausted",
+                        ErrorCategory::Internal,
+                        "can.open",
+                        false,
+                        "the CAN actor lifecycle epoch reached u64::MAX",
+                    )
+                })?;
+                state.next_actor_epoch = epoch;
                 let (actor, reply_rx) = spawn_can_actor(
                     adapter,
                     selector,
@@ -187,14 +227,21 @@ impl CanManager {
                     self.close_timeout,
                     self.events.clone(),
                 )?;
-                state.actors.insert(resource_id.clone(), actor.clone());
-                (actor, reply_rx)
+                state.actors.insert(
+                    resource_id.clone(),
+                    ActorEntry { handle: actor.clone(), epoch },
+                );
+                (actor, epoch, reply_rx)
+            };
+            if let Some(pending) = state.pending.get_mut(&session_id) {
+                pending.actor_epoch = Some(epoch);
             }
+            (actor, reply_rx)
         };
         guard.set_actor(actor.clone());
 
         let add_result = tokio::select! {
-            result = tokio::time::timeout(self.close_timeout, added) => match result {
+            result = tokio::time::timeout(self.close_timeout.saturating_add(Duration::from_millis(20)), added) => match result {
                 Ok(reply) => reply.map_err(|_| actor_unavailable("can.open", &resource_id))?,
                 Err(_) => Err(runtime_error(
                     "runtime.transport.timeout",
@@ -207,17 +254,18 @@ impl CanManager {
             _ = wait_cancelled(cancellation) => Err(session_closed("can.open", &resource_id)),
         };
         if let Err(error) = add_result {
-            if let Some(cleanup) = guard.begin_actor_session_removal() {
-                let _ = tokio::time::timeout(self.close_timeout, cleanup).await;
-            }
+            let _ = guard.cleanup().await;
             return Err(error.with_resource_id(resource_id));
         }
 
         let commit_result = {
             let mut state = lock_state(&self.state);
+            self.reconcile_finished_actor(&mut state, &resource_id);
             match state.pending.remove(&session_id) {
                 Some(pending) => state.leases.commit(pending.reservation).map(|token| {
-                    pending.done.send_replace(true);
+                    let actor_epoch = pending
+                        .actor_epoch
+                        .expect("admitted CAN pending session has an actor epoch");
                     state.active.insert(
                         session_id.clone(),
                         ActiveSession {
@@ -225,9 +273,19 @@ impl CanManager {
                             owner_id: owner_id.clone(),
                             token: token.clone(),
                             actor,
+                            actor_epoch,
                             closing: false,
                         },
                     );
+                    self.events.publish(
+                        RuntimeEventKind::SessionOpened,
+                        resource_id.clone(),
+                        session_id.clone(),
+                        owner_id.clone(),
+                        token.generation(),
+                    );
+                    guard.activate(token.clone());
+                    pending.done.send_replace(true);
                     token
                 }),
                 None => Err(session_closed("can.open", &resource_id)),
@@ -236,21 +294,11 @@ impl CanManager {
         let token = match commit_result {
             Ok(token) => token,
             Err(error) => {
-                if let Some(cleanup) = guard.begin_actor_session_removal() {
-                    let _ = tokio::time::timeout(self.close_timeout, cleanup).await;
-                }
+                let _ = guard.cleanup().await;
                 return Err(error);
             }
         };
-        guard.activate(token.clone());
         guard.disarm();
-        self.events.publish(
-            RuntimeEventKind::SessionOpened,
-            resource_id,
-            session_id.clone(),
-            owner_id,
-            token.generation(),
-        );
         Ok((session_id, token))
     }
 
@@ -397,8 +445,15 @@ impl CanManager {
         session_id: SessionId,
         token: &LeaseToken,
     ) -> HalResult<()> {
-        let (actor, resource_id, owner_id, generation) = {
+        let (actor, resource_id, owner_id, generation, actor_epoch) = {
             let mut state = lock_state(&self.state);
+            if let Some(resource_id) = state
+                .active
+                .get(&session_id)
+                .map(|entry| entry.resource_id.clone())
+            {
+                self.reconcile_finished_actor(&mut state, &resource_id);
+            }
             let Some(entry) = state.active.get(&session_id) else {
                 return closed_result(&state, &session_id, token, "can.close");
             };
@@ -406,6 +461,7 @@ impl CanManager {
             let entry_owner = entry.owner_id.clone();
             let entry_actor = entry.actor.clone();
             let entry_generation = entry.token.generation();
+            let entry_actor_epoch = entry.actor_epoch;
             let entry_closing = entry.closing;
             state.leases.validate(
                 &entry_resource,
@@ -420,12 +476,11 @@ impl CanManager {
             }
             let (reply_tx, reply_rx) = oneshot::channel();
             entry_actor
-                .try_command(
+                .try_cleanup(
                     CanCommand::RemoveSession {
                         session_id: session_id.clone(),
                         reply: reply_tx,
                     },
-                    "can.close",
                 )
                 .map_err(|error| error.with_resource_id(entry_resource.clone()))?;
             state
@@ -438,6 +493,7 @@ impl CanManager {
                 entry_resource,
                 entry_owner,
                 entry_generation,
+                entry_actor_epoch,
             )
         };
         let (actor_handle, reply_rx) = actor;
@@ -456,25 +512,50 @@ impl CanManager {
         if last_session {
             let _ = tokio::time::timeout(self.close_timeout, actor_handle.wait_finished()).await;
         }
-        self.finish_close(&session_id, token, &resource_id);
+        let finalized = self.finish_close(&session_id, token, &resource_id);
         if actor_handle.is_finished() {
             let mut state = lock_state(&self.state);
             if state
                 .actors
                 .get(&resource_id)
-                .is_some_and(|current| current.is_finished())
+                .is_some_and(|current| {
+                    current.epoch == actor_epoch && current.handle.is_finished()
+                })
             {
                 state.actors.remove(&resource_id);
             }
         }
-        self.events.publish(
-            RuntimeEventKind::SessionClosed,
-            resource_id,
-            session_id,
-            owner_id,
-            generation,
-        );
+        if finalized {
+            self.events.publish(
+                RuntimeEventKind::SessionClosed,
+                resource_id,
+                session_id,
+                owner_id,
+                generation,
+            );
+        }
         result
+    }
+
+    pub(crate) async fn close_reliably(
+        &self,
+        session_id: SessionId,
+        token: &LeaseToken,
+    ) -> HalResult<()> {
+        let deadline = Instant::now()
+            .checked_add(self.close_timeout)
+            .unwrap_or_else(Instant::now);
+        loop {
+            match self.close(session_id.clone(), token).await {
+                Err(error)
+                    if error.name().as_str() == "runtime.queue.full"
+                        && Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                result => return result,
+            }
+        }
     }
 
     pub(crate) async fn revoke_owner(&self, owner_id: &OwnerId) -> HalResult<()> {
@@ -490,6 +571,7 @@ impl CanManager {
             for session_id in pending_ids {
                 if let Some(entry) = state.pending.remove(&session_id) {
                     let _ = state.leases.cancel(&entry.reservation);
+                    entry.cancelled.store(true, Ordering::Release);
                     entry.cancellation.send_replace(true);
                     pending_done.push(entry.done.subscribe());
                 }
@@ -511,7 +593,7 @@ impl CanManager {
             }
         }
         for (session_id, token) in active {
-            let result = self.close(session_id, &token).await;
+            let result = self.close_reliably(session_id, &token).await;
             if first_error.is_none() {
                 first_error = result.err();
             }
@@ -546,13 +628,25 @@ impl CanManager {
         for (adapter_index, adapter) in self.adapters.iter().enumerate() {
             let adapter = Arc::clone(adapter);
             let runtime = runtime.clone();
+            let worker_timeout = self.close_timeout;
             let (reply_tx, reply_rx) = oneshot::channel();
             let name = format!("seeed-hal-can-enumerate-{adapter_index}");
             std::thread::Builder::new()
                 .name(name)
                 .spawn(move || {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        runtime.block_on(adapter.enumerate())
+                        match runtime.block_on(async {
+                            tokio::time::timeout(worker_timeout, adapter.enumerate()).await
+                        }) {
+                            Ok(result) => result,
+                            Err(_) => Err(runtime_error(
+                                "runtime.transport.timeout",
+                                ErrorCategory::Unavailable,
+                                "can.enumerate",
+                                true,
+                                format!("CAN adapter discovery exceeded its {worker_timeout:?} deadline"),
+                            )),
+                        }
                     }))
                     .unwrap_or_else(|_| {
                         Err(runtime_error(
@@ -578,7 +672,10 @@ impl CanManager {
         }
         let mut records = Vec::new();
         for (adapter_index, receiver) in receivers {
-            let descriptors = tokio::time::timeout(self.close_timeout, receiver)
+            let descriptors = tokio::time::timeout(
+                self.close_timeout.saturating_add(Duration::from_millis(20)),
+                receiver,
+            )
                 .await
                 .map_err(|_| {
                     runtime_error(
@@ -620,7 +717,14 @@ impl CanManager {
         required_mode: LeaseMode,
         operation: &'static str,
     ) -> HalResult<(CanActorHandle, ResourceId)> {
-        let state = lock_state(&self.state);
+        let mut state = lock_state(&self.state);
+        if let Some(resource_id) = state
+            .active
+            .get(session_id)
+            .map(|entry| entry.resource_id.clone())
+        {
+            self.reconcile_finished_actor(&mut state, &resource_id);
+        }
         let Some(entry) = state.active.get(session_id) else {
             return Err(missing_session_error(&state, session_id, token, operation));
         };
@@ -638,39 +742,102 @@ impl CanManager {
         Ok((entry.actor.clone(), entry.resource_id.clone()))
     }
 
+    fn reconcile_finished_actor(&self, state: &mut ManagerState, resource_id: &ResourceId) {
+        let Some(epoch) = state.actors.get(resource_id).and_then(|entry| {
+            entry.handle.is_finished().then_some(entry.epoch)
+        }) else {
+            return;
+        };
+        state.actors.remove(resource_id);
+
+        let active_ids: Vec<_> = state
+            .active
+            .iter()
+            .filter(|(_, session)| {
+                &session.resource_id == resource_id && session.actor_epoch == epoch
+            })
+            .map(|(session_id, _)| session_id.clone())
+            .collect();
+        for session_id in active_ids {
+            let Some(session) = state.active.remove(&session_id) else {
+                continue;
+            };
+            let _ = state
+                .leases
+                .release(resource_id, &session_id, &session.token);
+            self.events.publish(
+                RuntimeEventKind::CanBusUnknown,
+                resource_id.clone(),
+                session_id.clone(),
+                session.owner_id.clone(),
+                session.token.generation(),
+            );
+            self.events.publish(
+                RuntimeEventKind::SessionClosed,
+                resource_id.clone(),
+                session_id.clone(),
+                session.owner_id,
+                session.token.generation(),
+            );
+            remember_closed(state, session_id, session.token, resource_id.clone());
+        }
+
+        let pending_ids: Vec<_> = state
+            .pending
+            .iter()
+            .filter(|(_, session)| session.actor_epoch == Some(epoch))
+            .map(|(session_id, _)| session_id.clone())
+            .collect();
+        for session_id in pending_ids {
+            if let Some(session) = state.pending.remove(&session_id) {
+                let _ = state.leases.cancel(&session.reservation);
+                session.cancelled.store(true, Ordering::Release);
+                session.cancellation.send_replace(true);
+                session.done.send_replace(true);
+            }
+        }
+    }
+
     fn finish_close(
         &self,
         session_id: &SessionId,
         token: &LeaseToken,
         resource_id: &ResourceId,
-    ) {
+    ) -> bool {
         let mut state = lock_state(&self.state);
         let Some(entry) = state.active.remove(session_id) else {
-            return;
+            return false;
         };
         let _ = state.leases.release(resource_id, session_id, token);
-        while state.closed_order.len() >= CLOSED_SESSION_CAPACITY {
-            if let Some(expired) = state.closed_order.pop_front() {
-                state.closed.remove(&expired);
-            }
-        }
-        state.closed_order.push_back(session_id.clone());
-        state.closed.insert(
-            session_id.clone(),
-            ClosedSession {
-                token: entry.token,
-                resource_id: entry.resource_id,
-            },
-        );
+        remember_closed(&mut state, session_id.clone(), entry.token, entry.resource_id);
+        true
     }
+}
+
+fn remember_closed(
+    state: &mut ManagerState,
+    session_id: SessionId,
+    token: LeaseToken,
+    resource_id: ResourceId,
+) {
+    while state.closed_order.len() >= CLOSED_SESSION_CAPACITY {
+        if let Some(expired) = state.closed_order.pop_front() {
+            state.closed.remove(&expired);
+        }
+    }
+    state.closed_order.push_back(session_id.clone());
+    state.closed.insert(session_id, ClosedSession { token, resource_id });
 }
 
 struct PendingCanOpen {
     state: Arc<Mutex<ManagerState>>,
     session_id: SessionId,
     activation: Arc<Mutex<Option<LeaseToken>>>,
+    cancelled: Arc<AtomicBool>,
     done: watch::Sender<bool>,
     actor: Option<CanActorHandle>,
+    actor_assigned: bool,
+    close_timeout: Duration,
     armed: bool,
 }
 
@@ -679,20 +846,26 @@ impl PendingCanOpen {
         state: Arc<Mutex<ManagerState>>,
         session_id: SessionId,
         activation: Arc<Mutex<Option<LeaseToken>>>,
+        cancelled: Arc<AtomicBool>,
         done: watch::Sender<bool>,
+        close_timeout: Duration,
     ) -> Self {
         Self {
             state,
             session_id,
             activation,
+            cancelled,
             done,
             actor: None,
+            actor_assigned: false,
+            close_timeout,
             armed: true,
         }
     }
 
     fn set_actor(&mut self, actor: CanActorHandle) {
         self.actor = Some(actor);
+        self.actor_assigned = true;
     }
 
     fn activate(&self, token: LeaseToken) {
@@ -702,29 +875,21 @@ impl PendingCanOpen {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(token);
     }
 
-    fn remove_actor_session(&mut self) {
-        let _ = self.begin_actor_session_removal();
-    }
-
-    fn begin_actor_session_removal(
-        &mut self,
-    ) -> Option<oneshot::Receiver<crate::can_actor::RemoveOutcome>> {
-        let Some(actor) = &self.actor else {
-            return None;
+    async fn cleanup(&mut self) -> HalResult<()> {
+        self.cancelled.store(true, Ordering::Release);
+        let Some(actor) = self.actor.take() else {
+            if !self.actor_assigned {
+                self.done.send_replace(true);
+            }
+            return Ok(());
         };
-        let (reply, receiver) = oneshot::channel();
-        if actor.try_command(
-            CanCommand::RemoveSession {
-                session_id: self.session_id.clone(),
-                reply,
-            },
-            "can.open.cleanup",
-        ).is_err() {
-            self.actor = None;
-            return None;
-        }
-        self.actor = None;
-        Some(receiver)
+        reliable_actor_remove(
+            actor,
+            self.session_id.clone(),
+            self.done.clone(),
+            self.close_timeout,
+        )
+        .await
     }
 
     fn disarm(&mut self) {
@@ -737,14 +902,26 @@ impl Drop for PendingCanOpen {
         if !self.armed {
             return;
         }
+        self.cancelled.store(true, Ordering::Release);
         let mut state = lock_state(&self.state);
         if let Some(pending) = state.pending.remove(&self.session_id) {
             let _ = state.leases.cancel(&pending.reservation);
-            pending.done.send_replace(true);
         }
         drop(state);
-        self.remove_actor_session();
-        self.done.send_replace(true);
+        let Some(actor) = self.actor.take() else {
+            if !self.actor_assigned {
+                self.done.send_replace(true);
+            }
+            return;
+        };
+        let session_id = self.session_id.clone();
+        let done = self.done.clone();
+        let timeout = self.close_timeout;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = reliable_actor_remove(actor, session_id, done, timeout).await;
+            });
+        }
     }
 }
 
@@ -862,6 +1039,46 @@ async fn wait_pending_done(mut done: watch::Receiver<bool>, timeout: Duration) -
             "a provisional CAN open did not finish cleanup before the deadline",
         )
     })
+}
+
+async fn reliable_actor_remove(
+    actor: CanActorHandle,
+    session_id: SessionId,
+    done: watch::Sender<bool>,
+    timeout: Duration,
+) -> HalResult<()> {
+    let deadline = Instant::now().checked_add(timeout).unwrap_or_else(Instant::now);
+    loop {
+        if actor.is_finished() {
+            done.send_replace(true);
+            return Ok(());
+        }
+        let (reply, _) = oneshot::channel();
+        match actor.try_cleanup(CanCommand::RemoveSession {
+            session_id: session_id.clone(),
+            reply,
+        }) {
+            Ok(()) => break,
+            Err(error) if error.name().as_str() == "runtime.queue.full" => {
+                if Instant::now() >= deadline {
+                    return Err(runtime_error(
+                        "runtime.session.close_timeout",
+                        ErrorCategory::Unavailable,
+                        "can.cleanup",
+                        false,
+                        "CAN cleanup admission exceeded its finite deadline",
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            Err(_) => {
+                done.send_replace(true);
+                return Ok(());
+            }
+        }
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    wait_pending_done(done.subscribe(), remaining).await
 }
 
 fn lock_state(state: &Mutex<ManagerState>) -> std::sync::MutexGuard<'_, ManagerState> {

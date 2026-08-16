@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -18,6 +18,9 @@ use crate::events::{EventPublisher, RuntimeEventKind};
 use crate::runtime_error;
 
 const MANAGEMENT_QUEUE_CAPACITY: usize = 64;
+const CLEANUP_QUEUE_CAPACITY: usize = 64;
+const MANAGEMENT_COMMAND_BUDGET: usize = 16;
+const CLEANUP_COMMAND_BUDGET: usize = 16;
 const RECEIVE_POLL_SLICE: Duration = Duration::from_millis(2);
 const MAX_PENDING_RECEIVES_PER_SESSION: usize = 1;
 
@@ -28,11 +31,15 @@ pub(crate) struct ActorSessionSpec {
     pub(crate) config: CanOpenConfig,
     pub(crate) filters: CanFilterSet,
     pub(crate) activation: Arc<Mutex<Option<LeaseToken>>>,
+    pub(crate) cancelled: Arc<AtomicBool>,
+    pub(crate) cleanup_done: watch::Sender<bool>,
 }
 
 struct ActorSession {
     owner_id: OwnerId,
     activation: Arc<Mutex<Option<LeaseToken>>>,
+    cancelled: Arc<AtomicBool>,
+    cleanup_done: watch::Sender<bool>,
     filters: CanFilterSet,
     received: VecDeque<ReceivedCanFrame>,
     dropped: u64,
@@ -112,6 +119,7 @@ impl CanCommand {
 #[derive(Clone)]
 pub(crate) struct CanActorHandle {
     commands: mpsc::SyncSender<CanCommand>,
+    cleanup: mpsc::SyncSender<CanCommand>,
     tx_reserved: Arc<AtomicUsize>,
     tx_capacity: usize,
     completion: watch::Receiver<Option<HalResult<()>>>,
@@ -160,6 +168,13 @@ impl CanActorHandle {
         Ok(())
     }
 
+    pub(crate) fn try_cleanup(&self, command: CanCommand) -> HalResult<()> {
+        self.cleanup.try_send(command).map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => queue_full("can.cleanup", CLEANUP_QUEUE_CAPACITY),
+            mpsc::TrySendError::Disconnected(_) => actor_unavailable("can.cleanup"),
+        })
+    }
+
     pub(crate) fn is_finished(&self) -> bool {
         self.completion.borrow().is_some()
     }
@@ -187,6 +202,7 @@ pub(crate) fn spawn_can_actor(
     events: EventPublisher,
 ) -> HalResult<(CanActorHandle, oneshot::Receiver<HalResult<()>>)> {
     let (command_tx, command_rx) = mpsc::sync_channel(MANAGEMENT_QUEUE_CAPACITY);
+    let (cleanup_tx, cleanup_rx) = mpsc::sync_channel(CLEANUP_QUEUE_CAPACITY);
     let tx_reserved = Arc::new(AtomicUsize::new(0));
     let (completion_tx, completion_rx) = watch::channel(None);
     let (open_tx, open_rx) = oneshot::channel();
@@ -201,26 +217,46 @@ pub(crate) fn spawn_can_actor(
     })?;
     let thread_name = format!("seeed-hal-can-{}", selector.id().as_str());
     let actor_tx_reserved = Arc::clone(&tx_reserved);
+    let first_cleanup_done = first_session.cleanup_done.clone();
     std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
             let outcome = catch_unwind(AssertUnwindSafe(|| {
                 let open_config = first_session.config.clone();
-                let channel = runtime.block_on(adapter.open(&selector, &open_config));
+                let channel = runtime.block_on(async {
+                    tokio::time::timeout(
+                        close_timeout,
+                        adapter.open(&selector, &open_config),
+                    )
+                    .await
+                });
                 match channel {
-                    Ok(channel) => {
+                    Ok(Ok(channel)) => {
                         let _ = open_tx.send(Ok(()));
                         run_actor(
                             channel,
                             first_session,
                             command_rx,
+                            cleanup_rx,
                             actor_tx_reserved,
                             rx_capacity,
                             close_timeout,
                             events,
                         )
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
+                        let _ = open_tx.send(Err(error.clone()));
+                        Err(error)
+                    }
+                    Err(_) => {
+                        let error = runtime_error(
+                            "runtime.transport.timeout",
+                            ErrorCategory::Unavailable,
+                            "can.open",
+                            true,
+                            format!("CAN adapter open exceeded its {close_timeout:?} deadline"),
+                        )
+                        .with_resource_id(selector.id().clone());
                         let _ = open_tx.send(Err(error.clone()));
                         Err(error)
                     }
@@ -230,6 +266,9 @@ pub(crate) fn spawn_can_actor(
                 Ok(result) => result,
                 Err(_) => Err(actor_unavailable("can.actor")),
             };
+            if result.is_err() {
+                first_cleanup_done.send_replace(true);
+            }
             let _ = completion_tx.send(Some(result));
         })
         .map_err(|error| {
@@ -245,6 +284,7 @@ pub(crate) fn spawn_can_actor(
     Ok((
         CanActorHandle {
             commands: command_tx,
+            cleanup: cleanup_tx,
             tx_reserved,
             tx_capacity,
             completion: completion_rx,
@@ -257,6 +297,7 @@ fn run_actor(
     mut channel: Box<dyn CanChannel>,
     first_session: ActorSessionSpec,
     commands: mpsc::Receiver<CanCommand>,
+    cleanup: mpsc::Receiver<CanCommand>,
     tx_reserved: Arc<AtomicUsize>,
     rx_capacity: usize,
     close_timeout: Duration,
@@ -271,14 +312,30 @@ fn run_actor(
             first_session.owner_id,
             first_session.filters,
             first_session.activation,
+            first_session.cancelled,
+            first_session.cleanup_done,
             rx_capacity,
         ),
     );
     let mut last_bus_state = None;
 
     loop {
+        if let Some(result) = prune_cancelled_sessions(
+            channel.as_mut(),
+            &mut sessions,
+            &resource_id,
+            close_timeout,
+        ) {
+            reject_remaining(&cleanup, &tx_reserved);
+            reject_remaining(&commands, &tx_reserved);
+            return result;
+        }
         let mut disconnected = false;
-        while let Ok(command) = commands.try_recv() {
+        for _ in 0..CLEANUP_COMMAND_BUDGET {
+            let command = match cleanup.try_recv() {
+                Ok(command) => command,
+                Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
+            };
             let should_close = execute_command(
                 channel.as_mut(),
                 command,
@@ -292,6 +349,34 @@ fn run_actor(
                 &mut last_bus_state,
             );
             if should_close {
+                reject_remaining(&cleanup, &tx_reserved);
+                reject_remaining(&commands, &tx_reserved);
+                return Ok(());
+            }
+        }
+        for _ in 0..MANAGEMENT_COMMAND_BUDGET {
+            let command = match commands.try_recv() {
+                Ok(command) => command,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            };
+            let should_close = execute_command(
+                channel.as_mut(),
+                command,
+                &mut sessions,
+                &active_config,
+                &resource_id,
+                &tx_reserved,
+                rx_capacity,
+                close_timeout,
+                &events,
+                &mut last_bus_state,
+            );
+            if should_close {
+                reject_remaining(&cleanup, &tx_reserved);
                 reject_remaining(&commands, &tx_reserved);
                 return Ok(());
             }
@@ -321,32 +406,10 @@ fn run_actor(
             }
         }
         service_pending_receives(&mut sessions, &resource_id);
-
-        match commands.try_recv() {
-            Ok(command) => {
-                let should_close = execute_command(
-                    channel.as_mut(),
-                    command,
-                    &mut sessions,
-                    &active_config,
-                    &resource_id,
-                    &tx_reserved,
-                    rx_capacity,
-                    close_timeout,
-                    &events,
-                    &mut last_bus_state,
-                );
-                if should_close {
-                    reject_remaining(&commands, &tx_reserved);
-                    return Ok(());
-                }
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => disconnected = true,
-        }
         if disconnected {
             let close_result = channel.close();
             reject_all_sessions(&mut sessions, &resource_id);
+            reject_remaining(&cleanup, &tx_reserved);
             return close_result;
         }
     }
@@ -367,6 +430,12 @@ fn execute_command(
 ) -> bool {
     match command {
         CanCommand::AddSession { session, reply } => {
+            if session.cancelled.load(Ordering::Acquire) {
+                session.cleanup_done.send_replace(true);
+                let _ = reply.send(Err(session_closed("can.open", resource_id)));
+                return false;
+            }
+            let cleanup_done = session.cleanup_done.clone();
             let result = compatible_configuration(active_config, &session.config, resource_id)
                 .and_then(|()| {
                     if sessions.contains_key(&session.session_id) {
@@ -383,11 +452,16 @@ fn execute_command(
                             session.owner_id,
                             session.filters,
                             session.activation,
+                            session.cancelled,
+                            session.cleanup_done,
                             rx_capacity,
                         ),
                     );
                     Ok(())
                 });
+            if result.is_err() {
+                cleanup_done.send_replace(true);
+            }
             let _ = reply.send(result);
         }
         CanCommand::SendBatch {
@@ -512,8 +586,10 @@ fn execute_command(
                     last_session: true,
                     result,
                 });
+                removed.cleanup_done.send_replace(true);
                 return true;
             }
+            removed.cleanup_done.send_replace(true);
             let _ = reply.send(RemoveOutcome {
                 last_session: false,
                 result: Ok(()),
@@ -527,16 +603,79 @@ fn new_session(
     owner_id: OwnerId,
     filters: CanFilterSet,
     activation: Arc<Mutex<Option<LeaseToken>>>,
+    cancelled: Arc<AtomicBool>,
+    cleanup_done: watch::Sender<bool>,
     rx_capacity: usize,
 ) -> ActorSession {
     ActorSession {
         owner_id,
         activation,
+        cancelled,
+        cleanup_done,
         filters,
         received: VecDeque::with_capacity(rx_capacity),
         dropped: 0,
         receive_error: None,
         pending_receive: None,
+    }
+}
+
+fn prune_cancelled_sessions(
+    channel: &mut dyn CanChannel,
+    sessions: &mut HashMap<SessionId, ActorSession>,
+    resource_id: &ResourceId,
+    close_timeout: Duration,
+) -> Option<HalResult<()>> {
+    let cancelled: Vec<_> = sessions
+        .iter()
+        .filter(|(_, session)| {
+            session.cancelled.load(Ordering::Acquire)
+                && session
+                    .activation
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_none()
+        })
+        .map(|(session_id, _)| session_id.clone())
+        .collect();
+    if cancelled.is_empty() {
+        return None;
+    }
+    let mut removed = Vec::with_capacity(cancelled.len());
+    for session_id in cancelled {
+        if let Some(mut session) = sessions.remove(&session_id) {
+            if let Some(pending) = session.pending_receive.take() {
+                let _ = pending
+                    .reply
+                    .send(Err(session_closed("can.receive", resource_id)));
+            }
+            removed.push(session.cleanup_done);
+        }
+    }
+    if sessions.is_empty() {
+        let started = Instant::now();
+        let backend_result = channel.close();
+        let result = if started.elapsed() > close_timeout {
+            Err(runtime_error(
+                "runtime.session.close_timeout",
+                ErrorCategory::Unavailable,
+                "can.close",
+                false,
+                format!("CAN provisional cleanup exceeded its {close_timeout:?} deadline"),
+            )
+            .with_resource_id(resource_id.clone()))
+        } else {
+            backend_result
+        };
+        for done in removed {
+            done.send_replace(true);
+        }
+        Some(result)
+    } else {
+        for done in removed {
+            done.send_replace(true);
+        }
+        None
     }
 }
 
@@ -709,6 +848,7 @@ fn reject_all_sessions(
                 .reply
                 .send(Err(actor_unavailable("can.receive").with_resource_id(resource_id.clone())));
         }
+        session.cleanup_done.send_replace(true);
     }
 }
 
