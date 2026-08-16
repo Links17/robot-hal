@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod events;
+mod can_lease_table;
 mod lease_table;
 mod registry;
 mod serial_actor;
