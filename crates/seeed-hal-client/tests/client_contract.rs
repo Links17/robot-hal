@@ -187,10 +187,19 @@ async fn rust_client_round_trips_serial_through_broker() {
     let client = HalClient::connect(options).await.unwrap();
     assert_eq!(client.protocol_minor(), 0);
     let descriptor = client.enumerate_serial().await.unwrap().remove(0);
-    let serial = client
+    let mut serial = client
         .open_serial(descriptor.selector(), SerialConfig::default())
         .await
         .unwrap();
+    let conflict = match client
+        .open_serial(descriptor.selector(), SerialConfig::default())
+        .await
+    {
+        Ok(_) => panic!("a second remote control lease must conflict"),
+        Err(error) => error,
+    };
+    assert_eq!(conflict.name().as_str(), "runtime.lease.conflict");
+    assert_eq!(conflict.resource_id(), Some(descriptor.id()));
     serial.write(Bytes::from_static(b"hello")).await.unwrap();
     assert_eq!(&serial.read(5).await.unwrap()[..], b"hello");
     serial.close().await.unwrap();

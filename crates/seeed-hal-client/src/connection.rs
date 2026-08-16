@@ -426,7 +426,8 @@ impl HalClient {
         let envelope::Payload::OpenSerialResponse(response) = payload else {
             unreachable!()
         };
-        let result = RemoteSerialHandle::from_response(self.clone(), response);
+        let result =
+            RemoteSerialHandle::from_response(self.clone(), selector.id().clone(), response);
         if let Err(error) = &result {
             terminate(&self.inner.shared, error.clone());
         }
@@ -1693,6 +1694,167 @@ mod tests {
         first.abort();
         second.abort();
         writer_gate.release();
+        client.close().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .expect("test server must stop after client closure")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn retryable_close_admission_failure_retains_handle_until_close_succeeds() {
+        use seeed_hal_serial::SerialConfig;
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (writer_gate, client_io) = WriterTestGate::wrap(client_io);
+        let server = tokio::spawn(async move {
+            let mut wire = tokio_util::codec::Framed::new(
+                server_io,
+                frame_codec(seeed_hal_protocol::MAX_FRAME_BYTES),
+            );
+            let handshake_frame = wire.next().await.unwrap().unwrap();
+            let handshake = v1::Envelope::decode(handshake_frame).unwrap();
+            let offered = match handshake.payload.unwrap() {
+                envelope::Payload::HandshakeRequest(request) => request,
+                _ => panic!("expected handshake request"),
+            };
+            wire.send(Bytes::from(
+                v1::Envelope {
+                    request_id: handshake.request_id,
+                    payload: Some(envelope::Payload::HandshakeResponse(
+                        v1::HandshakeResponse {
+                            protocol_major: 1,
+                            protocol_minor: 0,
+                            capabilities: vec!["serial.bytes/v1".to_owned()],
+                            max_frame_bytes: offered.max_frame_bytes,
+                            max_read_bytes: offered.max_read_bytes,
+                            max_write_bytes: offered.max_write_bytes,
+                            protocol_minor_minimum: 0,
+                            protocol_minor_maximum: 0,
+                        },
+                    )),
+                }
+                .encode_to_vec(),
+            ))
+            .await
+            .unwrap();
+
+            let mut open = false;
+            let mut generation = 0_u64;
+            while let Some(frame) = wire.next().await {
+                let request = v1::Envelope::decode(frame.unwrap()).unwrap();
+                let response = match request.payload.unwrap() {
+                    envelope::Payload::EnumerateSerialRequest(_) => {
+                        envelope::Payload::EnumerateSerialResponse(v1::EnumerateSerialResponse {
+                            resources: vec![v1::ResourceDescriptor {
+                                resource_id: "serial:fake:retry-close".to_owned(),
+                                endpoint: "virtual://retry-close".to_owned(),
+                                identity_quality: v1::IdentityQuality::Strong as i32,
+                                transport: v1::TransportKind::Serial as i32,
+                                properties: Default::default(),
+                                capabilities: vec!["serial.bytes/v1".to_owned()],
+                            }],
+                        })
+                    }
+                    envelope::Payload::OpenSerialRequest(_) => {
+                        assert!(!open, "resource cannot reopen until close reaches the broker");
+                        open = true;
+                        generation += 1;
+                        envelope::Payload::OpenSerialResponse(v1::OpenSerialResponse {
+                            session_id: format!("session-retry-close-{generation}"),
+                            lease: Some(v1::LeaseToken {
+                                lease_id: format!("lease-retry-close-{generation}"),
+                                generation,
+                                mode: v1::LeaseMode::Control as i32,
+                            }),
+                        })
+                    }
+                    envelope::Payload::CloseSessionRequest(_) => {
+                        assert!(open, "only an open resource can be closed");
+                        open = false;
+                        envelope::Payload::CloseSessionResponse(v1::Empty {})
+                    }
+                    payload => panic!("unexpected request after successful close: {payload:?}"),
+                };
+                if wire
+                    .send(Bytes::from(
+                        v1::Envelope {
+                            request_id: request.request_id,
+                            payload: Some(response),
+                        }
+                        .encode_to_vec(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            assert!(!open, "test must close the reopened resource before disconnect");
+        });
+        let client = HalClient::from_io(
+            client_io,
+            ConnectionOptions::new("unused", [0x5a; 32]).with_queue_capacities(8, 1, 1),
+        )
+        .await
+        .unwrap();
+        let descriptor = client.enumerate_serial().await.unwrap().remove(0);
+        let mut serial = client
+            .open_serial(descriptor.selector(), SerialConfig::default())
+            .await
+            .unwrap();
+        writer_gate.arm();
+
+        let first_client = client.clone();
+        let first = tokio::spawn(async move { first_client.enumerate_serial().await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            writer_gate.wait_until_blocked(),
+        )
+        .await
+        .expect("writer must positively report its blocked state");
+
+        let second_client = client.clone();
+        let second = tokio::spawn(async move { second_client.enumerate_serial().await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if client
+                    .inner
+                    .shared
+                    .requests
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .pending
+                    .len()
+                    == 2
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second request must positively occupy the bounded writer queue");
+
+        let error = serial.close().await.unwrap_err();
+        assert_eq!(error.name().as_str(), "runtime.queue.full");
+        assert_eq!(error.operation().as_str(), "runtime.protocol.write");
+        assert_eq!(error.resource_id(), Some(descriptor.id()));
+
+        writer_gate.release();
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        serial.close().await.unwrap();
+
+        let closed = serial.flush().await.unwrap_err();
+        assert_eq!(closed.name().as_str(), "runtime.session.closed");
+        assert_eq!(closed.resource_id(), Some(descriptor.id()));
+
+        let mut reopened = client
+            .open_serial(descriptor.selector(), SerialConfig::default())
+            .await
+            .unwrap();
+        reopened.close().await.unwrap();
         client.close().await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), server)
             .await

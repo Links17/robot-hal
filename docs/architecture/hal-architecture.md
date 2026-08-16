@@ -74,6 +74,11 @@ Connection teardown revokes the owner before waiting for socket reader/writer ta
 permits only a bounded response drain and aborts a stalled task after the connection-task shutdown
 deadline, so a peer that stops reading cannot retain hardware ownership.
 
+The Rust broker client keeps a remote Serial handle reusable when a close request is rejected by
+local bounded-queue admission, allowing the caller to retry `close(&mut self)`. Once a close
+response succeeds, that handle is terminal and rejects every later operation locally; dropping an
+unclosed handle still relies on owner cleanup when its client connection terminates.
+
 Each launch creates a 256-bit startup token. The handshake compares it in constant time and rejects
 incompatible protocol versions, unsupported required capabilities, and invalid frame/read/write
 limits before exposing resources. Client and broker advertise inclusive minor ranges within one

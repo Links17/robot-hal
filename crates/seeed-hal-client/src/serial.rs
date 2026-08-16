@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use prost::Message;
-use seeed_hal_core::{ErrorCategory, HalError, HalResult, LeaseToken, SessionId};
+use seeed_hal_core::{ErrorCategory, HalError, HalResult, LeaseToken, ResourceId, SessionId};
 use seeed_hal_protocol::parse_session_lease;
 use seeed_hal_protocol::v1::{self, envelope};
 use seeed_hal_serial::ControlLines;
@@ -15,30 +15,52 @@ use crate::connection::ExpectedResponse;
 #[must_use = "a remote serial handle owns a broker session until it is explicitly closed or its client disconnects"]
 pub struct RemoteSerialHandle {
     client: HalClient,
+    resource_id: ResourceId,
     session_id: SessionId,
     lease: LeaseToken,
+    closed: bool,
 }
 
 impl RemoteSerialHandle {
     pub(crate) fn from_response(
         client: HalClient,
+        resource_id: ResourceId,
         response: v1::OpenSerialResponse,
     ) -> HalResult<Self> {
-        let (session_id, lease) = parse_session_lease(response.session_id, response.lease)?;
+        let (session_id, lease) = parse_session_lease(response.session_id, response.lease)
+            .map_err(|error| error.with_resource_id(resource_id.clone()))?;
         Ok(Self {
             client,
+            resource_id,
             session_id,
             lease,
+            closed: false,
         })
     }
 
+    fn ensure_open(&self, operation: &'static str) -> HalResult<()> {
+        if self.closed {
+            return Err(client_session_closed(operation, self.resource_id.clone()));
+        }
+        Ok(())
+    }
+
+    fn resource_error(&self, error: HalError) -> HalError {
+        if error.resource_id().is_some() {
+            error
+        } else {
+            error.with_resource_id(self.resource_id.clone())
+        }
+    }
+
     pub async fn read(&self, max_bytes: usize) -> HalResult<Bytes> {
+        self.ensure_open("serial.read")?;
         let (_, max_read, _) = self.client.limits();
         if max_bytes == 0 || max_bytes > max_read || max_bytes > u32::MAX as usize {
-            return Err(limit_error(
+            return Err(self.resource_error(limit_error(
                 "serial.read",
                 "read size exceeds the negotiated maximum",
-            ));
+            )));
         }
         let payload = self
             .client
@@ -50,12 +72,16 @@ impl RemoteSerialHandle {
                 }),
                 ExpectedResponse::SerialRead { max_bytes },
             )
-            .await?;
+            .await
+            .map_err(|error| self.resource_error(error))?;
         let envelope::Payload::SerialReadResponse(response) = payload else {
             unreachable!()
         };
         if response.data.len() > max_bytes || response.data.len() > max_read {
-            let error = limit_error("serial.read", "response exceeds the requested read size");
+            let error = self.resource_error(limit_error(
+                "serial.read",
+                "response exceeds the requested read size",
+            ));
             self.client.fail(error.clone());
             return Err(error);
         }
@@ -63,12 +89,13 @@ impl RemoteSerialHandle {
     }
 
     pub async fn write(&self, bytes: Bytes) -> HalResult<()> {
+        self.ensure_open("serial.write")?;
         let (_, _, max_write) = self.client.limits();
         if bytes.len() > max_write {
-            return Err(limit_error(
+            return Err(self.resource_error(limit_error(
                 "serial.write",
                 "write size exceeds the negotiated maximum",
-            ));
+            )));
         }
         let mut request = v1::SerialWriteRequest {
             session_id: self.session_id.as_str().to_owned(),
@@ -77,10 +104,10 @@ impl RemoteSerialHandle {
         };
         let frame_limit = self.client.limits().0;
         if serial_write_envelope_len(&request, bytes.len()) > frame_limit {
-            return Err(limit_error(
+            return Err(self.resource_error(limit_error(
                 "serial.write",
                 "write envelope exceeds the negotiated frame maximum",
-            ));
+            )));
         }
         request.data = bytes.to_vec();
         self.client
@@ -88,11 +115,13 @@ impl RemoteSerialHandle {
                 envelope::Payload::SerialWriteRequest(request),
                 ExpectedResponse::SerialWrite,
             )
-            .await?;
+            .await
+            .map_err(|error| self.resource_error(error))?;
         Ok(())
     }
 
     pub async fn flush(&self) -> HalResult<()> {
+        self.ensure_open("serial.flush")?;
         self.client
             .send(
                 envelope::Payload::SerialFlushRequest(v1::SerialFlushRequest {
@@ -101,11 +130,13 @@ impl RemoteSerialHandle {
                 }),
                 ExpectedResponse::SerialFlush,
             )
-            .await?;
+            .await
+            .map_err(|error| self.resource_error(error))?;
         Ok(())
     }
 
     pub async fn set_control_lines(&self, lines: ControlLines) -> HalResult<()> {
+        self.ensure_open("serial.set_control_lines")?;
         self.client
             .send(
                 envelope::Payload::SetSerialControlLinesRequest(v1::SetSerialControlLinesRequest {
@@ -116,13 +147,17 @@ impl RemoteSerialHandle {
                 }),
                 ExpectedResponse::SetControlLines,
             )
-            .await?;
+            .await
+            .map_err(|error| self.resource_error(error))?;
         Ok(())
     }
 
     /// Close is broker-idempotent for the retained session/lease replay
-    /// window. This consuming method sends exactly one authenticated close.
-    pub async fn close(self) -> HalResult<()> {
+    /// window. Local retryable admission failures leave this handle open so
+    /// the caller can retry. After a successful response, every operation on
+    /// this handle fails locally with `runtime.session.closed`.
+    pub async fn close(&mut self) -> HalResult<()> {
+        self.ensure_open("serial.close")?;
         self.client
             .send(
                 envelope::Payload::CloseSessionRequest(v1::CloseSessionRequest {
@@ -131,9 +166,23 @@ impl RemoteSerialHandle {
                 }),
                 ExpectedResponse::CloseSession,
             )
-            .await?;
+            .await
+            .map_err(|error| self.resource_error(error))?;
+        self.closed = true;
         Ok(())
     }
+}
+
+fn client_session_closed(operation: &'static str, resource_id: ResourceId) -> HalError {
+    HalError::new(
+        "runtime.session.closed",
+        ErrorCategory::Conflict,
+        operation,
+        false,
+        "the remote serial handle is closed",
+    )
+    .expect("static remote serial handle error metadata is valid")
+    .with_resource_id(resource_id)
 }
 
 fn serial_write_envelope_len(request: &v1::SerialWriteRequest, data_len: usize) -> usize {
