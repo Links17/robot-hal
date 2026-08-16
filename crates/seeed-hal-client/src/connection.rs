@@ -9,7 +9,7 @@ use seeed_hal_core::{ErrorCategory, HalError, HalResult, ResourceDescriptor, Res
 use seeed_hal_protocol::v1::{self, envelope};
 use seeed_hal_protocol::{
     MAX_FRAME_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR, SERIAL_CAPABILITY,
-    enumerate_serial_response_from_proto, error_from_proto, invalid_message,
+    enumerate_serial_response_from_proto, error_from_proto,
 };
 use seeed_hal_protocol::{
     PROTOCOL_MINOR_MAXIMUM, PROTOCOL_MINOR_MINIMUM, handshake_response_minor_range,
@@ -424,9 +424,14 @@ impl HalClient {
         config: SerialConfig,
     ) -> HalResult<RemoteSerialHandle> {
         if selector.transport() != seeed_hal_core::TransportKind::Serial {
-            return Err(invalid_message(
+            return Err(client_error(
+                "runtime.argument.invalid",
+                ErrorCategory::InvalidArgument,
+                "serial.open",
+                false,
                 "serial resource selector transport must be Serial",
-            ));
+            )
+            .with_resource_id(selector.id().clone()));
         }
         let payload = self
             .request(

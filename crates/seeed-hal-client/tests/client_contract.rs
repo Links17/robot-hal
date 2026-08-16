@@ -470,6 +470,50 @@ async fn broker_round_trip_preserves_missing_resource_id() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn serial_open_rejects_can_selector_before_transmission() {
+    use futures_util::StreamExt;
+    use seeed_hal_core::{
+        ErrorCategory, IdentityQuality, ResourceId, ResourceSelector, TransportKind,
+    };
+
+    let endpoint = fake::endpoint("serial-open-can-selector");
+    let listener = fake::bind(&endpoint);
+    let server = tokio::spawn(async move {
+        let mut wire = fake::accept_and_handshake(listener).await;
+        let outbound = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            wire.next(),
+        )
+        .await;
+        assert!(
+            outbound.is_err(),
+            "invalid local selector must not transmit an OpenSerial request",
+        );
+    });
+    let client = HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN))
+        .await
+        .unwrap();
+    let resource_id = ResourceId::parse("can:fake:wrong-serial-transport").unwrap();
+    let selector = ResourceSelector::exact(
+        resource_id.clone(),
+        IdentityQuality::Strong,
+        TransportKind::Can,
+    );
+    let error = match client.open_serial(selector, SerialConfig::default()).await {
+        Ok(_) => panic!("CAN selector must be rejected by local Serial validation"),
+        Err(error) => error,
+    };
+    assert_eq!(error.name().as_str(), "runtime.argument.invalid");
+    assert_eq!(error.category(), ErrorCategory::InvalidArgument);
+    assert_eq!(error.operation().as_str(), "serial.open");
+    assert_eq!(error.resource_id(), Some(&resource_id));
+    server.await.unwrap();
+    client.close().await.unwrap();
+    std::fs::remove_file(endpoint).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn reversed_responses_stay_correlated_to_their_callers() {
     let endpoint = fake::endpoint("correlation");
     let listener = fake::bind(&endpoint);

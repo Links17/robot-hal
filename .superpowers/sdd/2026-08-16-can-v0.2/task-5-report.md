@@ -156,3 +156,19 @@ completed successfully.
 - Tests, builds, lint, formatting, generated-code checks, and Python tests
   remain intentionally unexecuted; only static inspection and
   `git diff --check` are permitted.
+
+## Fix round 2
+
+- Reclassified the local `HalClient::open_serial` cross-transport selector
+  guard as caller input rather than malformed peer data. It now returns
+  `runtime.argument.invalid`, category `InvalidArgument`, operation
+  `serial.open`, and preserves the selector resource ID.
+- Added a focused client contract test that completes a handshake, invokes
+  `open_serial` with a CAN selector, asserts the full structured error, and
+  verifies that no OpenSerial request is transmitted.
+- Broker and peer-decoding behavior was intentionally left unchanged. The
+  protobuf schema and generated binding are unchanged, so the generator was
+  not rerun.
+- Tests, builds, lint, formatting, generated-code checks, and Python tests were
+  not run per the deferred-execution rule. Static inspection and
+  `git diff --check` are the only verification for this fix round.
