@@ -304,6 +304,15 @@ fn lagged(dropped: u64, descriptor: &ResourceDescriptor) -> HalError {
     .with_resource_id(descriptor.id().clone())
 }
 
+fn assert_timestamp_if_advertised(received: &ReceivedCanFrame, advertised: bool) {
+    if advertised {
+        let timestamp = received
+            .timestamp()
+            .expect("advertised CAN RX timestamps must be present");
+        assert!(!timestamp.clock_domain().is_empty());
+    }
+}
+
 /// Capability-gated reusable adapter checks. Physical adapters can call this
 /// helper unchanged; unsupported frame classes are skipped, never fabricated.
 pub async fn run_can_adapter_conformance<A: CanAdapter>(adapter: &A) -> HalResult<()> {
@@ -343,13 +352,7 @@ pub async fn run_can_adapter_conformance<A: CanAdapter>(adapter: &A) -> HalResul
         let received = channel.receive(Duration::from_millis(20))?
             .ok_or_else(|| HalError::new("runtime.transport.timeout", ErrorCategory::Unavailable, "can.conformance", true, "loopback frame was not received").expect("valid timeout"))?;
         assert_eq!(received.frame(), expected);
-        if supports(can_rx_timestamp_capability()) {
-            let timestamp = received.timestamp().ok_or_else(|| HalError::new(
-                "can.timestamp.missing", ErrorCategory::Internal, "can.conformance", false,
-                "advertised CAN RX timestamps were absent",
-            ).expect("valid timestamp error"))?;
-            assert!(!timestamp.clock_domain().is_empty());
-        }
+        assert_timestamp_if_advertised(&received, supports(can_rx_timestamp_capability()));
     }
     let _ = channel.bus_status()?;
     channel.close()?;
@@ -399,6 +402,7 @@ pub async fn run_can_adapter_conformance<A: CanAdapter>(adapter: &A) -> HalResul
             let received = configured.receive(Duration::from_millis(20))?
                 .ok_or_else(|| HalError::new("runtime.transport.timeout", ErrorCategory::Unavailable, "can.conformance", true, "configured FD frame was not received").expect("valid timeout"))?;
             assert_eq!(received.frame(), &fd_frame);
+            assert_timestamp_if_advertised(&received, supports(can_rx_timestamp_capability()));
         }
         configured.close()?;
         let mut restored = adapter.open(&selector, &CanOpenConfig::Attach(

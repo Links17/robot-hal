@@ -62,3 +62,8 @@ Fix-round tests were written but execution remains deferred by instruction. No t
 - Strengthened the reusable helper with exact five-capability-set assertions for the virtual subject, mandatory timestamp presence when the timestamp capability is advertised, and an incompatible Attach negative path asserting `can.configuration.mismatch` plus the canonical resource ID.
 - Changed Configure coverage to require an actually changed effective configuration, explicitly exercise FD mode when advertised, and verify restoration after close.
 - Added focused helper assertions/tests for the amended behavior; execution remains intentionally deferred.
+
+## Fix round 3
+
+- Added `assert_timestamp_if_advertised` and reused it for both the initial receive sequence and the configured-FD receive path, preventing timestamp-capability regressions in later helper extensions.
+- Added the corresponding focused helper assertion; execution remains intentionally deferred.
