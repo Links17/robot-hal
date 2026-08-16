@@ -136,3 +136,39 @@ deferred to the owning integration gate.
 Per instruction, no tests, builds, Clippy, rustfmt, cross-builds, or dependency
 resolution were run in this fix round. Static inspection and `git diff --check`
 were the only verification performed before staging.
+
+## Fix round 2
+
+- Fenced restoration with the interface index, current interface name, and a
+  freshly resolved canonical physical resource identity. Attach and Configure
+  also reject an endpoint that no longer resolves to the selected descriptor,
+  so rename, ifindex reuse, and hotplug identity conflicts fail closed.
+- Expanded nominal and data timing fingerprints to every raw kernel
+  `can_bittiming` field written during restore: bitrate, sample point, time
+  quantum, propagation segment, both phase segments, SJW, and prescaler.
+- Made an absent snapshot control-mode attribute restore as an explicit
+  all-nine-modes-disabled mask. Restore always submits the writable parameter
+  set, and focused static tests cover raw timing, interface name/index, physical
+  identity, control-mode, and termination fingerprint changes plus the explicit
+  clearing mask.
+- Distinguished failures before the first successful mutation from failures
+  that require rollback. In particular, a permission denial on the first
+  Configure operation is returned directly with its stable, resource-scoped
+  classification instead of being obscured by a second unauthorized rollback.
+- Kept the public active-configuration and core models unchanged. Ordinary
+  `vcan` Attach remains honest when timing is unobservable: it returns a
+  structured unsupported-configuration error, fabricates no timing, and
+  discovery does not advertise Configure.
+- Added an adapter-private raw-socket `vcan` path solely for ignored native
+  qualification. It covers Classical and FD loopback without claiming active
+  timing, authoritative software filtering, normalized bus status, structured
+  behavior after deletion, retryable fixture cleanup, permission mapping, and
+  a real-interface close-conflict retry that retains and restores its snapshot.
+
+The scope deliberately stays inside the SocketCAN adapter and its tests. The
+remaining risk is native/kernel behavior that cannot be established by static
+inspection, especially controller-specific timing normalization, permissions,
+hotplug races, and `vcan` FD behavior. Per the task ruling, no tests, builds,
+Clippy, rustfmt, cross-builds, Cargo metadata, or dependency resolution were run
+in this fix round; verification was limited to source/diff inspection and the
+allowed whitespace/staged-diff checks.

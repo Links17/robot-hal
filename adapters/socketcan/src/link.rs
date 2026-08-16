@@ -4,10 +4,14 @@ use seeed_hal_can::{
     CanActiveConfig, CanBitTiming, CanBusState, CanBusStatus, CanConfigureConfig,
     CanLinkExpectation, CanMode,
 };
-use seeed_hal_core::{ErrorCategory, ErrorContext, HalError, HalResult, ResourceDescriptor};
+use seeed_hal_core::{
+    ErrorCategory, ErrorContext, HalError, HalResult, ResourceDescriptor, ResourceId,
+};
 use socketcan::nl::{
     CanCtrlMode, CanCtrlModes, CanInterface, CanState, InterfaceCanParams, InterfaceDetails, Mtu,
 };
+
+use crate::identity::{identity_from_metadata, metadata_from_sysfs};
 
 const CLOCK_DOMAIN: &str = "host-monotonic";
 
@@ -23,10 +27,14 @@ pub(crate) struct LinkLease {
 #[derive(Clone, Debug)]
 struct LinkSnapshot {
     details: InterfaceDetails,
+    fingerprint: LinkFingerprint,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LinkFingerprint {
+    interface_index: u32,
+    interface_name: String,
+    physical_identity: ResourceId,
     is_up: bool,
     mtu: Option<Mtu>,
     nominal: Option<TimingFingerprint>,
@@ -40,7 +48,17 @@ struct LinkFingerprint {
 struct TimingFingerprint {
     bitrate: u32,
     sample_point: u32,
+    tq: u32,
+    prop_seg: u32,
+    phase_seg1: u32,
+    phase_seg2: u32,
     sjw: u32,
+    brp: u32,
+}
+
+struct ConfigureFailure {
+    error: HalError,
+    rollback_required: bool,
 }
 
 impl LinkLease {
@@ -54,6 +72,8 @@ impl LinkLease {
         let details = interface_handle
             .details()
             .map_err(|error| map_nl_error("can.open", error, descriptor))?;
+        let current = fingerprint(&details, "can.open", descriptor)?;
+        verify_physical_identity(&current, descriptor, "can.open")?;
         let active = active_config(&details, descriptor, "can.open")?;
         verify_expectation(expectation, &active, descriptor)?;
         Ok(Self {
@@ -75,17 +95,23 @@ impl LinkLease {
         let before = interface_handle
             .details()
             .map_err(|error| map_nl_error("can.configure", error, descriptor))?;
+        let snapshot_fingerprint = fingerprint(&before, "can.configure", descriptor)?;
+        verify_physical_identity(&snapshot_fingerprint, descriptor, "can.configure")?;
         let snapshot = LinkSnapshot {
             details: before.clone(),
+            fingerprint: snapshot_fingerprint,
         };
 
-        if let Err(error) = configure_link(&interface_handle, &before, request, descriptor) {
-            return Err(rollback_after_failure(
-                &interface_handle,
-                &snapshot.details,
-                descriptor,
-                error,
-            ));
+        if let Err(failure) = configure_link(&interface_handle, &before, request, descriptor) {
+            if failure.rollback_required {
+                return Err(rollback_after_failure(
+                    &interface_handle,
+                    &snapshot,
+                    descriptor,
+                    failure.error,
+                ));
+            }
+            return Err(failure.error);
         }
 
         let after = match interface_handle.details() {
@@ -94,7 +120,7 @@ impl LinkLease {
                 let error = map_nl_error("can.configure", error, descriptor);
                 return Err(rollback_after_failure(
                     &interface_handle,
-                    &snapshot.details,
+                    &snapshot,
                     descriptor,
                     error,
                 ));
@@ -105,7 +131,7 @@ impl LinkLease {
             Err(error) => {
                 return Err(rollback_after_failure(
                     &interface_handle,
-                    &snapshot.details,
+                    &snapshot,
                     descriptor,
                     error,
                 ));
@@ -114,12 +140,30 @@ impl LinkLease {
         if let Err(error) = verify_config(request, &after, &active, descriptor) {
             return Err(rollback_after_failure(
                 &interface_handle,
-                &snapshot.details,
+                &snapshot,
                 descriptor,
                 error,
             ));
         }
-        let applied = fingerprint(&after);
+        let applied = match fingerprint(&after, "can.configure", descriptor) {
+            Ok(applied) => applied,
+            Err(error) => {
+                return Err(rollback_after_failure(
+                    &interface_handle,
+                    &snapshot,
+                    descriptor,
+                    error,
+                ));
+            }
+        };
+        if let Err(error) = verify_physical_identity(&applied, descriptor, "can.configure") {
+            return Err(rollback_after_failure(
+                &interface_handle,
+                &snapshot,
+                descriptor,
+                error,
+            ));
+        }
         Ok(Self {
             interface: interface_handle,
             descriptor: descriptor.clone(),
@@ -133,28 +177,11 @@ impl LinkLease {
         &self,
         descriptor: &ResourceDescriptor,
     ) -> HalResult<CanBusStatus> {
-        let details = self
-            .interface
-            .details()
-            .map_err(|error| map_nl_error("can.status", error, descriptor))?;
-        let state = details
-            .can
-            .state
-            .map(map_bus_state)
-            .unwrap_or(CanBusState::Unknown);
-        let (tx, rx) = details
-            .can
-            .berr_counter
-            .map(|counter| (Some(u32::from(counter.txerr)), Some(u32::from(counter.rxerr))))
-            .unwrap_or((None, None));
-        Ok(CanBusStatus::new(state, tx, rx))
+        bus_status(&self.interface, descriptor)
     }
 
     pub(crate) fn close(&mut self, descriptor: &ResourceDescriptor) -> HalResult<()> {
-        let Some(snapshot) = self
-            .snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.details.clone())
+        let Some(snapshot) = self.snapshot.clone()
         else {
             return Ok(());
         };
@@ -163,10 +190,11 @@ impl LinkLease {
             .interface
             .details()
             .map_err(|error| map_nl_error("can.close", error, descriptor))?;
+        let current = fingerprint(&current, "can.close", descriptor)?;
         if self
             .applied
             .as_ref()
-            .is_some_and(|applied| fingerprint(&current) != *applied)
+            .is_some_and(|applied| current != *applied)
         {
             return Err(HalError::new(
                 "can.configuration.conflict",
@@ -211,6 +239,35 @@ pub(crate) fn details_for_descriptor(
     Ok(interface.details()?)
 }
 
+pub(crate) fn bus_status_for_interface(
+    interface: &str,
+    descriptor: &ResourceDescriptor,
+) -> HalResult<CanBusStatus> {
+    let interface = CanInterface::open(interface)
+        .map_err(|error| map_link_io_error("can.status", error.into(), descriptor))?;
+    bus_status(&interface, descriptor)
+}
+
+fn bus_status(
+    interface: &CanInterface,
+    descriptor: &ResourceDescriptor,
+) -> HalResult<CanBusStatus> {
+    let details = interface
+        .details()
+        .map_err(|error| map_nl_error("can.status", error, descriptor))?;
+    let state = details
+        .can
+        .state
+        .map(map_bus_state)
+        .unwrap_or(CanBusState::Unknown);
+    let (tx, rx) = details
+        .can
+        .berr_counter
+        .map(|counter| (Some(u32::from(counter.txerr)), Some(u32::from(counter.rxerr))))
+        .unwrap_or((None, None));
+    Ok(CanBusStatus::new(state, tx, rx))
+}
+
 pub(crate) fn capabilities_for_details(
     details: &InterfaceDetails,
     nonvirtual_sysfs_evidence: bool,
@@ -233,11 +290,16 @@ fn configure_link(
     before: &InterfaceDetails,
     request: &CanConfigureConfig,
     descriptor: &ResourceDescriptor,
-) -> HalResult<()> {
+) -> Result<(), ConfigureFailure> {
+    let mut rollback_required = false;
     if before.is_up {
-        interface
-            .bring_down()
-            .map_err(|error| map_nl_error("can.configure", error, descriptor))?;
+        if let Err(error) = interface.bring_down() {
+            return Err(ConfigureFailure {
+                error: map_nl_error("can.configure", error, descriptor),
+                rollback_required,
+            });
+        }
+        rollback_required = true;
     }
 
     let mut modes = CanCtrlModes::default();
@@ -251,20 +313,31 @@ fn configure_link(
         restart_ms: Some(request.restart_ms().unwrap_or(0)),
         ..InterfaceCanParams::default()
     };
-    interface
-        .set_can_params(&params)
-        .map_err(|error| map_nl_error("can.configure", error, descriptor))?;
-    interface
-        .set_mtu(if request.mode() == CanMode::Fd {
-            Mtu::Fd
-        } else {
-            Mtu::Standard
-        })
-        .map_err(|error| map_nl_error("can.configure", error, descriptor))?;
+    if let Err(error) = interface.set_can_params(&params) {
+        return Err(ConfigureFailure {
+            error: map_nl_error("can.configure", error, descriptor),
+            rollback_required,
+        });
+    }
+    rollback_required = true;
+    let mtu = if request.mode() == CanMode::Fd {
+        Mtu::Fd
+    } else {
+        Mtu::Standard
+    };
+    if let Err(error) = interface.set_mtu(mtu) {
+        return Err(ConfigureFailure {
+            error: map_nl_error("can.configure", error, descriptor),
+            rollback_required,
+        });
+    }
     if before.is_up {
-        interface
-            .bring_up()
-            .map_err(|error| map_nl_error("can.configure", error, descriptor))?;
+        if let Err(error) = interface.bring_up() {
+            return Err(ConfigureFailure {
+                error: map_nl_error("can.configure", error, descriptor),
+                rollback_required,
+            });
+        }
     }
     Ok(())
 }
@@ -283,31 +356,10 @@ fn restore_snapshot(
             .map_err(|error| map_nl_error("can.close", error, descriptor))?;
     }
 
-    let ctrl_mode = details.can.ctrl_mode.map(|snapshot_modes| {
-        let mut modes = CanCtrlModes::default();
-        for mode in control_modes() {
-            modes.add(mode, snapshot_modes.has_mode(mode));
-        }
-        modes
-    });
-    let params = InterfaceCanParams {
-        bit_timing: details.can.bit_timing,
-        data_bit_timing: details.can.data_bit_timing,
-        ctrl_mode,
-        restart_ms: details.can.restart_ms,
-        termination: details.can.termination,
-        ..InterfaceCanParams::default()
-    };
-    if details.can.bit_timing.is_some()
-        || details.can.data_bit_timing.is_some()
-        || details.can.ctrl_mode.is_some()
-        || details.can.restart_ms.is_some()
-        || details.can.termination.is_some()
-    {
-        interface
-            .set_can_params(&params)
-            .map_err(|error| map_nl_error("can.close", error, descriptor))?;
-    }
+    let params = restore_params(details);
+    interface
+        .set_can_params(&params)
+        .map_err(|error| map_nl_error("can.close", error, descriptor))?;
     if details.is_up {
         interface
             .bring_up()
@@ -316,16 +368,33 @@ fn restore_snapshot(
     Ok(())
 }
 
+fn restore_params(details: &InterfaceDetails) -> InterfaceCanParams {
+    let snapshot_modes = details.can.ctrl_mode.unwrap_or_default();
+    let mut modes = CanCtrlModes::default();
+    for mode in control_modes() {
+        modes.add(mode, snapshot_modes.has_mode(mode));
+    }
+    InterfaceCanParams {
+        bit_timing: details.can.bit_timing,
+        data_bit_timing: details.can.data_bit_timing,
+        ctrl_mode: Some(modes),
+        restart_ms: details.can.restart_ms,
+        termination: details.can.termination,
+        ..InterfaceCanParams::default()
+    }
+}
+
 fn restore_and_verify(
     interface: &CanInterface,
-    snapshot: &InterfaceDetails,
+    snapshot: &LinkSnapshot,
     descriptor: &ResourceDescriptor,
 ) -> HalResult<()> {
-    restore_snapshot(interface, snapshot, descriptor)?;
+    restore_snapshot(interface, &snapshot.details, descriptor)?;
     let restored = interface
         .details()
         .map_err(|error| map_nl_error("can.close", error, descriptor))?;
-    if fingerprint(&restored) != fingerprint(snapshot) {
+    let restored = fingerprint(&restored, "can.close", descriptor)?;
+    if restored != snapshot.fingerprint {
         return Err(HalError::new(
             "can.configuration.rollback_failed",
             ErrorCategory::Internal,
@@ -340,7 +409,7 @@ fn restore_and_verify(
 
 fn rollback_after_failure(
     interface: &CanInterface,
-    snapshot: &InterfaceDetails,
+    snapshot: &LinkSnapshot,
     descriptor: &ResourceDescriptor,
     primary: HalError,
 ) -> HalError {
@@ -616,21 +685,91 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_tracks_every_control_mode_and_termination() {
-        let details = InterfaceDetails::default();
-        let baseline = fingerprint(&details);
+    fn fingerprint_tracks_full_timing_control_modes_and_termination() {
+        let mut details = InterfaceDetails {
+            name: Some("can-test".to_owned()),
+            index: 7,
+            ..InterfaceDetails::default()
+        };
+        details.can.bit_timing = Some(socketcan::nl::CanBitTiming {
+            bitrate: 500_000,
+            sample_point: 875,
+            tq: 125,
+            prop_seg: 2,
+            phase_seg1: 4,
+            phase_seg2: 1,
+            sjw: 1,
+            brp: 2,
+        });
+        let identity = ResourceId::parse("can:path:test").expect("valid test identity");
+        let baseline = fingerprint_for_identity(&details, identity.clone());
+
+        let timing_mutations: [fn(&mut socketcan::nl::CanBitTiming); 8] = [
+            |timing: &mut socketcan::nl::CanBitTiming| timing.bitrate += 1,
+            |timing: &mut socketcan::nl::CanBitTiming| timing.sample_point += 1,
+            |timing: &mut socketcan::nl::CanBitTiming| timing.tq += 1,
+            |timing: &mut socketcan::nl::CanBitTiming| timing.prop_seg += 1,
+            |timing: &mut socketcan::nl::CanBitTiming| timing.phase_seg1 += 1,
+            |timing: &mut socketcan::nl::CanBitTiming| timing.phase_seg2 += 1,
+            |timing: &mut socketcan::nl::CanBitTiming| timing.sjw += 1,
+            |timing: &mut socketcan::nl::CanBitTiming| timing.brp += 1,
+        ];
+        for mutate in timing_mutations {
+            let mut changed = details.clone();
+            mutate(changed.can.bit_timing.as_mut().expect("nominal timing"));
+            assert_ne!(
+                fingerprint_for_identity(&changed, identity.clone()),
+                baseline
+            );
+        }
 
         for mode in control_modes() {
             let mut changed = details.clone();
             let mut modes = CanCtrlModes::default();
             modes.add(mode, true);
             changed.can.ctrl_mode = Some(modes);
-            assert_ne!(fingerprint(&changed), baseline);
+            assert_ne!(
+                fingerprint_for_identity(&changed, identity.clone()),
+                baseline
+            );
         }
 
-        let mut changed = details;
+        let mut changed = details.clone();
         changed.can.termination = Some(120);
-        assert_ne!(fingerprint(&changed), baseline);
+        assert_ne!(
+            fingerprint_for_identity(&changed, identity.clone()),
+            baseline
+        );
+
+        changed = details.clone();
+        changed.index += 1;
+        assert_ne!(
+            fingerprint_for_identity(&changed, identity.clone()),
+            baseline
+        );
+
+        changed = details.clone();
+        changed.name = Some("renamed".to_owned());
+        assert_ne!(
+            fingerprint_for_identity(&changed, identity.clone()),
+            baseline
+        );
+
+        let other_identity =
+            ResourceId::parse("can:path:other").expect("valid alternate test identity");
+        assert_ne!(fingerprint_for_identity(&details, other_identity), baseline);
+    }
+
+    #[test]
+    fn restore_explicitly_clears_absent_control_modes() {
+        let details = InterfaceDetails::default();
+        let modes = restore_params(&details)
+            .ctrl_mode
+            .expect("restore always sends a control-mode mask");
+
+        for mode in control_modes() {
+            assert!(!modes.has_mode(mode));
+        }
     }
 
     #[test]
@@ -647,8 +786,45 @@ mod tests {
     }
 }
 
-fn fingerprint(details: &InterfaceDetails) -> LinkFingerprint {
+fn fingerprint(
+    details: &InterfaceDetails,
+    operation: &'static str,
+    descriptor: &ResourceDescriptor,
+) -> HalResult<LinkFingerprint> {
+    let interface_name = details.name.as_deref().ok_or_else(|| {
+        HalError::new(
+            "runtime.transport.unavailable",
+            ErrorCategory::Unavailable,
+            operation,
+            true,
+            "SocketCAN netlink details omitted the interface name",
+        )
+        .expect("static SocketCAN error metadata is valid")
+        .with_resource_id(descriptor.id().clone())
+    })?;
+    let metadata = metadata_from_sysfs(interface_name);
+    let physical_identity = identity_from_metadata(&metadata).map_err(|error| {
+        HalError::new(
+            "runtime.transport.unavailable",
+            ErrorCategory::Unavailable,
+            operation,
+            true,
+            format!("SocketCAN physical identity could not be resolved: {error}"),
+        )
+        .expect("static SocketCAN error metadata is valid")
+        .with_resource_id(descriptor.id().clone())
+    })?;
+    Ok(fingerprint_for_identity(details, physical_identity.id))
+}
+
+fn fingerprint_for_identity(
+    details: &InterfaceDetails,
+    physical_identity: ResourceId,
+) -> LinkFingerprint {
     LinkFingerprint {
+        interface_index: details.index,
+        interface_name: details.name.clone().unwrap_or_default(),
+        physical_identity,
         is_up: details.is_up,
         mtu: details.mtu,
         nominal: details.can.bit_timing.map(timing_fingerprint),
@@ -657,6 +833,24 @@ fn fingerprint(details: &InterfaceDetails) -> LinkFingerprint {
         control_modes: control_fingerprint(details.can.ctrl_mode),
         termination: details.can.termination,
     }
+}
+
+fn verify_physical_identity(
+    fingerprint: &LinkFingerprint,
+    descriptor: &ResourceDescriptor,
+    operation: &'static str,
+) -> HalResult<()> {
+    if &fingerprint.physical_identity != descriptor.id() {
+        return Err(HalError::new(
+            "runtime.resource.not_found",
+            ErrorCategory::NotFound,
+            operation,
+            false,
+            "SocketCAN endpoint no longer resolves to the selected physical identity",
+        )?
+        .with_resource_id(descriptor.id().clone()));
+    }
+    Ok(())
 }
 
 fn timing_matches(expected: &CanBitTiming, actual: socketcan::nl::CanBitTiming) -> bool {
@@ -692,7 +886,12 @@ fn timing_fingerprint(timing: socketcan::nl::CanBitTiming) -> TimingFingerprint 
     TimingFingerprint {
         bitrate: timing.bitrate,
         sample_point: timing.sample_point,
+        tq: timing.tq,
+        prop_seg: timing.prop_seg,
+        phase_seg1: timing.phase_seg1,
+        phase_seg2: timing.phase_seg2,
         sjw: timing.sjw,
+        brp: timing.brp,
     }
 }
 
