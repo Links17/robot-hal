@@ -316,6 +316,13 @@ pub async fn run_can_adapter_conformance<A: CanAdapter>(adapter: &A) -> HalResul
     }
     let descriptor = &descriptors[0];
     let selector = descriptors[0].selector();
+    let advertised = [
+        can_classic_capability(), can_fd_capability(), can_configure_capability(),
+        can_error_frames_capability(), can_rx_timestamp_capability(),
+    ];
+    if adapter.adapter_name() == "virtual.can.loopback" {
+        assert_eq!(descriptor.capabilities().as_slice(), advertised.as_slice());
+    }
     let mut channel = adapter.open(&selector, &CanOpenConfig::Attach(
         CanLinkExpectation::new(None, None, None, None, None)?,
     )).await?;
@@ -326,9 +333,8 @@ pub async fn run_can_adapter_conformance<A: CanAdapter>(adapter: &A) -> HalResul
         frames.push(CanFrame::classic_data(CanId::standard(0x123)?, Bytes::from_static(&[1, 2, 3]))?);
         frames.push(CanFrame::classic_remote(CanId::standard(0x124)?, 2)?);
     }
-    if supports(can_fd_capability()) {
-        frames.push(CanFrame::fd_data(CanId::extended(0x12345)?, Bytes::from_static(&[4; 12]), true, true)?);
-    }
+    let fd_frame = CanFrame::fd_data(CanId::extended(0x12345)?, Bytes::from_static(&[4; 12]), true, true)?;
+    if supports(can_fd_capability()) && baseline.mode() == CanMode::Fd { frames.push(fd_frame.clone()); }
     if supports(can_error_frames_capability()) {
         frames.push(CanFrame::error(vec![seeed_hal_can::CanErrorClass::BusError], Bytes::from_static(&[5]))?);
     }
@@ -338,13 +344,28 @@ pub async fn run_can_adapter_conformance<A: CanAdapter>(adapter: &A) -> HalResul
             .ok_or_else(|| HalError::new("runtime.transport.timeout", ErrorCategory::Unavailable, "can.conformance", true, "loopback frame was not received").expect("valid timeout"))?;
         assert_eq!(received.frame(), expected);
         if supports(can_rx_timestamp_capability()) {
-            if let Some(timestamp) = received.timestamp() { assert!(!timestamp.clock_domain().is_empty()); }
+            let timestamp = received.timestamp().ok_or_else(|| HalError::new(
+                "can.timestamp.missing", ErrorCategory::Internal, "can.conformance", false,
+                "advertised CAN RX timestamps were absent",
+            ).expect("valid timestamp error"))?;
+            assert!(!timestamp.clock_domain().is_empty());
         }
     }
     let _ = channel.bus_status()?;
     channel.close()?;
     let closed_error = channel.receive(Duration::ZERO).expect_err("closed channel must reject receive");
     assert_eq!(closed_error.name().as_str(), "runtime.session.closed");
+
+    let incompatible = CanLinkExpectation::new(
+        Some(if baseline.mode() == CanMode::Classic { CanMode::Fd } else { CanMode::Classic }),
+        None, None, None, None,
+    )?;
+    let open_error = match adapter.open(&selector, &CanOpenConfig::Attach(incompatible)).await {
+        Ok(_) => panic!("incompatible Attach must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(open_error.name().as_str(), "can.configuration.mismatch");
+    assert_eq!(open_error.resource_id(), Some(descriptor.id()));
 
     let expectation = CanLinkExpectation::new(
         Some(baseline.mode()),
@@ -358,12 +379,27 @@ pub async fn run_can_adapter_conformance<A: CanAdapter>(adapter: &A) -> HalResul
     attached.close()?;
 
     if supports(can_configure_capability()) {
+        let (configure_mode, configure_data) = if supports(can_fd_capability()) {
+            let data = baseline.data().copied().or_else(|| CanBitTiming::new(
+                baseline.nominal().bitrate(), None, None,
+            ).ok());
+            (CanMode::Fd, data)
+        } else {
+            (baseline.mode(), baseline.data().copied())
+        };
         let request = CanConfigureConfig::new(
-            baseline.mode(), *baseline.nominal(), baseline.data().copied(),
-            baseline.listen_only(), baseline.loopback(),
+            configure_mode, *baseline.nominal(), configure_data,
+            if configure_mode == baseline.mode() { !baseline.listen_only() } else { baseline.listen_only() },
+            baseline.loopback(),
         )?;
         let mut configured = adapter.open(&selector, &CanOpenConfig::Configure(request)).await?;
-        assert_eq!(configured.active_config(), &baseline);
+        assert_ne!(configured.active_config(), &baseline);
+        if configure_mode == CanMode::Fd {
+            configured.send(&fd_frame)?;
+            let received = configured.receive(Duration::from_millis(20))?
+                .ok_or_else(|| HalError::new("runtime.transport.timeout", ErrorCategory::Unavailable, "can.conformance", true, "configured FD frame was not received").expect("valid timeout"))?;
+            assert_eq!(received.frame(), &fd_frame);
+        }
         configured.close()?;
         let mut restored = adapter.open(&selector, &CanOpenConfig::Attach(
             CanLinkExpectation::new(Some(baseline.mode()), Some(baseline.nominal().bitrate()), baseline.data().map(|timing| timing.bitrate()), Some(baseline.listen_only()), Some(baseline.loopback()))?,

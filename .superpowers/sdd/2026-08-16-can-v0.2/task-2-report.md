@@ -56,3 +56,9 @@ Addressed the critical/important review findings:
 - Added focused fail-next send/receive/status/close tests asserting canonical resource IDs, plus overflow/lag coverage.
 
 Fix-round tests were written but execution remains deferred by instruction. No tests, builds, lint, formatting, or protocol checks were run; only static inspection and `git diff --check` are permitted for this round.
+
+## Fix round 2
+
+- Strengthened the reusable helper with exact five-capability-set assertions for the virtual subject, mandatory timestamp presence when the timestamp capability is advertised, and an incompatible Attach negative path asserting `can.configuration.mismatch` plus the canonical resource ID.
+- Changed Configure coverage to require an actually changed effective configuration, explicitly exercise FD mode when advertised, and verify restoration after close.
+- Added focused helper assertions/tests for the amended behavior; execution remains intentionally deferred.
