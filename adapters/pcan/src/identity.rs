@@ -1,27 +1,4 @@
-use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use seeed_hal_core::{Endpoint, HalResult, IdentityQuality, ResourceId};
-
-const IDENTITY_ENCODE_SET: &AsciiSet = &CONTROLS
-    .add(b' ')
-    .add(b'%')
-    .add(b'/')
-    .add(b'?')
-    .add(b'#')
-    .add(b'[')
-    .add(b']')
-    .add(b'@')
-    .add(b'!')
-    .add(b'$')
-    .add(b'&')
-    .add(b'\'')
-    .add(b'(')
-    .add(b')')
-    .add(b'*')
-    .add(b'+')
-    .add(b',')
-    .add(b';')
-    .add(b'=')
-    .add(b':');
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PcanChannelMetadata {
@@ -50,16 +27,9 @@ pub fn identity_from_metadata(metadata: &PcanChannelMetadata) -> HalResult<PcanI
             IdentityQuality::Strong,
         );
     }
-    if let Some(device_name) = non_empty(metadata.device_name.as_deref()) {
-        return identity(
-            format!(
-                "can:pcan:hardware:{}:{:02X}",
-                encode_segment(device_name),
-                metadata.controller_number
-            ),
-            IdentityQuality::Medium,
-        );
-    }
+    // A model/hardware name describes a product family, not one physical
+    // instance. Without a nonzero vendor device ID (or future serial evidence),
+    // only the transient handle distinguishes channels, so identity stays Weak.
     identity(
         format!("can:pcan:handle:{:04X}", metadata.handle),
         IdentityQuality::Weak,
@@ -71,12 +41,4 @@ fn identity(id: String, quality: IdentityQuality) -> HalResult<PcanIdentity> {
         id: ResourceId::parse(id)?,
         quality,
     })
-}
-
-fn non_empty(value: Option<&str>) -> Option<&str> {
-    value.map(str::trim).filter(|value| !value.is_empty())
-}
-
-fn encode_segment(value: &str) -> String {
-    utf8_percent_encode(value, IDENTITY_ENCODE_SET).to_string()
 }

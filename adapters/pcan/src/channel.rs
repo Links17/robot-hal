@@ -65,7 +65,7 @@ const MAX_HARDWARE_NAME: usize = 33;
 const MAX_FD_BITRATE_STRING: usize = 256;
 const MAX_SKIPPED_DIAGNOSTICS: usize = 64;
 const RECEIVE_POLL_INTERVAL: Duration = Duration::from_millis(1);
-const CLOCK_DOMAIN: &str = "pcan-basic";
+const PREPARED_CLOCK_DOMAIN: &str = "pcan-basic.pending";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DriverDevice {
@@ -176,6 +176,7 @@ impl Driver for RealDriver {
             ));
         }
 
+        let prior_listen_only = self.raw.get_u32(device.handle, PCAN_LISTEN_ONLY)?;
         self.raw
             .set_u32(
                 device.handle,
@@ -198,29 +199,51 @@ impl Driver for RealDriver {
             .map_err(DriverError::from)?;
         let owner = match prepared.kind {
             PreparedKind::Classic(bitrate) => Connected::Classic(
-                builder.classic(bitrate).connect().map_err(DriverError::from)?,
+                match builder.classic(bitrate).connect().map_err(DriverError::from) {
+                    Ok(owner) => owner,
+                    Err(error) => {
+                        let _ = self.raw.set_u32(device.handle, PCAN_LISTEN_ONLY, prior_listen_only);
+                        return Err(error);
+                    }
+                },
             ),
             PreparedKind::Fd(timing) => Connected::Fd(
-                builder
+                match builder
                     .fd_explicit(timing)
                     .connect()
-                    .map_err(DriverError::from)?,
+                    .map_err(DriverError::from) {
+                        Ok(owner) => owner,
+                        Err(error) => {
+                            let _ = self.raw.set_u32(device.handle, PCAN_LISTEN_ONLY, prior_listen_only);
+                            return Err(error);
+                        }
+                    },
             ),
         };
+        if matches!(config, CanOpenConfig::Configure(_)) {
+            if let Err(error) = self.raw.verify_configured(device.handle, &prepared) {
+                drop(owner);
+                let _ = self.raw.set_u32(device.handle, PCAN_LISTEN_ONLY, prior_listen_only);
+                return Err(error);
+            }
+        }
         if let Err(error) = self.raw.set_u32(
             device.handle,
             PCAN_ALLOW_RTR_FRAMES,
             PCAN_PARAMETER_ON,
         ) {
             drop(owner);
+            let _ = self.raw.set_u32(device.handle, PCAN_LISTEN_ONLY, prior_listen_only);
             return Err(error);
         }
-        let active = prepared.active;
+        let clock_domain = new_clock_domain(device.handle);
+        let active = active_with_clock_domain(&prepared.active, &clock_domain)?;
         let mode = owner.mode();
         let channel = RealChannel {
             raw: Arc::clone(&self.raw),
             handle: device.handle,
             mode,
+            clock_domain,
             owner: Some(owner),
         };
         Ok((Box::new(channel), active))
@@ -231,6 +254,7 @@ struct RealChannel {
     raw: Arc<RawLibrary>,
     handle: u16,
     mode: CanMode,
+    clock_domain: String,
     owner: Option<Connected>,
 }
 
@@ -259,7 +283,7 @@ impl DriverChannel for RealChannel {
         if self.owner.is_none() {
             return Err(DriverError::Closed);
         }
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now().checked_add(timeout);
         loop {
             for _ in 0..MAX_SKIPPED_DIAGNOSTICS {
                 let received = match self.mode {
@@ -271,7 +295,7 @@ impl DriverChannel for RealChannel {
                         let timestamp = CanTimestamp::new(
                             timestamp_ns,
                             CanTimestampSource::HostMonotonic,
-                            CLOCK_DOMAIN,
+                            self.clock_domain.clone(),
                         )
                         .map_err(|error| DriverError::InvalidFrame(error.to_string()))?;
                         return Ok(Some(ReceivedCanFrame::new(frame, Some(timestamp))));
@@ -280,10 +304,13 @@ impl DriverChannel for RealChannel {
                     RawReceive::Empty => break,
                 }
             }
-            if timeout.is_zero() || Instant::now() >= deadline {
+            let now = Instant::now();
+            if timeout.is_zero() || deadline.is_some_and(|deadline| now >= deadline) {
                 return Ok(None);
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = deadline
+                .map(|deadline| deadline.saturating_duration_since(now))
+                .unwrap_or(RECEIVE_POLL_INTERVAL);
             std::thread::sleep(remaining.min(RECEIVE_POLL_INTERVAL));
         }
     }
@@ -325,8 +352,15 @@ impl DriverChannel for RealChannel {
     }
 
     fn close(&mut self) -> Result<(), DriverError> {
-        self.owner.take();
-        Ok(())
+        let Some(owner) = self.owner.take() else {
+            return Ok(());
+        };
+        let result = self.raw.uninitialize(self.handle);
+        // The upstream typestate owner releases its receive event and performs
+        // a best-effort second uninitialize on drop. The first call above is
+        // authoritative so its documented vendor status reaches the caller.
+        drop(owner);
+        result
     }
 }
 
@@ -400,11 +434,13 @@ impl CanChannel for NativePcanChannel {
         if self.closed {
             return Ok(());
         }
-        self.backend.close().map_err(|error| {
+        let result = self.backend.close().map_err(|error| {
             map_driver_error("can.close", error, Some(self.descriptor.id()))
-        })?;
+        });
+        // A close failure still retires the handle. Repeating close must not
+        // act on a resource already released by the backend cleanup path.
         self.closed = true;
-        Ok(())
+        result
     }
 }
 
@@ -422,6 +458,7 @@ struct PreparedOpen {
     active: CanActiveConfig,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PreparedKind {
     Classic(ClassicBitrate),
     Fd(PcanFdTiming),
@@ -435,6 +472,25 @@ impl PreparedOpen {
     fn mode(&self) -> CanMode {
         self.active.mode()
     }
+}
+
+fn new_clock_domain(handle: u16) -> String {
+    format!("pcan-basic:{handle:04X}:{}", uuid::Uuid::new_v4())
+}
+
+fn active_with_clock_domain(
+    active: &CanActiveConfig,
+    clock_domain: &str,
+) -> Result<CanActiveConfig, DriverError> {
+    CanActiveConfig::new(
+        active.mode(),
+        *active.nominal(),
+        active.data().copied(),
+        active.listen_only(),
+        active.loopback(),
+        clock_domain,
+    )
+    .map_err(|error| DriverError::Platform(error.to_string()))
 }
 
 fn prepare_configure(
@@ -456,7 +512,7 @@ fn prepare_configure(
         request.data().copied(),
         request.listen_only(),
         false,
-        CLOCK_DOMAIN,
+        PREPARED_CLOCK_DOMAIN,
     )
     .map_err(|error| DriverError::Unsupported(error.to_string()))?;
     let kind = match request.mode() {
@@ -564,7 +620,14 @@ fn prepare_attach(
             )
         }
     };
-    let active = CanActiveConfig::new(mode, nominal, data, listen_only, false, CLOCK_DOMAIN)
+    let active = CanActiveConfig::new(
+        mode,
+        nominal,
+        data,
+        listen_only,
+        false,
+        PREPARED_CLOCK_DOMAIN,
+    )
         .map_err(|error| DriverError::Unsupported(error.to_string()))?;
     Ok(PreparedOpen { kind, active })
 }
@@ -576,7 +639,7 @@ fn verify_expectation(
     data_bitrate: Option<u32>,
     listen_only: bool,
 ) -> Result<(), DriverError> {
-    if expectation.loopback().is_some() {
+    if expectation.loopback() == Some(true) {
         return Err(DriverError::Unsupported(
             "PCAN-Basic cannot query controller loopback state".to_owned(),
         ));
@@ -1067,6 +1130,11 @@ fn from_classic_message(message: &PcanMessage) -> Result<Option<CanFrame>, Drive
     }
     let id = from_raw_id(message.id, message.message_type)?;
     if message.message_type & PCAN_MESSAGE_RTR != 0 {
+        if message.message_type & PCAN_MESSAGE_FD != 0 {
+            return Err(DriverError::InvalidFrame(
+                "PCAN FD remote frames are invalid".to_owned(),
+            ));
+        }
         return CanFrame::classic_remote(id, message.len).map(Some).map_err(|error| {
             DriverError::InvalidFrame(error.to_string())
         });
@@ -1094,7 +1162,9 @@ fn from_fd_message(message: &PcanMessageFd) -> Result<Option<CanFrame>, DriverEr
         });
     }
     if message.message_type & PCAN_MESSAGE_FD != 0 {
-        let len = usize::from(dlc_to_len(message.dlc));
+        let len = usize::from(dlc_to_len(message.dlc).ok_or_else(|| {
+            DriverError::InvalidFrame(format!("PCAN FD DLC {} exceeds 15", message.dlc))
+        })?);
         return CanFrame::fd_data(
             id,
             message.data[..len].to_vec(),
@@ -1227,8 +1297,8 @@ fn len_to_dlc(length: usize) -> Option<u8> {
     }
 }
 
-fn dlc_to_len(dlc: u8) -> u8 {
-    match dlc {
+fn dlc_to_len(dlc: u8) -> Option<u8> {
+    Some(match dlc {
         0..=8 => dlc,
         9 => 12,
         10 => 16,
@@ -1236,8 +1306,9 @@ fn dlc_to_len(dlc: u8) -> u8 {
         12 => 24,
         13 => 32,
         14 => 48,
-        _ => 64,
-    }
+        15 => 64,
+        _ => return None,
+    })
 }
 
 fn check_status(status: u32) -> Result<(), DriverError> {

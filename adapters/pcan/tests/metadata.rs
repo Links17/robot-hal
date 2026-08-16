@@ -20,7 +20,7 @@ fn vendor_device_identity_is_strong_and_channel_specific() {
 }
 
 #[test]
-fn hardware_metadata_without_vendor_id_is_medium_and_encoded() {
+fn hardware_model_without_instance_evidence_is_weak() {
     let metadata = PcanChannelMetadata {
         handle: 0x52,
         device_type: 0x05,
@@ -31,11 +31,8 @@ fn hardware_metadata_without_vendor_id_is_medium_and_encoded() {
 
     let identity = identity_from_metadata(&metadata).unwrap();
 
-    assert_eq!(
-        identity.id.as_str(),
-        "can:pcan:hardware:PCAN%2FUSB%201%25:00"
-    );
-    assert_eq!(identity.quality, IdentityQuality::Medium);
+    assert_eq!(identity.id.as_str(), "can:pcan:handle:0052");
+    assert_eq!(identity.quality, IdentityQuality::Weak);
 }
 
 #[test]
