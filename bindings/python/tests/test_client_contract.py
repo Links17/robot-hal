@@ -91,7 +91,7 @@ async def fake_broker(
                 assert hello.request_id == 1
                 assert hello.WhichOneof("payload") == "handshake_request"
                 assert hello.handshake_request.protocol_minor_minimum == 0
-                assert hello.handshake_request.protocol_minor_maximum == 0
+                assert hello.handshake_request.protocol_minor_maximum == 1
                 await send_frame(
                     writer_stream,
                     envelope(
@@ -168,11 +168,20 @@ async def test_python_client_accepts_overlap_selection_and_rejects_no_shared_min
         await client.close()
         release.set()
 
+    release = asyncio.Event()
     async with fake_broker(
         handler,
         selected_minor=1,
         minimum_minor=0,
         maximum_minor=1,
+    ) as endpoint:
+        client = await HalClient.connect(endpoint, TOKEN)
+        assert client.protocol_minor == 1
+        await client.close()
+        release.set()
+
+    async with fake_broker(
+        handler, selected_minor=2, minimum_minor=2, maximum_minor=2
     ) as endpoint:
         with pytest.raises(HalError) as caught:
             await HalClient.connect(endpoint, TOKEN)

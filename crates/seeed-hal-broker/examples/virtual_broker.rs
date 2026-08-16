@@ -2,7 +2,7 @@
 
 use seeed_hal_broker::{Broker, StartupToken};
 use seeed_hal_runtime::HalRuntime;
-use seeed_hal_testkit::VirtualSerialAdapter;
+use seeed_hal_testkit::{VirtualCanAdapter, VirtualSerialAdapter};
 use zeroize::Zeroize;
 
 #[tokio::main]
@@ -33,6 +33,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     token.zeroize();
     let runtime = HalRuntime::builder()
         .serial_adapter(VirtualSerialAdapter::loopback("serial:virtual:python"))
+        .can_adapter(VirtualCanAdapter::loopback("can:virtual:python"))
         .build();
     let broker = Broker::with_startup_token(runtime, startup_token);
     serve_one(broker).await

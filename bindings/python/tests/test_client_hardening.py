@@ -15,6 +15,8 @@ from types import ModuleType
 import pytest
 
 from seeed_hal import (
+    CanMode,
+    CanSession,
     ControlLines,
     ErrorCategory,
     HalClient,
@@ -25,6 +27,7 @@ from seeed_hal import (
     SerialSession,
     TransportKind,
 )
+from seeed_hal.can import _CanSessionProfile
 from seeed_hal.proto import hal_pb2
 from seeed_hal.transport_unix import HARD_FRAME_BYTES, UnixFramedTransport
 
@@ -1145,6 +1148,52 @@ async def test_terminal_fanout_and_repeated_calls_receive_fresh_immutable_errors
     assert repeated.value == first_error
     assert repeated.value is not first_error
     assert repeated.value.context is not first_error.context
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_malformed_can_status_uses_shared_terminal_fanout() -> None:
+    transport = ScriptedTransport()
+    client = direct_client(transport)
+    session = CanSession(
+        client,
+        "session:can",
+        "lease:can",
+        1,
+        hal_pb2.LEASE_MODE_CONTROL,
+        _CanSessionProfile(
+            CanMode.CLASSIC,
+            True,
+            False,
+            False,
+            False,
+            "can:virtual:hardening",
+            "session:can",
+        ),
+    )
+    status = asyncio.create_task(session.bus_status())
+    serial = asyncio.create_task(client.enumerate_serial())
+    requests = [await next_request(transport), await next_request(transport)]
+    status_request = next(
+        request
+        for request in requests
+        if request.WhichOneof("payload") == "get_can_bus_status_request"
+    )
+    transport.inbound.put_nowait(
+        hal_pb2.Envelope(
+            request_id=status_request.request_id,
+            get_can_bus_status_response=hal_pb2.GetCanBusStatusResponse(
+                status=hal_pb2.CanBusStatus(state=999)
+            ),
+        ).SerializeToString()
+    )
+
+    first, second = await asyncio.gather(status, serial, return_exceptions=True)
+    assert isinstance(first, HalError)
+    assert isinstance(second, HalError)
+    assert first.name == "runtime.protocol.invalid_message"
+    assert second.name == "runtime.protocol.invalid_message"
+    assert first is not second
     await client.close()
 
 
