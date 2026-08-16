@@ -83,6 +83,27 @@ async fn receive_timeout_and_close_are_finite_and_structured() {
 }
 
 #[tokio::test]
+async fn receive_overflow_reports_lag_before_retained_frames() {
+    let adapter = VirtualCanAdapter::loopback("can:virtual:lag");
+    let descriptor = adapter.enumerate().await.unwrap().remove(0);
+    let mut channel = adapter.open(&descriptor.selector(), &CanOpenConfig::Attach(
+        seeed_hal_can::CanLinkExpectation::new(None, None, None, None, None).unwrap(),
+    )).await.unwrap();
+    for value in 0..=256u16 {
+        adapter.inject_received(
+            CanFrame::classic_data(CanId::standard(value & 0x7ff), Bytes::from_static(&[1])).unwrap(),
+            None,
+        ).unwrap();
+    }
+    let lagged = channel.receive(Duration::ZERO).unwrap_err();
+    assert_eq!(lagged.name().as_str(), "can.receive.lagged");
+    assert_eq!(lagged.resource_id(), Some(descriptor.id()));
+    assert_eq!(lagged.context().iter().collect::<Vec<_>>(), vec![("dropped_count", "1")]);
+    let retained = channel.receive(Duration::ZERO).unwrap().unwrap();
+    assert_eq!(retained.frame().id(), Some(&CanId::standard(1).unwrap()));
+}
+
+#[tokio::test]
 async fn descriptor_is_strong_can_and_advertises_exact_capabilities() {
     let adapter = VirtualCanAdapter::loopback("can:virtual:capabilities");
     let descriptor = adapter.enumerate().await.unwrap().remove(0);
@@ -104,16 +125,58 @@ async fn fault_hooks_are_one_shot_and_transition_waits_are_bounded() {
     let adapter = VirtualCanAdapter::loopback("can:virtual:faults");
     assert!(!adapter.wait_for_open(Duration::from_millis(1)));
     let descriptor = adapter.enumerate().await.unwrap().remove(0);
+    let waiter_adapter = adapter.clone();
+    let waiter = tokio::task::spawn_blocking(move || waiter_adapter.wait_for_open(Duration::from_millis(100)));
     let mut channel = adapter.open(&descriptor.selector(), &CanOpenConfig::Attach(
         seeed_hal_can::CanLinkExpectation::new(None, None, None, None, None).unwrap(),
     )).await.unwrap();
-    assert!(adapter.wait_for_open(Duration::from_millis(10)));
-    adapter.fail_next_status(seeed_hal_core::HalError::new(
-        "can.status.injected", seeed_hal_core::ErrorCategory::Unavailable,
-        "test.status", true, "injected",
-    ).unwrap());
-    assert_eq!(channel.bus_status().unwrap_err().name().as_str(), "can.status.injected");
+    assert!(waiter.await.unwrap());
+    let injected = || seeed_hal_core::HalError::new(
+        "can.injected", seeed_hal_core::ErrorCategory::Unavailable,
+        "test.injected", true, "injected",
+    ).unwrap();
+    let frame = CanFrame::classic_remote(CanId::standard(1).unwrap(), 0).unwrap();
+    adapter.fail_next_send(injected());
+    let send_error = channel.send(&frame).unwrap_err();
+    assert_eq!(send_error.name().as_str(), "can.injected");
+    assert_eq!(send_error.resource_id(), Some(descriptor.id()));
+    adapter.fail_next_receive(injected());
+    let receive_error = channel.receive(Duration::ZERO).unwrap_err();
+    assert_eq!(receive_error.name().as_str(), "can.injected");
+    assert_eq!(receive_error.resource_id(), Some(descriptor.id()));
+    adapter.fail_next_status(injected());
+    let status_error = channel.bus_status().unwrap_err();
+    assert_eq!(status_error.name().as_str(), "can.injected");
+    assert_eq!(status_error.resource_id(), Some(descriptor.id()));
     assert_eq!(channel.bus_status().unwrap().state(), CanBusState::Active);
-    channel.close().unwrap();
-    assert!(adapter.wait_for_close(Duration::from_millis(10)));
+    let close_waiter_adapter = adapter.clone();
+    let close_waiter = tokio::task::spawn_blocking(move || close_waiter_adapter.wait_for_close(Duration::from_millis(100)));
+    adapter.fail_next_close(injected());
+    let close_error = channel.close().unwrap_err();
+    assert_eq!(close_error.name().as_str(), "can.injected");
+    assert_eq!(close_error.resource_id(), Some(descriptor.id()));
+    assert!(close_waiter.await.unwrap());
+    assert!(!adapter.wait_for_close(Duration::from_millis(1)));
+}
+
+#[tokio::test]
+async fn transition_waits_observe_each_repeated_open_and_close() {
+    let adapter = VirtualCanAdapter::loopback("can:virtual:transitions");
+    let descriptor = adapter.enumerate().await.unwrap().remove(0);
+    let open_waiter = { let adapter = adapter.clone(); tokio::task::spawn_blocking(move || adapter.wait_for_open(Duration::from_millis(100))) };
+    let mut first = adapter.open(&descriptor.selector(), &CanOpenConfig::Attach(
+        seeed_hal_can::CanLinkExpectation::new(None, None, None, None, None).unwrap(),
+    )).await.unwrap();
+    assert!(open_waiter.await.unwrap());
+    let close_waiter = { let adapter = adapter.clone(); tokio::task::spawn_blocking(move || adapter.wait_for_close(Duration::from_millis(100))) };
+    first.close().unwrap();
+    assert!(close_waiter.await.unwrap());
+    let open_waiter = { let adapter = adapter.clone(); tokio::task::spawn_blocking(move || adapter.wait_for_open(Duration::from_millis(100))) };
+    let mut second = adapter.open(&descriptor.selector(), &CanOpenConfig::Attach(
+        seeed_hal_can::CanLinkExpectation::new(None, None, None, None, None).unwrap(),
+    )).await.unwrap();
+    assert!(open_waiter.await.unwrap());
+    let close_waiter = { let adapter = adapter.clone(); tokio::task::spawn_blocking(move || adapter.wait_for_close(Duration::from_millis(100))) };
+    second.close().unwrap();
+    assert!(close_waiter.await.unwrap());
 }

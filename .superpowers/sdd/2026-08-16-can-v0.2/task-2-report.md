@@ -45,3 +45,14 @@ Per the deferred-verification requirement, no tests, builds/checks, Clippy, rust
 ## Concerns
 
 - Verification is intentionally deferred; compile and test failures, if any, will be found by the owning integration task.
+
+## Fix round 1
+
+Addressed the critical/important review findings:
+
+- Expanded `run_can_adapter_conformance` into a capability-gated reusable suite covering frame classes/order, effective configuration, timestamps, timeout/close, capability-gated behavior, and Configure restoration.
+- Added saturating RX dropped-frame accounting and structured `can.receive.lagged` errors with bounded `dropped_count` context before retained frames.
+- Corrected transition waits to use a call-entry baseline, with tests covering repeated waits and finite timeouts.
+- Added focused fail-next send/receive/status/close tests asserting canonical resource IDs, plus overflow/lag coverage.
+
+Fix-round tests were written but execution remains deferred by instruction. No tests, builds, lint, formatting, or protocol checks were run; only static inspection and `git diff --check` are permitted for this round.

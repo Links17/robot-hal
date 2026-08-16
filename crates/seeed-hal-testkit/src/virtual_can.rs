@@ -3,11 +3,11 @@ use bytes::Bytes;
 use seeed_hal_can::{
     can_classic_capability, can_configure_capability, can_error_frames_capability,
     can_fd_capability, can_rx_timestamp_capability, CanActiveConfig, CanAdapter, CanBitTiming,
-    CanBusState, CanBusStatus, CanChannel, CanFrame, CanId, CanLinkExpectation, CanMode,
+    CanBusState, CanBusStatus, CanChannel, CanConfigureConfig, CanFrame, CanId, CanLinkExpectation, CanMode,
     CanOpenConfig, CanTimestamp, ReceivedCanFrame,
 };
 use seeed_hal_core::{
-    CapabilitySet, ErrorCategory, HalError, HalResult, IdentityQuality, ResourceDescriptor,
+    CapabilitySet, ErrorCategory, ErrorContext, HalError, HalResult, IdentityQuality, ResourceDescriptor,
     ResourceId, ResourceProperties, ResourceSelector, TransportKind, resolve_resource,
 };
 use std::collections::VecDeque;
@@ -33,6 +33,7 @@ struct SharedState {
 #[derive(Debug)]
 struct BusInner {
     rx: VecDeque<ReceivedCanFrame>,
+    rx_dropped: u64,
     tx: VecDeque<CanFrame>,
     active: CanActiveConfig,
     status: CanBusStatus,
@@ -85,6 +86,7 @@ impl VirtualCanAdapter {
             state: Arc::new(SharedState {
                 inner: Mutex::new(BusInner {
                     rx: VecDeque::with_capacity(RX_CAPACITY),
+                    rx_dropped: 0,
                     tx: VecDeque::with_capacity(TX_CAPACITY),
                     active,
                     status: CanBusStatus::new(CanBusState::Active, Some(0), Some(0)),
@@ -106,7 +108,10 @@ impl VirtualCanAdapter {
     /// Injects one received frame. A full RX queue drops the oldest frame.
     pub fn inject_received(&self, frame: CanFrame, timestamp: Option<CanTimestamp>) -> HalResult<()> {
         let mut inner = self.state.inner.lock().expect("virtual CAN mutex poisoned");
-        if inner.rx.len() == RX_CAPACITY { inner.rx.pop_front(); }
+        if inner.rx.len() == RX_CAPACITY {
+            inner.rx.pop_front();
+            inner.rx_dropped = inner.rx_dropped.saturating_add(1);
+        }
         inner.rx.push_back(ReceivedCanFrame::new(frame, timestamp));
         self.state.changed.notify_all();
         Ok(())
@@ -142,9 +147,10 @@ impl VirtualCanAdapter {
     fn wait_transition(&self, timeout: Duration, open: bool) -> bool {
         let deadline = Instant::now() + timeout;
         let mut guard = self.state.inner.lock().expect("virtual CAN mutex poisoned");
+        let baseline = if open { guard.open_count } else { guard.close_count };
         loop {
             let current = if open { guard.open_count } else { guard.close_count };
-            if current > 0 { return true; }
+            if current > baseline { return true; }
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else { return false; };
             let (next, result) = self.state.changed.wait_timeout(guard, remaining).expect("virtual CAN mutex poisoned");
             guard = next;
@@ -210,6 +216,11 @@ impl CanChannel for VirtualCanChannel {
         let mut guard = self.state.inner.lock().expect("virtual CAN mutex poisoned");
         if let Some(error) = guard.next_receive.take() { return Err(error.with_resource_id(self.descriptor.id().clone())); }
         loop {
+            if guard.rx_dropped > 0 {
+                let dropped = guard.rx_dropped;
+                guard.rx_dropped = 0;
+                return Err(lagged(dropped, &self.descriptor));
+            }
             if let Some(frame) = guard.rx.pop_front() { return Ok(Some(frame)); }
             if timeout.is_zero() { return Ok(None); }
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else { return Ok(None); };
@@ -225,7 +236,10 @@ impl CanChannel for VirtualCanChannel {
         if let Some(error) = guard.next_send.take() { return Err(error.with_resource_id(self.descriptor.id().clone())); }
         if guard.tx.len() >= TX_CAPACITY { return Err(queue_full("can.send", &self.descriptor)); }
         guard.tx.push_back(frame.clone());
-        if guard.rx.len() == RX_CAPACITY { guard.rx.pop_front(); }
+        if guard.rx.len() == RX_CAPACITY {
+            guard.rx.pop_front();
+            guard.rx_dropped = guard.rx_dropped.saturating_add(1);
+        }
         let timestamp = CanTimestamp::new(0, seeed_hal_can::CanTimestampSource::HostMonotonic, CLOCK_DOMAIN)
             .expect("virtual timestamp is valid");
         guard.rx.push_back(ReceivedCanFrame::new(frame.clone(), Some(timestamp)));
@@ -275,19 +289,87 @@ fn closed(operation: &'static str, descriptor: &ResourceDescriptor) -> HalError 
     HalError::new("runtime.session.closed", ErrorCategory::Conflict, operation, false, "CAN channel is closed").expect("valid error").with_resource_id(descriptor.id().clone())
 }
 
-/// Basic reusable adapter checks. Physical adapters may call this helper for the
-/// capabilities they advertise; it intentionally uses only public interfaces.
+fn lagged(dropped: u64, descriptor: &ResourceDescriptor) -> HalError {
+    let context = ErrorContext::new([("dropped_count", dropped.to_string())])
+        .expect("static lag context key is valid");
+    HalError::new(
+        "can.receive.lagged",
+        ErrorCategory::Unavailable,
+        "can.receive",
+        true,
+        "bounded CAN receive queue dropped frames",
+    )
+    .expect("valid lag error")
+    .with_context(context)
+    .with_resource_id(descriptor.id().clone())
+}
+
+/// Capability-gated reusable adapter checks. Physical adapters can call this
+/// helper unchanged; unsupported frame classes are skipped, never fabricated.
 pub async fn run_can_adapter_conformance<A: CanAdapter>(adapter: &A) -> HalResult<()> {
     let descriptors = adapter.enumerate().await?;
-    assert!(!descriptors.is_empty());
+    if descriptors.is_empty() {
+        return Err(HalError::new(
+            "runtime.resource.not_found", ErrorCategory::NotFound, "can.conformance", false,
+            "adapter enumerated no CAN resources",
+        )?);
+    }
+    let descriptor = &descriptors[0];
     let selector = descriptors[0].selector();
-    let expectation = CanLinkExpectation::new(Some(CanMode::Classic), Some(500_000), None, Some(false), Some(true))?;
-    let mut channel = adapter.open(&selector, &CanOpenConfig::Attach(expectation)).await?;
-    let id = CanId::standard(0x123)?;
-    let frame = CanFrame::classic_data(id, Bytes::from_static(&[1, 2, 3]))?;
-    channel.send(&frame)?;
-    let received = channel.receive(Duration::from_millis(20))?.expect("loopback frame");
-    assert_eq!(received.frame(), &frame);
-    assert_eq!(channel.bus_status()?.state(), CanBusState::Active);
-    channel.close()
+    let mut channel = adapter.open(&selector, &CanOpenConfig::Attach(
+        CanLinkExpectation::new(None, None, None, None, None)?,
+    )).await?;
+    let baseline = channel.active_config().clone();
+    let supports = |capability| descriptor.capabilities().contains(&capability);
+    let mut frames = Vec::new();
+    if supports(can_classic_capability()) {
+        frames.push(CanFrame::classic_data(CanId::standard(0x123)?, Bytes::from_static(&[1, 2, 3]))?);
+        frames.push(CanFrame::classic_remote(CanId::standard(0x124)?, 2)?);
+    }
+    if supports(can_fd_capability()) {
+        frames.push(CanFrame::fd_data(CanId::extended(0x12345)?, Bytes::from_static(&[4; 12]), true, true)?);
+    }
+    if supports(can_error_frames_capability()) {
+        frames.push(CanFrame::error(vec![seeed_hal_can::CanErrorClass::BusError], Bytes::from_static(&[5]))?);
+    }
+    for frame in &frames { channel.send(frame)?; }
+    for expected in &frames {
+        let received = channel.receive(Duration::from_millis(20))?
+            .ok_or_else(|| HalError::new("runtime.transport.timeout", ErrorCategory::Unavailable, "can.conformance", true, "loopback frame was not received").expect("valid timeout"))?;
+        assert_eq!(received.frame(), expected);
+        if supports(can_rx_timestamp_capability()) {
+            if let Some(timestamp) = received.timestamp() { assert!(!timestamp.clock_domain().is_empty()); }
+        }
+    }
+    let _ = channel.bus_status()?;
+    channel.close()?;
+    let closed_error = channel.receive(Duration::ZERO).expect_err("closed channel must reject receive");
+    assert_eq!(closed_error.name().as_str(), "runtime.session.closed");
+
+    let expectation = CanLinkExpectation::new(
+        Some(baseline.mode()),
+        Some(baseline.nominal().bitrate()),
+        baseline.data().map(|timing| timing.bitrate()),
+        Some(baseline.listen_only()),
+        Some(baseline.loopback()),
+    )?;
+    let mut attached = adapter.open(&selector, &CanOpenConfig::Attach(expectation)).await?;
+    assert_eq!(attached.active_config(), &baseline);
+    attached.close()?;
+
+    if supports(can_configure_capability()) {
+        let request = CanConfigureConfig::new(
+            baseline.mode(), *baseline.nominal(), baseline.data().copied(),
+            baseline.listen_only(), baseline.loopback(),
+        )?;
+        let mut configured = adapter.open(&selector, &CanOpenConfig::Configure(request)).await?;
+        assert_eq!(configured.active_config(), &baseline);
+        configured.close()?;
+        let mut restored = adapter.open(&selector, &CanOpenConfig::Attach(
+            CanLinkExpectation::new(Some(baseline.mode()), Some(baseline.nominal().bitrate()), baseline.data().map(|timing| timing.bitrate()), Some(baseline.listen_only()), Some(baseline.loopback()))?,
+        )).await?;
+        assert_eq!(restored.active_config(), &baseline);
+        restored.close()?;
+    }
+    Ok(())
 }
