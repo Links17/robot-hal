@@ -2,7 +2,7 @@ use bytes::Bytes;
 use seeed_hal_core::{ErrorCategory, HalError, HalResult};
 use std::fmt;
 
-use crate::{MAX_CLASSIC_DATA_BYTES, MAX_FD_DATA_BYTES};
+use crate::MAX_CLASSIC_DATA_BYTES;
 
 fn invalid_frame(message: &'static str) -> HalError {
     HalError::new(
@@ -102,8 +102,10 @@ impl CanFrame {
         error_state_indicator: bool,
     ) -> HalResult<Self> {
         let data = data.into();
-        if data.len() > MAX_FD_DATA_BYTES {
-            return Err(invalid_frame("CAN FD data exceeds 64 bytes"));
+        if !matches!(data.len(), 0..=8 | 12 | 16 | 20 | 24 | 32 | 48 | 64) {
+            return Err(invalid_frame(
+                "CAN FD data length must be one of 0..=8, 12, 16, 20, 24, 32, 48, or 64",
+            ));
         }
         Ok(Self::FdData {
             id,
@@ -267,7 +269,19 @@ pub struct CanBatchSendError {
 }
 
 impl CanBatchSendError {
-    pub fn new(error: HalError, committed: usize) -> Self {
+    /// Creates an admission/rejection error. Atomic admission always commits zero frames.
+    pub fn new(error: HalError) -> Self {
+        Self {
+            error,
+            committed: 0,
+        }
+    }
+
+    /// Creates an error after backend transmission accepted a prefix.
+    ///
+    /// This is distinct from local admission rejection, which must use `new`
+    /// and therefore always reports a zero committed prefix.
+    pub fn backend_prefix(error: HalError, committed: usize) -> Self {
         Self { error, committed }
     }
 

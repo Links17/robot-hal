@@ -44,3 +44,17 @@ Created: `crates/seeed-hal-can/Cargo.toml`, `src/lib.rs`, `src/frame.rs`,
 - Downstream protocol/runtime exhaustive matches will need their planned v0.2
   updates before the workspace can compile with the new core enum variants.
 - Full verification remains deferred by instruction.
+
+## Fix round 1
+
+- Added exact CAN FD payload-length validation for the permitted wire lengths;
+  `frame_limits_and_flags_are_enforced` now covers every rejected gap.
+- Changed local batch-admission error construction to always report
+  `committed() == 0`; backend-prefix construction is explicit and separately
+  covered by `batch_error_preserves_prefix_and_redacts_debug`.
+- Added optional nonzero `restart_ms` to Configure, with accessor and rejection
+  coverage in `configure_restart_ms_is_optional_and_nonzero`.
+
+Tests for this fix round were written but NOT RUN due to the deferred
+verification rule. Builds, lint, formatting, and protocol checks remain
+deferred as well.

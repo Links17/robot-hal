@@ -112,6 +112,7 @@ pub struct CanConfigureConfig {
     data: Option<CanBitTiming>,
     listen_only: bool,
     loopback: bool,
+    restart_ms: Option<u32>,
 }
 
 impl CanConfigureConfig {
@@ -122,6 +123,20 @@ impl CanConfigureConfig {
         listen_only: bool,
         loopback: bool,
     ) -> HalResult<Self> {
+        Self::new_with_restart(mode, nominal, data, listen_only, loopback, None)
+    }
+
+    pub fn new_with_restart(
+        mode: CanMode,
+        nominal: CanBitTiming,
+        data: Option<CanBitTiming>,
+        listen_only: bool,
+        loopback: bool,
+        restart_ms: Option<u32>,
+    ) -> HalResult<Self> {
+        if restart_ms.is_some_and(|value| value == 0) {
+            return Err(invalid_config("CAN restart time must be nonzero when specified"));
+        }
         match (mode, data.is_some()) {
             (CanMode::Classic, true) => {
                 return Err(invalid_config(
@@ -141,6 +156,7 @@ impl CanConfigureConfig {
             data,
             listen_only,
             loopback,
+            restart_ms,
         })
     }
 
@@ -162,6 +178,10 @@ impl CanConfigureConfig {
 
     pub fn loopback(&self) -> bool {
         self.loopback
+    }
+
+    pub fn restart_ms(&self) -> Option<u32> {
+        self.restart_ms
     }
 }
 

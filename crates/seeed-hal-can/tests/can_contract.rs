@@ -34,6 +34,9 @@ fn frame_limits_and_flags_are_enforced() {
     assert!(CanFrame::classic_remote(standard, 9).is_err());
     assert!(CanFrame::fd_data(standard, Bytes::from(vec![0; 64]), true, true).is_ok());
     assert!(CanFrame::fd_data(standard, Bytes::from(vec![0; 65]), false, false).is_err());
+    for length in [9, 10, 11, 13, 14, 15, 17, 18, 19, 21, 22, 23, 25, 26, 27, 28, 29, 30, 31, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63] {
+        assert!(CanFrame::fd_data(standard, Bytes::from(vec![0; length]), false, false).is_err());
+    }
     assert!(CanFrame::error(vec![CanErrorClass::BusError], Bytes::new()).is_ok());
     assert!(CanFrame::error(Vec::new(), Bytes::new()).is_err());
     assert!(CanFrame::error(vec![CanErrorClass::Other], Bytes::from(vec![0; 9])).is_err());
@@ -124,11 +127,38 @@ fn batch_error_preserves_prefix_and_redacts_debug() {
         "private adapter diagnostic",
     )
     .unwrap();
-    let batch = CanBatchSendError::new(error, 3);
-    assert_eq!(batch.committed(), 3);
+    let batch = CanBatchSendError::new(error.clone());
+    assert_eq!(batch.committed(), 0);
     assert_eq!(batch.error().name().as_str(), "can.bus.off");
     let debug = format!("{batch:?}");
     assert!(!debug.contains("private adapter diagnostic"));
+
+    let partial = CanBatchSendError::backend_prefix(error, 3);
+    assert_eq!(partial.committed(), 3);
+}
+
+#[test]
+fn configure_restart_ms_is_optional_and_nonzero() {
+    let nominal = CanBitTiming::new(500_000, None, None).unwrap();
+    let config = CanConfigureConfig::new_with_restart(
+        CanMode::Classic,
+        nominal,
+        None,
+        false,
+        false,
+        Some(250),
+    )
+    .unwrap();
+    assert_eq!(config.restart_ms(), Some(250));
+    assert!(CanConfigureConfig::new_with_restart(
+        CanMode::Classic,
+        nominal,
+        None,
+        false,
+        false,
+        Some(0),
+    )
+    .is_err());
 }
 
 #[test]
