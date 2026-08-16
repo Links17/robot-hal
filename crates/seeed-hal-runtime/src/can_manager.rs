@@ -82,6 +82,10 @@ pub(crate) struct CanManager {
     open_commit_gate: Option<Arc<ManagerTestGate>>,
     #[cfg(test)]
     close_finalize_gate: Option<Arc<ManagerTestGate>>,
+    #[cfg(test)]
+    close_event_gate: Option<Arc<ManagerThreadGate>>,
+    #[cfg(test)]
+    open_reserve_signal: Option<Arc<ManagerStateSignal>>,
 }
 
 #[cfg(test)]
@@ -114,6 +118,73 @@ impl ManagerTestGate {
     }
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct ManagerThreadGate {
+    reached: AtomicBool,
+    released: Mutex<bool>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl ManagerThreadGate {
+    fn wait(&self) {
+        self.reached.store(true, Ordering::Release);
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*released {
+            released = self
+                .changed
+                .wait(released)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    async fn wait_reached(&self) {
+        while !self.reached.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn release(&self) {
+        *self
+            .released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        self.changed.notify_one();
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ManagerStateSignal {
+    armed: AtomicBool,
+    reached: AtomicBool,
+    changed: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl ManagerStateSignal {
+    fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+    }
+
+    fn reach_if_armed(&self) {
+        if self.armed.load(Ordering::Acquire) {
+            self.reached.store(true, Ordering::Release);
+            self.changed.notify_one();
+        }
+    }
+
+    async fn wait_reached(&self) {
+        while !self.reached.load(Ordering::Acquire) {
+            self.changed.notified().await;
+        }
+    }
+}
+
 impl CanManager {
     pub(crate) fn new(
         adapters: Vec<Arc<dyn CanAdapter>>,
@@ -133,6 +204,10 @@ impl CanManager {
             open_commit_gate: None,
             #[cfg(test)]
             close_finalize_gate: None,
+            #[cfg(test)]
+            close_event_gate: None,
+            #[cfg(test)]
+            open_reserve_signal: None,
         }
     }
 
@@ -195,6 +270,10 @@ impl CanManager {
         let termination_failed = Arc::new(AtomicBool::new(false));
         let terminal_health_emitted = Arc::new(AtomicBool::new(false));
         let (cancellation, done) = {
+            #[cfg(test)]
+            if let Some(signal) = &self.open_reserve_signal {
+                signal.reach_if_armed();
+            }
             let mut state = lock_state(&self.state);
             self.reconcile_finished_actor(&mut state, &resource_id);
             let reservation = state.leases.reserve(
@@ -499,7 +578,7 @@ impl CanManager {
         session_id: SessionId,
         token: &LeaseToken,
     ) -> HalResult<()> {
-        let (actor, resource_id, owner_id, generation, actor_epoch) = {
+        let (actor, resource_id, actor_epoch) = {
             let mut state = lock_state(&self.state);
             if let Some(resource_id) = state
                 .active
@@ -514,7 +593,6 @@ impl CanManager {
             let entry_resource = entry.resource_id.clone();
             let entry_owner = entry.owner_id.clone();
             let entry_actor = entry.actor.clone();
-            let entry_generation = entry.token.generation();
             let entry_actor_epoch = entry.actor_epoch;
             let entry_closing = entry.closing;
             state.leases.validate(
@@ -546,8 +624,6 @@ impl CanManager {
             (
                 (entry_actor, reply_rx),
                 entry_resource,
-                entry_owner,
-                entry_generation,
                 entry_actor_epoch,
             )
         };
@@ -572,41 +648,14 @@ impl CanManager {
         if let Some(gate) = &self.close_finalize_gate {
             gate.wait().await;
         }
-        let finalized = self.finish_close(&session_id, token, &resource_id);
-        if actor_handle.is_finished() {
-            let mut state = lock_state(&self.state);
-            if state
-                .actors
-                .get(&resource_id)
-                .is_some_and(|current| {
-                    current.epoch == actor_epoch && current.handle.is_finished()
-                })
-            {
-                state.actors.remove(&resource_id);
-            }
-        }
-        if let Some(finalized) = finalized {
-            if result.is_err()
-                && !finalized
-                    .terminal_health_emitted
-                    .swap(true, Ordering::AcqRel)
-            {
-                self.events.publish(
-                    RuntimeEventKind::CanBusUnknown,
-                    resource_id.clone(),
-                    session_id.clone(),
-                    owner_id.clone(),
-                    generation,
-                );
-            }
-            self.events.publish(
-                RuntimeEventKind::SessionClosed,
-                resource_id,
-                session_id,
-                owner_id,
-                generation,
-            );
-        }
+        self.finish_close(
+            &session_id,
+            token,
+            &resource_id,
+            result.is_err(),
+            actor_handle.is_finished(),
+            actor_epoch,
+        );
         result
     }
 
@@ -884,10 +933,13 @@ impl CanManager {
         session_id: &SessionId,
         token: &LeaseToken,
         resource_id: &ResourceId,
-    ) -> Option<ActiveSession> {
+        close_failed: bool,
+        actor_finished: bool,
+        actor_epoch: u64,
+    ) {
         let mut state = lock_state(&self.state);
         let Some(entry) = state.active.remove(session_id) else {
-            return None;
+            return;
         };
         let _ = state.leases.release(resource_id, session_id, token);
         remember_closed(
@@ -896,7 +948,40 @@ impl CanManager {
             entry.token.clone(),
             entry.resource_id.clone(),
         );
-        Some(entry)
+        #[cfg(test)]
+        if let Some(gate) = &self.close_event_gate {
+            gate.wait();
+        }
+        if close_failed
+            && !entry
+                .terminal_health_emitted
+                .swap(true, Ordering::AcqRel)
+        {
+            self.events.publish(
+                RuntimeEventKind::CanBusUnknown,
+                resource_id.clone(),
+                session_id.clone(),
+                entry.owner_id.clone(),
+                entry.token.generation(),
+            );
+        }
+        self.events.publish(
+            RuntimeEventKind::SessionClosed,
+            resource_id.clone(),
+            session_id.clone(),
+            entry.owner_id,
+            entry.token.generation(),
+        );
+        if actor_finished
+            && state
+                .actors
+                .get(resource_id)
+                .is_some_and(|current| {
+                    current.epoch == actor_epoch && current.handle.is_finished()
+                })
+        {
+            state.actors.remove(resource_id);
+        }
     }
 }
 
@@ -1233,7 +1318,10 @@ mod tests {
     use seeed_hal_core::{ErrorCategory, HalError, LeaseMode, OwnerId};
     use seeed_hal_testkit::VirtualCanAdapter;
 
-    use super::{CanManager, ManagerTestGate, reliable_actor_remove};
+    use super::{
+        CanManager, ManagerStateSignal, ManagerTestGate, ManagerThreadGate,
+        reliable_actor_remove,
+    };
     use crate::can_actor::CanActorHandle;
     use crate::events::{EventPublisher, RuntimeEventKind};
 
@@ -1398,6 +1486,58 @@ mod tests {
             .unwrap();
         gate.release();
         assert_eq!(closing.await.unwrap().unwrap_err().name().as_str(), "test.can.close");
+        assert_eq!(subscription.recv().await.unwrap().kind(), RuntimeEventKind::SessionOpened);
+        assert_eq!(subscription.recv().await.unwrap().kind(), RuntimeEventKind::CanBusUnknown);
+        assert_eq!(subscription.recv().await.unwrap().kind(), RuntimeEventKind::SessionClosed);
+        assert_eq!(subscription.recv().await.unwrap().kind(), RuntimeEventKind::SessionOpened);
+        assert!(tokio::time::timeout(Duration::from_millis(10), subscription.recv()).await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_first_failed_close_publishes_terminal_events_before_reopen() {
+        let adapter = VirtualCanAdapter::loopback("can:runtime:finish-first-events");
+        let selector = adapter.descriptor().selector();
+        adapter.fail_next_close(
+            HalError::new(
+                "test.can.close",
+                ErrorCategory::Unavailable,
+                "can.close",
+                false,
+                "injected close failure",
+            )
+            .unwrap(),
+        );
+        let (mut manager, events) = manager(adapter);
+        let terminal_gate = Arc::new(ManagerThreadGate::default());
+        let reserve_signal = Arc::new(ManagerStateSignal::default());
+        manager.close_event_gate = Some(Arc::clone(&terminal_gate));
+        manager.open_reserve_signal = Some(Arc::clone(&reserve_signal));
+        let manager = Arc::new(manager);
+        let mut subscription = events.subscribe();
+        let (session, token) = manager
+            .open(owner("finish-first-close"), selector.clone(), LeaseMode::Observe, attach(), filters())
+            .await
+            .unwrap();
+        reserve_signal.arm();
+        let closing = {
+            let manager = Arc::clone(&manager);
+            let token = token.clone();
+            tokio::spawn(async move { manager.close(session, &token).await })
+        };
+        terminal_gate.wait_reached().await;
+        let reopening = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                manager
+                    .open(owner("finish-first-reuse"), selector, LeaseMode::Observe, attach(), filters())
+                    .await
+            })
+        };
+        reserve_signal.wait_reached().await;
+        assert!(!reopening.is_finished());
+        terminal_gate.release();
+        assert_eq!(closing.await.unwrap().unwrap_err().name().as_str(), "test.can.close");
+        reopening.await.unwrap().unwrap();
         assert_eq!(subscription.recv().await.unwrap().kind(), RuntimeEventKind::SessionOpened);
         assert_eq!(subscription.recv().await.unwrap().kind(), RuntimeEventKind::CanBusUnknown);
         assert_eq!(subscription.recv().await.unwrap().kind(), RuntimeEventKind::SessionClosed);

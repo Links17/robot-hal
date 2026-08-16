@@ -114,3 +114,14 @@ Addressed the remaining cleanup-termination and deterministic-test findings plus
 The pre-existing cancellation concern after explicit close enters its `closing` state remains outside this scoped round as directed and is reserved for the final broad review.
 
 Per the task execution rule, no test, build, lint, formatting, protocol, generated-code, or dependency-generation command was run in fix round 2. Verification was limited to static source/diff inspection and the permitted diff checks. The final unstaged `git diff --check` exited 0 with no output.
+
+## Fix round 3
+
+Addressed the remaining receive-pressure proof and close/reopen event-order findings:
+
+- Receive-starvation coverage now snapshots the producer-attempt count immediately after releasing the blocked backend and again inside the receive future at its exact completion point. Requiring the completion snapshot to exceed the post-release baseline proves management producers replenished pressure after release while the receive remained pending; retries accumulated before release cannot satisfy the assertion.
+- Close finalization now keeps the manager-state mutex across active-session removal, lease release, closed-session caching, optional `CanBusUnknown` publication, `SessionClosed` publication, and matching finished-actor removal. A concurrent open therefore cannot reserve or commit the resource before the old session's terminal events are published.
+- Added a two-worker, test-only finish-first race that pauses close after lease release and closed-cache insertion while the manager-state mutex remains held, signals when a concurrent reopen reaches the reservation-lock boundary, and confirms reopen cannot finish until close publishes. The asserted sequence is old `SessionOpened`, old `CanBusUnknown`, old `SessionClosed`, then new `SessionOpened`.
+- The existing actor-epoch guard, expected/failed termination flags, terminal-health deduplication, cleanup-completion watches, and finite cleanup paths remain in place. Reconciliation-first close tests continue to cover the complementary ordering.
+
+Per the task execution rule, no test, build, lint, formatting, protocol, generated-code, or dependency-generation command was run in fix round 3. Verification was limited to static source/diff inspection and the permitted diff checks. The final unstaged and staged `git diff --check` commands exited 0 with no output.

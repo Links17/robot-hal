@@ -93,12 +93,15 @@ async fn enqueue_blocked_receive(
     runtime: &HalRuntime,
     handle: &seeed_hal_runtime::CanHandle,
     timeout: Duration,
-) -> tokio::task::JoinHandle<HalResult<Vec<ReceivedCanFrame>>> {
+    attempts: Arc<AtomicUsize>,
+) -> tokio::task::JoinHandle<(HalResult<Vec<ReceivedCanFrame>>, usize)> {
     let runtime = runtime.clone();
     let session = handle.session_id();
     let token = handle.lease_token().clone();
     let mut operation = Box::pin(async move {
-        runtime.receive_can(session, &token, 1, timeout).await
+        let result = runtime.receive_can(session, &token, 1, timeout).await;
+        let attempts_at_completion = attempts.load(Ordering::Acquire);
+        (result, attempts_at_completion)
     });
     tokio::select! {
         biased;
@@ -510,9 +513,15 @@ async fn management_pressure_does_not_starve_receive_deadline() {
     let observer = runtime.open_can(owner("budget"), adapter.selector(), LeaseMode::Observe, attach(), all_frames()).await.unwrap();
     gate.wait_started().await;
     let started = Instant::now();
-    let receive = enqueue_blocked_receive(&runtime, &observer, Duration::from_millis(20)).await;
     let stop = Arc::new(AtomicBool::new(false));
     let attempts = Arc::new(AtomicUsize::new(0));
+    let receive = enqueue_blocked_receive(
+        &runtime,
+        &observer,
+        Duration::from_millis(20),
+        Arc::clone(&attempts),
+    )
+    .await;
     let mut producers = Vec::new();
     for _ in 0..64 {
         let runtime = runtime.clone();
@@ -533,7 +542,10 @@ async fn management_pressure_does_not_starve_receive_deadline() {
         tokio::task::yield_now().await;
     }
     gate.release();
-    assert!(receive.await.unwrap().unwrap().is_empty());
+    let attempts_after_release = attempts.load(Ordering::Acquire);
+    let (received, attempts_at_completion) = receive.await.unwrap();
+    assert!(received.unwrap().is_empty());
+    assert!(attempts_at_completion > attempts_after_release);
     assert!(started.elapsed() < Duration::from_millis(100));
     stop.store(true, Ordering::Release);
     for producer in producers { producer.await.unwrap(); }
