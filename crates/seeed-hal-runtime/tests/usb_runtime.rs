@@ -45,3 +45,34 @@ async fn usb_runtime_fences_stale_leases_after_close_and_reopen() {
     );
     second.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn usb_owner_revoke_releases_claim_for_another_owner() {
+    let adapter = VirtualUsbAdapter::loopback("usb:runtime:revoke");
+    let runtime = HalRuntime::builder().usb_adapter(adapter).build();
+    let descriptor = runtime.enumerate_usb().await.unwrap().remove(0);
+    let owner = OwnerId::parse("owner:usb-revoked").unwrap();
+    let handle = runtime
+        .open_usb(owner.clone(), descriptor.selector(), 0)
+        .await
+        .unwrap();
+    runtime.revoke_owner(&owner).await.unwrap();
+    assert_eq!(
+        handle
+            .transfer(UsbTransfer::bulk_in(0x81, 1).unwrap(), Duration::ZERO)
+            .await
+            .unwrap_err()
+            .name()
+            .as_str(),
+        "runtime.session.closed"
+    );
+    let mut replacement = runtime
+        .open_usb(
+            OwnerId::parse("owner:usb-new").unwrap(),
+            descriptor.selector(),
+            0,
+        )
+        .await
+        .unwrap();
+    replacement.close().await.unwrap();
+}

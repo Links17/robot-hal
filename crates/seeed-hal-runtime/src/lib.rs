@@ -493,10 +493,12 @@ impl HalRuntime {
     pub async fn revoke_owner(&self, owner: &OwnerId) -> HalResult<()> {
         let serial_result = self.revoke_serial_owner(owner).await;
         let can_result = self.inner.can_manager.revoke_owner(owner).await;
-        match (serial_result, can_result) {
-            (Err(error), _) => Err(error),
-            (Ok(()), Err(error)) => Err(error),
-            (Ok(()), Ok(())) => Ok(()),
+        let usb_result = self.inner.usb_manager.revoke_owner(owner).await;
+        match (serial_result, can_result, usb_result) {
+            (Err(error), _, _) => Err(error),
+            (Ok(()), Err(error), _) => Err(error),
+            (Ok(()), Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(()), Ok(())) => Ok(()),
         }
     }
 
