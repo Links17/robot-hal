@@ -31,7 +31,7 @@ mod macos {
         AVCaptureOutput, AVCaptureSession, AVCaptureVideoDataOutput,
         AVCaptureVideoDataOutputSampleBufferDelegate, AVMediaType, AVMediaTypeVideo,
     };
-    use objc2_core_media::CMSampleBuffer;
+    use objc2_core_media::{CMSampleBuffer, CMVideoFormatDescriptionGetDimensions};
     use objc2_core_video::{
         CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBaseAddressOfPlane,
         CVPixelBufferGetBytesPerRow, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetDataSize,
@@ -155,6 +155,7 @@ mod macos {
                     permission_denied("camera.open").with_resource_id(descriptor.id().clone())
                 );
             }
+            ensure_active_format(&device, request.format(), &descriptor)?;
             {
                 let mut claimed = claims.lock().expect("AVFoundation claim mutex poisoned");
                 if !claimed.insert(descriptor.id().clone()) {
@@ -175,6 +176,39 @@ mod macos {
                 }
             }
         })
+    }
+
+    fn ensure_active_format(
+        device: &AVCaptureDevice,
+        requested: &CameraFormat,
+        descriptor: &ResourceDescriptor,
+    ) -> HalResult<()> {
+        // SAFETY: The selected retained device is connected and authorized;
+        // its active format description is retained for this comparison.
+        let active_format = unsafe { device.activeFormat() };
+        // SAFETY: See the active-format access rationale above.
+        let description = unsafe { active_format.formatDescription() };
+        // SAFETY: The retained AVFoundation format description is a valid
+        // CMVideoFormatDescription for the selected video capture device.
+        let dimensions = unsafe { CMVideoFormatDescriptionGetDimensions(&description) };
+        // SAFETY: CoreMedia's generated getter reads the immutable format
+        // description returned by the selected device.
+        let subtype = unsafe { description.media_sub_type() };
+        let matches_pixel_format = match requested.pixel_format() {
+            CameraPixelFormat::Nv12 => {
+                subtype == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                    || subtype == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            }
+            CameraPixelFormat::Yuyv => subtype == kCVPixelFormatType_422YpCbCr8_yuvs,
+            CameraPixelFormat::Mjpeg => false,
+        };
+        if !matches_pixel_format
+            || dimensions.width != i32::try_from(requested.width()).unwrap_or_default()
+            || dimensions.height != i32::try_from(requested.height()).unwrap_or_default()
+        {
+            return Err(format_unsupported("camera.open", descriptor));
+        }
+        Ok(())
     }
 
     fn configure_session(
