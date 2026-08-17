@@ -1091,6 +1091,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "seeed-hal-adapter-shared-memory"
+version = "0.4.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "libc",
+ "seeed-hal-camera",
+ "seeed-hal-core",
+ "sha2",
+ "subtle",
+ "thiserror",
+ "windows-permissions",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
+
+[[package]]
 name = "seeed-hal-adapter-socketcan"
 version = "0.2.0"
 dependencies = [

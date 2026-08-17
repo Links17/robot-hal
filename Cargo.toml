@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "adapters/pcan",
     "adapters/nusb",
+    "adapters/shared-memory",
     "adapters/linux-gpio",
     "adapters/windows-gpio",
     "adapters/socketcan",
