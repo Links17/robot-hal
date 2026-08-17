@@ -77,3 +77,11 @@ lists compiled adapters only; it does not claim that optional runtime libraries 
 were available at startup. Startup diagnostics record an unavailable optional adapter using stable
 structured error fields. `--require-adapter pcan` turns an unavailable or uncompiled PCAN adapter
 into a startup failure before the endpoint is published.
+
+The USB/GPIO vertical slice supports wire major 1, inclusive minors `0..=2`. Minor 2 adds only
+optional USB Control/Bulk/Interrupt and GPIO line/edge operations and their hardware-class
+capabilities. A peer negotiated below minor 2 rejects those operations locally or at broker
+dispatch; the pre-existing Serial and CAN meanings remain unchanged. The manifest may list
+independently compiled `nusb`, `linux-gpio`, or `windows-gpio` adapters, but that does not claim
+their vendor runtime, controller, or physical hardware was available. `virtual-adapters` is
+test-only and is not a production-device claim.

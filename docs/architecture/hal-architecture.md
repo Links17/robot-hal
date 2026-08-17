@@ -1,7 +1,7 @@
 # Seeed HAL Architecture
 
-**Status:** v0.1 core and Serial implemented; later hardware classes planned
-**Date:** 2026-08-14  
+**Status:** v0.3 USB/GPIO implementation landed; release validation and native hardware qualification remain open
+**Date:** 2026-08-17
 **Scope:** Team-reusable Rust HAL; `lerobot-easy` is the first consumer, not the domain model.
 
 ## 1. Objective
@@ -54,7 +54,7 @@ The broker constructs the same runtime and exposes it through versioned local IP
 
 The broker is a deployment adapter, not a separate implementation. Platform handles never cross IPC.
 
-The v0.1 broker accepts frames up to exactly 1 MiB. Each connection has a 32-request admission
+The broker accepts frames up to exactly 1 MiB. Each connection has a 32-request admission
 queue, at most 32 executing requests, and a 64-response queue; runtime event subscriptions retain
 64 events. Request or execution admission overflow returns `runtime.queue.full`. Response overflow
 returns `runtime.queue.response_full`, closes the connection, and is recorded in its cleanup outcome
@@ -74,10 +74,10 @@ Connection teardown revokes the owner before waiting for socket reader/writer ta
 permits only a bounded response drain and aborts a stalled task after the connection-task shutdown
 deadline, so a peer that stops reading cannot retain hardware ownership.
 
-The Rust broker client keeps a remote Serial handle reusable when a close request is rejected by
-local bounded-queue admission, allowing the caller to retry `close(&mut self)`. Once a close
-response succeeds, that handle is terminal and rejects every later operation locally; dropping an
-unclosed handle still relies on owner cleanup when its client connection terminates.
+The Rust broker client keeps remote Serial, CAN, USB, and GPIO handles reusable when a close request
+is rejected by local bounded-queue admission, allowing the caller to retry `close(&mut self)`.
+Once a close response succeeds, that handle is terminal and rejects every later operation locally;
+dropping an unclosed handle still relies on owner cleanup when its client connection terminates.
 
 Each launch creates a 256-bit startup token. The handshake compares it in constant time and rejects
 incompatible protocol versions, unsupported required capabilities, and invalid frame/read/write
@@ -93,7 +93,8 @@ For Electron applications, Electron Main owns broker process lifecycle and updat
 
 ### 3.4 Python broker client
 
-The Python binding exposes protobuf-independent async `HalClient` and `SerialSession` types. It
+The Python binding exposes protobuf-independent async `HalClient`, `SerialSession`, `CanSession`,
+`UsbSession`, and `GpioSession` types. It
 performs authentication and limit negotiation before starting one bounded writer task and one
 reader task. Pending requests, cancellation and completion tombstones, writer admission, and event
 delivery are bounded; request IDs are nonzero and correlated independently of response order.
@@ -130,6 +131,7 @@ seeed-hal/
 │   ├── pcan/
 │   ├── nusb/
 │   ├── linux-gpio/
+│   ├── windows-gpio/
 │   └── camera-platform/
 ├── bindings/
 │   ├── python/
@@ -247,7 +249,11 @@ The initial Serial interface covers:
 - line-control operations where supported;
 - explicit close and idempotent cleanup.
 
-CAN, USB, GPIO, and Camera add separate interfaces in later vertical slices while reusing core identity, session, lease, error, and event behavior.
+CAN/CAN FD, USB, and GPIO have separate interfaces while reusing core identity, session, lease,
+error, and event behavior. USB exposes bounded Control/Bulk/Interrupt transfers per claimed
+interface. GPIO exposes bounded line read/write/configuration and rising/falling edge requests with
+monotonic timestamps; its bounded edge delivery queue drops oldest events and reports structured
+lag. Camera remains a later vertical slice.
 
 ## 7. Camera data plane
 
@@ -260,6 +266,11 @@ Camera control uses normal broker IPC. Frame payloads use a bounded shared-memor
 - The runtime owns one task or blocking worker per opened resource as required by its adapter.
 - Blocking vendor calls never execute on Tokio executor workers.
 - Operation queues are bounded and preserve documented ordering.
+- USB owns one bounded terminal worker per claimed interface and GPIO owns one per opened line group.
+  USB transfers are bounded to 16 KiB with at most 64 pending transfers; GPIO edge requests are
+  bounded to 1,024 events, with a default delivery capacity of 256 and oldest-drop lag reporting.
+  A finite close deadline quarantines an uninterruptible native worker rather than releasing its
+  resource for reuse prematurely.
 - Cancellation has a deadline; adapters that cannot cancel synchronously are isolated in a disposable worker.
 - The Python Windows transport uses one bounded, per-transport actor thread as the sole steady-state
   owner of its Named Pipe handle. Its command capacity is four; full or closed admission fails
