@@ -17,6 +17,28 @@ fn wire_minor_two_is_the_latest_additive_protocol_version() {
     assert_eq!(seeed_hal_protocol::PROTOCOL_MINOR, 2);
 }
 
+#[test]
+fn usb_and_gpio_minor_two_envelopes_use_reserved_additive_tags() {
+    assert_tags(
+        &envelope_with(envelope::Payload::EnumerateUsbRequest(
+            v1::EnumerateUsbRequest {},
+        )),
+        &[1, 62],
+    );
+    assert_tags(
+        &envelope_with(envelope::Payload::EnumerateGpioRequest(
+            v1::EnumerateGpioRequest {},
+        )),
+        &[1, 70],
+    );
+}
+
+#[test]
+fn usb_and_gpio_open_requests_lock_session_and_lease_field_tags() {
+    assert_tags(&v1::OpenUsbRequest::default(), &[]);
+    assert_tags(&v1::OpenGpioRequest::default(), &[]);
+}
+
 fn envelope_with(payload: envelope::Payload) -> v1::Envelope {
     v1::Envelope {
         request_id: 7,

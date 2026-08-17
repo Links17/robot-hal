@@ -34,11 +34,58 @@ message Envelope {
     Empty replace_can_filters_response = 59;
     GetCanBusStatusRequest get_can_bus_status_request = 60;
     GetCanBusStatusResponse get_can_bus_status_response = 61;
+    EnumerateUsbRequest enumerate_usb_request = 62;
+    EnumerateUsbResponse enumerate_usb_response = 63;
+    OpenUsbRequest open_usb_request = 64;
+    OpenUsbResponse open_usb_response = 65;
+    UsbTransferRequest usb_transfer_request = 66;
+    UsbTransferResponse usb_transfer_response = 67;
+    CloseUsbRequest close_usb_request = 68;
+    Empty close_usb_response = 69;
+    EnumerateGpioRequest enumerate_gpio_request = 70;
+    EnumerateGpioResponse enumerate_gpio_response = 71;
+    OpenGpioRequest open_gpio_request = 72;
+    OpenGpioResponse open_gpio_response = 73;
+    GpioReadRequest gpio_read_request = 74;
+    GpioReadResponse gpio_read_response = 75;
+    GpioWriteRequest gpio_write_request = 76;
+    Empty gpio_write_response = 77;
+    GpioNextEdgeRequest gpio_next_edge_request = 78;
+    GpioNextEdgeResponse gpio_next_edge_response = 79;
+    CloseGpioRequest close_gpio_request = 80;
+    Empty close_gpio_response = 81;
     Error error = 100;
   }
 }
 
 message Empty {}
+
+message EnumerateUsbRequest {}
+message EnumerateUsbResponse { repeated ResourceDescriptor resources = 1; }
+message EnumerateGpioRequest {}
+message EnumerateGpioResponse { repeated ResourceDescriptor resources = 1; }
+
+message OpenUsbRequest { ResourceSelector selector = 1; uint32 interface_number = 2; }
+message OpenUsbResponse { string session_id = 1; LeaseToken lease = 2; }
+enum UsbTransferKind { USB_TRANSFER_KIND_UNSPECIFIED = 0; USB_TRANSFER_KIND_CONTROL_OUT = 1; USB_TRANSFER_KIND_CONTROL_IN = 2; USB_TRANSFER_KIND_BULK_OUT = 3; USB_TRANSFER_KIND_BULK_IN = 4; USB_TRANSFER_KIND_INTERRUPT_OUT = 5; USB_TRANSFER_KIND_INTERRUPT_IN = 6; }
+message UsbTransferRequest { string session_id = 1; LeaseToken lease = 2; UsbTransferKind kind = 3; uint32 request_type = 4; uint32 request = 5; uint32 value = 6; uint32 index = 7; uint32 endpoint = 8; bytes data = 9; uint32 max_bytes = 10; uint64 timeout_ms = 11; }
+message UsbTransferResponse { bytes data = 1; }
+message CloseUsbRequest { string session_id = 1; LeaseToken lease = 2; }
+
+enum GpioBias { GPIO_BIAS_UNSPECIFIED = 0; GPIO_BIAS_DISABLED = 1; GPIO_BIAS_PULL_UP = 2; GPIO_BIAS_PULL_DOWN = 3; }
+enum GpioDrive { GPIO_DRIVE_UNSPECIFIED = 0; GPIO_DRIVE_PUSH_PULL = 1; GPIO_DRIVE_OPEN_DRAIN = 2; GPIO_DRIVE_OPEN_SOURCE = 3; }
+enum GpioDirection { GPIO_DIRECTION_UNSPECIFIED = 0; GPIO_DIRECTION_INPUT = 1; GPIO_DIRECTION_OUTPUT = 2; }
+enum GpioEdge { GPIO_EDGE_UNSPECIFIED = 0; GPIO_EDGE_RISING = 1; GPIO_EDGE_FALLING = 2; }
+message GpioLineConfig { GpioDirection direction = 1; bool active_low = 2; GpioBias bias = 3; GpioDrive drive = 4; optional bool initial_value = 5; }
+message OpenGpioRequest { ResourceSelector selector = 1; repeated uint32 lines = 2; GpioLineConfig config = 3; }
+message OpenGpioResponse { string session_id = 1; LeaseToken lease = 2; }
+message GpioReadRequest { string session_id = 1; LeaseToken lease = 2; }
+message GpioReadResponse { repeated bool values = 1; }
+message GpioWriteRequest { string session_id = 1; LeaseToken lease = 2; repeated bool values = 3; }
+message GpioNextEdgeRequest { string session_id = 1; LeaseToken lease = 2; bool rising = 3; bool falling = 4; uint32 capacity = 5; uint64 timeout_ms = 6; }
+message GpioEdgeEvent { GpioEdge edge = 1; uint64 monotonic_ns = 2; uint64 sequence = 3; }
+message GpioNextEdgeResponse { GpioEdgeEvent event = 1; }
+message CloseGpioRequest { string session_id = 1; LeaseToken lease = 2; }
 
 message HandshakeRequest {
   bytes startup_token = 1;
