@@ -1544,6 +1544,39 @@ fn camera_minor_three_defines_additive_transport_and_payload_tags_without_frame_
 }
 
 #[test]
+fn camera_next_frame_lease_decoder_rejects_zero_sequence_and_preserves_validated_wire_fields() {
+    let zero_sequence = seeed_hal_protocol::camera_next_frame_lease_response_from_proto(
+        v1::CameraNextFrameLeaseResponse {
+            lease: Some(v1::FrameLease {
+                slot_index: 0,
+                sequence: 0,
+                generation: 1,
+            }),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        zero_sequence.name().as_str(),
+        "runtime.protocol.invalid_message"
+    );
+
+    let lease = seeed_hal_protocol::camera_next_frame_lease_response_from_proto(
+        v1::CameraNextFrameLeaseResponse {
+            lease: Some(v1::FrameLease {
+                slot_index: 2,
+                sequence: 7,
+                generation: 3,
+            }),
+        },
+    )
+    .unwrap()
+    .expect("valid frame lease is present");
+    assert_eq!(lease.slot_index(), 2);
+    assert_eq!(lease.sequence(), 7);
+    assert_eq!(lease.generation(), 3);
+}
+
+#[test]
 fn serial_operation_decoders_reject_can_and_maintenance_values() {
     let can_selector = v1::ResourceSelector {
         resource_id: "can:test".to_owned(),

@@ -9,7 +9,7 @@ mod can_conversion;
 mod conversion;
 
 pub use camera_conversion::{
-    camera_capture_request_from_proto, camera_control_descriptor_from_proto,
+    WireFrameLease, camera_capture_request_from_proto, camera_control_descriptor_from_proto,
     camera_control_descriptor_to_proto, camera_control_kind_from_proto,
     camera_control_value_from_proto, camera_control_value_to_proto,
     camera_controls_response_from_proto, camera_format_from_proto,

@@ -280,23 +280,58 @@ pub fn camera_mapping_descriptor_to_proto(value: &MappingDescriptor) -> v1::Mapp
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WireFrameLease {
+    slot_index: usize,
+    sequence: u64,
+    generation: u64,
+}
+
+impl WireFrameLease {
+    pub const fn slot_index(self) -> usize {
+        self.slot_index
+    }
+
+    pub const fn sequence(self) -> u64 {
+        self.sequence
+    }
+
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub fn bind(self, descriptor: &MappingDescriptor) -> FrameLease {
+        FrameLease::with_identity(
+            descriptor.mapping_identity().clone(),
+            self.slot_index,
+            self.sequence,
+            self.generation,
+        )
+    }
+}
+
 pub fn camera_next_frame_lease_response_from_proto(
     value: v1::CameraNextFrameLeaseResponse,
-) -> HalResult<Option<FrameLease>> {
+) -> HalResult<Option<WireFrameLease>> {
     let Some(lease) = value.lease else {
         return Ok(None);
     };
     if lease.generation == 0 {
         return Err(invalid_message("camera frame lease generation is required"));
     }
+    if lease.sequence == 0 {
+        return Err(invalid_message("camera frame lease sequence is required"));
+    }
     let slot_index = usize::try_from(lease.slot_index)
         .map_err(|_| invalid_message("camera frame slot index is invalid"))?;
     if slot_index >= MAX_CAMERA_SLOT_COUNT {
         return Err(invalid_message("camera frame slot index exceeds bound"));
     }
-    // Frame leases are meaningful only with their mapping identity; callers
-    // combine this wire value with their previously authenticated descriptor.
-    Ok(None)
+    Ok(Some(WireFrameLease {
+        slot_index,
+        sequence: lease.sequence,
+        generation: lease.generation,
+    }))
 }
 
 pub fn frame_lease_to_proto(value: &FrameLease) -> v1::FrameLease {

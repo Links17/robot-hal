@@ -25,6 +25,8 @@ use seeed_hal_gpio::{
 use seeed_hal_protocol::v1::{self, envelope};
 use seeed_hal_protocol::{
     MAX_FRAME_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR, SERIAL_CAPABILITY,
+    camera_control_value_from_proto, camera_controls_response_from_proto,
+    camera_mapping_descriptor_from_proto, camera_next_frame_lease_response_from_proto,
     can_receive_response_from_proto, can_send_response_from_proto,
     enumerate_can_response_from_proto, enumerate_serial_response_from_proto, error_from_proto,
     get_can_bus_status_response_from_proto, gpio_next_edge_response_from_proto,
@@ -309,6 +311,9 @@ pub(crate) enum ExpectedResponse {
     CameraDroppedCount {
         resource_id: ResourceId,
     },
+    CameraControls {
+        resource_id: ResourceId,
+    },
     CameraGetControl {
         resource_id: ResourceId,
     },
@@ -345,6 +350,7 @@ impl ExpectedResponse {
             | Self::CameraMappingDescriptor { resource_id }
             | Self::CameraNextFrameLease { resource_id }
             | Self::CameraDroppedCount { resource_id }
+            | Self::CameraControls { resource_id }
             | Self::CameraGetControl { resource_id }
             | Self::CameraSetControl { resource_id }
             | Self::CameraSetAuto { resource_id }
@@ -2179,20 +2185,8 @@ fn validate_response(expected: ExpectedResponse, payload: &envelope::Payload) ->
             .map_err(|error| attach_resource(error, &resource_id)),
         (ExpectedResponse::CaptureCamera { .. }, envelope::Payload::CaptureCameraResponse(_))
         | (
-            ExpectedResponse::CameraMappingDescriptor { .. },
-            envelope::Payload::CameraMappingDescriptorResponse(_),
-        )
-        | (
-            ExpectedResponse::CameraNextFrameLease { .. },
-            envelope::Payload::CameraNextFrameLeaseResponse(_),
-        )
-        | (
             ExpectedResponse::CameraDroppedCount { .. },
             envelope::Payload::CameraDroppedCountResponse(_),
-        )
-        | (
-            ExpectedResponse::CameraGetControl { .. },
-            envelope::Payload::CameraGetControlResponse(_),
         )
         | (
             ExpectedResponse::CameraSetControl { .. },
@@ -2202,6 +2196,40 @@ fn validate_response(expected: ExpectedResponse, payload: &envelope::Payload) ->
         | (ExpectedResponse::CloseCamera { .. }, envelope::Payload::CloseCameraResponse(_)) => {
             Ok(())
         }
+        (
+            ExpectedResponse::CameraMappingDescriptor { resource_id },
+            envelope::Payload::CameraMappingDescriptorResponse(response),
+        ) => response
+            .descriptor
+            .clone()
+            .ok_or_else(|| {
+                seeed_hal_protocol::invalid_message("camera mapping descriptor is missing")
+            })
+            .and_then(camera_mapping_descriptor_from_proto)
+            .map(|_| ())
+            .map_err(|error| attach_resource(error, &resource_id)),
+        (
+            ExpectedResponse::CameraNextFrameLease { resource_id },
+            envelope::Payload::CameraNextFrameLeaseResponse(response),
+        ) => camera_next_frame_lease_response_from_proto(*response)
+            .map(|_| ())
+            .map_err(|error| attach_resource(error, &resource_id)),
+        (
+            ExpectedResponse::CameraControls { resource_id },
+            envelope::Payload::CameraControlsResponse(response),
+        ) => camera_controls_response_from_proto(response.clone())
+            .map(|_| ())
+            .map_err(|error| attach_resource(error, &resource_id)),
+        (
+            ExpectedResponse::CameraGetControl { resource_id },
+            envelope::Payload::CameraGetControlResponse(response),
+        ) => response
+            .value
+            .clone()
+            .ok_or_else(|| seeed_hal_protocol::invalid_message("camera control value is missing"))
+            .and_then(camera_control_value_from_proto)
+            .map(|_| ())
+            .map_err(|error| attach_resource(error, &resource_id)),
         _ => Err(resource_id.map_or_else(unexpected_response, |resource_id| {
             unexpected_response().with_resource_id(resource_id)
         })),
@@ -2679,6 +2707,50 @@ mod tests {
             state.take_request_id().unwrap_err().name().as_str(),
             "runtime.protocol.request_id_exhausted"
         );
+    }
+
+    #[test]
+    fn camera_response_validation_rejects_invalid_associated_payloads() {
+        let resource_id = seeed_hal_core::ResourceId::parse("camera:virtual:validation").unwrap();
+        let mapping = envelope::Payload::CameraMappingDescriptorResponse(
+            v1::CameraMappingDescriptorResponse { descriptor: None },
+        );
+        let lease =
+            envelope::Payload::CameraNextFrameLeaseResponse(v1::CameraNextFrameLeaseResponse {
+                lease: Some(v1::FrameLease {
+                    slot_index: 0,
+                    sequence: 0,
+                    generation: 1,
+                }),
+            });
+        let control = envelope::Payload::CameraGetControlResponse(v1::CameraGetControlResponse {
+            value: None,
+        });
+
+        for (expected, payload) in [
+            (
+                ExpectedResponse::CameraMappingDescriptor {
+                    resource_id: resource_id.clone(),
+                },
+                mapping,
+            ),
+            (
+                ExpectedResponse::CameraNextFrameLease {
+                    resource_id: resource_id.clone(),
+                },
+                lease,
+            ),
+            (
+                ExpectedResponse::CameraGetControl {
+                    resource_id: resource_id.clone(),
+                },
+                control,
+            ),
+        ] {
+            let error = super::validate_response(expected, &payload).unwrap_err();
+            assert_eq!(error.name().as_str(), "runtime.protocol.invalid_message");
+            assert_eq!(error.resource_id(), Some(&resource_id));
+        }
     }
 
     #[test]

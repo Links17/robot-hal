@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import FrozenInstanceError
 
 import pytest
 
 import seeed_hal
 from seeed_hal import (
-    BorrowedFrame,
     CameraFormat,
     CameraSession,
     FrameLease,
@@ -18,9 +18,17 @@ from seeed_hal.proto import hal_pb2
 from test_client_contract import TOKEN, envelope, fake_broker, read_frame, send_frame
 
 
-def test_camera_public_values_redact_tokens_and_invalidate_borrowed_frames() -> None:
+class _BytesMappingReader:
+    def copy_bytes(self, descriptor: MappingDescriptor, lease: FrameLease) -> bytearray:
+        assert descriptor.mapping_identity == b"i" * 32
+        assert lease.slot_index == 0
+        assert lease.sequence != 0
+        assert lease.generation == 1
+        return bytearray(b"frame")
+
+
+def test_camera_public_values_redact_tokens_and_expose_no_callback_constructed_borrowed_frames() -> None:
     assert {
-        "BorrowedFrame",
         "CameraFormat",
         "CameraSession",
         "FrameLease",
@@ -39,12 +47,189 @@ def test_camera_public_values_redact_tokens_and_invalidate_borrowed_frames() -> 
     with pytest.raises(FrozenInstanceError):
         descriptor.total_length = 1  # type: ignore[misc]
 
-    session = CameraSession(None, "camera-session", "camera-lease", 1, "camera:virtual:test")
-    frame = BorrowedFrame(session, FrameLease(0, 1, 1), lambda: b"frame")
-    assert frame.copy_bytes() == b"frame"
-    session._invalidate()
-    with pytest.raises(HalError, match="runtime.lease.stale_generation"):
-        frame.copy_bytes()
+    assert "BorrowedFrame" not in seeed_hal.__all__
+    assert not hasattr(seeed_hal, "BorrowedFrame")
+    assert not hasattr(CameraSession, "borrowed_frame")
+
+
+@pytest.mark.asyncio
+async def test_next_frame_invalidates_prior_copy_borrow_and_returns_owned_bytes() -> None:
+    capabilities = ["camera.capture/v1", "camera.frames.shm/v1"]
+
+    async def handler(reader, writer):
+        request = hal_pb2.Envelope.FromString(await read_frame(reader))
+        assert request.WhichOneof("payload") == "enumerate_camera_request"
+        await send_frame(
+            writer,
+            envelope(
+                request.request_id,
+                "enumerate_camera_response",
+                hal_pb2.EnumerateCameraResponse(
+                    resources=[
+                        hal_pb2.ResourceDescriptor(
+                            resource_id="camera:virtual:borrow",
+                            endpoint="virtual://camera:borrow",
+                            identity_quality=hal_pb2.IDENTITY_QUALITY_STRONG,
+                            transport=hal_pb2.TRANSPORT_KIND_CAMERA,
+                            capabilities=capabilities,
+                        )
+                    ]
+                ),
+            ).SerializeToString(),
+        )
+        request = hal_pb2.Envelope.FromString(await read_frame(reader))
+        assert request.WhichOneof("payload") == "open_camera_request"
+        await send_frame(
+            writer,
+            envelope(
+                request.request_id,
+                "open_camera_response",
+                hal_pb2.OpenCameraResponse(
+                    session_id="camera-borrow",
+                    lease=hal_pb2.LeaseToken(
+                        lease_id="camera-borrow-lease",
+                        generation=1,
+                        mode=hal_pb2.LEASE_MODE_CONTROL,
+                    ),
+                ),
+            ).SerializeToString(),
+        )
+        request = hal_pb2.Envelope.FromString(await read_frame(reader))
+        assert request.WhichOneof("payload") == "camera_mapping_descriptor_request"
+        await send_frame(
+            writer,
+            envelope(
+                request.request_id,
+                "camera_mapping_descriptor_response",
+                hal_pb2.CameraMappingDescriptorResponse(
+                    descriptor=hal_pb2.MappingDescriptor(
+                        mapping_name="camera-borrow-mapping",
+                        mapping_identity=b"i" * 32,
+                        capability_token=b"t" * 32,
+                        total_length=4096,
+                    )
+                ),
+            ).SerializeToString(),
+        )
+        for sequence in (1, 2):
+            request = hal_pb2.Envelope.FromString(await read_frame(reader))
+            assert request.WhichOneof("payload") == "camera_next_frame_lease_request"
+            await send_frame(
+                writer,
+                envelope(
+                    request.request_id,
+                    "camera_next_frame_lease_response",
+                    hal_pb2.CameraNextFrameLeaseResponse(
+                        lease=hal_pb2.FrameLease(
+                            slot_index=0, sequence=sequence, generation=1
+                        )
+                    ),
+                ).SerializeToString(),
+            )
+
+    async with fake_broker(
+        handler,
+        selected_minor=3,
+        minimum_minor=3,
+        maximum_minor=3,
+        capabilities=["serial.bytes/v1", *capabilities],
+    ) as endpoint:
+        from seeed_hal import HalClient
+
+        client = await HalClient.connect(endpoint, TOKEN)
+        resource = (await client.enumerate_camera())[0]
+        session = await client.open_camera(
+            resource.selector(), CameraFormat(PixelFormat.NV12, 640, 480)
+        )
+        await session.mapping_descriptor()
+        session._mapping_reader = _BytesMappingReader()
+        first = await session.next_frame()
+        assert first is not None
+        assert first.copy_bytes() == b"frame"
+        second = await session.next_frame()
+        assert second is not None
+        with pytest.raises(HalError, match="runtime.lease.stale_generation"):
+            first.copy_bytes()
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_malformed_camera_frame_lease_terminates_the_python_client() -> None:
+    capabilities = ["camera.capture/v1", "camera.frames.shm/v1"]
+    release = asyncio.Event()
+
+    async def handler(reader, writer):
+        request = hal_pb2.Envelope.FromString(await read_frame(reader))
+        assert request.WhichOneof("payload") == "enumerate_camera_request"
+        await send_frame(
+            writer,
+            envelope(
+                request.request_id,
+                "enumerate_camera_response",
+                hal_pb2.EnumerateCameraResponse(
+                    resources=[
+                        hal_pb2.ResourceDescriptor(
+                            resource_id="camera:virtual:malformed",
+                            endpoint="virtual://camera:malformed",
+                            identity_quality=hal_pb2.IDENTITY_QUALITY_STRONG,
+                            transport=hal_pb2.TRANSPORT_KIND_CAMERA,
+                            capabilities=capabilities,
+                        )
+                    ]
+                ),
+            ).SerializeToString(),
+        )
+        request = hal_pb2.Envelope.FromString(await read_frame(reader))
+        assert request.WhichOneof("payload") == "open_camera_request"
+        await send_frame(
+            writer,
+            envelope(
+                request.request_id,
+                "open_camera_response",
+                hal_pb2.OpenCameraResponse(
+                    session_id="camera-malformed",
+                    lease=hal_pb2.LeaseToken(
+                        lease_id="camera-malformed-lease",
+                        generation=1,
+                        mode=hal_pb2.LEASE_MODE_CONTROL,
+                    ),
+                ),
+            ).SerializeToString(),
+        )
+        request = hal_pb2.Envelope.FromString(await read_frame(reader))
+        assert request.WhichOneof("payload") == "camera_next_frame_lease_request"
+        await send_frame(
+            writer,
+            envelope(
+                request.request_id,
+                "camera_next_frame_lease_response",
+                hal_pb2.CameraNextFrameLeaseResponse(
+                    lease=hal_pb2.FrameLease(slot_index=0, sequence=0, generation=1)
+                ),
+            ).SerializeToString(),
+        )
+        await release.wait()
+
+    async with fake_broker(
+        handler,
+        selected_minor=3,
+        minimum_minor=3,
+        maximum_minor=3,
+        capabilities=["serial.bytes/v1", *capabilities],
+    ) as endpoint:
+        from seeed_hal import HalClient
+
+        client = await HalClient.connect(endpoint, TOKEN)
+        resource = (await client.enumerate_camera())[0]
+        session = await client.open_camera(
+            resource.selector(), CameraFormat(PixelFormat.NV12, 640, 480)
+        )
+        with pytest.raises(HalError, match="runtime.protocol.invalid_message"):
+            await session.next_frame_lease()
+        assert client._terminal is not None
+        assert client._terminal.name == "runtime.protocol.invalid_message"
+        await client.close()
+        release.set()
 
 
 @pytest.mark.asyncio
@@ -130,6 +315,18 @@ async def test_camera_fake_broker_wires_capture_mapping_lease_controls_and_close
             ).SerializeToString(),
         )
         request = hal_pb2.Envelope.FromString(await read_frame(reader))
+        assert request.WhichOneof("payload") == "camera_next_frame_lease_request"
+        await send_frame(
+            writer,
+            envelope(
+                request.request_id,
+                "camera_next_frame_lease_response",
+                hal_pb2.CameraNextFrameLeaseResponse(
+                    lease=hal_pb2.FrameLease(slot_index=0, sequence=2, generation=1)
+                ),
+            ).SerializeToString(),
+        )
+        request = hal_pb2.Envelope.FromString(await read_frame(reader))
         assert request.WhichOneof("payload") == "camera_get_control_request"
         await send_frame(
             writer,
@@ -184,7 +381,12 @@ async def test_camera_fake_broker_wires_capture_mapping_lease_controls_and_close
         await session.capture(1)
         descriptor = await session.mapping_descriptor()
         assert b"t" * 32 not in repr(descriptor).encode()
-        assert await session.next_frame_lease() == FrameLease(0, 1, 1)
+        lease = await session.next_frame_lease()
+        assert lease == FrameLease(0, 1, 1)
+        frame = await session.next_frame()
+        assert frame is not None
+        with pytest.raises(HalError, match="shared-memory reader unavailable"):
+            frame.copy_bytes()
         assert (await session.get_control(seeed_hal.ControlKind.EXPOSURE)).integer == 42
         await session.set_control(seeed_hal.ControlKind.EXPOSURE, seeed_hal.ControlValue(integer=43))
         await session.set_auto(seeed_hal.ControlKind.EXPOSURE, True)

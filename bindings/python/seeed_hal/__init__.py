@@ -61,7 +61,6 @@ from .gpio import (
     GpioSession,
 )
 from .camera import (
-    BorrowedFrame,
     CameraFormat,
     CameraSession,
     ControlKind,
@@ -93,7 +92,6 @@ __all__ = [
     "CanMode",
     "CanOpenConfig",
     "CanSession",
-    "BorrowedFrame",
     "CameraFormat",
     "CameraSession",
     "ControlKind",

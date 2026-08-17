@@ -95,6 +95,7 @@ mod tests {
         broker.writer().publish(metadata(1, 1), &[1; 8]).unwrap();
 
         let mut client = ReadOnlyMapping::open(&descriptor).unwrap();
+        assert_eq!(client.slot_count(), 4);
         let lease = broker.next_frame_lease().unwrap().unwrap();
         let frame = client.copy(lease).unwrap().unwrap();
         assert_eq!(frame.payload(), &[1; 8]);

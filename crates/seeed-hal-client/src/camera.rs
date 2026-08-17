@@ -6,7 +6,8 @@ use seeed_hal_core::{ErrorCategory, HalError, HalResult, LeaseToken, ResourceId,
 use seeed_hal_protocol::v1::{self, envelope};
 use seeed_hal_protocol::{
     camera_control_value_from_proto, camera_control_value_to_proto,
-    camera_mapping_descriptor_from_proto, camera_open_response_from_proto,
+    camera_controls_response_from_proto, camera_mapping_descriptor_from_proto,
+    camera_next_frame_lease_response_from_proto, camera_open_response_from_proto,
 };
 
 use crate::HalClient;
@@ -139,23 +140,30 @@ impl RemoteCameraHandle {
         let envelope::Payload::CameraNextFrameLeaseResponse(response) = payload else {
             unreachable!()
         };
-        let Some(lease) = response.lease else {
-            return Ok(None);
+        let wire_lease = camera_next_frame_lease_response_from_proto(response)
+            .map_err(|error| attach_resource(error, &self.resource_id));
+        let wire_lease = match wire_lease {
+            Ok(None) => return Ok(None),
+            Ok(Some(lease)) => lease,
+            Err(error) => {
+                self.client.fail(error.clone());
+                return Err(error);
+            }
         };
-        if lease.generation == 0 || lease.slot_index >= 8 {
-            let error = attach_resource(
-                seeed_hal_protocol::invalid_message("camera frame lease is invalid"),
-                &self.resource_id,
+        let mapping = self.open_mapping(descriptor)?;
+        if mapping.mapping_identity() != descriptor.mapping_identity()
+            || wire_lease.slot_index() >= mapping.slot_count()
+        {
+            let error = self.local_error(
+                "runtime.protocol.invalid_message",
+                ErrorCategory::InvalidArgument,
+                "camera.next_frame_lease",
+                "camera frame lease does not match the opened mapping layout",
             );
             self.client.fail(error.clone());
             return Err(error);
         }
-        Ok(Some(FrameLease::with_identity(
-            descriptor.mapping_identity().clone(),
-            lease.slot_index as usize,
-            lease.sequence,
-            lease.generation,
-        )))
+        Ok(Some(wire_lease.bind(descriptor)))
     }
 
     pub async fn dropped_count(&self) -> HalResult<u64> {
@@ -178,6 +186,29 @@ impl RemoteCameraHandle {
             unreachable!()
         };
         Ok(response.dropped_count)
+    }
+
+    pub async fn controls(&self) -> HalResult<Vec<seeed_hal_camera::CameraControlDescriptor>> {
+        self.ensure_open("camera.controls")?;
+        self.client
+            .require_camera_controls("camera.controls", &self.resource_id)?;
+        let payload = self
+            .send(
+                envelope::Payload::CameraControlsRequest(v1::CameraControlsRequest {
+                    session_id: self.session_id.as_str().to_owned(),
+                    lease: Some((&self.lease).into()),
+                }),
+                ExpectedResponse::CameraControls {
+                    resource_id: self.resource_id.clone(),
+                },
+                "camera.controls",
+            )
+            .await?;
+        let envelope::Payload::CameraControlsResponse(response) = payload else {
+            unreachable!()
+        };
+        camera_controls_response_from_proto(response)
+            .map_err(|error| attach_resource(error, &self.resource_id))
     }
 
     pub async fn get_control(&self, kind: CameraControlKind) -> HalResult<CameraControlValue> {

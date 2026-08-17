@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Protocol
 
 from .errors import ErrorCategory, HalError, client_error
 
@@ -103,26 +103,48 @@ class FrameLease:
             or not _plain_int(self.sequence)
             or not _plain_int(self.generation)
             or not 0 <= self.slot_index < MAX_CAMERA_SLOT_COUNT
+            or self.sequence == 0
             or self.generation == 0
         ):
             raise _invalid("camera frame lease is invalid")
 
 
-class BorrowedFrame:
+class _MappingReader(Protocol):
+    def copy_bytes(self, descriptor: MappingDescriptor, lease: FrameLease) -> bytes: ...
+
+
+class _UnavailableMappingReader:
+    def copy_bytes(self, descriptor: MappingDescriptor, lease: FrameLease) -> bytes:
+        raise HalError(
+            "shared_memory.unavailable",
+            ErrorCategory.UNAVAILABLE,
+            "camera.frame.copy",
+            False,
+            "shared-memory reader unavailable",
+        )
+
+
+class _BorrowedFrame:
     """Copy-only read access; data must not outlive its session generation."""
 
-    __slots__ = ("_session", "_lease", "_copy")
+    __slots__ = ("_session", "_descriptor", "_lease", "_epoch")
 
     def __init__(
         self,
         session: CameraSession,
+        descriptor: MappingDescriptor,
         lease: FrameLease,
-        copy: Callable[[], bytes],
+        epoch: int,
     ) -> None:
-        self._session, self._lease, self._copy = session, lease, copy
+        self._session = session
+        self._descriptor = descriptor
+        self._lease = lease
+        self._epoch = epoch
 
     def copy_bytes(self) -> bytes:
-        if not self._session._is_generation_live(self._lease.generation):
+        if not self._session._is_borrow_live(
+            self._descriptor, self._lease, self._epoch
+        ):
             raise HalError(
                 "runtime.lease.stale_generation",
                 ErrorCategory.CONFLICT,
@@ -131,7 +153,7 @@ class BorrowedFrame:
                 "camera frame lease is no longer valid",
                 resource_id=self._session._resource_id,
             )
-        return bytes(self._copy())
+        return bytes(self._session._mapping_reader.copy_bytes(self._descriptor, self._lease))
 
 
 class CameraSession:
@@ -143,6 +165,9 @@ class CameraSession:
         "_mode",
         "_resource_id",
         "_closed",
+        "_mapping_descriptor",
+        "_borrow_epoch",
+        "_mapping_reader",
     )
 
     def __init__(
@@ -157,6 +182,9 @@ class CameraSession:
         self._client, self._session_id, self._lease_id = client, session_id, lease_id
         self._generation, self._mode = generation, mode
         self._resource_id, self._closed = resource_id, False
+        self._mapping_descriptor: MappingDescriptor | None = None
+        self._borrow_epoch = 0
+        self._mapping_reader: _MappingReader = _UnavailableMappingReader()
 
     async def capture(self, timeout_ms: int) -> None:
         self._ensure_open("camera.capture")
@@ -166,12 +194,35 @@ class CameraSession:
     async def mapping_descriptor(self) -> MappingDescriptor:
         self._ensure_open("camera.mapping_descriptor")
         assert self._client is not None
-        return await self._client._camera_mapping_descriptor(self)
+        descriptor = await self._client._camera_mapping_descriptor(self)
+        self._mapping_descriptor = descriptor
+        return descriptor
 
     async def next_frame_lease(self) -> FrameLease | None:
         self._ensure_open("camera.next_frame_lease")
         assert self._client is not None
         return await self._client._camera_next_frame_lease(self)
+
+    async def next_frame(self) -> _BorrowedFrame | None:
+        """Acquires the next copy-only frame borrow, invalidating the preceding borrow."""
+        self._ensure_open("camera.next_frame")
+        descriptor = self._mapping_descriptor
+        if descriptor is None:
+            descriptor = await self.mapping_descriptor()
+        lease = await self.next_frame_lease()
+        self._borrow_epoch += 1
+        if lease is None:
+            return None
+        if lease.generation != self._generation:
+            raise HalError(
+                "runtime.lease.stale_generation",
+                ErrorCategory.CONFLICT,
+                "camera.next_frame",
+                False,
+                "camera frame lease generation does not match the session",
+                resource_id=self._resource_id,
+            )
+        return _BorrowedFrame(self, descriptor, lease, self._borrow_epoch)
 
     async def dropped_count(self) -> int:
         self._ensure_open("camera.dropped_count")
@@ -201,10 +252,19 @@ class CameraSession:
 
     def _invalidate(self) -> None:
         self._closed = True
-        self._generation += 1
+        self._borrow_epoch += 1
 
-    def _is_generation_live(self, generation: int) -> bool:
-        return not self._closed and generation == self._generation
+    def _is_borrow_live(
+        self, descriptor: MappingDescriptor, lease: FrameLease, epoch: int
+    ) -> bool:
+        return (
+            not self._closed
+            and descriptor is self._mapping_descriptor
+            and len(descriptor.mapping_identity) == 32
+            and lease.sequence != 0
+            and lease.generation == self._generation
+            and epoch == self._borrow_epoch
+        )
 
     def _ensure_open(self, operation: str) -> None:
         if self._closed:

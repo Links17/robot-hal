@@ -574,6 +574,16 @@ impl ReadOnlyMapping {
         })
     }
 
+    /// Returns the validated ring layout's slot count without exposing mapping memory.
+    pub fn slot_count(&self) -> usize {
+        self.header.config().slot_count()
+    }
+
+    /// Returns the identity validated against the opened mapping header.
+    pub fn mapping_identity(&self) -> &MappingIdentity {
+        self.header.identity()
+    }
+
     /// Copies a pinned frame under a shared OS lock. This API intentionally never yields a
     /// mapping-backed byte slice; external language bindings must use this operation.
     pub fn copy(&mut self, lease: FrameLease) -> HalResult<Option<CopiedFrame>> {

@@ -40,3 +40,33 @@
   converting a wire frame lease, because the wire lease contains no mapping
   identity. This preserves the ring's identity fencing and prevents a
   descriptor-independent unsafe view.
+
+## Task 5 defect follow-up
+
+### API behavior
+
+- The protocol decodes a Camera wire lease into `WireFrameLease`, which validates
+  non-zero sequence and generation and retains only wire fields. A caller can
+  bind it to an already-authenticated `MappingDescriptor`; protocol decoding
+  never manufactures an identity-less public `FrameLease`.
+- Rust validates mapping descriptors, next-frame leases, controls lists, and
+  control-get values at the connection response boundary. Any invalid associated
+  response terminates the client. `ReadOnlyMapping::slot_count()` exposes only
+  validated layout metadata, and `RemoteCameraHandle::next_frame_lease` opens
+  and validates the actual mapping layout before accepting the lease slot.
+- Python removes `BorrowedFrame` from the public surface. `CameraSession.next_frame()`
+  is the sole frame-borrow acquisition API; it tracks the verified descriptor and
+  borrow epoch, invalidates prior borrows, and returns only copy access. As there
+  is no native Python shared-memory reader, `copy_bytes()` fails closed with
+  `shared_memory.unavailable` rather than accepting caller-provided callbacks.
+  `next_frame_lease()` remains low-level control metadata only.
+
+### TDD commands
+
+- Red: `cargo test -p seeed-hal-protocol camera_next_frame_lease_decoder_rejects_zero_sequence_and_preserves_validated_wire_fields`
+  failed because zero sequence returned `Ok(None)`.
+- Red: `cargo test -p seeed-hal-client camera_response_validation_rejects_invalid_associated_payloads`
+  failed because malformed Camera responses returned `Ok(())`.
+- Red: `cargo test -p seeed-hal-adapter-shared-memory independently_reopened_mapping_only_returns_an_owned_copy`
+  failed to compile because validated mapping layout exposed no `slot_count`.
+- Green: reran those focused commands successfully after the minimum fixes.

@@ -1268,8 +1268,14 @@ class HalClient:
         )
         assert isinstance(response, hal_pb2.CameraMappingDescriptorResponse)
         if not response.HasField("descriptor"):
-            raise _invalid_message("broker returned invalid camera mapping descriptor")
-        return _camera_mapping_descriptor_from_proto(response.descriptor)
+            error = _invalid_message("broker returned invalid camera mapping descriptor")
+            self._terminate(error)
+            raise error
+        try:
+            return _camera_mapping_descriptor_from_proto(response.descriptor)
+        except HalError as error:
+            self._terminate(error)
+            raise
 
     async def _camera_next_frame_lease(
         self, session: CameraSession
@@ -1288,11 +1294,13 @@ class HalClient:
             resource_id=session._resource_id,
         )
         assert isinstance(response, hal_pb2.CameraNextFrameLeaseResponse)
-        return (
-            _frame_lease_from_proto(response.lease)
-            if response.HasField("lease")
-            else None
-        )
+        if not response.HasField("lease"):
+            return None
+        try:
+            return _frame_lease_from_proto(response.lease)
+        except HalError as error:
+            self._terminate(error)
+            raise
 
     async def _camera_dropped_count(self, session: CameraSession) -> int:
         self._require_camera_capability(
@@ -1308,7 +1316,9 @@ class HalClient:
         )
         assert isinstance(response, hal_pb2.CameraDroppedCountResponse)
         if response.dropped_count > MAX_U64:
-            raise _invalid_message("camera dropped count exceeds the wire bound")
+            error = _invalid_message("camera dropped count exceeds the wire bound")
+            self._terminate(error)
+            raise error
         return response.dropped_count
 
     async def _camera_get_control(
@@ -1329,8 +1339,14 @@ class HalClient:
         )
         assert isinstance(response, hal_pb2.CameraGetControlResponse)
         if not response.HasField("value"):
-            raise _invalid_message("broker returned invalid camera control value")
-        return _camera_control_value_from_proto(response.value)
+            error = _invalid_message("broker returned invalid camera control value")
+            self._terminate(error)
+            raise error
+        try:
+            return _camera_control_value_from_proto(response.value)
+        except HalError as error:
+            self._terminate(error)
+            raise
 
     async def _camera_set_control(
         self, session: CameraSession, kind: ControlKind, value: ControlValue
