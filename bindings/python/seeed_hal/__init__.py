@@ -49,6 +49,17 @@ from .serial import (
     SerialSession,
     StopBits,
 )
+from .usb import UsbSession, UsbTransfer, UsbTransferKind
+from .gpio import (
+    GpioBias,
+    GpioDirection,
+    GpioDrive,
+    GpioEdge,
+    GpioEdgeEvent,
+    GpioEdgeRequest,
+    GpioLineConfig,
+    GpioSession,
+)
 
 __all__ = [
     "ControlLines",
@@ -80,6 +91,14 @@ __all__ = [
     "ErrorCategory",
     "EventSubscription",
     "FlowControl",
+    "GpioBias",
+    "GpioDirection",
+    "GpioDrive",
+    "GpioEdge",
+    "GpioEdgeEvent",
+    "GpioEdgeRequest",
+    "GpioLineConfig",
+    "GpioSession",
     "HalClient",
     "HalError",
     "IdentityQuality",
@@ -95,4 +114,7 @@ __all__ = [
     "SerialSession",
     "StopBits",
     "TransportKind",
+    "UsbSession",
+    "UsbTransfer",
+    "UsbTransferKind",
 ]

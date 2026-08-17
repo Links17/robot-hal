@@ -62,12 +62,17 @@ from .can import (
     ReceivedCanFrame,
     _CanSessionProfile,
 )
+from .usb import UsbSession, UsbTransfer, UsbTransferKind
+from .gpio import (
+    GpioBias, GpioDirection, GpioDrive, GpioEdge, GpioEdgeEvent,
+    GpioEdgeRequest, GpioLineConfig, GpioSession, MAX_GPIO_EVENTS,
+)
 from .transport_unix import HARD_FRAME_BYTES, UnixFramedTransport
 
 
 PROTOCOL_MAJOR = 1
 PROTOCOL_MINOR_MINIMUM = 0
-PROTOCOL_MINOR_MAXIMUM = 1
+PROTOCOL_MINOR_MAXIMUM = 2
 PROTOCOL_MINOR = PROTOCOL_MINOR_MAXIMUM
 SERIAL_CAPABILITY = "serial.bytes/v1"
 CAN_CLASSIC_CAPABILITY = "can.classic/v1"
@@ -75,6 +80,11 @@ CAN_FD_CAPABILITY = "can.fd/v1"
 CAN_CONFIGURE_CAPABILITY = "can.configure/v1"
 CAN_ERROR_FRAMES_CAPABILITY = "can.error-frames/v1"
 CAN_RX_TIMESTAMP_CAPABILITY = "can.rx-timestamp/v1"
+USB_CONTROL_CAPABILITY = "usb.control/v1"
+USB_BULK_CAPABILITY = "usb.bulk/v1"
+USB_INTERRUPT_CAPABILITY = "usb.interrupt/v1"
+GPIO_LINES_CAPABILITY = "gpio.lines/v1"
+GPIO_EDGES_CAPABILITY = "gpio.edges/v1"
 DEFAULT_TRANSFER_BYTES = 64 * 1024
 DEFAULT_CAPACITY = 32
 DEFAULT_EVENT_CAPACITY = 64
@@ -103,6 +113,8 @@ class IdentityQuality(Enum):
 class TransportKind(Enum):
     SERIAL = "serial"
     CAN = "can"
+    USB = "usb"
+    GPIO = "gpio"
 
 
 class LeaseMode(Enum):
@@ -208,6 +220,7 @@ class _Pending:
     profile: _CanSessionProfile | None = None
     lease_mode: LeaseMode | None = None
     resource_id: str | None = None
+    line_count: int | None = None
 
 
 class HalClient:
@@ -535,6 +548,131 @@ class HalClient:
             generation,
             lease_mode,
             profile,
+        )
+
+    async def enumerate_usb(self) -> list[ResourceDescriptor]:
+        self._require_usb_gpio_capability("usb.enumerate", USB_CONTROL_CAPABILITY)
+        response = await self._request(
+            "enumerate_usb_request",
+            hal_pb2.EnumerateUsbRequest(),
+            "enumerate_usb_response",
+        )
+        assert isinstance(response, hal_pb2.EnumerateUsbResponse)
+        return [
+            _decode_descriptor(item, expected=TransportKind.USB)
+            for item in response.resources
+        ]
+
+    async def open_usb(
+        self, selector: ResourceSelector, interface_number: int
+    ) -> UsbSession:
+        if not isinstance(selector, ResourceSelector):
+            raise _argument_error("usb.open", "selector must be ResourceSelector")
+        if selector.transport is not TransportKind.USB:
+            raise _resource_argument_error(
+                "usb.open",
+                "USB resource selector transport must be USB",
+                selector.resource_id,
+            )
+        if not _is_plain_int(interface_number) or not 0 <= interface_number <= 255:
+            raise _resource_argument_error(
+                "usb.open", "USB interface number is invalid", selector.resource_id
+            )
+        self._require_usb_gpio_capability(
+            "usb.open", USB_CONTROL_CAPABILITY, selector.resource_id
+        )
+        response = await self._request(
+            "open_usb_request",
+            hal_pb2.OpenUsbRequest(
+                selector=_selector_to_proto(selector, "usb.open"),
+                interface_number=interface_number,
+            ),
+            "open_usb_response",
+            resource_id=selector.resource_id,
+        )
+        assert isinstance(response, hal_pb2.OpenUsbResponse)
+        session_id, lease_id, generation, mode = _decode_open_session_response(
+            response, "USB"
+        )
+        return UsbSession(
+            self, session_id, lease_id, generation, mode, selector.resource_id
+        )
+
+    async def enumerate_gpio(self) -> list[ResourceDescriptor]:
+        self._require_usb_gpio_capability("gpio.enumerate", GPIO_LINES_CAPABILITY)
+        response = await self._request(
+            "enumerate_gpio_request",
+            hal_pb2.EnumerateGpioRequest(),
+            "enumerate_gpio_response",
+        )
+        assert isinstance(response, hal_pb2.EnumerateGpioResponse)
+        return [
+            _decode_descriptor(item, expected=TransportKind.GPIO)
+            for item in response.resources
+        ]
+
+    async def open_gpio(
+        self,
+        selector: ResourceSelector,
+        lines: tuple[int, ...],
+        config: GpioLineConfig,
+    ) -> GpioSession:
+        if not isinstance(selector, ResourceSelector):
+            raise _argument_error("gpio.open", "selector must be ResourceSelector")
+        if selector.transport is not TransportKind.GPIO:
+            raise _resource_argument_error(
+                "gpio.open",
+                "GPIO resource selector transport must be GPIO",
+                selector.resource_id,
+            )
+        try:
+            normalized_lines = tuple(lines)
+        except TypeError as error:
+            raise _resource_argument_error(
+                "gpio.open", "GPIO lines are invalid", selector.resource_id
+            ) from error
+        if (
+            not normalized_lines
+            or len(normalized_lines) > MAX_GPIO_EVENTS
+            or any(
+                not _is_plain_int(line) or line < 0 or line > MAX_U32
+                for line in normalized_lines
+            )
+            or len(set(normalized_lines)) != len(normalized_lines)
+        ):
+            raise _resource_argument_error(
+                "gpio.open", "GPIO lines are invalid", selector.resource_id
+            )
+        if not isinstance(config, GpioLineConfig):
+            raise _resource_argument_error(
+                "gpio.open", "GPIO config is invalid", selector.resource_id
+            )
+        self._require_usb_gpio_capability(
+            "gpio.open", GPIO_LINES_CAPABILITY, selector.resource_id
+        )
+        response = await self._request(
+            "open_gpio_request",
+            hal_pb2.OpenGpioRequest(
+                selector=_selector_to_proto(selector, "gpio.open"),
+                lines=normalized_lines,
+                config=_gpio_config_to_proto(config),
+            ),
+            "open_gpio_response",
+            resource_id=selector.resource_id,
+            line_count=len(normalized_lines),
+        )
+        assert isinstance(response, hal_pb2.OpenGpioResponse)
+        session_id, lease_id, generation, mode = _decode_open_session_response(
+            response, "GPIO"
+        )
+        return GpioSession(
+            self,
+            session_id,
+            lease_id,
+            generation,
+            mode,
+            selector.resource_id,
+            len(normalized_lines),
         )
 
     async def close(self) -> None:
@@ -891,6 +1029,154 @@ class HalClient:
                 raise
             raise attached from error
 
+    async def _usb_transfer(
+        self, session: UsbSession, transfer: UsbTransfer, timeout_ms: int
+    ) -> bytes:
+        if not isinstance(transfer, UsbTransfer):
+            raise _resource_argument_error(
+                "usb.transfer", "transfer must be UsbTransfer", session._resource_id
+            )
+        if not _is_plain_int(timeout_ms) or not 0 <= timeout_ms <= MAX_U64:
+            raise _resource_argument_error(
+                "usb.transfer", "USB timeout is invalid", session._resource_id
+            )
+        capability = _usb_transfer_capability(transfer.kind)
+        self._require_usb_gpio_capability(
+            "usb.transfer", capability, session._resource_id
+        )
+        payload_size = len(transfer.data)
+        requested_read = transfer.max_bytes if _usb_transfer_is_in(transfer.kind) else None
+        if payload_size > self._write_limit or (
+            requested_read is not None and requested_read > self._read_limit
+        ):
+            raise _resource_argument_error(
+                "usb.transfer",
+                "USB transfer exceeds negotiated byte limits",
+                session._resource_id,
+            )
+        response = await self._request(
+            "usb_transfer_request",
+            _usb_transfer_to_proto(session, transfer, timeout_ms),
+            "usb_transfer_response",
+            requested_read=requested_read,
+            resource_id=session._resource_id,
+        )
+        assert isinstance(response, hal_pb2.UsbTransferResponse)
+        return bytes(response.data)
+
+    async def _usb_close(self, session: UsbSession) -> None:
+        await self._request(
+            "close_usb_request",
+            hal_pb2.CloseUsbRequest(
+                session_id=session._session_id, lease=self._usb_gpio_lease(session)
+            ),
+            "close_usb_response",
+            resource_id=session._resource_id,
+        )
+
+    async def _gpio_read(self, session: GpioSession) -> tuple[bool, ...]:
+        response = await self._request(
+            "gpio_read_request",
+            hal_pb2.GpioReadRequest(
+                session_id=session._session_id, lease=self._usb_gpio_lease(session)
+            ),
+            "gpio_read_response",
+            resource_id=session._resource_id,
+            line_count=session._line_count,
+        )
+        assert isinstance(response, hal_pb2.GpioReadResponse)
+        return tuple(response.values)
+
+    async def _gpio_write(self, session: GpioSession, values: tuple[bool, ...]) -> None:
+        try:
+            normalized_values = tuple(values)
+        except TypeError as error:
+            raise _resource_argument_error(
+                "gpio.write", "GPIO values are invalid", session._resource_id
+            ) from error
+        if (
+            len(normalized_values) != session._line_count
+            or not all(isinstance(value, bool) for value in normalized_values)
+        ):
+            raise _resource_argument_error(
+                "gpio.write", "GPIO values are invalid", session._resource_id
+            )
+        await self._request(
+            "gpio_write_request",
+            hal_pb2.GpioWriteRequest(
+                session_id=session._session_id,
+                lease=self._usb_gpio_lease(session),
+                values=normalized_values,
+            ),
+            "gpio_write_response",
+            resource_id=session._resource_id,
+        )
+
+    async def _gpio_next_edge(
+        self, session: GpioSession, request: GpioEdgeRequest, timeout_ms: int
+    ) -> GpioEdgeEvent | None:
+        if not isinstance(request, GpioEdgeRequest):
+            raise _resource_argument_error(
+                "gpio.next_edge", "GPIO edge request is invalid", session._resource_id
+            )
+        if not _is_plain_int(timeout_ms) or not 0 <= timeout_ms <= MAX_U64:
+            raise _resource_argument_error(
+                "gpio.next_edge", "GPIO timeout is invalid", session._resource_id
+            )
+        self._require_usb_gpio_capability(
+            "gpio.next_edge", GPIO_EDGES_CAPABILITY, session._resource_id
+        )
+        response = await self._request(
+            "gpio_next_edge_request",
+            hal_pb2.GpioNextEdgeRequest(
+                session_id=session._session_id,
+                lease=self._usb_gpio_lease(session),
+                rising=request.rising,
+                falling=request.falling,
+                capacity=request.capacity,
+                timeout_ms=timeout_ms,
+            ),
+            "gpio_next_edge_response",
+            resource_id=session._resource_id,
+        )
+        assert isinstance(response, hal_pb2.GpioNextEdgeResponse)
+        if not response.HasField("event"):
+            return None
+        return _gpio_edge_from_proto(response.event)
+
+    async def _gpio_close(self, session: GpioSession) -> None:
+        await self._request(
+            "close_gpio_request",
+            hal_pb2.CloseGpioRequest(
+                session_id=session._session_id, lease=self._usb_gpio_lease(session)
+            ),
+            "close_gpio_response",
+            resource_id=session._resource_id,
+        )
+
+    def _usb_gpio_lease(
+        self, session: UsbSession | GpioSession
+    ) -> hal_pb2.LeaseToken:
+        return hal_pb2.LeaseToken(
+            lease_id=session._lease_id,
+            generation=session._generation,
+            mode=session._mode,
+        )
+
+    def _require_usb_gpio_capability(
+        self, operation: str, capability: str, resource_id: str | None = None
+    ) -> None:
+        if self._protocol_minor >= 2 and capability in self._capabilities:
+            return
+        error = client_error(
+            "runtime.protocol.capability_unsupported",
+            ErrorCategory.CONFLICT,
+            operation,
+            False,
+            "the negotiated broker protocol does not advertise the required capability",
+        )
+        raise error if resource_id is None else _attach_resource(error, resource_id)
+
     def _require_can_capability(
         self, operation: str, resource_id: str | None = None
     ) -> None:
@@ -920,6 +1206,7 @@ class HalClient:
         profile: _CanSessionProfile | None = None,
         lease_mode: LeaseMode | None = None,
         resource_id: str | None = None,
+        line_count: int | None = None,
     ) -> Message:
         if self._terminal is not None:
             raise _fresh_error(self._terminal)
@@ -946,6 +1233,7 @@ class HalClient:
             profile,
             lease_mode,
             resource_id,
+            line_count,
         )
         try:
             self._writer_queue.put_nowait(request)
@@ -1335,6 +1623,16 @@ def _preflight_frame(frame: bytes, client: HalClient) -> int:
                         raise frame_too_large(
                             "serial read response exceeds the negotiated or requested byte limit"
                         )
+        if field == 67 and wire == 2:
+            for nested_field, nested_wire, nested_value in _fields(value):
+                if nested_field == 1 and nested_wire == 2:
+                    size = len(nested_value)
+                    if size > client._read_limit or (
+                        requested_read is not None and size > requested_read
+                    ):
+                        raise frame_too_large(
+                            "USB transfer response exceeds the negotiated or requested byte limit"
+                        )
         if (
             field == 57
             and wire == 2
@@ -1571,6 +1869,8 @@ def _decode_descriptor(
     transports = {
         hal_pb2.TRANSPORT_KIND_SERIAL: TransportKind.SERIAL,
         hal_pb2.TRANSPORT_KIND_CAN: TransportKind.CAN,
+        hal_pb2.TRANSPORT_KIND_USB: TransportKind.USB,
+        hal_pb2.TRANSPORT_KIND_GPIO: TransportKind.GPIO,
     }
     transport = transports.get(value.transport)
     if quality is None or transport is None or (
@@ -1584,7 +1884,7 @@ def _decode_descriptor(
     elif transport is TransportKind.SERIAL:
         capabilities = (SERIAL_CAPABILITY,)
     else:
-        raise _invalid_message("CAN resource descriptor capabilities are empty")
+        raise _invalid_message("broker resource descriptor capabilities are empty")
     return ResourceDescriptor(
         resource_id,
         value.endpoint,
@@ -1735,6 +2035,10 @@ def _transport_to_proto(value: TransportKind) -> int:
         return hal_pb2.TRANSPORT_KIND_SERIAL
     if value is TransportKind.CAN:
         return hal_pb2.TRANSPORT_KIND_CAN
+    if value is TransportKind.USB:
+        return hal_pb2.TRANSPORT_KIND_USB
+    if value is TransportKind.GPIO:
+        return hal_pb2.TRANSPORT_KIND_GPIO
     raise _argument_error("serial.open", "transport kind is invalid")
 
 
@@ -1753,6 +2057,10 @@ def _transport_to_proto_for_operation(value: TransportKind, operation: str) -> i
         return hal_pb2.TRANSPORT_KIND_SERIAL
     if value is TransportKind.CAN:
         return hal_pb2.TRANSPORT_KIND_CAN
+    if value is TransportKind.USB:
+        return hal_pb2.TRANSPORT_KIND_USB
+    if value is TransportKind.GPIO:
+        return hal_pb2.TRANSPORT_KIND_GPIO
     raise _argument_error(operation, "transport kind is invalid")
 
 
@@ -2044,6 +2352,107 @@ def _decode_open_can_response(
         raise _invalid_message("broker returned invalid CAN session metadata") from error
 
 
+def _decode_open_session_response(
+    response: hal_pb2.OpenUsbResponse | hal_pb2.OpenGpioResponse, transport: str
+) -> tuple[str, str, int, int]:
+    try:
+        session_id = _valid_identifier(response.session_id, "session.id")
+        if not response.HasField("lease"):
+            raise ValueError
+        lease_id = _valid_identifier(response.lease.lease_id, "lease.id")
+        if (
+            response.lease.generation == 0
+            or response.lease.mode != hal_pb2.LEASE_MODE_CONTROL
+        ):
+            raise ValueError
+        return session_id, lease_id, response.lease.generation, response.lease.mode
+    except (ValueError, HalError) as error:
+        raise _invalid_message(
+            f"broker returned invalid {transport} session metadata"
+        ) from error
+
+
+def _usb_transfer_capability(kind: UsbTransferKind) -> str:
+    if kind in {UsbTransferKind.CONTROL_OUT, UsbTransferKind.CONTROL_IN}:
+        return USB_CONTROL_CAPABILITY
+    if kind in {UsbTransferKind.BULK_OUT, UsbTransferKind.BULK_IN}:
+        return USB_BULK_CAPABILITY
+    if kind in {UsbTransferKind.INTERRUPT_OUT, UsbTransferKind.INTERRUPT_IN}:
+        return USB_INTERRUPT_CAPABILITY
+    raise _argument_error("usb.transfer", "USB transfer kind is invalid")
+
+
+def _usb_transfer_is_in(kind: UsbTransferKind) -> bool:
+    return kind in {
+        UsbTransferKind.CONTROL_IN,
+        UsbTransferKind.BULK_IN,
+        UsbTransferKind.INTERRUPT_IN,
+    }
+
+
+def _usb_transfer_to_proto(
+    session: UsbSession, transfer: UsbTransfer, timeout_ms: int
+) -> hal_pb2.UsbTransferRequest:
+    return hal_pb2.UsbTransferRequest(
+        session_id=session._session_id,
+        lease=hal_pb2.LeaseToken(
+            lease_id=session._lease_id,
+            generation=session._generation,
+            mode=session._mode,
+        ),
+        kind={
+            UsbTransferKind.CONTROL_OUT: hal_pb2.USB_TRANSFER_KIND_CONTROL_OUT,
+            UsbTransferKind.CONTROL_IN: hal_pb2.USB_TRANSFER_KIND_CONTROL_IN,
+            UsbTransferKind.BULK_OUT: hal_pb2.USB_TRANSFER_KIND_BULK_OUT,
+            UsbTransferKind.BULK_IN: hal_pb2.USB_TRANSFER_KIND_BULK_IN,
+            UsbTransferKind.INTERRUPT_OUT: hal_pb2.USB_TRANSFER_KIND_INTERRUPT_OUT,
+            UsbTransferKind.INTERRUPT_IN: hal_pb2.USB_TRANSFER_KIND_INTERRUPT_IN,
+        }[transfer.kind],
+        request_type=transfer.request_type,
+        request=transfer.request,
+        value=transfer.value,
+        index=transfer.index,
+        endpoint=transfer.endpoint or 0,
+        data=transfer.data,
+        max_bytes=transfer.max_bytes,
+        timeout_ms=timeout_ms,
+    )
+
+
+def _gpio_config_to_proto(config: GpioLineConfig) -> hal_pb2.GpioLineConfig:
+    result = hal_pb2.GpioLineConfig(
+        direction={
+            GpioDirection.INPUT: hal_pb2.GPIO_DIRECTION_INPUT,
+            GpioDirection.OUTPUT: hal_pb2.GPIO_DIRECTION_OUTPUT,
+        }[config.direction],
+        active_low=config.active_low,
+        bias={
+            GpioBias.DISABLED: hal_pb2.GPIO_BIAS_DISABLED,
+            GpioBias.PULL_UP: hal_pb2.GPIO_BIAS_PULL_UP,
+            GpioBias.PULL_DOWN: hal_pb2.GPIO_BIAS_PULL_DOWN,
+        }[config.bias],
+    )
+    if config.drive is not None:
+        result.drive = {
+            GpioDrive.PUSH_PULL: hal_pb2.GPIO_DRIVE_PUSH_PULL,
+            GpioDrive.OPEN_DRAIN: hal_pb2.GPIO_DRIVE_OPEN_DRAIN,
+            GpioDrive.OPEN_SOURCE: hal_pb2.GPIO_DRIVE_OPEN_SOURCE,
+        }[config.drive]
+    if config.initial_value is not None:
+        result.initial_value = config.initial_value
+    return result
+
+
+def _gpio_edge_from_proto(value: hal_pb2.GpioEdgeEvent) -> GpioEdgeEvent:
+    edge = {
+        hal_pb2.GPIO_EDGE_RISING: GpioEdge.RISING,
+        hal_pb2.GPIO_EDGE_FALLING: GpioEdge.FALLING,
+    }.get(value.edge)
+    if edge is None or value.sequence == 0:
+        raise _invalid_message("GPIO edge event is invalid")
+    return GpioEdgeEvent(edge, value.monotonic_ns, value.sequence)
+
+
 def _frame_data_length(frame: CanFrame) -> int:
     return len(frame.data) if hasattr(frame, "data") else 0
 
@@ -2058,6 +2467,46 @@ def _frame_allowed(frame: CanFrame, profile: _CanSessionProfile) -> bool:
 
 def _validate_response_payload(value: Message, pending: _Pending) -> None:
     try:
+        if pending.expected == "enumerate_usb_response":
+            assert isinstance(value, hal_pb2.EnumerateUsbResponse)
+            for descriptor in value.resources:
+                _decode_descriptor(descriptor, expected=TransportKind.USB)
+            return
+        if pending.expected == "open_usb_response":
+            assert isinstance(value, hal_pb2.OpenUsbResponse)
+            _decode_open_session_response(value, "USB")
+            return
+        if pending.expected == "usb_transfer_response":
+            assert isinstance(value, hal_pb2.UsbTransferResponse)
+            if (
+                pending.requested_read is not None
+                and len(value.data) > pending.requested_read
+            ):
+                raise _invalid_message(
+                    "USB transfer response exceeds requested byte maximum"
+                )
+            return
+        if pending.expected == "enumerate_gpio_response":
+            assert isinstance(value, hal_pb2.EnumerateGpioResponse)
+            for descriptor in value.resources:
+                _decode_descriptor(descriptor, expected=TransportKind.GPIO)
+            return
+        if pending.expected == "open_gpio_response":
+            assert isinstance(value, hal_pb2.OpenGpioResponse)
+            _decode_open_session_response(value, "GPIO")
+            return
+        if pending.expected == "gpio_read_response":
+            assert isinstance(value, hal_pb2.GpioReadResponse)
+            if pending.line_count is None or len(value.values) != pending.line_count:
+                raise _invalid_message(
+                    "GPIO read response value count does not match session lines"
+                )
+            return
+        if pending.expected == "gpio_next_edge_response":
+            assert isinstance(value, hal_pb2.GpioNextEdgeResponse)
+            if value.HasField("event"):
+                _gpio_edge_from_proto(value.event)
+            return
         if pending.expected == "enumerate_can_response":
             assert isinstance(value, hal_pb2.EnumerateCanResponse)
             for descriptor in value.resources:
