@@ -1273,6 +1273,8 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "seeed-hal-adapter-shared-memory",
+ "seeed-hal-camera",
  "seeed-hal-can",
  "seeed-hal-core",
  "seeed-hal-gpio",

@@ -99,6 +99,14 @@ impl VirtualCameraAdapter {
             .present = false;
     }
 
+    /// Makes a previously unplugged virtual camera discoverable again.
+    pub fn plug(&self) {
+        self.state
+            .lock()
+            .expect("virtual camera mutex poisoned")
+            .present = true;
+    }
+
     pub fn unplug_before_next_publication(&self) {
         self.state
             .lock()

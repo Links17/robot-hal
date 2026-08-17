@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod camera_manager;
 mod can_actor;
 mod can_lease_table;
 mod can_manager;
@@ -14,10 +15,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use camera_manager::CameraManager;
 use can_manager::CanManager;
 pub use events::{EventSubscription, RuntimeEvent, RuntimeEventKind};
 use gpio_manager::GpioManager;
 use registry::{CloseAction, Registry};
+use seeed_hal_adapter_shared_memory::{FrameLease, MappingDescriptor};
+use seeed_hal_camera::{
+    CameraAdapter, CameraControlDescriptor, CameraControlKind, CameraControlValue, CameraRequest,
+};
 use seeed_hal_can::{
     CanAdapter, CanBatchSendError, CanBusStatus, CanFilterSet, CanFrame, CanOpenConfig,
     DEFAULT_CAN_RX_CAPACITY, DEFAULT_CAN_TX_CAPACITY, ReceivedCanFrame,
@@ -45,6 +51,8 @@ pub struct HalRuntimeBuilder {
     usb_close_timeout: Duration,
     gpio_adapter: Option<Arc<dyn GpioAdapter>>,
     gpio_close_timeout: Duration,
+    camera_adapter: Option<Arc<dyn CameraAdapter>>,
+    camera_close_timeout: Duration,
 }
 
 /// Maximum configurable frames in one session's software receive ring.
@@ -65,6 +73,8 @@ impl Default for HalRuntimeBuilder {
             usb_close_timeout: Duration::from_secs(2),
             gpio_adapter: None,
             gpio_close_timeout: Duration::from_secs(2),
+            camera_adapter: None,
+            camera_close_timeout: Duration::from_secs(2),
         }
     }
 }
@@ -127,6 +137,21 @@ impl HalRuntimeBuilder {
         self
     }
 
+    pub fn camera_adapter<A>(mut self, adapter: A) -> Self
+    where
+        A: CameraAdapter + 'static,
+    {
+        self.camera_adapter = Some(Arc::new(adapter));
+        self
+    }
+
+    /// Sets the finite deadline for Camera worker cleanup. A blocked native
+    /// close retains its exclusive lease and shared-memory mapping quarantine.
+    pub fn camera_close_timeout(mut self, timeout: Duration) -> Self {
+        self.camera_close_timeout = timeout;
+        self
+    }
+
     /// Sets each CAN session's drop-oldest RX ring capacity.
     ///
     /// Values are clamped to `1..=4096`; the default is 256 frames.
@@ -168,6 +193,7 @@ impl HalRuntimeBuilder {
                 can_manager,
                 usb_manager: UsbManager::new(self.usb_adapter, self.usb_close_timeout),
                 gpio_manager: GpioManager::new(self.gpio_adapter, self.gpio_close_timeout),
+                camera_manager: CameraManager::new(self.camera_adapter, self.camera_close_timeout),
             }),
         }
     }
@@ -181,6 +207,7 @@ struct RuntimeInner {
     can_manager: CanManager,
     usb_manager: UsbManager,
     gpio_manager: GpioManager,
+    camera_manager: CameraManager,
 }
 
 #[derive(Clone)]
@@ -284,6 +311,124 @@ impl HalRuntime {
     }
     pub async fn close_gpio(&self, session: SessionId, lease: &LeaseToken) -> HalResult<()> {
         self.inner.gpio_manager.close(session, lease).await
+    }
+
+    pub async fn enumerate_camera(&self) -> HalResult<Vec<ResourceDescriptor>> {
+        self.inner.camera_manager.enumerate().await
+    }
+
+    pub async fn open_camera(
+        &self,
+        owner: OwnerId,
+        selector: ResourceSelector,
+        request: CameraRequest,
+    ) -> HalResult<CameraHandle> {
+        let (session_id, lease) = self
+            .inner
+            .camera_manager
+            .open(owner, selector, request)
+            .await?;
+        Ok(CameraHandle {
+            runtime: self.clone(),
+            session_id,
+            lease,
+            closed: false,
+        })
+    }
+
+    pub async fn capture_camera(
+        &self,
+        session: SessionId,
+        lease: &LeaseToken,
+        timeout: Duration,
+    ) -> HalResult<()> {
+        self.inner
+            .camera_manager
+            .capture(session, lease, timeout)
+            .await
+    }
+
+    pub async fn camera_mapping_descriptor(
+        &self,
+        session: SessionId,
+        lease: &LeaseToken,
+    ) -> HalResult<MappingDescriptor> {
+        self.inner
+            .camera_manager
+            .mapping_descriptor(session, lease)
+            .await
+    }
+
+    pub async fn camera_next_frame_lease(
+        &self,
+        session: SessionId,
+        lease: &LeaseToken,
+    ) -> HalResult<Option<FrameLease>> {
+        self.inner
+            .camera_manager
+            .next_frame_lease(session, lease)
+            .await
+    }
+
+    pub async fn camera_dropped_count(
+        &self,
+        session: SessionId,
+        lease: &LeaseToken,
+    ) -> HalResult<u64> {
+        self.inner
+            .camera_manager
+            .dropped_count(session, lease)
+            .await
+    }
+
+    pub async fn camera_controls(
+        &self,
+        session: SessionId,
+        lease: &LeaseToken,
+    ) -> HalResult<Vec<CameraControlDescriptor>> {
+        self.inner.camera_manager.controls(session, lease).await
+    }
+
+    pub async fn camera_get_control(
+        &self,
+        session: SessionId,
+        lease: &LeaseToken,
+        kind: CameraControlKind,
+    ) -> HalResult<CameraControlValue> {
+        self.inner
+            .camera_manager
+            .get_control(session, lease, kind)
+            .await
+    }
+
+    pub async fn camera_set_control(
+        &self,
+        session: SessionId,
+        lease: &LeaseToken,
+        kind: CameraControlKind,
+        value: CameraControlValue,
+    ) -> HalResult<()> {
+        self.inner
+            .camera_manager
+            .set_control(session, lease, kind, value)
+            .await
+    }
+
+    pub async fn camera_set_auto(
+        &self,
+        session: SessionId,
+        lease: &LeaseToken,
+        kind: CameraControlKind,
+        enabled: bool,
+    ) -> HalResult<()> {
+        self.inner
+            .camera_manager
+            .set_auto(session, lease, kind, enabled)
+            .await
+    }
+
+    pub async fn close_camera(&self, session: SessionId, lease: &LeaseToken) -> HalResult<()> {
+        self.inner.camera_manager.close(session, lease).await
     }
 
     pub async fn open_can(
@@ -514,12 +659,20 @@ impl HalRuntime {
         let can_result = self.inner.can_manager.revoke_owner(owner).await;
         let usb_result = self.inner.usb_manager.revoke_owner(owner).await;
         let gpio_result = self.inner.gpio_manager.revoke_owner(owner).await;
-        match (serial_result, can_result, usb_result, gpio_result) {
-            (Err(error), _, _, _) => Err(error),
-            (Ok(()), Err(error), _, _) => Err(error),
-            (Ok(()), Ok(()), Err(error), _) => Err(error),
-            (Ok(()), Ok(()), Ok(()), Err(error)) => Err(error),
-            (Ok(()), Ok(()), Ok(()), Ok(())) => Ok(()),
+        let camera_result = self.inner.camera_manager.revoke_owner(owner).await;
+        match (
+            serial_result,
+            can_result,
+            usb_result,
+            gpio_result,
+            camera_result,
+        ) {
+            (Err(error), _, _, _, _) => Err(error),
+            (Ok(()), Err(error), _, _, _) => Err(error),
+            (Ok(()), Ok(()), Err(error), _, _) => Err(error),
+            (Ok(()), Ok(()), Ok(()), Err(error), _) => Err(error),
+            (Ok(()), Ok(()), Ok(()), Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(()), Ok(()), Ok(()), Ok(())) => Ok(()),
         }
     }
 
@@ -661,6 +814,78 @@ pub struct GpioHandle {
     session_id: SessionId,
     lease: LeaseToken,
     closed: bool,
+}
+pub struct CameraHandle {
+    runtime: HalRuntime,
+    session_id: SessionId,
+    lease: LeaseToken,
+    closed: bool,
+}
+impl CameraHandle {
+    pub fn session_id(&self) -> SessionId {
+        self.session_id.clone()
+    }
+    pub fn lease_token(&self) -> &LeaseToken {
+        &self.lease
+    }
+    pub fn into_parts(mut self) -> (SessionId, LeaseToken) {
+        self.closed = true;
+        (self.session_id.clone(), self.lease.clone())
+    }
+    pub async fn capture(&self, timeout: Duration) -> HalResult<()> {
+        self.runtime
+            .capture_camera(self.session_id(), &self.lease, timeout)
+            .await
+    }
+    pub async fn mapping_descriptor(&self) -> HalResult<MappingDescriptor> {
+        self.runtime
+            .camera_mapping_descriptor(self.session_id(), &self.lease)
+            .await
+    }
+    pub async fn next_frame_lease(&self) -> HalResult<Option<FrameLease>> {
+        self.runtime
+            .camera_next_frame_lease(self.session_id(), &self.lease)
+            .await
+    }
+    pub async fn dropped_count(&self) -> HalResult<u64> {
+        self.runtime
+            .camera_dropped_count(self.session_id(), &self.lease)
+            .await
+    }
+    pub async fn controls(&self) -> HalResult<Vec<CameraControlDescriptor>> {
+        self.runtime
+            .camera_controls(self.session_id(), &self.lease)
+            .await
+    }
+    pub async fn get_control(&self, kind: CameraControlKind) -> HalResult<CameraControlValue> {
+        self.runtime
+            .camera_get_control(self.session_id(), &self.lease, kind)
+            .await
+    }
+    pub async fn set_control(
+        &self,
+        kind: CameraControlKind,
+        value: CameraControlValue,
+    ) -> HalResult<()> {
+        self.runtime
+            .camera_set_control(self.session_id(), &self.lease, kind, value)
+            .await
+    }
+    pub async fn set_auto(&self, kind: CameraControlKind, enabled: bool) -> HalResult<()> {
+        self.runtime
+            .camera_set_auto(self.session_id(), &self.lease, kind, enabled)
+            .await
+    }
+    pub async fn close(&mut self) -> HalResult<()> {
+        let result = self
+            .runtime
+            .close_camera(self.session_id(), &self.lease)
+            .await;
+        if result.is_ok() {
+            self.closed = true;
+        }
+        result
+    }
 }
 impl GpioHandle {
     pub fn session_id(&self) -> SessionId {
