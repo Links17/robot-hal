@@ -138,15 +138,18 @@ async fn camera_hot_unplug_closes_then_releases_for_reopen() {
             .as_str(),
         "camera.session.unplugged"
     );
-    assert_eq!(
-        handle
-            .capture(Duration::ZERO)
-            .await
-            .unwrap_err()
-            .name()
-            .as_str(),
-        "runtime.session.closed"
-    );
+    let terminal = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let error = handle.capture(Duration::ZERO).await.unwrap_err();
+            if error.name().as_str() != "runtime.session.closed" {
+                return error;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal worker cleanup must complete");
+    assert_eq!(terminal.name().as_str(), "camera.session.unplugged");
 
     adapter.plug();
     let mut replacement = tokio::time::timeout(Duration::from_secs(1), async {
@@ -170,4 +173,24 @@ async fn camera_hot_unplug_closes_then_releases_for_reopen() {
     .await
     .unwrap();
     replacement.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn camera_close_invalidates_an_already_open_frame_reader() {
+    let adapter = VirtualCameraAdapter::pattern("camera:runtime:reader-close");
+    let runtime = HalRuntime::builder().camera_adapter(adapter).build();
+    let descriptor = runtime.enumerate_camera().await.unwrap().remove(0);
+    let owner = OwnerId::parse("owner:camera-reader-close").unwrap();
+    let mut handle = runtime
+        .open_camera(owner, descriptor.selector(), request())
+        .await
+        .unwrap();
+    let mapping = handle.mapping_descriptor().await.unwrap();
+    handle.capture(Duration::ZERO).await.unwrap();
+    let lease = handle.next_frame_lease().await.unwrap().unwrap();
+    let mut reader = seeed_hal_adapter_shared_memory::ReadOnlyMapping::open(&mapping).unwrap();
+
+    handle.close().await.unwrap();
+
+    assert!(reader.copy(lease).unwrap().is_none());
 }

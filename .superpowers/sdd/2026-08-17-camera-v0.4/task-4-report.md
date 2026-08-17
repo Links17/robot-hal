@@ -12,6 +12,11 @@
   control APIs. Mapping descriptors use the shared-memory crate's redacted token behavior.
 - Added virtual-camera runtime integration coverage for exclusivity, stale leases after reopen,
   shared-ring publication, controls, owner revocation, hot-unplug cleanup, and reopening.
+- Hardened Camera timeout and terminal handling: an opening worker quarantines its reserved
+  generation until it exits; owner revocation registers completion reapers for every target
+  before waiting; terminal native-unavailable errors are retained for later session requests.
+- Fenced close against queued native work and made shared-memory close publish a synchronized
+  terminal header state before unlinking, so already-open readers reject old frame leases.
 
 ## Verification
 
@@ -19,6 +24,8 @@
 - `cargo test -p seeed-hal-camera`
 - `cargo test -p seeed-hal-testkit`
 - `cargo test -p seeed-hal-adapter-shared-memory`
+- `cargo fmt --all --check`
+- `cargo clippy -p seeed-hal-runtime --all-targets --all-features -- -D warnings`
 
 ## Platform limits
 

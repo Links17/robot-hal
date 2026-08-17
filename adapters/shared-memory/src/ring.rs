@@ -24,6 +24,9 @@ const HEADER_PAYLOAD_CAPACITY: usize = 56;
 const HEADER_IDENTITY: usize = 64;
 const HEADER_TOKEN_HASH: usize = 96;
 const HEADER_DROPPED_COUNT: usize = 128;
+const HEADER_TERMINAL_STATE: usize = 136;
+const TERMINAL_STATE_OPEN: u64 = 0;
+const TERMINAL_STATE_CLOSED: u64 = 1;
 
 const SLOT_STATE: usize = 0;
 const SLOT_SEQUENCE: usize = 8;
@@ -114,6 +117,20 @@ impl BrokerMapping {
 
     pub fn close(&mut self) -> HalResult<()> {
         if !self.closed {
+            self.mapping
+                .try_lock_exclusive()
+                .map_err(|error| unavailable("shared_memory.close", error.to_string()))?;
+            // SAFETY: the broker holds the exclusive mapping lock and the fixed terminal-state
+            // field lies within the writable header.
+            unsafe {
+                write_u64(
+                    self.mapping.as_ptr().add(HEADER_TERMINAL_STATE),
+                    TERMINAL_STATE_CLOSED,
+                )
+            };
+            self.mapping
+                .unlock()
+                .map_err(|error| unavailable("shared_memory.close", error.to_string()))?;
             Mapping::unlink(&self.descriptor.name)
                 .map_err(|error| unavailable("shared_memory.close", error.to_string()))?;
             self.closed = true;
@@ -537,6 +554,9 @@ impl ReadOnlyMapping {
     }
 
     fn copy_locked(&self, lease: FrameLease) -> HalResult<Option<CopiedFrame>> {
+        if self.terminal_state()? != TERMINAL_STATE_OPEN {
+            return Ok(None);
+        }
         if lease.slot_index >= self.header.config().slot_count()
             || self.slot_state(lease.slot_index)? != SlotState::Pinned
         {
@@ -640,6 +660,12 @@ impl ReadOnlyMapping {
     fn slot_state(&self, index: usize) -> HalResult<SlotState> {
         // SAFETY: caller holds the shared OS lock; field is within validated slot header.
         SlotState::from_raw(unsafe { read_u64(self.slot_base(index).add(SLOT_STATE)) })
+    }
+
+    fn terminal_state(&self) -> HalResult<u64> {
+        // SAFETY: caller holds the shared mapping lock and the fixed terminal-state field is
+        // within the validated header.
+        Ok(unsafe { read_u64(self.mapping.as_ptr().add(HEADER_TERMINAL_STATE)) })
     }
 
     fn slot_sequence(&self, index: usize) -> HalResult<u64> {

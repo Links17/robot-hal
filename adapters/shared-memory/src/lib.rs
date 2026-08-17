@@ -98,6 +98,19 @@ mod tests {
     }
 
     #[test]
+    fn an_open_reader_rejects_a_frame_lease_after_the_broker_closes() {
+        let mut broker = BrokerMapping::create(config()).unwrap();
+        let descriptor = broker.descriptor().clone();
+        broker.writer().publish(metadata(1, 1), &[1; 8]).unwrap();
+
+        let mut client = ReadOnlyMapping::open(&descriptor).unwrap();
+        let lease = broker.next_frame_lease().unwrap().unwrap();
+        broker.close().unwrap();
+
+        assert!(client.copy(lease).unwrap().is_none());
+    }
+
+    #[test]
     fn rejects_bad_capability_token() {
         let broker = BrokerMapping::create(config()).unwrap();
         let mut descriptor = broker.descriptor().clone();
