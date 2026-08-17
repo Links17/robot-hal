@@ -15,6 +15,7 @@ use seeed_hal_can::{
 use seeed_hal_core::{
     CapabilityId, CapabilitySet, HalResult, OwnerId, ResourceDescriptor, ResourceSelector,
 };
+use seeed_hal_gpio::GpioEdge;
 use seeed_hal_protocol::v1::{self, envelope};
 use seeed_hal_runtime::{HalRuntime, RuntimeEventKind};
 use seeed_hal_serial::{ControlLines, SerialAdapter, SerialConfig, SerialSession};
@@ -467,6 +468,28 @@ fn usb_gpio_broker() -> Broker {
     Broker::with_startup_token(runtime, StartupToken::from_bytes(TOKEN))
 }
 
+fn usb_gpio_broker_with_adapters() -> (Broker, VirtualUsbAdapter, VirtualGpioAdapter) {
+    let usb = VirtualUsbAdapter::loopback("usb:virtual:broker");
+    let gpio = VirtualGpioAdapter::line_bank("gpio:virtual:broker", 2);
+    let runtime = HalRuntime::builder()
+        .usb_adapter(usb.clone())
+        .gpio_adapter(gpio.clone())
+        .build();
+    (
+        Broker::with_startup_token(runtime, StartupToken::from_bytes(TOKEN)),
+        usb,
+        gpio,
+    )
+}
+
+fn minor_two_handshake() -> v1::HandshakeRequest {
+    let mut handshake = valid_handshake(TOKEN.to_vec());
+    handshake.protocol_minor = 2;
+    handshake.protocol_minor_minimum = 2;
+    handshake.protocol_minor_maximum = 2;
+    handshake
+}
+
 #[tokio::test]
 async fn minor_two_handshake_enumerates_usb_and_gpio() {
     let (server_io, client_io) = tokio::io::duplex(16 * 1024);
@@ -536,6 +559,234 @@ async fn minor_two_handshake_enumerates_usb_and_gpio() {
         gpio_open.payload,
         Some(envelope::Payload::OpenGpioResponse(_))
     ));
+    drop(client);
+    assert!(server.await.unwrap().cleanup_error().is_none());
+}
+
+#[tokio::test]
+async fn minor_two_broker_dispatches_owner_scoped_usb_and_gpio_sessions() {
+    let (broker, usb, gpio) = usb_gpio_broker_with_adapters();
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    let handshake = client
+        .request(envelope::Payload::HandshakeRequest(minor_two_handshake()))
+        .await;
+    let handshake = match handshake.payload {
+        Some(envelope::Payload::HandshakeResponse(response)) => response,
+        other => panic!("expected minor-two handshake response, got {other:?}"),
+    };
+    for capability in [
+        "usb.control/v1",
+        "usb.bulk/v1",
+        "usb.interrupt/v1",
+        "gpio.lines/v1",
+        "gpio.edges/v1",
+    ] {
+        assert!(
+            handshake
+                .capabilities
+                .iter()
+                .any(|value| value == capability),
+            "minor-two handshake did not advertise {capability}"
+        );
+    }
+
+    let usb_descriptor = match client
+        .request(envelope::Payload::EnumerateUsbRequest(
+            v1::EnumerateUsbRequest {},
+        ))
+        .await
+        .payload
+    {
+        Some(envelope::Payload::EnumerateUsbResponse(response)) => {
+            response.resources.into_iter().next().unwrap()
+        }
+        other => panic!("expected USB enumeration, got {other:?}"),
+    };
+    let usb_session = match client
+        .request(envelope::Payload::OpenUsbRequest(v1::OpenUsbRequest {
+            selector: Some(v1::ResourceSelector {
+                resource_id: usb_descriptor.resource_id,
+                minimum_identity_quality: usb_descriptor.identity_quality,
+                transport: usb_descriptor.transport,
+            }),
+            interface_number: 0,
+        }))
+        .await
+        .payload
+    {
+        Some(envelope::Payload::OpenUsbResponse(response)) => response,
+        other => panic!("expected USB open, got {other:?}"),
+    };
+    let transfer = |kind, endpoint, data, max_bytes| v1::UsbTransferRequest {
+        session_id: usb_session.session_id.clone(),
+        lease: usb_session.lease.clone(),
+        kind: kind as i32,
+        endpoint,
+        data,
+        max_bytes,
+        timeout_ms: 100,
+        ..Default::default()
+    };
+    assert!(matches!(
+        client
+            .request(envelope::Payload::UsbTransferRequest(transfer(
+                v1::UsbTransferKind::BulkOut,
+                1,
+                b"usb-loopback".to_vec(),
+                0,
+            )))
+            .await
+            .payload,
+        Some(envelope::Payload::UsbTransferResponse(_))
+    ));
+    let usb_read = client
+        .request(envelope::Payload::UsbTransferRequest(transfer(
+            v1::UsbTransferKind::BulkIn,
+            0x81,
+            vec![],
+            64,
+        )))
+        .await;
+    match usb_read.payload {
+        Some(envelope::Payload::UsbTransferResponse(response)) => {
+            assert_eq!(response.data, b"usb-loopback");
+        }
+        other => panic!("expected USB transfer response, got {other:?}"),
+    }
+
+    let gpio_descriptor = match client
+        .request(envelope::Payload::EnumerateGpioRequest(
+            v1::EnumerateGpioRequest {},
+        ))
+        .await
+        .payload
+    {
+        Some(envelope::Payload::EnumerateGpioResponse(response)) => {
+            response.resources.into_iter().next().unwrap()
+        }
+        other => panic!("expected GPIO enumeration, got {other:?}"),
+    };
+    let selector = || v1::ResourceSelector {
+        resource_id: gpio_descriptor.resource_id.clone(),
+        minimum_identity_quality: gpio_descriptor.identity_quality,
+        transport: gpio_descriptor.transport,
+    };
+    let gpio_output = match client
+        .request(envelope::Payload::OpenGpioRequest(v1::OpenGpioRequest {
+            selector: Some(selector()),
+            lines: vec![0],
+            config: Some(v1::GpioLineConfig {
+                direction: v1::GpioDirection::Output as i32,
+                active_low: false,
+                bias: v1::GpioBias::Disabled as i32,
+                drive: v1::GpioDrive::PushPull as i32,
+                initial_value: Some(false),
+            }),
+        }))
+        .await
+        .payload
+    {
+        Some(envelope::Payload::OpenGpioResponse(response)) => response,
+        other => panic!("expected GPIO output open, got {other:?}"),
+    };
+    assert!(matches!(
+        client
+            .request(envelope::Payload::GpioWriteRequest(v1::GpioWriteRequest {
+                session_id: gpio_output.session_id.clone(),
+                lease: gpio_output.lease.clone(),
+                values: vec![true],
+            }))
+            .await
+            .payload,
+        Some(envelope::Payload::GpioWriteResponse(_))
+    ));
+    match client
+        .request(envelope::Payload::GpioReadRequest(v1::GpioReadRequest {
+            session_id: gpio_output.session_id.clone(),
+            lease: gpio_output.lease.clone(),
+        }))
+        .await
+        .payload
+    {
+        Some(envelope::Payload::GpioReadResponse(response)) => assert_eq!(response.values, [true]),
+        other => panic!("expected GPIO read response, got {other:?}"),
+    }
+    assert!(matches!(
+        client
+            .request(envelope::Payload::CloseGpioRequest(v1::CloseGpioRequest {
+                session_id: gpio_output.session_id,
+                lease: gpio_output.lease,
+            }))
+            .await
+            .payload,
+        Some(envelope::Payload::CloseGpioResponse(_))
+    ));
+    let gpio_input = match client
+        .request(envelope::Payload::OpenGpioRequest(v1::OpenGpioRequest {
+            selector: Some(selector()),
+            lines: vec![1],
+            config: Some(v1::GpioLineConfig {
+                direction: v1::GpioDirection::Input as i32,
+                active_low: false,
+                bias: v1::GpioBias::Disabled as i32,
+                drive: v1::GpioDrive::Unspecified as i32,
+                initial_value: None,
+            }),
+        }))
+        .await
+        .payload
+    {
+        Some(envelope::Payload::OpenGpioResponse(response)) => response,
+        other => panic!("expected GPIO input open, got {other:?}"),
+    };
+    gpio.inject_edge(1, GpioEdge::Rising, 42).unwrap();
+    match client
+        .request(envelope::Payload::GpioNextEdgeRequest(
+            v1::GpioNextEdgeRequest {
+                session_id: gpio_input.session_id.clone(),
+                lease: gpio_input.lease.clone(),
+                rising: true,
+                falling: false,
+                capacity: 1,
+                timeout_ms: 100,
+            },
+        ))
+        .await
+        .payload
+    {
+        Some(envelope::Payload::GpioNextEdgeResponse(response)) => {
+            let event = response.event.expect("injected edge must be delivered");
+            assert_eq!(event.edge, v1::GpioEdge::Rising as i32);
+            assert_eq!(event.monotonic_ns, 42);
+        }
+        other => panic!("expected GPIO edge response, got {other:?}"),
+    }
+
+    assert!(matches!(
+        client
+            .request(envelope::Payload::CloseUsbRequest(v1::CloseUsbRequest {
+                session_id: usb_session.session_id,
+                lease: usb_session.lease,
+            }))
+            .await
+            .payload,
+        Some(envelope::Payload::CloseUsbResponse(_))
+    ));
+    assert!(matches!(
+        client
+            .request(envelope::Payload::CloseGpioRequest(v1::CloseGpioRequest {
+                session_id: gpio_input.session_id,
+                lease: gpio_input.lease,
+            }))
+            .await
+            .payload,
+        Some(envelope::Payload::CloseGpioResponse(_))
+    ));
+    assert!(usb.claimed_interfaces().is_empty());
+    assert!(gpio.claimed_lines().is_empty());
+
     drop(client);
     assert!(server.await.unwrap().cleanup_error().is_none());
 }

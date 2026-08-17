@@ -12,9 +12,11 @@ getrandom = { workspace = true }
 prost = { workspace = true }
 seeed-hal-core = { path = "../seeed-hal-core" }
 seeed-hal-can = { path = "../seeed-hal-can" }
+seeed-hal-gpio = { path = "../seeed-hal-gpio" }
 seeed-hal-protocol = { path = "../seeed-hal-protocol" }
 seeed-hal-runtime = { path = "../seeed-hal-runtime" }
 seeed-hal-serial = { path = "../seeed-hal-serial" }
+seeed-hal-usb = { path = "../seeed-hal-usb" }
 subtle = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

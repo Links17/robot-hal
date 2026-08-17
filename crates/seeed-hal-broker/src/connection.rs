@@ -26,6 +26,10 @@ use crate::can_dispatch::{
     self, CanDispatchLimits, CanSessions, broker_capabilities, is_can_payload, is_can_session,
     new_session_registry,
 };
+use crate::usb_gpio_dispatch::{
+    self, UsbGpioDispatchLimits, UsbGpioSessions,
+    new_session_registry as new_usb_gpio_session_registry,
+};
 use crate::{Broker, StartupToken};
 
 const DEFAULT_REQUEST_QUEUE_CAPACITY: usize = 32;
@@ -183,6 +187,7 @@ impl Broker {
         let active = Arc::new(Mutex::new(HashSet::new()));
         let can_sessions = new_session_registry();
         let serial_sessions = Arc::new(Mutex::new(SerialSessionRegistry::default()));
+        let usb_gpio_sessions = new_usb_gpio_session_registry();
         let (frame_limit_tx, frame_limit_rx) = watch::channel(None::<usize>);
         let (request_tx, request_rx) = mpsc::channel(self.config.request_queue_capacity);
         let (response_tx, response_rx) = mpsc::channel(self.config.response_queue_capacity);
@@ -215,6 +220,7 @@ impl Broker {
             active,
             can_sessions,
             serial_sessions,
+            usb_gpio_sessions,
             frame_limit_tx,
             cancel_rx,
         ));
@@ -439,6 +445,7 @@ async fn dispatch_requests(
     active: Arc<Mutex<HashSet<u64>>>,
     can_sessions: CanSessions,
     serial_sessions: SerialSessions,
+    usb_gpio_sessions: UsbGpioSessions,
     frame_limit: watch::Sender<Option<usize>>,
     mut cancel: watch::Receiver<bool>,
 ) -> Option<HalError> {
@@ -607,6 +614,7 @@ async fn dispatch_requests(
                 let owner = owner.clone();
                 let can_sessions = can_sessions.clone();
                 let serial_sessions = serial_sessions.clone();
+                let usb_gpio_sessions = usb_gpio_sessions.clone();
                 let limits = limits.expect("successful handshake sets negotiated limits");
                 let payload = request.envelope.payload.take();
                 tasks.spawn(async move {
@@ -618,6 +626,7 @@ async fn dispatch_requests(
                         limits,
                         can_sessions,
                         serial_sessions,
+                        usb_gpio_sessions,
                     ).await;
                     (request_id, response)
                 });
@@ -667,7 +676,8 @@ fn validate_handshake(
         PROTOCOL_MINOR_MINIMUM,
         PROTOCOL_MINOR_MAXIMUM,
     )?;
-    let capabilities = broker_capabilities(selected_minor);
+    let mut capabilities = broker_capabilities(selected_minor);
+    capabilities.extend(usb_gpio_dispatch::broker_capabilities(selected_minor));
     for capability in &request.required_capabilities {
         if !capabilities.contains(capability) {
             return Err(protocol_error(
@@ -762,6 +772,7 @@ fn prost_varint_len(mut value: u64) -> usize {
     len
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_operation(
     runtime: HalRuntime,
     owner: OwnerId,
@@ -770,6 +781,7 @@ async fn dispatch_operation(
     limits: NegotiatedLimits,
     can_sessions: CanSessions,
     serial_sessions: SerialSessions,
+    usb_gpio_sessions: UsbGpioSessions,
 ) -> v1::Envelope {
     let result = match payload {
         Some(payload) if is_usb_gpio_payload(&payload) && limits.protocol_minor < 2 => {
@@ -793,6 +805,20 @@ async fn dispatch_operation(
                     max_write_bytes: limits.max_write_bytes,
                 },
                 can_sessions,
+            )
+            .await
+        }
+        Some(payload) if is_usb_gpio_payload(&payload) => {
+            usb_gpio_dispatch::dispatch(
+                runtime,
+                owner,
+                payload,
+                UsbGpioDispatchLimits {
+                    max_frame_bytes: limits.max_frame_bytes,
+                    max_read_bytes: limits.max_read_bytes,
+                    max_write_bytes: limits.max_write_bytes,
+                },
+                usb_gpio_sessions,
             )
             .await
         }
