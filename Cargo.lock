@@ -1334,6 +1334,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "seeed-hal-adapter-mediafoundation"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "seeed-hal-camera",
+ "seeed-hal-core",
+ "tokio",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
 name = "seeed-hal-adapter-nusb"
 version = "0.3.0"
 dependencies = [

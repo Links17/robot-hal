@@ -195,3 +195,75 @@ close behavior, and hot-unplug coverage were not relaxed.
   `devicesWithMediaType:` API because the pinned `objc2` release does not
   expose a usable discovery-session path. This is isolated and documented for
   replacement when the compatible binding line adds it.
+
+## Windows Media Foundation adapter slice
+
+- Added the workspace package `seeed-hal-adapter-mediafoundation`. It uses the
+  existing target-scoped `windows` 0.58 bindings, with the adapter-local
+  `windows-core` dependency required by the binding's COM implementation macro.
+- On Windows, discovery initializes COM/MF on the calling blocking worker and
+  uses `MFEnumDeviceSources` with the video-capture source type. The Media
+  Foundation video-capture symbolic link is both the transient endpoint and
+  verifiable identity evidence; its percent-encoded value creates a
+  `Medium`-quality resource ID. Enumeration order is never used as identity.
+- `open` re-enumerates, resolves the selected descriptor, and claims its
+  resource ID exclusively per adapter instance. The native worker re-enumerates
+  the symbolic link before activation, initializes COM/MF, creates a Source
+  Reader configured with `MF_SOURCE_READER_ASYNC_CALLBACK`, and requires the
+  actual output type to exactly match requested dimensions and NV12/YUY2/MJPG
+  subtype. Missing/invalid stride, format, source, or API operation fails
+  closed.
+- Capture uses an asynchronous Source Reader callback and a bounded native
+  worker receive loop; it does not issue synchronous `ReadSample`. The receipt
+  timestamp uses `Instant`, sequence starts at one and increments only after a
+  valid frame. It validates buffer pointer/length, public 24 MiB bound,
+  format-specific plane geometry and stride, locks each MF buffer once, then
+  performs one copy into `CameraFrame`.
+- `close` raises a shutdown fence, cancels outstanding asynchronous read with
+  `Flush`, joins the worker through `spawn_blocking` with a one-second bound,
+  and releases the adapter claim. Controls are not advertised; all control
+  operations return stable `camera.control.unsupported`.
+- On non-Windows platforms, `enumerate` and `open` return stable
+  `runtime.adapter.unavailable` before any native discovery or probing.
+  The `hardware-tests` feature provides an ignored test selected by
+  `SEEED_HAL_CAMERA_RESOURCE_ID`; it is not hardware qualification evidence.
+
+## Media Foundation TDD evidence
+
+- Red:
+  `cargo test -p seeed-hal-adapter-mediafoundation --all-features` initially
+  failed while compiling the test-first crate because `expect_err` required
+  `Debug` on `Box<dyn CameraCaptureSession>`. The test was changed to an
+  explicit `match`, then failed before the platform-gated adapter behavior was
+  wired in.
+- Green:
+  after implementing the platform gate and symbolic-link identity helper,
+  `cargo test -p seeed-hal-adapter-mediafoundation --all-features` passed the
+  empty-identity, percent-encoding, and no-probe non-Windows tests.
+- Windows compilation then exposed three binding-boundary defects (the
+  `MFEnumDeviceSources` borrow, non-`Send` activation object crossing a
+  thread, and buffer-unlock result handling). The worker now transfers only
+  the symbolic link across threads, re-enumerates/activates on its native
+  worker, and pairs every successful buffer lock with `Unlock`.
+
+## Media Foundation verification
+
+- Passed:
+  `cargo fmt --all --check`
+- Passed:
+  `cargo test -p seeed-hal-adapter-mediafoundation --all-features`
+- Passed:
+  `cargo clippy -p seeed-hal-adapter-mediafoundation --all-targets --all-features -- -D warnings`
+- Passed:
+  `cargo check -p seeed-hal-adapter-mediafoundation --target x86_64-pc-windows-gnu`
+
+## Media Foundation limitations
+
+- The cross-target check validates Rust and Windows binding type correctness,
+  but this macOS host cannot exercise the Windows Media Foundation runtime,
+  privacy authorization flow, device driver behavior, or ignored hardware
+  test.
+- Capture uses Media Foundation's documented asynchronous Source Reader
+  callback and `Flush` cancellation contract. Real-device qualification must
+  still verify prompt driver cancellation/hot-unplug behavior and each
+  advertised source format on supported Windows releases.
