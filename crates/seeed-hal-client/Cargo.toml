@@ -18,6 +18,7 @@ seeed-hal-protocol = { path = "../seeed-hal-protocol" }
 seeed-hal-runtime = { path = "../seeed-hal-runtime" }
 seeed-hal-serial = { path = "../seeed-hal-serial" }
 seeed-hal-usb = { path = "../seeed-hal-usb" }
+subtle = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 zeroize = { workspace = true }

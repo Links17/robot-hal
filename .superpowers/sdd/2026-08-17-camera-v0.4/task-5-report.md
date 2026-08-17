@@ -70,3 +70,35 @@
 - Red: `cargo test -p seeed-hal-adapter-shared-memory independently_reopened_mapping_only_returns_an_owned_copy`
   failed to compile because validated mapping layout exposed no `slot_count`.
 - Green: reran those focused commands successfully after the minimum fixes.
+
+### Important defect fixes
+
+- Rust `RemoteCameraHandle` now retains the mapping identity returned by its own
+  `mapping_descriptor()` call. `open_mapping()` and `next_frame_lease()` reject
+  a descriptor with any other identity as `runtime.argument.invalid` before
+  admitting `camera_next_frame_lease_request`; cloning the current session's
+  authenticated descriptor continues to work. The mapping remains copy-only.
+- Python keeps the mapping-reader implementation internal. Without the built-in
+  verified local reader, both public acquisition APIs (`next_frame()` and
+  `next_frame_lease()`) now fail as `shared_memory.unavailable` before their
+  lease RPC, so they cannot pin a broker slot that Python cannot read.
+
+### Defect TDD commands
+
+- Rust red:
+  `cargo test -p seeed-hal-client --test client_contract camera_rejects_another_session_mapping_before_frame_lease_admission`
+  failed because the fake broker observed `CameraNextFrameLeaseRequest`.
+- Rust green: reran the same command successfully after binding the accepted
+  mapping identity to each `RemoteCameraHandle`.
+- Python red:
+  `uv run pytest tests/test_camera_contract.py -k 'frame_acquisition_without_a_local_mapping_reader'`
+  failed because both public paths sent `camera_next_frame_lease_request`.
+- Python green: reran the same command successfully after adding the local
+  reader precondition.
+- Coverage:
+  `cargo fmt --all --check`;
+  `cargo clippy -p seeed-hal-client --tests -- -D warnings`;
+  `cargo test -p seeed-hal-client --test client_contract`;
+  `cargo test -p seeed-hal-protocol`;
+  `cargo test -p seeed-hal-adapter-shared-memory`; and
+  `uv run pytest tests/test_camera_contract.py`.

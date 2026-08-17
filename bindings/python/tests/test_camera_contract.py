@@ -27,6 +27,91 @@ class _BytesMappingReader:
         return bytearray(b"frame")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("acquire", ["next_frame", "next_frame_lease"])
+async def test_frame_acquisition_without_a_local_mapping_reader_fails_before_lease_rpc(
+    acquire: str,
+) -> None:
+    capabilities = ["camera.capture/v1", "camera.frames.shm/v1"]
+
+    async def handler(reader, writer):
+        request = hal_pb2.Envelope.FromString(await read_frame(reader))
+        assert request.WhichOneof("payload") == "enumerate_camera_request"
+        await send_frame(
+            writer,
+            envelope(
+                request.request_id,
+                "enumerate_camera_response",
+                hal_pb2.EnumerateCameraResponse(
+                    resources=[
+                        hal_pb2.ResourceDescriptor(
+                            resource_id="camera:virtual:no-reader",
+                            endpoint="virtual://camera:no-reader",
+                            identity_quality=hal_pb2.IDENTITY_QUALITY_STRONG,
+                            transport=hal_pb2.TRANSPORT_KIND_CAMERA,
+                            capabilities=capabilities,
+                        )
+                    ]
+                ),
+            ).SerializeToString(),
+        )
+        request = hal_pb2.Envelope.FromString(await read_frame(reader))
+        assert request.WhichOneof("payload") == "open_camera_request"
+        await send_frame(
+            writer,
+            envelope(
+                request.request_id,
+                "open_camera_response",
+                hal_pb2.OpenCameraResponse(
+                    session_id="camera-no-reader",
+                    lease=hal_pb2.LeaseToken(
+                        lease_id="camera-no-reader-lease",
+                        generation=1,
+                        mode=hal_pb2.LEASE_MODE_CONTROL,
+                    ),
+                ),
+            ).SerializeToString(),
+        )
+        request = hal_pb2.Envelope.FromString(await read_frame(reader))
+        assert request.WhichOneof("payload") == "camera_mapping_descriptor_request"
+        await send_frame(
+            writer,
+            envelope(
+                request.request_id,
+                "camera_mapping_descriptor_response",
+                hal_pb2.CameraMappingDescriptorResponse(
+                    descriptor=hal_pb2.MappingDescriptor(
+                        mapping_name="camera-no-reader-mapping",
+                        mapping_identity=b"i" * 32,
+                        capability_token=b"t" * 32,
+                        total_length=4096,
+                    )
+                ),
+            ).SerializeToString(),
+        )
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(read_frame(reader), timeout=0.1)
+
+    async with fake_broker(
+        handler,
+        selected_minor=3,
+        minimum_minor=3,
+        maximum_minor=3,
+        capabilities=["serial.bytes/v1", *capabilities],
+    ) as endpoint:
+        from seeed_hal import HalClient
+
+        client = await HalClient.connect(endpoint, TOKEN)
+        resource = (await client.enumerate_camera())[0]
+        session = await client.open_camera(
+            resource.selector(), CameraFormat(PixelFormat.NV12, 640, 480)
+        )
+        await session.mapping_descriptor()
+        with pytest.raises(HalError, match="shared_memory.unavailable"):
+            await getattr(session, acquire)()
+        await client.close()
+
+
 def test_camera_public_values_redact_tokens_and_expose_no_callback_constructed_borrowed_frames() -> None:
     assert {
         "CameraFormat",
@@ -224,6 +309,7 @@ async def test_malformed_camera_frame_lease_terminates_the_python_client() -> No
         session = await client.open_camera(
             resource.selector(), CameraFormat(PixelFormat.NV12, 640, 480)
         )
+        session._mapping_reader = _BytesMappingReader()
         with pytest.raises(HalError, match="runtime.protocol.invalid_message"):
             await session.next_frame_lease()
         assert client._terminal is not None
@@ -381,12 +467,12 @@ async def test_camera_fake_broker_wires_capture_mapping_lease_controls_and_close
         await session.capture(1)
         descriptor = await session.mapping_descriptor()
         assert b"t" * 32 not in repr(descriptor).encode()
+        session._mapping_reader = _BytesMappingReader()
         lease = await session.next_frame_lease()
         assert lease == FrameLease(0, 1, 1)
         frame = await session.next_frame()
         assert frame is not None
-        with pytest.raises(HalError, match="shared-memory reader unavailable"):
-            frame.copy_bytes()
+        assert frame.copy_bytes() == b"frame"
         assert (await session.get_control(seeed_hal.ControlKind.EXPOSURE)).integer == 42
         await session.set_control(seeed_hal.ControlKind.EXPOSURE, seeed_hal.ControlValue(integer=43))
         await session.set_auto(seeed_hal.ControlKind.EXPOSURE, True)

@@ -1535,6 +1535,163 @@ async fn legacy_minor_zero_rejects_can_before_writer_admission() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn camera_rejects_another_session_mapping_before_frame_lease_admission() {
+    use futures_util::StreamExt;
+    use seeed_hal_camera::{CameraFormat, CameraPixelFormat, CameraRequest};
+    use seeed_hal_protocol::v1::{self, envelope};
+    use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+    let endpoint = fake::endpoint("camera-cross-session-mapping");
+    let listener = fake::bind(&endpoint);
+    let server = tokio::spawn(async move {
+        let (io, _) = test_deadline(listener.accept(), "fake broker must accept the client")
+            .await
+            .unwrap();
+        let mut wire = Framed::new(
+            io,
+            LengthDelimitedCodec::builder()
+                .max_frame_length(seeed_hal_protocol::MAX_FRAME_BYTES)
+                .new_codec(),
+        );
+        let handshake = fake::recv(&mut wire).await;
+        fake::send(
+            &mut wire,
+            v1::Envelope {
+                request_id: handshake.request_id,
+                payload: Some(envelope::Payload::HandshakeResponse(
+                    v1::HandshakeResponse {
+                        protocol_major: 1,
+                        protocol_minor: 3,
+                        capabilities: vec![
+                            "serial.bytes/v1".to_owned(),
+                            "camera.capture/v1".to_owned(),
+                            "camera.frames.shm/v1".to_owned(),
+                        ],
+                        max_frame_bytes: seeed_hal_protocol::MAX_FRAME_BYTES as u32,
+                        max_read_bytes: 64 * 1024,
+                        max_write_bytes: 64 * 1024,
+                        protocol_minor_minimum: 3,
+                        protocol_minor_maximum: 3,
+                    },
+                )),
+            },
+        )
+        .await;
+        let enumerate = fake::recv(&mut wire).await;
+        fake::send(
+            &mut wire,
+            v1::Envelope {
+                request_id: enumerate.request_id,
+                payload: Some(envelope::Payload::EnumerateCameraResponse(
+                    v1::EnumerateCameraResponse {
+                        resources: vec![v1::ResourceDescriptor {
+                            resource_id: "camera:fake:cross-session".to_owned(),
+                            endpoint: "virtual://camera:cross-session".to_owned(),
+                            identity_quality: v1::IdentityQuality::Strong as i32,
+                            transport: v1::TransportKind::Camera as i32,
+                            properties: Default::default(),
+                            capabilities: vec![
+                                "camera.capture/v1".to_owned(),
+                                "camera.frames.shm/v1".to_owned(),
+                            ],
+                        }],
+                    },
+                )),
+            },
+        )
+        .await;
+        for session_id in ["camera-a", "camera-b"] {
+            let open = fake::recv(&mut wire).await;
+            fake::send(
+                &mut wire,
+                v1::Envelope {
+                    request_id: open.request_id,
+                    payload: Some(envelope::Payload::OpenCameraResponse(
+                        v1::OpenCameraResponse {
+                            session_id: session_id.to_owned(),
+                            lease: Some(v1::LeaseToken {
+                                lease_id: format!("{session_id}-lease"),
+                                generation: 1,
+                                mode: v1::LeaseMode::Control as i32,
+                            }),
+                        },
+                    )),
+                },
+            )
+            .await;
+        }
+        let mapping = fake::recv(&mut wire).await;
+        fake::send(
+            &mut wire,
+            v1::Envelope {
+                request_id: mapping.request_id,
+                payload: Some(envelope::Payload::CameraMappingDescriptorResponse(
+                    v1::CameraMappingDescriptorResponse {
+                        descriptor: Some(v1::MappingDescriptor {
+                            mapping_name: "camera-cross-session-a".to_owned(),
+                            mapping_identity: vec![0xA1; 32],
+                            capability_token: vec![0xA2; 32],
+                            total_length: 4096,
+                        }),
+                    },
+                )),
+            },
+        )
+        .await;
+        let mapping = fake::recv(&mut wire).await;
+        fake::send(
+            &mut wire,
+            v1::Envelope {
+                request_id: mapping.request_id,
+                payload: Some(envelope::Payload::CameraMappingDescriptorResponse(
+                    v1::CameraMappingDescriptorResponse {
+                        descriptor: Some(v1::MappingDescriptor {
+                            mapping_name: "camera-cross-session-b".to_owned(),
+                            mapping_identity: vec![0xB1; 32],
+                            capability_token: vec![0xB2; 32],
+                            total_length: 4096,
+                        }),
+                    },
+                )),
+            },
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), wire.next())
+                .await
+                .is_err(),
+            "a cross-session mapping must reject before CameraNextFrameLease admission"
+        );
+    });
+    let client = HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN))
+        .await
+        .unwrap();
+    let descriptor = client.enumerate_camera().await.unwrap().remove(0);
+    let request = CameraRequest::new(
+        CameraFormat::new(CameraPixelFormat::Nv12, 640, 480).unwrap(),
+        4,
+    )
+    .unwrap();
+    let camera_a = client
+        .open_camera(descriptor.selector(), request.clone())
+        .await
+        .unwrap();
+    let camera_b = client
+        .open_camera(descriptor.selector(), request)
+        .await
+        .unwrap();
+    let descriptor_a = camera_a.mapping_descriptor().await.unwrap();
+    let _descriptor_b = camera_b.mapping_descriptor().await.unwrap();
+    let error = camera_b.next_frame_lease(&descriptor_a).await.unwrap_err();
+    assert_eq!(error.name().as_str(), "runtime.argument.invalid");
+    assert_eq!(error.operation().as_str(), "camera.next_frame_lease");
+    server.await.unwrap();
+    client.close().await.unwrap();
+    std::fs::remove_file(endpoint).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn real_broker_owner_disconnect_revokes_remote_can_session() {
     use seeed_hal_broker::{Broker, StartupToken, listener::UnixBroker};
     use seeed_hal_can::{CanFilterSet, CanLinkExpectation, CanMode, CanOpenConfig};

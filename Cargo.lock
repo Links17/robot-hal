@@ -1232,6 +1232,7 @@ dependencies = [
  "seeed-hal-serial",
  "seeed-hal-testkit",
  "seeed-hal-usb",
+ "subtle",
  "tokio",
  "tokio-util",
  "zeroize",

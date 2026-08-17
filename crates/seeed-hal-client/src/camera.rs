@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Mutex, time::Duration};
 
 use seeed_hal_adapter_shared_memory::{FrameLease, MappingDescriptor, ReadOnlyMapping};
 use seeed_hal_camera::{CameraControlKind, CameraControlValue};
@@ -9,6 +9,7 @@ use seeed_hal_protocol::{
     camera_controls_response_from_proto, camera_mapping_descriptor_from_proto,
     camera_next_frame_lease_response_from_proto, camera_open_response_from_proto,
 };
+use subtle::ConstantTimeEq;
 
 use crate::HalClient;
 use crate::connection::ExpectedResponse;
@@ -21,6 +22,7 @@ pub struct RemoteCameraHandle {
     session_id: SessionId,
     lease: LeaseToken,
     closed: bool,
+    mapping_descriptor: Mutex<Option<MappingDescriptor>>,
 }
 
 impl RemoteCameraHandle {
@@ -37,6 +39,7 @@ impl RemoteCameraHandle {
             session_id,
             lease,
             closed: false,
+            mapping_descriptor: Mutex::new(None),
         })
     }
 
@@ -106,6 +109,13 @@ impl RemoteCameraHandle {
         if let Err(error) = &result {
             self.client.fail(error.clone());
         }
+        if let Ok(descriptor) = &result {
+            *self
+                .mapping_descriptor
+                .lock()
+                .expect("camera mapping descriptor mutex is not poisoned") =
+                Some(descriptor.clone());
+        }
         result
     }
 
@@ -115,6 +125,7 @@ impl RemoteCameraHandle {
         self.ensure_open("camera.mapping.open")?;
         self.client
             .require_camera_frames_shm("camera.mapping.open", &self.resource_id)?;
+        self.ensure_current_mapping(descriptor, "camera.mapping.open")?;
         ReadOnlyMapping::open(descriptor).map_err(|error| attach_resource(error, &self.resource_id))
     }
 
@@ -125,6 +136,7 @@ impl RemoteCameraHandle {
         self.ensure_open("camera.next_frame_lease")?;
         self.client
             .require_camera_frames_shm("camera.next_frame_lease", &self.resource_id)?;
+        self.ensure_current_mapping(descriptor, "camera.next_frame_lease")?;
         let payload = self
             .send(
                 envelope::Payload::CameraNextFrameLeaseRequest(v1::CameraNextFrameLeaseRequest {
@@ -339,6 +351,34 @@ impl RemoteCameraHandle {
         HalError::new(name, category, operation, false, message)
             .expect("static Camera client error metadata is valid")
             .with_resource_id(self.resource_id.clone())
+    }
+
+    fn ensure_current_mapping(
+        &self,
+        descriptor: &MappingDescriptor,
+        operation: &'static str,
+    ) -> HalResult<()> {
+        let mapping = self
+            .mapping_descriptor
+            .lock()
+            .expect("camera mapping descriptor mutex is not poisoned");
+        if mapping.as_ref().is_some_and(|current| {
+            current.mapping_name() == descriptor.mapping_name()
+                && current.mapping_identity() == descriptor.mapping_identity()
+                && current
+                    .capability_token_bytes()
+                    .ct_eq(descriptor.capability_token_bytes())
+                    .into()
+                && current.total_length() == descriptor.total_length()
+        }) {
+            return Ok(());
+        }
+        Err(self.local_error(
+            "runtime.argument.invalid",
+            ErrorCategory::InvalidArgument,
+            operation,
+            "camera mapping descriptor does not belong to this session",
+        ))
     }
 }
 

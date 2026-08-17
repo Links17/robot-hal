@@ -124,6 +124,17 @@ class _UnavailableMappingReader:
         )
 
 
+def _mapping_reader_unavailable(operation: str, resource_id: str) -> HalError:
+    return HalError(
+        "shared_memory.unavailable",
+        ErrorCategory.UNAVAILABLE,
+        operation,
+        False,
+        "shared-memory reader unavailable",
+        resource_id=resource_id,
+    )
+
+
 class _BorrowedFrame:
     """Copy-only read access; data must not outlive its session generation."""
 
@@ -200,12 +211,14 @@ class CameraSession:
 
     async def next_frame_lease(self) -> FrameLease | None:
         self._ensure_open("camera.next_frame_lease")
+        self._ensure_mapping_reader("camera.next_frame_lease")
         assert self._client is not None
         return await self._client._camera_next_frame_lease(self)
 
     async def next_frame(self) -> _BorrowedFrame | None:
         """Acquires the next copy-only frame borrow, invalidating the preceding borrow."""
         self._ensure_open("camera.next_frame")
+        self._ensure_mapping_reader("camera.next_frame")
         descriptor = self._mapping_descriptor
         if descriptor is None:
             descriptor = await self.mapping_descriptor()
@@ -265,6 +278,10 @@ class CameraSession:
             and lease.generation == self._generation
             and epoch == self._borrow_epoch
         )
+
+    def _ensure_mapping_reader(self, operation: str) -> None:
+        if isinstance(self._mapping_reader, _UnavailableMappingReader):
+            raise _mapping_reader_unavailable(operation, self._resource_id)
 
     def _ensure_open(self, operation: str) -> None:
         if self._closed:
