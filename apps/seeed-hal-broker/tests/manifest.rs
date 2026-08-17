@@ -51,6 +51,25 @@ fn manifest_is_deterministic_business_independent_and_hardware_free() {
         expected_adapters.push("socketcan");
         expected_features.push("socketcan");
     }
+    #[cfg(all(feature = "nusb", not(feature = "virtual-adapters")))]
+    {
+        expected_adapters.push("nusb");
+        expected_features.push("nusb");
+    }
+    #[cfg(all(
+        feature = "linux-gpio",
+        target_os = "linux",
+        not(feature = "virtual-adapters")
+    ))]
+    {
+        expected_adapters.push("linux-gpio");
+        expected_features.push("linux-gpio");
+    }
+    #[cfg(all(feature = "windows-gpio", windows, not(feature = "virtual-adapters")))]
+    {
+        expected_adapters.push("windows-gpio");
+        expected_features.push("windows-gpio");
+    }
     #[cfg(feature = "virtual-adapters")]
     {
         expected_adapters.extend([

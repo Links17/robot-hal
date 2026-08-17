@@ -85,6 +85,16 @@ fn enabled_adapters() -> Vec<&'static str> {
     adapters.push("pcan");
     #[cfg(feature = "socketcan")]
     adapters.push("socketcan");
+    #[cfg(all(feature = "nusb", not(feature = "virtual-adapters")))]
+    adapters.push("nusb");
+    #[cfg(all(
+        feature = "linux-gpio",
+        target_os = "linux",
+        not(feature = "virtual-adapters")
+    ))]
+    adapters.push("linux-gpio");
+    #[cfg(all(feature = "windows-gpio", windows, not(feature = "virtual-adapters")))]
+    adapters.push("windows-gpio");
     #[cfg(feature = "virtual-adapters")]
     adapters.extend([
         "virtual-can",
@@ -104,6 +114,16 @@ fn enabled_features() -> Vec<&'static str> {
     features.push("pcan");
     #[cfg(feature = "socketcan")]
     features.push("socketcan");
+    #[cfg(all(feature = "nusb", not(feature = "virtual-adapters")))]
+    features.push("nusb");
+    #[cfg(all(
+        feature = "linux-gpio",
+        target_os = "linux",
+        not(feature = "virtual-adapters")
+    ))]
+    features.push("linux-gpio");
+    #[cfg(all(feature = "windows-gpio", windows, not(feature = "virtual-adapters")))]
+    features.push("windows-gpio");
     #[cfg(feature = "virtual-adapters")]
     features.push("virtual-adapters");
     features

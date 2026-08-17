@@ -2,6 +2,9 @@
 resolver = "3"
 members = [
     "adapters/pcan",
+    "adapters/nusb",
+    "adapters/linux-gpio",
+    "adapters/windows-gpio",
     "adapters/socketcan",
     "adapters/serialport",
     "adapters/windows-file",

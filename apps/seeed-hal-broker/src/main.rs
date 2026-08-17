@@ -7,12 +7,22 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, ValueEnum};
+#[cfg(all(
+    feature = "linux-gpio",
+    target_os = "linux",
+    not(feature = "virtual-adapters")
+))]
+use seeed_hal_adapter_linux_gpio::LinuxGpioAdapter;
+#[cfg(all(feature = "nusb", not(feature = "virtual-adapters")))]
+use seeed_hal_adapter_nusb::NusbAdapter;
 #[cfg(feature = "pcan")]
 use seeed_hal_adapter_pcan::PcanAdapter;
 #[cfg(feature = "serialport")]
 use seeed_hal_adapter_serialport::SerialPortAdapter;
 #[cfg(feature = "socketcan")]
 use seeed_hal_adapter_socketcan::SocketCanAdapter;
+#[cfg(all(feature = "windows-gpio", windows, not(feature = "virtual-adapters")))]
+use seeed_hal_adapter_windows_gpio::WindowsGpioAdapter;
 use seeed_hal_broker::Broker;
 use seeed_hal_runtime::HalRuntime;
 use serde::Serialize;
@@ -103,6 +113,22 @@ fn build_runtime(required: &[RequiredAdapter]) -> Result<HalRuntime, Box<dyn std
     #[cfg(feature = "socketcan")]
     {
         builder = builder.can_adapter(SocketCanAdapter::new());
+    }
+    #[cfg(all(feature = "nusb", not(feature = "virtual-adapters")))]
+    {
+        builder = builder.usb_adapter(NusbAdapter::new());
+    }
+    #[cfg(all(
+        feature = "linux-gpio",
+        target_os = "linux",
+        not(feature = "virtual-adapters")
+    ))]
+    {
+        builder = builder.gpio_adapter(LinuxGpioAdapter::new());
+    }
+    #[cfg(all(feature = "windows-gpio", windows, not(feature = "virtual-adapters")))]
+    {
+        builder = builder.gpio_adapter(WindowsGpioAdapter::new());
     }
     #[cfg(feature = "virtual-adapters")]
     {

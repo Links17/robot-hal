@@ -40,6 +40,26 @@ jobs:
           cargo test -p seeed-hal-broker-app --no-default-features --test manifest
           cargo test -p seeed-hal-broker-app --features virtual-adapters --test manifest
           cargo test -p seeed-hal-broker-app --features socketcan,pcan,virtual-adapters --test manifest
+          cargo test -p seeed-hal-broker-app --features nusb --test manifest
+      - name: Check native adapter target paths
+        if: ${{ steps.workspace.outputs.has-packages == 'true' }}
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            cargo clippy -p seeed-hal-adapter-linux-gpio --all-targets -- -D warnings
+            cargo clippy -p seeed-hal-adapter-nusb --all-targets -- -D warnings
+          fi
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            cargo clippy -p seeed-hal-adapter-windows-gpio --all-targets -- -D warnings
+            cargo clippy -p seeed-hal-adapter-nusb --all-targets -- -D warnings
+          fi
+      - name: Confirm native hardware tests remain ignored
+        if: ${{ steps.workspace.outputs.has-packages == 'true' }}
+        shell: bash
+        run: |
+          cargo test -p seeed-hal-adapter-nusb --test hardware
+          cargo test -p seeed-hal-adapter-linux-gpio --test hardware
+          cargo test -p seeed-hal-adapter-windows-gpio --test hardware
       - name: Build broker conformance executable
         if: ${{ steps.workspace.outputs.has-packages == 'true' }}
         run: cargo build -p seeed-hal-broker-app --features virtual-adapters

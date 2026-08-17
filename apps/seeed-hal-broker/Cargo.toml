@@ -11,6 +11,9 @@ default = ["serialport"]
 pcan = ["dep:seeed-hal-adapter-pcan"]
 serialport = ["dep:seeed-hal-adapter-serialport"]
 socketcan = ["dep:seeed-hal-adapter-socketcan"]
+nusb = ["dep:seeed-hal-adapter-nusb"]
+linux-gpio = ["dep:seeed-hal-adapter-linux-gpio"]
+windows-gpio = ["dep:seeed-hal-adapter-windows-gpio"]
 virtual-adapters = ["dep:seeed-hal-testkit"]
 
 [[bin]]
@@ -22,6 +25,9 @@ clap = { workspace = true }
 seeed-hal-adapter-serialport = { path = "../../adapters/serialport", optional = true }
 seeed-hal-adapter-pcan = { path = "../../adapters/pcan", optional = true }
 seeed-hal-adapter-socketcan = { path = "../../adapters/socketcan", optional = true }
+seeed-hal-adapter-nusb = { path = "../../adapters/nusb", optional = true }
+seeed-hal-adapter-linux-gpio = { path = "../../adapters/linux-gpio", optional = true }
+seeed-hal-adapter-windows-gpio = { path = "../../adapters/windows-gpio", optional = true }
 seeed-hal-broker = { path = "../../crates/seeed-hal-broker" }
 seeed-hal-core = { path = "../../crates/seeed-hal-core" }
 seeed-hal-protocol = { path = "../../crates/seeed-hal-protocol" }
