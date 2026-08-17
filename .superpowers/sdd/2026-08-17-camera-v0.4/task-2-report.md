@@ -2,7 +2,7 @@
 
 ## Commit
 
-Pending.
+`63c59f9 feat(camera): add public capture contract`
 
 ## Modified files
 
