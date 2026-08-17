@@ -234,3 +234,145 @@ async fn usb_runtime_rejects_full_queue_without_waiting_for_native_io() {
     }
     handle.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn usb_close_times_out_while_transfer_blocks_and_keeps_claim_exclusive() {
+    let adapter = BlockingUsbAdapter::new("usb:runtime:close-timeout");
+    let runtime = HalRuntime::builder()
+        .usb_adapter(adapter.clone())
+        .usb_close_timeout(Duration::from_millis(20))
+        .build();
+    let descriptor = runtime.enumerate_usb().await.unwrap().remove(0);
+    let owner = OwnerId::parse("owner:usb-close-timeout").unwrap();
+    let mut handle = runtime
+        .open_usb(owner.clone(), descriptor.selector(), 0)
+        .await
+        .unwrap();
+    let started = adapter.transfer_started.notified();
+    let transfer = {
+        let runtime = runtime.clone();
+        let session = handle.session_id();
+        let lease = handle.lease_token().clone();
+        tokio::spawn(async move {
+            runtime
+                .usb_transfer(
+                    session,
+                    &lease,
+                    UsbTransfer::bulk_in(0x81, 1).unwrap(),
+                    Duration::from_secs(60),
+                )
+                .await
+        })
+    };
+    started.await;
+
+    assert_eq!(
+        handle.close().await.unwrap_err().name().as_str(),
+        "runtime.session.close_timeout"
+    );
+    let reuse = runtime
+        .open_usb(
+            OwnerId::parse("owner:usb-reuse-before-worker-exits").unwrap(),
+            descriptor.selector(),
+            0,
+        )
+        .await;
+    assert_eq!(
+        reuse.err().unwrap().name().as_str(),
+        "runtime.lease.conflict"
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(20), transfer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err()
+            .name()
+            .as_str(),
+        "runtime.session.closed"
+    );
+
+    adapter.release_transfer.add_permits(1);
+    let mut replacement = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match runtime
+                .open_usb(
+                    OwnerId::parse("owner:usb-reuse-after-worker-exits").unwrap(),
+                    descriptor.selector(),
+                    0,
+                )
+                .await
+            {
+                Ok(handle) => return handle,
+                Err(error) if error.name().as_str() == "runtime.lease.conflict" => {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("unexpected open error: {error:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    replacement.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn usb_cancelled_queued_transfer_does_not_start_native_io() {
+    let adapter = BlockingUsbAdapter::new("usb:runtime:cancelled-queue");
+    let runtime = HalRuntime::builder().usb_adapter(adapter.clone()).build();
+    let descriptor = runtime.enumerate_usb().await.unwrap().remove(0);
+    let mut handle = runtime
+        .open_usb(
+            OwnerId::parse("owner:usb-cancelled-queue").unwrap(),
+            descriptor.selector(),
+            0,
+        )
+        .await
+        .unwrap();
+    let started = adapter.transfer_started.notified();
+    let first = {
+        let runtime = runtime.clone();
+        let session = handle.session_id();
+        let lease = handle.lease_token().clone();
+        tokio::spawn(async move {
+            runtime
+                .usb_transfer(
+                    session,
+                    &lease,
+                    UsbTransfer::bulk_in(0x81, 1).unwrap(),
+                    Duration::from_secs(60),
+                )
+                .await
+        })
+    };
+    started.await;
+    let cancelled = {
+        let runtime = runtime.clone();
+        let session = handle.session_id();
+        let lease = handle.lease_token().clone();
+        tokio::spawn(async move {
+            runtime
+                .usb_transfer(
+                    session,
+                    &lease,
+                    UsbTransfer::bulk_in(0x81, 1).unwrap(),
+                    Duration::from_secs(60),
+                )
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    cancelled.abort();
+    adapter.release_transfer.add_permits(1);
+    first.await.unwrap().unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            adapter.transfer_started.notified()
+        )
+        .await
+        .is_err(),
+        "a cancelled queued transfer must not reach the native session"
+    );
+    handle.close().await.unwrap();
+}

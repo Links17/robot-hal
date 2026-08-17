@@ -9,10 +9,7 @@ use seeed_hal_gpio::{
 use std::{
     collections::HashMap,
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::Duration,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
@@ -33,7 +30,8 @@ struct State {
 }
 pub(crate) struct GpioManager {
     adapter: Option<Arc<dyn GpioAdapter>>,
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
+    close_timeout: Duration,
 }
 
 enum GpioCommand {
@@ -70,7 +68,7 @@ impl GpioCommand {
 #[derive(Clone)]
 struct GpioWorker {
     commands: mpsc::Sender<GpioCommand>,
-    shutdown: Arc<AtomicBool>,
+    shutdown: watch::Sender<bool>,
     completion: watch::Receiver<Option<HalResult<()>>>,
 }
 
@@ -91,7 +89,11 @@ impl GpioWorker {
     }
 
     fn request_close(&self) {
-        self.shutdown.store(true, Ordering::Release);
+        let _ = self.shutdown.send(true);
+    }
+
+    fn is_closing(&self) -> bool {
+        *self.shutdown.borrow()
     }
 
     fn is_finished(&self) -> bool {
@@ -129,8 +131,7 @@ fn spawn_worker(
     let (commands, mut command_rx) = mpsc::channel::<GpioCommand>(COMMAND_QUEUE_CAPACITY);
     let (opened_tx, opened_rx) = oneshot::channel();
     let (completion_tx, completion) = watch::channel(None);
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let worker_shutdown = Arc::clone(&shutdown);
+    let (shutdown, worker_shutdown) = watch::channel(false);
     let name = format!("seeed-hal-gpio-{}", selector.id().as_str());
     std::thread::Builder::new()
         .name(name)
@@ -146,7 +147,7 @@ fn spawn_worker(
                         return Err(error);
                     }
                 };
-                while !worker_shutdown.load(Ordering::Acquire) {
+                while !*worker_shutdown.borrow() {
                     let command = match command_rx.try_recv() {
                         Ok(command) => command,
                         Err(mpsc::error::TryRecvError::Empty) => {
@@ -155,7 +156,7 @@ fn spawn_worker(
                         }
                         Err(mpsc::error::TryRecvError::Disconnected) => break,
                     };
-                    if worker_shutdown.load(Ordering::Acquire) {
+                    if *worker_shutdown.borrow() {
                         command.reject_closed();
                         break;
                     }
@@ -231,11 +232,33 @@ fn session_closed(operation: &'static str) -> seeed_hal_core::HalError {
 }
 
 impl GpioManager {
-    pub(crate) fn new(adapter: Option<Arc<dyn GpioAdapter>>) -> Self {
+    pub(crate) fn new(adapter: Option<Arc<dyn GpioAdapter>>, close_timeout: Duration) -> Self {
         Self {
             adapter,
-            state: Mutex::new(State::default()),
+            state: Arc::new(Mutex::new(State::default())),
+            close_timeout,
         }
+    }
+
+    fn reap_when_finished(&self, id: SessionId, worker: GpioWorker) {
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            let _ = worker.wait_closed().await;
+            finish_session(&state, &id).await;
+        });
+    }
+
+    fn release_reservation_when_finished(
+        &self,
+        resource: ResourceId,
+        id: SessionId,
+        worker: GpioWorker,
+    ) {
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            let _ = worker.wait_closed().await;
+            state.lock().await.leases.release(&resource, &id);
+        });
     }
     fn adapter(&self, op: &'static str) -> HalResult<Arc<dyn GpioAdapter>> {
         self.adapter.clone().ok_or_else(|| {
@@ -280,18 +303,28 @@ impl GpioManager {
                 return Err(e);
             }
         };
-        if let Err(e) = opened
-            .await
-            .unwrap_or_else(|_| Err(actor_unavailable("gpio.open")))
-        {
-            self.state.lock().await.leases.release(descriptor.id(), &id);
-            return Err(e);
+        match tokio::time::timeout(self.close_timeout, opened).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => {
+                self.state.lock().await.leases.release(descriptor.id(), &id);
+                return Err(error);
+            }
+            Ok(Err(_)) => {
+                self.state.lock().await.leases.release(descriptor.id(), &id);
+                return Err(actor_unavailable("gpio.open"));
+            }
+            Err(_) => {
+                worker.request_close();
+                self.release_reservation_when_finished(descriptor.id().clone(), id, worker);
+                return Err(open_timeout("gpio.open", self.close_timeout)
+                    .with_resource_id(descriptor.id().clone()));
+            }
         }
         let mut s = self.state.lock().await;
         if !s.leases.commit(descriptor.id(), &id, &lease) {
             worker.request_close();
             drop(s);
-            let _ = worker.wait_closed().await;
+            self.release_reservation_when_finished(descriptor.id().clone(), id, worker);
             return Err(runtime_error(
                 "runtime.session.closed",
                 ErrorCategory::Conflict,
@@ -328,6 +361,9 @@ impl GpioManager {
                         .insert(id.clone(), (entry.resource.clone(), entry.owner));
                     return Err(actor_unavailable(op).with_resource_id(entry.resource));
                 }
+                if entry.worker.is_closing() {
+                    return Err(session_closed(op).with_resource_id(entry.resource.clone()));
+                }
                 Ok((entry.worker.clone(), entry.resource.clone()))
             }
             None => {
@@ -350,9 +386,8 @@ impl GpioManager {
         worker
             .try_enqueue(GpioCommand::Read { reply }, "gpio.read")
             .map_err(|error| error.with_resource_id(resource.clone()))?;
-        response
+        wait_for_reply(response, &worker, "gpio.read")
             .await
-            .unwrap_or_else(|_| Err(actor_unavailable("gpio.read")))
             .map_err(|error| error.with_resource_id(resource))
     }
     pub(crate) async fn write(
@@ -366,9 +401,8 @@ impl GpioManager {
         worker
             .try_enqueue(GpioCommand::Write { values, reply }, "gpio.write")
             .map_err(|error| error.with_resource_id(resource.clone()))?;
-        response
+        wait_for_reply(response, &worker, "gpio.write")
             .await
-            .unwrap_or_else(|_| Err(actor_unavailable("gpio.write")))
             .map_err(|error| error.with_resource_id(resource))
     }
     pub(crate) async fn next_edge(
@@ -390,30 +424,28 @@ impl GpioManager {
                 "gpio.next_edge",
             )
             .map_err(|error| error.with_resource_id(resource.clone()))?;
-        response
+        wait_for_reply(response, &worker, "gpio.next_edge")
             .await
-            .unwrap_or_else(|_| Err(actor_unavailable("gpio.next_edge")))
             .map_err(|error| error.with_resource_id(resource))
     }
     pub(crate) async fn close(&self, id: SessionId, lease: &LeaseToken) -> HalResult<()> {
         let (worker, resource) = self.session_worker(&id, lease, "gpio.close").await?;
-        let mut s = self.state.lock().await;
-        let e = s
-            .sessions
-            .remove(&id)
-            .expect("validated GPIO session remains active");
-        s.leases.release(&resource, &id);
-        s.closed.insert(id, (resource.clone(), e.owner));
-        drop(s);
         worker.request_close();
-        worker
-            .wait_closed()
-            .await
-            .map_err(|x| x.with_resource_id(resource))
+        self.reap_when_finished(id.clone(), worker.clone());
+        match tokio::time::timeout(self.close_timeout, worker.wait_closed()).await {
+            Ok(result) => {
+                let result = result.map_err(|error| error.with_resource_id(resource.clone()));
+                finish_session(&self.state, &id).await;
+                result
+            }
+            Err(_) => {
+                Err(close_timeout("gpio.close", self.close_timeout).with_resource_id(resource))
+            }
+        }
     }
     pub(crate) async fn revoke_owner(&self, owner: &OwnerId) -> HalResult<()> {
         let workers = {
-            let mut state = self.state.lock().await;
+            let state = self.state.lock().await;
             let ids = state
                 .sessions
                 .iter()
@@ -422,23 +454,75 @@ impl GpioManager {
                 .collect::<Vec<_>>();
             let mut workers = Vec::new();
             for id in ids {
-                if let Some(entry) = state.sessions.remove(&id) {
-                    state.leases.release(&entry.resource, &id);
-                    state
-                        .closed
-                        .insert(id, (entry.resource.clone(), entry.owner.clone()));
+                if let Some(entry) = state.sessions.get(&id) {
                     entry.worker.request_close();
-                    workers.push((entry.worker, entry.resource));
+                    workers.push((id, entry.worker.clone(), entry.resource.clone()));
                 }
             }
             workers
         };
-        for (worker, resource) in workers {
-            worker
-                .wait_closed()
-                .await
-                .map_err(|error| error.with_resource_id(resource))?;
+        for (id, worker, resource) in workers {
+            self.reap_when_finished(id.clone(), worker.clone());
+            match tokio::time::timeout(self.close_timeout, worker.wait_closed()).await {
+                Ok(result) => {
+                    result.map_err(|error| error.with_resource_id(resource.clone()))?;
+                    finish_session(&self.state, &id).await;
+                }
+                Err(_) => {
+                    return Err(close_timeout("gpio.revoke_owner", self.close_timeout)
+                        .with_resource_id(resource));
+                }
+            }
         }
         Ok(())
     }
+}
+
+async fn finish_session(state: &Mutex<State>, id: &SessionId) {
+    let mut state = state.lock().await;
+    if let Some(entry) = state.sessions.remove(id) {
+        state.leases.release(&entry.resource, id);
+        state
+            .closed
+            .insert(id.clone(), (entry.resource.clone(), entry.owner));
+    }
+}
+
+async fn wait_for_reply<T>(
+    response: oneshot::Receiver<HalResult<T>>,
+    worker: &GpioWorker,
+    operation: &'static str,
+) -> HalResult<T> {
+    let mut closing = worker.shutdown.subscribe();
+    tokio::select! {
+        result = response => result.unwrap_or_else(|_| Err(actor_unavailable(operation))),
+        changed = closing.changed() => {
+            let _ = changed;
+            Err(session_closed(operation))
+        }
+    }
+}
+
+fn close_timeout(operation: &'static str, timeout: Duration) -> seeed_hal_core::HalError {
+    runtime_error(
+        "runtime.session.close_timeout",
+        ErrorCategory::Unavailable,
+        operation,
+        false,
+        format!(
+            "GPIO worker did not release its native session within {timeout:?}; the resource remains quarantined"
+        ),
+    )
+}
+
+fn open_timeout(operation: &'static str, timeout: Duration) -> seeed_hal_core::HalError {
+    runtime_error(
+        "runtime.transport.timeout",
+        ErrorCategory::Unavailable,
+        operation,
+        true,
+        format!(
+            "GPIO worker did not finish opening within {timeout:?}; the resource remains quarantined"
+        ),
+    )
 }

@@ -42,7 +42,9 @@ pub struct HalRuntimeBuilder {
     can_tx_capacity: usize,
     can_close_timeout: Duration,
     usb_adapter: Option<Arc<dyn UsbAdapter>>,
+    usb_close_timeout: Duration,
     gpio_adapter: Option<Arc<dyn GpioAdapter>>,
+    gpio_close_timeout: Duration,
 }
 
 /// Maximum configurable frames in one session's software receive ring.
@@ -60,7 +62,9 @@ impl Default for HalRuntimeBuilder {
             can_tx_capacity: DEFAULT_CAN_TX_CAPACITY,
             can_close_timeout: Duration::from_secs(2),
             usb_adapter: None,
+            usb_close_timeout: Duration::from_secs(2),
             gpio_adapter: None,
+            gpio_close_timeout: Duration::from_secs(2),
         }
     }
 }
@@ -100,11 +104,26 @@ impl HalRuntimeBuilder {
         self.usb_adapter = Some(Arc::new(adapter));
         self
     }
+
+    /// Sets the finite deadline for USB worker cleanup. A worker that remains
+    /// blocked in backend I/O keeps its native session and lease quarantined.
+    pub fn usb_close_timeout(mut self, timeout: Duration) -> Self {
+        self.usb_close_timeout = timeout;
+        self
+    }
+
     pub fn gpio_adapter<A>(mut self, adapter: A) -> Self
     where
         A: GpioAdapter + 'static,
     {
         self.gpio_adapter = Some(Arc::new(adapter));
+        self
+    }
+
+    /// Sets the finite deadline for GPIO worker cleanup. A worker that remains
+    /// blocked in backend I/O keeps its native session and lease quarantined.
+    pub fn gpio_close_timeout(mut self, timeout: Duration) -> Self {
+        self.gpio_close_timeout = timeout;
         self
     }
 
@@ -147,8 +166,8 @@ impl HalRuntimeBuilder {
                 events,
                 serial_close_timeout: self.serial_close_timeout,
                 can_manager,
-                usb_manager: UsbManager::new(self.usb_adapter),
-                gpio_manager: GpioManager::new(self.gpio_adapter),
+                usb_manager: UsbManager::new(self.usb_adapter, self.usb_close_timeout),
+                gpio_manager: GpioManager::new(self.gpio_adapter, self.gpio_close_timeout),
             }),
         }
     }

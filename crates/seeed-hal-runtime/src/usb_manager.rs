@@ -8,10 +8,7 @@ use seeed_hal_usb::{UsbAdapter, UsbInterfaceClaim, UsbTransfer, usb_control_capa
 use std::{
     collections::HashMap,
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::Duration,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
@@ -32,7 +29,8 @@ struct State {
 }
 pub(crate) struct UsbManager {
     adapter: Option<Arc<dyn UsbAdapter>>,
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
+    close_timeout: Duration,
 }
 
 enum UsbCommand {
@@ -53,7 +51,7 @@ impl UsbCommand {
 #[derive(Clone)]
 struct UsbWorker {
     commands: mpsc::Sender<UsbCommand>,
-    shutdown: Arc<AtomicBool>,
+    shutdown: watch::Sender<bool>,
     completion: watch::Receiver<Option<HalResult<()>>>,
 }
 
@@ -74,7 +72,11 @@ impl UsbWorker {
     }
 
     fn request_close(&self) {
-        self.shutdown.store(true, Ordering::Release);
+        let _ = self.shutdown.send(true);
+    }
+
+    fn is_closing(&self) -> bool {
+        *self.shutdown.borrow()
     }
 
     fn is_finished(&self) -> bool {
@@ -111,8 +113,7 @@ fn spawn_worker(
     let (commands, mut command_rx) = mpsc::channel::<UsbCommand>(COMMAND_QUEUE_CAPACITY);
     let (opened_tx, opened_rx) = oneshot::channel();
     let (completion_tx, completion) = watch::channel(None);
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let worker_shutdown = Arc::clone(&shutdown);
+    let (shutdown, worker_shutdown) = watch::channel(false);
     let name = format!("seeed-hal-usb-{}", selector.id().as_str());
     std::thread::Builder::new()
         .name(name)
@@ -128,7 +129,7 @@ fn spawn_worker(
                         return Err(error);
                     }
                 };
-                while !worker_shutdown.load(Ordering::Acquire) {
+                while !*worker_shutdown.borrow() {
                     let command = match command_rx.try_recv() {
                         Ok(command) => command,
                         Err(mpsc::error::TryRecvError::Empty) => {
@@ -137,7 +138,7 @@ fn spawn_worker(
                         }
                         Err(mpsc::error::TryRecvError::Disconnected) => break,
                     };
-                    if worker_shutdown.load(Ordering::Acquire) {
+                    if *worker_shutdown.borrow() {
                         command.reject_closed();
                         break;
                     }
@@ -204,11 +205,33 @@ fn session_closed(operation: &'static str) -> seeed_hal_core::HalError {
 }
 
 impl UsbManager {
-    pub(crate) fn new(adapter: Option<Arc<dyn UsbAdapter>>) -> Self {
+    pub(crate) fn new(adapter: Option<Arc<dyn UsbAdapter>>, close_timeout: Duration) -> Self {
         Self {
             adapter,
-            state: Mutex::new(State::default()),
+            state: Arc::new(Mutex::new(State::default())),
+            close_timeout,
         }
+    }
+
+    fn reap_when_finished(&self, id: SessionId, worker: UsbWorker) {
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            let _ = worker.wait_closed().await;
+            finish_session(&state, &id).await;
+        });
+    }
+
+    fn release_reservation_when_finished(
+        &self,
+        resource: ResourceId,
+        id: SessionId,
+        worker: UsbWorker,
+    ) {
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            let _ = worker.wait_closed().await;
+            state.lock().await.leases.release(&resource, &id);
+        });
     }
     fn adapter(&self, op: &'static str) -> HalResult<Arc<dyn UsbAdapter>> {
         self.adapter.clone().ok_or_else(|| {
@@ -253,18 +276,28 @@ impl UsbManager {
                 return Err(e);
             }
         };
-        if let Err(e) = opened
-            .await
-            .unwrap_or_else(|_| Err(actor_unavailable("usb.open")))
-        {
-            self.state.lock().await.leases.release(descriptor.id(), &id);
-            return Err(e);
+        match tokio::time::timeout(self.close_timeout, opened).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => {
+                self.state.lock().await.leases.release(descriptor.id(), &id);
+                return Err(error);
+            }
+            Ok(Err(_)) => {
+                self.state.lock().await.leases.release(descriptor.id(), &id);
+                return Err(actor_unavailable("usb.open"));
+            }
+            Err(_) => {
+                worker.request_close();
+                self.release_reservation_when_finished(descriptor.id().clone(), id, worker);
+                return Err(open_timeout("usb.open", self.close_timeout)
+                    .with_resource_id(descriptor.id().clone()));
+            }
         }
         let mut state = self.state.lock().await;
         if !state.leases.commit(descriptor.id(), &id, &lease) {
             worker.request_close();
             drop(state);
-            let _ = worker.wait_closed().await;
+            self.release_reservation_when_finished(descriptor.id().clone(), id, worker);
             return Err(runtime_error(
                 "runtime.session.closed",
                 ErrorCategory::Conflict,
@@ -320,6 +353,9 @@ impl UsbManager {
                     .insert(id, (entry.resource.clone(), entry.owner));
                 return Err(actor_unavailable("usb.transfer").with_resource_id(entry.resource));
             }
+            if entry.worker.is_closing() {
+                return Err(session_closed("usb.transfer").with_resource_id(entry.resource.clone()));
+            }
             (entry.worker.clone(), entry.resource.clone())
         };
         let (reply, response) = oneshot::channel();
@@ -333,14 +369,19 @@ impl UsbManager {
                 "usb.transfer",
             )
             .map_err(|error| error.with_resource_id(resource.clone()))?;
-        response
-            .await
-            .unwrap_or_else(|_| Err(actor_unavailable("usb.transfer")))
-            .map_err(|error| error.with_resource_id(resource))
+        let mut closing = worker.shutdown.subscribe();
+        tokio::select! {
+            result = response => result.unwrap_or_else(|_| Err(actor_unavailable("usb.transfer"))),
+            changed = closing.changed() => {
+                let _ = changed;
+                Err(session_closed("usb.transfer"))
+            }
+        }
+        .map_err(|error| error.with_resource_id(resource))
     }
     pub(crate) async fn close(&self, id: SessionId, lease: &LeaseToken) -> HalResult<()> {
-        let mut state = self.state.lock().await;
-        let entry = state.sessions.remove(&id).ok_or_else(|| {
+        let state = self.state.lock().await;
+        let entry = state.sessions.get(&id).ok_or_else(|| {
             runtime_error(
                 "runtime.session.closed",
                 ErrorCategory::Conflict,
@@ -352,21 +393,25 @@ impl UsbManager {
         state
             .leases
             .validate(&entry.resource, &id, &entry.owner, lease, "usb.close")?;
-        state.leases.release(&entry.resource, &id);
-        state
-            .closed
-            .insert(id, (entry.resource.clone(), entry.owner.clone()));
+        let worker = entry.worker.clone();
+        let resource = entry.resource.clone();
         drop(state);
-        entry.worker.request_close();
-        entry
-            .worker
-            .wait_closed()
-            .await
-            .map_err(|e| e.with_resource_id(entry.resource))
+        worker.request_close();
+        self.reap_when_finished(id.clone(), worker.clone());
+        match tokio::time::timeout(self.close_timeout, worker.wait_closed()).await {
+            Ok(result) => {
+                let result = result.map_err(|e| e.with_resource_id(resource.clone()));
+                finish_session(&self.state, &id).await;
+                result
+            }
+            Err(_) => {
+                Err(close_timeout("usb.close", self.close_timeout).with_resource_id(resource))
+            }
+        }
     }
     pub(crate) async fn revoke_owner(&self, owner: &OwnerId) -> HalResult<()> {
         let workers = {
-            let mut state = self.state.lock().await;
+            let state = self.state.lock().await;
             let ids = state
                 .sessions
                 .iter()
@@ -375,23 +420,60 @@ impl UsbManager {
                 .collect::<Vec<_>>();
             let mut workers = Vec::new();
             for id in ids {
-                if let Some(entry) = state.sessions.remove(&id) {
-                    state.leases.release(&entry.resource, &id);
-                    state
-                        .closed
-                        .insert(id, (entry.resource.clone(), entry.owner.clone()));
+                if let Some(entry) = state.sessions.get(&id) {
                     entry.worker.request_close();
-                    workers.push((entry.worker, entry.resource));
+                    workers.push((id, entry.worker.clone(), entry.resource.clone()));
                 }
             }
             workers
         };
-        for (worker, resource) in workers {
-            worker
-                .wait_closed()
-                .await
-                .map_err(|error| error.with_resource_id(resource))?;
+        for (id, worker, resource) in workers {
+            self.reap_when_finished(id.clone(), worker.clone());
+            match tokio::time::timeout(self.close_timeout, worker.wait_closed()).await {
+                Ok(result) => {
+                    result.map_err(|error| error.with_resource_id(resource.clone()))?;
+                    finish_session(&self.state, &id).await;
+                }
+                Err(_) => {
+                    return Err(close_timeout("usb.revoke_owner", self.close_timeout)
+                        .with_resource_id(resource));
+                }
+            }
         }
         Ok(())
     }
+}
+
+async fn finish_session(state: &Mutex<State>, id: &SessionId) {
+    let mut state = state.lock().await;
+    if let Some(entry) = state.sessions.remove(id) {
+        state.leases.release(&entry.resource, id);
+        state
+            .closed
+            .insert(id.clone(), (entry.resource.clone(), entry.owner));
+    }
+}
+
+fn close_timeout(operation: &'static str, timeout: Duration) -> seeed_hal_core::HalError {
+    runtime_error(
+        "runtime.session.close_timeout",
+        ErrorCategory::Unavailable,
+        operation,
+        false,
+        format!(
+            "USB worker did not release its native session within {timeout:?}; the resource remains quarantined"
+        ),
+    )
+}
+
+fn open_timeout(operation: &'static str, timeout: Duration) -> seeed_hal_core::HalError {
+    runtime_error(
+        "runtime.transport.timeout",
+        ErrorCategory::Unavailable,
+        operation,
+        true,
+        format!(
+            "USB worker did not finish opening within {timeout:?}; the resource remains quarantined"
+        ),
+    )
 }
