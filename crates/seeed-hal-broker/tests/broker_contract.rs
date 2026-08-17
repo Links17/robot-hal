@@ -466,6 +466,27 @@ fn can_handshake() -> v1::HandshakeRequest {
     handshake
 }
 
+#[tokio::test]
+async fn usb_and_gpio_envelopes_require_wire_minor_two() {
+    let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+    let server = tokio::spawn(async move { broker().serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    client.handshake().await;
+    for payload in [
+        envelope::Payload::EnumerateUsbRequest(v1::EnumerateUsbRequest {}),
+        envelope::Payload::EnumerateGpioRequest(v1::EnumerateGpioRequest {}),
+    ] {
+        let response = client.request(payload).await;
+        let error = match response.payload {
+            Some(envelope::Payload::Error(error)) => error,
+            other => panic!("expected protocol error, got {other:?}"),
+        };
+        assert_eq!(error.name, "runtime.protocol.unsupported_capability");
+    }
+    drop(client);
+    assert!(server.await.unwrap().cleanup_error().is_none());
+}
+
 async fn handshake_can<T>(client: &mut Client<T>) -> v1::HandshakeResponse
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -804,9 +825,9 @@ async fn broker_selects_highest_shared_minor_and_reports_its_supported_range() {
         Some(envelope::Payload::HandshakeResponse(response)) => response,
         other => panic!("expected handshake response, got {other:?}"),
     };
-    assert_eq!(accepted.protocol_minor, 1);
+    assert_eq!(accepted.protocol_minor, 2);
     assert_eq!(accepted.protocol_minor_minimum, 0);
-    assert_eq!(accepted.protocol_minor_maximum, 1);
+    assert_eq!(accepted.protocol_minor_maximum, 2);
 
     drop(client);
     assert!(server.await.unwrap().cleanup_error().is_none());

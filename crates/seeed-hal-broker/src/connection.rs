@@ -772,6 +772,15 @@ async fn dispatch_operation(
     serial_sessions: SerialSessions,
 ) -> v1::Envelope {
     let result = match payload {
+        Some(payload) if is_usb_gpio_payload(&payload) && limits.protocol_minor < 2 => {
+            Err(protocol_error(
+                "runtime.protocol.unsupported_capability",
+                "runtime.protocol.dispatch",
+                ErrorCategory::Conflict,
+                false,
+                "USB and GPIO operations require negotiated protocol minor 2",
+            ))
+        }
         Some(payload) if is_can_payload(&payload) => {
             can_dispatch::dispatch(
                 runtime,
@@ -806,6 +815,32 @@ async fn dispatch_operation(
         },
         Err(error) => error_envelope(request_id, error),
     }
+}
+
+fn is_usb_gpio_payload(payload: &envelope::Payload) -> bool {
+    matches!(
+        payload,
+        envelope::Payload::EnumerateUsbRequest(_)
+            | envelope::Payload::EnumerateUsbResponse(_)
+            | envelope::Payload::OpenUsbRequest(_)
+            | envelope::Payload::OpenUsbResponse(_)
+            | envelope::Payload::UsbTransferRequest(_)
+            | envelope::Payload::UsbTransferResponse(_)
+            | envelope::Payload::CloseUsbRequest(_)
+            | envelope::Payload::CloseUsbResponse(_)
+            | envelope::Payload::EnumerateGpioRequest(_)
+            | envelope::Payload::EnumerateGpioResponse(_)
+            | envelope::Payload::OpenGpioRequest(_)
+            | envelope::Payload::OpenGpioResponse(_)
+            | envelope::Payload::GpioReadRequest(_)
+            | envelope::Payload::GpioReadResponse(_)
+            | envelope::Payload::GpioWriteRequest(_)
+            | envelope::Payload::GpioWriteResponse(_)
+            | envelope::Payload::GpioNextEdgeRequest(_)
+            | envelope::Payload::GpioNextEdgeResponse(_)
+            | envelope::Payload::CloseGpioRequest(_)
+            | envelope::Payload::CloseGpioResponse(_)
+    )
 }
 
 async fn dispatch_operation_inner(
