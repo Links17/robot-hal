@@ -34,14 +34,15 @@ jobs:
       - name: Run Rust tests
         if: ${{ steps.workspace.outputs.has-packages == 'true' }}
         run: cargo test --workspace --all-features
-      - name: Verify production and virtual broker manifests
+      - name: Verify broker manifests
         if: ${{ steps.workspace.outputs.has-packages == 'true' }}
         run: |
           cargo test -p seeed-hal-broker-app --no-default-features --test manifest
-          cargo test -p seeed-hal-broker-app --features virtual-adapter --test manifest
+          cargo test -p seeed-hal-broker-app --features virtual-adapters --test manifest
+          cargo test -p seeed-hal-broker-app --features socketcan,pcan,virtual-adapters --test manifest
       - name: Build broker conformance executable
         if: ${{ steps.workspace.outputs.has-packages == 'true' }}
-        run: cargo build -p seeed-hal-broker-app --features virtual-adapter
+        run: cargo build -p seeed-hal-broker-app --features virtual-adapters
       - name: Run broker black-box conformance
         if: ${{ steps.workspace.outputs.has-packages == 'true' }}
         shell: bash

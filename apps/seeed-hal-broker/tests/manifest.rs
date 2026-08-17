@@ -34,39 +34,52 @@ fn manifest_is_deterministic_business_independent_and_hardware_free() {
     assert_eq!(manifest["broker_version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(manifest["wire"]["major"], 1);
     assert_eq!(manifest["wire"]["minimum_minor"], 0);
-    assert_eq!(manifest["wire"]["maximum_minor"], 0);
+    assert_eq!(manifest["broker_version"], "0.2.0");
+    assert_eq!(manifest["wire"]["maximum_minor"], 1);
     assert_eq!(manifest["target"]["triple"], env!("SEEED_HAL_TARGET"));
     assert_eq!(manifest["target"]["os"], std::env::consts::OS);
     assert_eq!(manifest["target"]["arch"], std::env::consts::ARCH);
-    #[cfg(feature = "virtual-adapter")]
+    let mut expected_adapters = vec!["serialport"];
+    let mut expected_features = Vec::new();
+    #[cfg(feature = "pcan")]
     {
-        assert_eq!(
-            manifest["enabled"]["adapters"],
-            serde_json::json!(["virtual-serial"])
-        );
-        assert_eq!(
-            manifest["enabled"]["features"],
-            serde_json::json!(["virtual-adapter"])
-        );
+        expected_adapters.push("pcan");
+        expected_features.push("pcan");
     }
-    #[cfg(not(feature = "virtual-adapter"))]
+    #[cfg(feature = "socketcan")]
     {
-        assert_eq!(
-            manifest["enabled"]["adapters"],
-            serde_json::json!(["serialport"])
-        );
-        assert_eq!(manifest["enabled"]["features"], serde_json::json!([]));
+        expected_adapters.push("socketcan");
+        expected_features.push("socketcan");
     }
+    #[cfg(feature = "virtual-adapters")]
+    {
+        expected_adapters.extend(["virtual-can", "virtual-serial"]);
+        expected_features.push("virtual-adapters");
+    }
+    expected_adapters.sort_unstable();
+    assert_eq!(
+        manifest["enabled"]["adapters"],
+        serde_json::json!(expected_adapters)
+    );
+    assert_eq!(
+        manifest["enabled"]["features"],
+        serde_json::json!(expected_features)
+    );
+    #[cfg(feature = "pcan")]
+    assert_eq!(
+        manifest["required_vendor_runtime_libraries"],
+        serde_json::json!(["PCAN-Basic"])
+    );
+    #[cfg(not(feature = "pcan"))]
+    assert_eq!(
+        manifest["required_vendor_runtime_libraries"],
+        serde_json::json!([])
+    );
     assert_eq!(manifest["msrv"], "1.85");
     assert_eq!(manifest["artifact_checksum"]["algorithm"], "sha256");
     let executable = std::fs::read(env!("CARGO_BIN_EXE_seeed-hal-broker")).unwrap();
     let expected_checksum = format!("{:x}", Sha256::digest(executable));
     assert_eq!(manifest["artifact_checksum"]["value"], expected_checksum);
-    assert_eq!(
-        manifest["required_vendor_runtime_libraries"],
-        serde_json::json!([])
-    );
-
     let lower = stdout.to_ascii_lowercase();
     for forbidden in [
         "robot",

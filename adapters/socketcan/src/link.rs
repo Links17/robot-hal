@@ -185,16 +185,12 @@ impl LinkLease {
         })
     }
 
-    pub(crate) fn bus_status(
-        &self,
-        descriptor: &ResourceDescriptor,
-    ) -> HalResult<CanBusStatus> {
+    pub(crate) fn bus_status(&self, descriptor: &ResourceDescriptor) -> HalResult<CanBusStatus> {
         bus_status(&self.interface, descriptor)
     }
 
     pub(crate) fn close(&mut self, descriptor: &ResourceDescriptor) -> HalResult<()> {
-        let Some(snapshot) = self.snapshot.clone()
-        else {
+        let Some(snapshot) = self.snapshot.clone() else {
             return Ok(());
         };
 
@@ -277,7 +273,12 @@ fn bus_status(
     let (tx, rx) = details
         .can
         .berr_counter
-        .map(|counter| (Some(u32::from(counter.txerr)), Some(u32::from(counter.rxerr))))
+        .map(|counter| {
+            (
+                Some(u32::from(counter.txerr)),
+                Some(u32::from(counter.rxerr)),
+            )
+        })
         .unwrap_or((None, None));
     Ok(CanBusStatus::new(state, tx, rx))
 }
@@ -571,7 +572,9 @@ fn verify_expectation(
             .nominal_bitrate()
             .is_some_and(|bitrate| bitrate != active.nominal().bitrate())
         || expectation.data_bitrate().is_some_and(|bitrate| {
-            active.data().is_none_or(|timing| timing.bitrate() != bitrate)
+            active
+                .data()
+                .is_none_or(|timing| timing.bitrate() != bitrate)
         })
         || expectation
             .listen_only()
@@ -681,11 +684,7 @@ mod tests {
     fn classic_verification_accepts_absent_data_timing() {
         let request = request();
         let details = configured_details(&request);
-        assert!(config_matches(
-            &request,
-            &details,
-            &active(&request)
-        ));
+        assert!(config_matches(&request, &details, &active(&request)));
 
         let mut unexpected_data = details;
         unexpected_data.can.data_bit_timing = Some(to_socketcan_timing(request.nominal()));
@@ -1023,14 +1022,12 @@ fn from_socketcan_timing(
     operation: &'static str,
     timing_kind: &'static str,
 ) -> HalResult<CanBitTiming> {
-    let sample_point = nonzero_u16(timing.sample_point).ok_or_else(|| {
-        invalid_kernel_timing(operation, timing_kind, "sample point exceeds u16")
-    })?;
+    let sample_point = nonzero_u16(timing.sample_point)
+        .ok_or_else(|| invalid_kernel_timing(operation, timing_kind, "sample point exceeds u16"))?;
     let sjw = nonzero_u16(timing.sjw)
         .ok_or_else(|| invalid_kernel_timing(operation, timing_kind, "SJW exceeds u16"))?;
-    CanBitTiming::new(timing.bitrate, sample_point, sjw).map_err(|error| {
-        invalid_kernel_timing(operation, timing_kind, error.debug_message())
-    })
+    CanBitTiming::new(timing.bitrate, sample_point, sjw)
+        .map_err(|error| invalid_kernel_timing(operation, timing_kind, error.debug_message()))
 }
 
 fn nonzero_u16(value: u32) -> Option<Option<u16>> {
@@ -1070,10 +1067,8 @@ fn map_link_io_error(
     descriptor: &ResourceDescriptor,
 ) -> HalError {
     match error.raw_os_error() {
-        Some(raw_code) => {
-            os_link_error(operation, raw_code, error.to_string())
-                .with_resource_id(descriptor.id().clone())
-        }
+        Some(raw_code) => os_link_error(operation, raw_code, error.to_string())
+            .with_resource_id(descriptor.id().clone()),
         None => generic_link_error(operation, error).with_resource_id(descriptor.id().clone()),
     }
 }

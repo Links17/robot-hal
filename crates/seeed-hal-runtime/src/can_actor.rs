@@ -147,10 +147,12 @@ impl CanActorHandle {
         command: CanCommand,
         operation: &'static str,
     ) -> HalResult<()> {
-        self.commands.try_send(command).map_err(|error| match error {
-            mpsc::TrySendError::Full(_) => queue_full(operation, MANAGEMENT_QUEUE_CAPACITY),
-            mpsc::TrySendError::Disconnected(_) => actor_unavailable(operation),
-        })
+        self.commands
+            .try_send(command)
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => queue_full(operation, MANAGEMENT_QUEUE_CAPACITY),
+                mpsc::TrySendError::Disconnected(_) => actor_unavailable(operation),
+            })
     }
 
     pub(crate) fn try_send_batch(&self, command: CanCommand, frames: usize) -> HalResult<()> {
@@ -262,11 +264,7 @@ pub(crate) fn spawn_can_actor(
             let outcome = catch_unwind(AssertUnwindSafe(|| {
                 let open_config = first_session.config.clone();
                 let channel = runtime.block_on(async {
-                    tokio::time::timeout(
-                        close_timeout,
-                        adapter.open(&selector, &open_config),
-                    )
-                    .await
+                    tokio::time::timeout(close_timeout, adapter.open(&selector, &open_config)).await
                 });
                 match channel {
                     Ok(Ok(channel)) => {
@@ -331,6 +329,7 @@ pub(crate) fn spawn_can_actor(
     ))
 }
 
+#[allow(clippy::too_many_arguments)] // Actor construction owns all bounded worker channels.
 fn run_actor(
     mut channel: Box<dyn CanChannel>,
     first_session: ActorSessionSpec,
@@ -360,12 +359,9 @@ fn run_actor(
     let mut last_bus_state = None;
 
     loop {
-        if let Some(result) = prune_cancelled_sessions(
-            channel.as_mut(),
-            &mut sessions,
-            &resource_id,
-            close_timeout,
-        ) {
+        if let Some(result) =
+            prune_cancelled_sessions(channel.as_mut(), &mut sessions, &resource_id, close_timeout)
+        {
             reject_remaining(&cleanup, &tx_reserved);
             reject_remaining(&commands, &tx_reserved);
             return result;
@@ -521,14 +517,12 @@ fn execute_command(
         } => {
             let frame_count = frames.len();
             let result = if sessions.contains_key(&session_id) {
-                let mut committed = 0;
                 let mut result = Ok(());
-                for frame in &frames {
+                for (committed, frame) in frames.iter().enumerate() {
                     if let Err(error) = channel.send(frame) {
                         result = Err(CanBatchSendError::backend_prefix(error, committed));
                         break;
                     }
-                    committed += 1;
                 }
                 result
             } else {
@@ -580,7 +574,7 @@ fn execute_command(
         }
         CanCommand::BusStatus { session_id, reply } => {
             let result = if sessions.contains_key(&session_id) {
-                channel.bus_status().map(|status| {
+                channel.bus_status().inspect(|status| {
                     publish_bus_transition(
                         status.state(),
                         last_bus_state,
@@ -588,7 +582,6 @@ fn execute_command(
                         resource_id,
                         events,
                     );
-                    status
                 })
             } else {
                 Err(session_closed("can.status", resource_id))
@@ -633,9 +626,7 @@ fn execute_command(
                 removed
                     .termination_failed
                     .store(result.is_err(), Ordering::Release);
-                removed
-                    .termination_expected
-                    .store(true, Ordering::Release);
+                removed.termination_expected.store(true, Ordering::Release);
                 let _ = reply.send(RemoveOutcome {
                     last_session: true,
                     result,
@@ -659,6 +650,7 @@ fn execute_command(
     false
 }
 
+#[allow(clippy::too_many_arguments)] // Session state is created atomically with its bounded queues.
 fn new_session(
     owner_id: OwnerId,
     filters: CanFilterSet,
@@ -836,15 +828,15 @@ fn compatible_configuration(
 }
 
 fn expectation_mismatch(expectation: &CanLinkExpectation, active: &CanActiveConfig) -> bool {
-    expectation.mode().is_some_and(|value| value != active.mode())
+    expectation
+        .mode()
+        .is_some_and(|value| value != active.mode())
         || expectation
             .nominal_bitrate()
             .is_some_and(|value| value != active.nominal().bitrate())
-        || expectation.data_bitrate().is_some_and(|value| {
-            active
-                .data()
-                .is_none_or(|timing| timing.bitrate() != value)
-        })
+        || expectation
+            .data_bitrate()
+            .is_some_and(|value| active.data().is_none_or(|timing| timing.bitrate() != value))
         || expectation
             .listen_only()
             .is_some_and(|value| value != active.listen_only())
@@ -902,15 +894,12 @@ fn publish_health_for_session(
     }
 }
 
-fn reject_all_sessions(
-    sessions: &mut HashMap<SessionId, ActorSession>,
-    resource_id: &ResourceId,
-) {
+fn reject_all_sessions(sessions: &mut HashMap<SessionId, ActorSession>, resource_id: &ResourceId) {
     for session in sessions.values_mut() {
         if let Some(pending) = session.pending_receive.take() {
-            let _ = pending
-                .reply
-                .send(Err(actor_unavailable("can.receive").with_resource_id(resource_id.clone())));
+            let _ = pending.reply.send(Err(
+                actor_unavailable("can.receive").with_resource_id(resource_id.clone())
+            ));
         }
         session.cleanup_done.send_replace(true);
     }

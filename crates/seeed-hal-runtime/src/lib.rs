@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 mod can_actor;
-mod can_manager;
 mod can_lease_table;
+mod can_manager;
 mod events;
 mod lease_table;
 mod registry;
@@ -15,13 +15,13 @@ use bytes::Bytes;
 use can_manager::CanManager;
 pub use events::{EventSubscription, RuntimeEvent, RuntimeEventKind};
 use registry::{CloseAction, Registry};
-use seeed_hal_core::{
-    ErrorCategory, HalError, HalResult, LeaseMode, LeaseToken, OwnerId, ResourceDescriptor,
-    ResourceSelector, SessionId,
-};
 use seeed_hal_can::{
     CanAdapter, CanBatchSendError, CanBusStatus, CanFilterSet, CanFrame, CanOpenConfig,
     DEFAULT_CAN_RX_CAPACITY, DEFAULT_CAN_TX_CAPACITY, ReceivedCanFrame,
+};
+use seeed_hal_core::{
+    ErrorCategory, HalError, HalResult, LeaseMode, LeaseToken, OwnerId, ResourceDescriptor,
+    ResourceSelector, SessionId,
 };
 use seeed_hal_serial::{ControlLines, SerialAdapter, SerialConfig};
 use serial_actor::{ActorMetadata, SerialCommand, spawn_serial_actor};
@@ -228,11 +228,7 @@ impl HalRuntime {
         self.inner.can_manager.bus_status(session, lease).await
     }
 
-    pub async fn close_can(
-        &self,
-        session: SessionId,
-        lease: &LeaseToken,
-    ) -> HalResult<()> {
+    pub async fn close_can(&self, session: SessionId, lease: &LeaseToken) -> HalResult<()> {
         self.inner.can_manager.close(session, lease).await
     }
 
@@ -537,10 +533,7 @@ impl CanHandle {
             .await
     }
 
-    pub async fn send_batch(
-        &self,
-        frames: Vec<CanFrame>,
-    ) -> Result<(), CanBatchSendError> {
+    pub async fn send_batch(&self, frames: Vec<CanFrame>) -> Result<(), CanBatchSendError> {
         self.runtime
             .send_can_batch(self.session_id(), &self.lease, frames)
             .await
@@ -571,10 +564,7 @@ impl CanHandle {
     /// Closes the session. A failed local admission leaves this handle open so
     /// the caller can retry; only a successful close marks it terminal.
     pub async fn close(&mut self) -> HalResult<()> {
-        let result = self
-            .runtime
-            .close_can(self.session_id(), &self.lease)
-            .await;
+        let result = self.runtime.close_can(self.session_id(), &self.lease).await;
         if result.is_ok() {
             self.closed = true;
         }

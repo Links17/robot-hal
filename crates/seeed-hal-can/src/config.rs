@@ -135,7 +135,9 @@ impl CanConfigureConfig {
         restart_ms: Option<u32>,
     ) -> HalResult<Self> {
         if restart_ms.is_some_and(|value| value == 0) {
-            return Err(invalid_config("CAN restart time must be nonzero when specified"));
+            return Err(invalid_config(
+                "CAN restart time must be nonzero when specified",
+            ));
         }
         match (mode, data.is_some()) {
             (CanMode::Classic, true) => {
@@ -144,9 +146,7 @@ impl CanConfigureConfig {
                 ));
             }
             (CanMode::Fd, false) => {
-                return Err(invalid_config(
-                    "CAN FD configuration requires data timing",
-                ));
+                return Err(invalid_config("CAN FD configuration requires data timing"));
             }
             _ => {}
         }

@@ -71,3 +71,9 @@ Every broker artifact includes a machine-readable manifest containing:
 - MSRV used for the build;
 - artifact checksum;
 - required vendor runtime libraries, when any.
+
+For v0.2 the broker is `0.2.0` and supports wire major 1, inclusive minors `0..=1`. Its manifest
+lists compiled adapters only; it does not claim that optional runtime libraries or physical devices
+were available at startup. Startup diagnostics record an unavailable optional adapter using stable
+structured error fields. `--require-adapter pcan` turns an unavailable or uncompiled PCAN adapter
+into a startup failure before the endpoint is published.

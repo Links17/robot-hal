@@ -9,9 +9,7 @@ pub use identity::{PcanChannelMetadata, PcanIdentity, identity_from_metadata};
 
 use async_trait::async_trait;
 use seeed_hal_can::{CanAdapter, CanChannel, CanOpenConfig};
-use seeed_hal_core::{
-    ErrorCategory, HalError, HalResult, ResourceDescriptor, ResourceSelector,
-};
+use seeed_hal_core::{ErrorCategory, HalError, HalResult, ResourceDescriptor, ResourceSelector};
 
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 use std::sync::Arc;
@@ -150,7 +148,10 @@ fn descriptor_from_device(device: channel::DriverDevice) -> HalResult<ResourceDe
     let mut properties = std::collections::BTreeMap::new();
     properties.insert("adapter".to_owned(), "pcan".to_owned());
     properties.insert("handle".to_owned(), format!("0x{:04X}", device.handle));
-    properties.insert("device_type".to_owned(), format!("0x{:02X}", device.device_type));
+    properties.insert(
+        "device_type".to_owned(),
+        format!("0x{:02X}", device.device_type),
+    );
     properties.insert(
         "controller_number".to_owned(),
         device.controller_number.to_string(),
@@ -190,7 +191,10 @@ fn open_sync(
     for device in devices {
         paired.push((descriptor_from_device(device.clone())?, device));
     }
-    let descriptors: Vec<_> = paired.iter().map(|(descriptor, _)| descriptor.clone()).collect();
+    let descriptors: Vec<_> = paired
+        .iter()
+        .map(|(descriptor, _)| descriptor.clone())
+        .collect();
     let descriptor = resolve_resource(
         &descriptors,
         selector,
@@ -247,9 +251,9 @@ mod tests {
     use std::time::Duration;
 
     use seeed_hal_can::{
-        CanActiveConfig, CanBitTiming, CanBusState, CanBusStatus, CanConfigureConfig,
-        CanFrame, CanId, CanMode, CanTimestamp, CanTimestampSource,
-        ReceivedCanFrame, can_error_frames_capability,
+        CanActiveConfig, CanBitTiming, CanBusState, CanBusStatus, CanConfigureConfig, CanFrame,
+        CanId, CanMode, CanTimestamp, CanTimestampSource, ReceivedCanFrame,
+        can_error_frames_capability,
     };
 
     use super::*;
@@ -271,9 +275,7 @@ mod tests {
 
     impl Driver for FakeDriver {
         fn discover(&self) -> Result<Vec<DriverDevice>, DriverError> {
-            self.devices
-                .clone()
-                .map_err(DriverError::Unavailable)
+            self.devices.clone().map_err(DriverError::Unavailable)
         }
 
         fn open(
@@ -311,10 +313,7 @@ mod tests {
     }
 
     impl DriverChannel for FakeChannel {
-        fn receive(
-            &mut self,
-            timeout: Duration,
-        ) -> Result<Option<ReceivedCanFrame>, DriverError> {
+        fn receive(&mut self, timeout: Duration) -> Result<Option<ReceivedCanFrame>, DriverError> {
             let mut state = self.state.lock().expect("fake PCAN mutex poisoned");
             state.receive_timeouts.push(timeout);
             Ok(state.received.pop_front())
@@ -380,12 +379,8 @@ mod tests {
             true,
         )
         .unwrap();
-        let timestamp = CanTimestamp::new(
-            42_000,
-            CanTimestampSource::Hardware,
-            "pcan-fake",
-        )
-        .unwrap();
+        let timestamp =
+            CanTimestamp::new(42_000, CanTimestampSource::Hardware, "pcan-fake").unwrap();
         Arc::new(Mutex::new(FakeState {
             received: VecDeque::from([ReceivedCanFrame::new(frame, Some(timestamp))]),
             sent: Vec::new(),
@@ -416,15 +411,27 @@ mod tests {
         let descriptors = adapter.enumerate().await.unwrap();
         let descriptor = &descriptors[0];
 
-        assert!(descriptor.capabilities().contains(&can_classic_capability()));
+        assert!(
+            descriptor
+                .capabilities()
+                .contains(&can_classic_capability())
+        );
         assert!(descriptor.capabilities().contains(&can_fd_capability()));
-        assert!(descriptor.capabilities().contains(&can_configure_capability()));
-        assert!(descriptor
-            .capabilities()
-            .contains(&can_rx_timestamp_capability()));
-        assert!(!descriptor
-            .capabilities()
-            .contains(&can_error_frames_capability()));
+        assert!(
+            descriptor
+                .capabilities()
+                .contains(&can_configure_capability())
+        );
+        assert!(
+            descriptor
+                .capabilities()
+                .contains(&can_rx_timestamp_capability())
+        );
+        assert!(
+            !descriptor
+                .capabilities()
+                .contains(&can_error_frames_capability())
+        );
 
         let mut channel = adapter
             .open(&descriptor.selector(), &fd_config())
@@ -455,10 +462,7 @@ mod tests {
 
     #[tokio::test]
     async fn unavailable_fake_driver_maps_to_adapter_unavailable() {
-        let adapter = fake_adapter(
-            Err("PCANBasic.dll was not found".to_owned()),
-            state(),
-        );
+        let adapter = fake_adapter(Err("PCANBasic.dll was not found".to_owned()), state());
 
         let error = adapter.enumerate().await.unwrap_err();
 

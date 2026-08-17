@@ -11,16 +11,12 @@ pub use identity::{CanIdentity, CanInterfaceMetadata, identity_from_metadata};
 
 use async_trait::async_trait;
 use seeed_hal_can::{CanAdapter, CanChannel, CanOpenConfig};
-use seeed_hal_core::{
-    ErrorCategory, HalError, HalResult, ResourceDescriptor, ResourceSelector,
-};
+use seeed_hal_core::{ErrorCategory, HalError, HalResult, ResourceDescriptor, ResourceSelector};
 
 #[cfg(target_os = "linux")]
 use seeed_hal_can::{can_classic_capability, can_configure_capability, can_fd_capability};
 #[cfg(target_os = "linux")]
-use seeed_hal_core::{
-    CapabilitySet, ResourceProperties, TransportKind, resolve_resource,
-};
+use seeed_hal_core::{CapabilitySet, ResourceProperties, TransportKind, resolve_resource};
 
 #[derive(Clone, Debug, Default)]
 pub struct SocketCanAdapter;
@@ -55,9 +51,7 @@ impl CanAdapter for SocketCanAdapter {
         let config = config.clone();
         tokio::task::spawn_blocking(move || open_sync(&selector, &config))
             .await
-            .map_err(|error| {
-                join_error("can.open", error).with_resource_id(resource_id)
-            })?
+            .map_err(|error| join_error("can.open", error).with_resource_id(resource_id))?
     }
 }
 
@@ -97,12 +91,9 @@ fn descriptor_from_interface(interface: &str) -> HalResult<ResourceDescriptor> {
     let identity = identity_from_metadata(&metadata)?;
     let details = link::details_for_descriptor(interface)
         .map_err(|error| discovery_error("can.enumerate", error))?;
-    let nonvirtual_sysfs_evidence =
-        !metadata.virtual_interface && metadata.stable_path.is_some();
-    let (supports_fd, supports_configure) = link::capabilities_for_details(
-        &details,
-        nonvirtual_sysfs_evidence,
-    );
+    let nonvirtual_sysfs_evidence = !metadata.virtual_interface && metadata.stable_path.is_some();
+    let (supports_fd, supports_configure) =
+        link::capabilities_for_details(&details, nonvirtual_sysfs_evidence);
     let mut capabilities = vec![can_classic_capability()];
     if supports_fd {
         capabilities.push(can_fd_capability());
@@ -114,10 +105,7 @@ fn descriptor_from_interface(interface: &str) -> HalResult<ResourceDescriptor> {
     let mut properties = std::collections::BTreeMap::new();
     properties.insert("adapter".to_owned(), "socketcan".to_owned());
     properties.insert("interface".to_owned(), interface.to_owned());
-    properties.insert(
-        "virtual".to_owned(),
-        metadata.virtual_interface.to_string(),
-    );
+    properties.insert("virtual".to_owned(), metadata.virtual_interface.to_string());
     properties.insert(
         "link_state".to_owned(),
         if details.is_up {
@@ -149,8 +137,8 @@ fn open_sync(
     selector: &ResourceSelector,
     config: &CanOpenConfig,
 ) -> HalResult<Box<dyn CanChannel>> {
-    let descriptors = enumerate_sync()
-        .map_err(|error| error.with_resource_id(selector.id().clone()))?;
+    let descriptors =
+        enumerate_sync().map_err(|error| error.with_resource_id(selector.id().clone()))?;
     let descriptor = resolve_resource(
         &descriptors,
         selector,
@@ -164,7 +152,10 @@ fn open_sync(
             link::LinkLease::attach(&interface, expectation, &descriptor)?
         }
         CanOpenConfig::Configure(request) => {
-            if !descriptor.capabilities().contains(&can_configure_capability()) {
+            if !descriptor
+                .capabilities()
+                .contains(&can_configure_capability())
+            {
                 return Err(HalError::new(
                     "runtime.protocol.capability_unsupported",
                     ErrorCategory::Conflict,

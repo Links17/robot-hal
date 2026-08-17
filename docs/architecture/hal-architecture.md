@@ -325,8 +325,14 @@ Implementation status is intentionally separate from cross-platform release qual
   check recorded in [v0.1.0 acceptance](../releases/v0.1.0-acceptance.md). The Linux cross-target
   check remains blocked by the missing libudev pkg-config target sysroot/wrapper.
 - Pending external acceptance: native Linux and Windows CI execution and physical Serial loopback.
-- Planned: CAN/CAN FD, USB, GPIO, Camera, Node bindings, shared-memory frame transport, device
-  protocols, and consuming-application migration.
+- Implemented in v0.2: CAN/CAN FD typed frames, bounded virtual conformance, resource lease
+  compatibility/fencing, one worker actor per opened CAN resource, wire minor 1, broker and
+  Rust/Python clients, Linux SocketCAN, and optional PCAN-Basic loading on Linux/Windows.
+  CAN filters, receive queues, timestamps, partial batch results, and Attach/Configure restoration
+  are transport-level semantics; queues are bounded and stale leases fail before adapter I/O.
+- Pending external acceptance: native SocketCAN `vcan`, PCAN-Basic runtime/device loopback, and
+  native Linux/Windows CI execution. USB, GPIO, Camera, Node bindings, shared-memory frame
+  transport, device protocols, and consuming-application migration remain planned.
 
 These modules retain the responsibility boundary defined in
 [HAL responsibility](../contracts/hal-responsibility.md); implementation status does not move

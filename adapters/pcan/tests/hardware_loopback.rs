@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use seeed_hal_adapter_pcan::PcanAdapter;
 use seeed_hal_can::{
-    CanAdapter, CanBitTiming, CanChannel, CanConfigureConfig, CanFrame, CanId,
-    CanMode, CanOpenConfig, ResourceDescriptor, ResourceSelector,
+    CanAdapter, CanBitTiming, CanChannel, CanConfigureConfig, CanFrame, CanId, CanMode,
+    CanOpenConfig, ResourceDescriptor, ResourceSelector,
 };
 use seeed_hal_core::HalResult;
 

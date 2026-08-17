@@ -1,11 +1,11 @@
 # Broker black-box conformance
 
 This suite qualifies the built broker executable without physical hardware. The executable must be
-compiled with the test-only `virtual-adapter` feature; there is no runtime switch that replaces the
-production adapter.
+compiled with the test-only `virtual-adapters` feature; there is no runtime switch that replaces the
+production adapters.
 
 ```bash
-cargo build -p seeed-hal-broker-app --features virtual-adapter
+cargo build -p seeed-hal-broker-app --features virtual-adapters
 uv run --project bindings/python --frozen pytest -q tests/conformance/test_runner_contract.py
 uv run --project bindings/python --frozen python \
   tests/conformance/run-broker-conformance.py \
@@ -15,7 +15,7 @@ uv run --project bindings/python --frozen python \
 On Windows, pass `target/debug/seeed-hal-broker.exe`. The Python 3.11 runner creates a unique local
 endpoint and startup token, waits with bounded deadlines, exchanges length-prefixed protobuf
 frames, and removes its token, endpoint, temporary directory, and child process. It covers
-handshake, Serial enumeration/open/write/read/flush/control lines, stale-generation rejection,
+minor-1 handshake, virtual CAN enumeration/open/close, Serial enumeration/open/write/read/flush/control lines, stale-generation rejection,
 disconnect owner cleanup with resource reuse, and cooperative process shutdown.
 
 One monotonic deadline bounds each complete request even when runtime events are interleaved. Process

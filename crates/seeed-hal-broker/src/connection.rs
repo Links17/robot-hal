@@ -639,9 +639,7 @@ fn event_is_visible_to_owner(event: &RuntimeEvent, owner: &OwnerId) -> bool {
         | RuntimeEventKind::CanBusPassive
         | RuntimeEventKind::CanBusOff
         | RuntimeEventKind::CanBusStopped
-        | RuntimeEventKind::CanBusUnknown => {
-            event.owner_id() == owner
-        }
+        | RuntimeEventKind::CanBusUnknown => event.owner_id() == owner,
     }
 }
 

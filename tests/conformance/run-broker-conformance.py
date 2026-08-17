@@ -26,10 +26,12 @@ from seeed_hal.transport_unix import UnixFramedTransport  # noqa: E402
 
 
 PROTOCOL_MAJOR = 1
-PROTOCOL_MINOR_MINIMUM = 0
-PROTOCOL_MINOR_MAXIMUM = 0
+PROTOCOL_MINOR_MINIMUM = 1
+PROTOCOL_MINOR_MAXIMUM = 1
 PROTOCOL_MINOR = PROTOCOL_MINOR_MAXIMUM
 SERIAL_CAPABILITY = "serial.bytes/v1"
+CAN_CLASSIC_CAPABILITY = "can.classic/v1"
+CAN_FD_CAPABILITY = "can.fd/v1"
 TRANSFER_LIMIT = 64 * 1024
 FRAME_LIMIT = 1024 * 1024
 DIAGNOSTIC_LIMIT = 64 * 1024
@@ -216,7 +218,7 @@ class RawClient:
                 startup_token=token,
                 protocol_major=PROTOCOL_MAJOR,
                 protocol_minor=PROTOCOL_MINOR,
-                required_capabilities=[SERIAL_CAPABILITY],
+                required_capabilities=[SERIAL_CAPABILITY, CAN_CLASSIC_CAPABILITY, CAN_FD_CAPABILITY],
                 max_frame_bytes=FRAME_LIMIT,
                 max_read_bytes=TRANSFER_LIMIT,
                 max_write_bytes=TRANSFER_LIMIT,
@@ -232,6 +234,8 @@ class RawClient:
             "selected protocol minor is outside the offered range",
         )
         _require(SERIAL_CAPABILITY in handshake.capabilities, "Serial capability missing")
+        _require(CAN_CLASSIC_CAPABILITY in handshake.capabilities, "Classic CAN capability missing")
+        _require(CAN_FD_CAPABILITY in handshake.capabilities, "CAN FD capability missing")
         self.transport.set_frame_limit(handshake.max_frame_bytes)
 
     async def close(self) -> None:
@@ -286,6 +290,35 @@ async def _open_serial(client: RawClient, descriptor):
     )
 
 
+async def _exercise_can(client: RawClient) -> None:
+    enumerated = await client.request("enumerate_can_request", hal_pb2.EnumerateCanRequest())
+    resources = _expect_payload(enumerated, "enumerate_can_response").resources
+    _require(len(resources) == 1, f"expected one virtual CAN resource, got {len(resources)}")
+    descriptor = resources[0]
+    _require(descriptor.properties.get("adapter") == "virtual", "CAN adapter was not virtual")
+    opened = _expect_payload(
+        await client.request(
+            "open_can_request",
+            hal_pb2.OpenCanRequest(
+                selector=_selector(descriptor),
+                mode=hal_pb2.LEASE_MODE_CONTROL,
+                config=hal_pb2.CanOpenConfig(
+                    attach=hal_pb2.CanLinkExpectation(mode=hal_pb2.CAN_MODE_CLASSIC)
+                ),
+                filters=hal_pb2.CanFilterSet(),
+            ),
+        ),
+        "open_can_response",
+    )
+    _expect_payload(
+        await client.request(
+            "close_session_request",
+            hal_pb2.CloseSessionRequest(session_id=opened.session_id, lease=opened.lease),
+        ),
+        "close_session_response",
+    )
+
+
 async def exercise_contract(endpoint: str, token: bytes, timeout: float) -> None:
     first = RawClient(
         await _await_with_cap(connect_transport(endpoint), timeout), timeout
@@ -293,6 +326,7 @@ async def exercise_contract(endpoint: str, token: bytes, timeout: float) -> None
     second = None
     try:
         await first.handshake(token)
+        await _exercise_can(first)
         enumerated = await first.request(
             "enumerate_serial_request", hal_pb2.EnumerateSerialRequest()
         )
@@ -484,7 +518,7 @@ def main() -> int:
     except (AssertionError, asyncio.TimeoutError, OSError) as error:
         print(f"broker conformance failed: {error}", file=sys.stderr)
         return 1
-    print("broker conformance passed: 9 contract checks")
+    print("broker conformance passed: Serial and CAN contract checks")
     return 0
 
 

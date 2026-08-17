@@ -81,15 +81,24 @@ pub enum CanErrorClass {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CanFrame {
-    ClassicData { id: CanId, data: Bytes },
-    ClassicRemote { id: CanId, dlc: u8 },
+    ClassicData {
+        id: CanId,
+        data: Bytes,
+    },
+    ClassicRemote {
+        id: CanId,
+        dlc: u8,
+    },
     FdData {
         id: CanId,
         data: Bytes,
         bitrate_switch: bool,
         error_state_indicator: bool,
     },
-    Error { classes: Vec<CanErrorClass>, data: Bytes },
+    Error {
+        classes: Vec<CanErrorClass>,
+        data: Bytes,
+    },
 }
 
 impl CanFrame {
@@ -134,9 +143,7 @@ impl CanFrame {
     pub fn error(classes: Vec<CanErrorClass>, data: impl Into<Bytes>) -> HalResult<Self> {
         let data = data.into();
         if classes.is_empty() || classes.len() > MAX_CAN_ERROR_CLASSES {
-            return Err(invalid_frame(
-                "CAN error frame must contain 1..=10 classes",
-            ));
+            return Err(invalid_frame("CAN error frame must contain 1..=10 classes"));
         }
         if data.len() > MAX_CLASSIC_DATA_BYTES {
             return Err(invalid_frame("CAN error diagnostics exceed 8 bytes"));
@@ -173,9 +180,7 @@ impl CanFrame {
             }
             Self::Error { classes, data } => {
                 if classes.is_empty() || classes.len() > MAX_CAN_ERROR_CLASSES {
-                    return Err(invalid_frame(
-                        "CAN error frame must contain 1..=10 classes",
-                    ));
+                    return Err(invalid_frame("CAN error frame must contain 1..=10 classes"));
                 }
                 if data.len() > MAX_CLASSIC_DATA_BYTES {
                     return Err(invalid_frame("CAN error diagnostics exceed 8 bytes"));
@@ -269,10 +274,14 @@ impl CanTimestamp {
     ) -> HalResult<Self> {
         let clock_domain = clock_domain.into();
         if clock_domain.is_empty() {
-            return Err(invalid_frame("CAN timestamp clock domain must not be empty"));
+            return Err(invalid_frame(
+                "CAN timestamp clock domain must not be empty",
+            ));
         }
         if clock_domain.len() > 255 {
-            return Err(invalid_frame("CAN timestamp clock domain exceeds 255 bytes"));
+            return Err(invalid_frame(
+                "CAN timestamp clock domain exceeds 255 bytes",
+            ));
         }
         if !clock_domain.is_ascii() {
             return Err(invalid_frame("CAN timestamp clock domain must be ASCII"));

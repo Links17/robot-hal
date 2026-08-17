@@ -81,8 +81,10 @@ impl TryFrom<v1::ResourceDescriptor> for ResourceDescriptor {
                     "CAN resource descriptor requires explicit capabilities",
                 ));
             }
-            vec![CapabilityId::parse(crate::SERIAL_CAPABILITY)
-                .expect("the static Serial capability identifier is valid")]
+            vec![
+                CapabilityId::parse(crate::SERIAL_CAPABILITY)
+                    .expect("the static Serial capability identifier is valid"),
+            ]
         } else {
             value
                 .capabilities
@@ -298,9 +300,7 @@ pub fn parse_serial_session_lease(
 ) -> HalResult<(SessionId, LeaseToken)> {
     let (session, lease) = parse_session_lease(session_id, lease)?;
     if lease.mode() != LeaseMode::Control {
-        return Err(invalid_message(
-            "Serial session lease mode must be Control",
-        ));
+        return Err(invalid_message("Serial session lease mode must be Control"));
     }
     Ok((session, lease))
 }

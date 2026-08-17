@@ -7,15 +7,18 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, ValueEnum};
-#[cfg(not(feature = "virtual-adapter"))]
+#[cfg(feature = "pcan")]
+use seeed_hal_adapter_pcan::PcanAdapter;
 use seeed_hal_adapter_serialport::SerialPortAdapter;
+#[cfg(feature = "socketcan")]
+use seeed_hal_adapter_socketcan::SocketCanAdapter;
 use seeed_hal_broker::Broker;
 use seeed_hal_runtime::HalRuntime;
 use serde::Serialize;
 use tokio::task::JoinSet;
 
-#[cfg(feature = "virtual-adapter")]
-use seeed_hal_testkit::VirtualSerialAdapter;
+#[cfg(feature = "virtual-adapters")]
+use seeed_hal_testkit::{VirtualCanAdapter, VirtualSerialAdapter};
 
 const MAX_CONNECTIONS: usize = 64;
 
@@ -35,12 +38,19 @@ struct Args {
     manifest: bool,
     #[arg(long, value_enum, default_value_t = LogFormat::Json)]
     log_format: LogFormat,
+    #[arg(long, value_enum)]
+    require_adapter: Vec<RequiredAdapter>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
 enum LogFormat {
     Json,
     Pretty,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, ValueEnum)]
+enum RequiredAdapter {
+    Pcan,
 }
 
 #[derive(Serialize)]
@@ -74,17 +84,54 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .auth_token_file
         .expect("clap requires --auth-token-file");
     let token = token::read_and_remove_token(token_path).await?;
-    #[cfg(not(feature = "virtual-adapter"))]
-    let runtime = HalRuntime::builder()
-        .serial_adapter(SerialPortAdapter::new())
-        .build();
-    #[cfg(feature = "virtual-adapter")]
-    let runtime = HalRuntime::builder()
-        .serial_adapter(VirtualSerialAdapter::loopback("serial:virtual:broker-app"))
-        .build();
+    let runtime = build_runtime(&args.require_adapter)?;
     let broker = Broker::with_startup_token(runtime, token);
     serve(endpoint, broker).await?;
     Ok(())
+}
+
+fn build_runtime(required: &[RequiredAdapter]) -> Result<HalRuntime, Box<dyn std::error::Error>> {
+    #[allow(unused_mut)]
+    let mut builder = HalRuntime::builder().serial_adapter(SerialPortAdapter::new());
+    #[cfg(feature = "socketcan")]
+    {
+        builder = builder.can_adapter(SocketCanAdapter::new());
+    }
+    #[cfg(feature = "virtual-adapters")]
+    {
+        builder = builder
+            .serial_adapter(VirtualSerialAdapter::loopback("serial:virtual:broker-app"))
+            .can_adapter(VirtualCanAdapter::loopback("can:virtual:broker-app"));
+    }
+    #[cfg(feature = "pcan")]
+    {
+        match PcanAdapter::load() {
+            Ok(adapter) => builder = builder.can_adapter(adapter),
+            Err(error) => {
+                log_adapter_load_error("pcan", &error);
+                if required.contains(&RequiredAdapter::Pcan) {
+                    return Err(Box::new(error));
+                }
+            }
+        }
+    }
+    #[cfg(not(feature = "pcan"))]
+    if required.contains(&RequiredAdapter::Pcan) {
+        return Err("the broker was built without the pcan adapter feature".into());
+    }
+    Ok(builder.build())
+}
+
+#[cfg(feature = "pcan")]
+fn log_adapter_load_error(adapter: &'static str, error: &seeed_hal_core::HalError) {
+    tracing::warn!(
+        adapter,
+        error.name = error.name().as_str(),
+        error.category = ?error.category(),
+        error.operation = error.operation().as_str(),
+        error.retryable = error.retryable(),
+        "optional CAN adapter unavailable",
+    );
 }
 
 fn install_tracing(format: LogFormat) -> io::Result<()> {

@@ -13,9 +13,18 @@ fn constants_and_capabilities_are_stable() {
     assert_eq!(DEFAULT_CAN_TX_CAPACITY, 64);
     assert_eq!(can_classic_capability().as_str(), CAN_CLASSIC_CAPABILITY);
     assert_eq!(can_fd_capability().as_str(), CAN_FD_CAPABILITY);
-    assert_eq!(can_configure_capability().as_str(), CAN_CONFIGURE_CAPABILITY);
-    assert_eq!(can_error_frames_capability().as_str(), CAN_ERROR_FRAMES_CAPABILITY);
-    assert_eq!(can_rx_timestamp_capability().as_str(), CAN_RX_TIMESTAMP_CAPABILITY);
+    assert_eq!(
+        can_configure_capability().as_str(),
+        CAN_CONFIGURE_CAPABILITY
+    );
+    assert_eq!(
+        can_error_frames_capability().as_str(),
+        CAN_ERROR_FRAMES_CAPABILITY
+    );
+    assert_eq!(
+        can_rx_timestamp_capability().as_str(),
+        CAN_RX_TIMESTAMP_CAPABILITY
+    );
 }
 
 #[test]
@@ -35,7 +44,11 @@ fn frame_limits_and_flags_are_enforced() {
     assert!(CanFrame::classic_remote(standard, 9).is_err());
     assert!(CanFrame::fd_data(standard, Bytes::from(vec![0; 64]), true, true).is_ok());
     assert!(CanFrame::fd_data(standard, Bytes::from(vec![0; 65]), false, false).is_err());
-    for length in [9, 10, 11, 13, 14, 15, 17, 18, 19, 21, 22, 23, 25, 26, 27, 28, 29, 30, 31, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63] {
+    for length in [
+        9, 10, 11, 13, 14, 15, 17, 18, 19, 21, 22, 23, 25, 26, 27, 28, 29, 30, 31, 33, 34, 35, 36,
+        37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
+        61, 62, 63,
+    ] {
         assert!(CanFrame::fd_data(standard, Bytes::from(vec![0; length]), false, false).is_err());
     }
     assert!(CanFrame::error(vec![CanErrorClass::BusError], Bytes::new()).is_ok());
@@ -92,16 +105,21 @@ fn public_frame_variants_still_require_canonical_validation() {
         },
     ];
     for frame in invalid_frames {
-        assert_eq!(frame.validate().unwrap_err().name().as_str(), "can.frame.invalid");
+        assert_eq!(
+            frame.validate().unwrap_err().name().as_str(),
+            "can.frame.invalid"
+        );
     }
-    assert!(CanFrame::FdData {
-        id: CanId::Extended(0x1fff_ffff),
-        data: Bytes::from(vec![0; MAX_FD_DATA_BYTES]),
-        bitrate_switch: true,
-        error_state_indicator: true,
-    }
-    .validate()
-    .is_ok());
+    assert!(
+        CanFrame::FdData {
+            id: CanId::Extended(0x1fff_ffff),
+            data: Bytes::from(vec![0; MAX_FD_DATA_BYTES]),
+            bitrate_switch: true,
+            error_state_indicator: true,
+        }
+        .validate()
+        .is_ok()
+    );
 }
 
 #[test]
@@ -128,7 +146,7 @@ fn filters_match_classes_formats_and_error_frames() {
     .unwrap();
     assert!(data_filter.matches(&data));
     assert!(!data_filter.matches(&remote));
-    assert!(!data_filter.matches(&extended.clone().into_data_frame()));
+    assert!(!data_filter.matches(&extended.into_data_frame()));
 
     let error_filter = CanFilter::new(
         0xffff_ffff,
@@ -174,7 +192,9 @@ fn configuration_rejects_invalid_timing_combinations() {
     assert!(CanBitTiming::new(500_000, Some(1000), None).is_err());
     assert!(CanBitTiming::new(500_000, None, Some(0)).is_err());
     let nominal = CanBitTiming::new(500_000, None, None).unwrap();
-    assert!(CanConfigureConfig::new(CanMode::Classic, nominal, Some(nominal), false, false).is_err());
+    assert!(
+        CanConfigureConfig::new(CanMode::Classic, nominal, Some(nominal), false, false).is_err()
+    );
     assert!(CanConfigureConfig::new(CanMode::Fd, nominal, None, false, false).is_err());
     assert!(CanConfigureConfig::new(CanMode::Classic, nominal, None, false, false).is_ok());
 }
@@ -212,15 +232,17 @@ fn configure_restart_ms_is_optional_and_nonzero() {
     )
     .unwrap();
     assert_eq!(config.restart_ms(), Some(250));
-    assert!(CanConfigureConfig::new_with_restart(
-        CanMode::Classic,
-        nominal,
-        None,
-        false,
-        false,
-        Some(0),
-    )
-    .is_err());
+    assert!(
+        CanConfigureConfig::new_with_restart(
+            CanMode::Classic,
+            nominal,
+            None,
+            false,
+            false,
+            Some(0),
+        )
+        .is_err()
+    );
 }
 
 #[test]

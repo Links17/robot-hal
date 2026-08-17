@@ -5,9 +5,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use async_trait::async_trait;
 use seeed_hal_adapter_socketcan::SocketCanAdapter;
 use seeed_hal_can::{
-    CanAdapter, CanBitTiming, CanChannel, CanConfigureConfig, CanLinkExpectation,
-    CanMode, CanOpenConfig, IdentityQuality, ResourceDescriptor, ResourceSelector,
-    can_configure_capability,
+    CanAdapter, CanBitTiming, CanChannel, CanConfigureConfig, CanLinkExpectation, CanMode,
+    CanOpenConfig, IdentityQuality, ResourceDescriptor, ResourceSelector, can_configure_capability,
 };
 use seeed_hal_core::{ErrorCategory, HalResult};
 use socketcan::nl::{CanCtrlMode, CanInterface, InterfaceDetails, Mtu};
@@ -61,10 +60,7 @@ impl Drop for VcanFixture {
     }
 }
 
-async fn descriptor_for(
-    adapter: &SocketCanAdapter,
-    interface: &str,
-) -> ResourceDescriptor {
+async fn descriptor_for(adapter: &SocketCanAdapter, interface: &str) -> ResourceDescriptor {
     adapter
         .enumerate()
         .await
@@ -92,9 +88,11 @@ async fn vcan_discovery_is_weak_and_does_not_advertise_configuration() {
 
     assert_eq!(descriptor.minimum_identity_quality(), IdentityQuality::Weak);
     assert_eq!(descriptor.properties().get("virtual"), Some("true"));
-    assert!(!descriptor
-        .capabilities()
-        .contains(&can_configure_capability()));
+    assert!(
+        !descriptor
+            .capabilities()
+            .contains(&can_configure_capability())
+    );
 }
 
 #[tokio::test]
@@ -198,9 +196,7 @@ fn timing_from_kernel(timing: socketcan::nl::CanBitTiming) -> CanBitTiming {
     let sample_point = u16::try_from(timing.sample_point)
         .ok()
         .filter(|value| *value != 0);
-    let sjw = u16::try_from(timing.sjw)
-        .ok()
-        .filter(|value| *value != 0);
+    let sjw = u16::try_from(timing.sjw).ok().filter(|value| *value != 0);
     CanBitTiming::new(timing.bitrate, sample_point, sjw)
         .expect("selected real interface reports representable timing")
 }
@@ -336,9 +332,11 @@ async fn selected_real_configure_reports_permission_or_close_retries_after_confl
         .expect("set SEEED_HAL_SOCKETCAN_CONFORMANCE_INTERFACE to a provisioned real CAN link");
     let adapter = SocketCanAdapter::new();
     let descriptor = descriptor_for(&adapter, &interface_name).await;
-    assert!(descriptor
-        .capabilities()
-        .contains(&can_configure_capability()));
+    assert!(
+        descriptor
+            .capabilities()
+            .contains(&can_configure_capability())
+    );
     let interface = CanInterface::open(&interface_name).expect("open selected CAN interface");
     let baseline = interface
         .details()
@@ -351,10 +349,7 @@ async fn selected_real_configure_reports_permission_or_close_retries_after_confl
     {
         Ok(channel) => channel,
         Err(error) => {
-            assert_eq!(
-                error.name().as_str(),
-                "runtime.transport.permission_denied"
-            );
+            assert_eq!(error.name().as_str(), "runtime.transport.permission_denied");
             assert_eq!(error.category(), ErrorCategory::Conflict);
             assert_eq!(error.operation().as_str(), "can.configure");
             assert!(!error.retryable());
@@ -363,9 +358,7 @@ async fn selected_real_configure_reports_permission_or_close_retries_after_confl
         }
     };
 
-    let applied = interface
-        .details()
-        .expect("query configured CAN interface");
+    let applied = interface.details().expect("query configured CAN interface");
     if applied.is_up {
         interface.bring_down().expect("inject down-state conflict");
     } else {
@@ -394,16 +387,10 @@ async fn selected_real_configure_reports_permission_or_close_retries_after_confl
     channel
         .close()
         .expect("retry restores the retained pre-Configure snapshot");
-    let restored = interface
-        .details()
-        .expect("query restored CAN interface");
+    let restored = interface.details().expect("query restored CAN interface");
     assert_eq!(restored.is_up, baseline.is_up);
     assert_eq!(restored.mtu, baseline.mtu);
-    assert_timing_restored(
-        "nominal",
-        baseline.can.bit_timing,
-        restored.can.bit_timing,
-    );
+    assert_timing_restored("nominal", baseline.can.bit_timing, restored.can.bit_timing);
     assert_timing_restored(
         "data",
         baseline.can.data_bit_timing,

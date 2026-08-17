@@ -4,7 +4,7 @@ use seeed_hal_can::{
     CanActiveConfig, CanBatchSendError, CanBitTiming, CanBusState, CanBusStatus,
     CanConfigureConfig, CanErrorClass, CanFilter, CanFilterSet, CanFrame, CanFrameClasses, CanId,
     CanIdFormat, CanLinkExpectation, CanMode, CanOpenConfig, CanTimestamp, CanTimestampSource,
-    ReceivedCanFrame, MAX_CAN_BATCH_FRAMES,
+    MAX_CAN_BATCH_FRAMES, ReceivedCanFrame,
 };
 use seeed_hal_core::{
     HalError, HalResult, LeaseMode, LeaseToken, ResourceDescriptor, ResourceSelector, SessionId,
@@ -92,9 +92,10 @@ fn error_class_from_proto(value: i32) -> HalResult<CanErrorClass> {
         v1::CanErrorClass::BusError => Ok(CanErrorClass::BusError),
         v1::CanErrorClass::Restarted => Ok(CanErrorClass::Restarted),
         v1::CanErrorClass::Other => Ok(CanErrorClass::Other),
-        v1::CanErrorClass::Unspecified => {
-            Err(invalid("can_frame.error_classes", "contains an unspecified value"))
-        }
+        v1::CanErrorClass::Unspecified => Err(invalid(
+            "can_frame.error_classes",
+            "contains an unspecified value",
+        )),
     }
 }
 
@@ -125,7 +126,10 @@ impl TryFrom<v1::CanFrame> for CanFrame {
                     || value.error_state_indicator
                     || !value.error_classes.is_empty()
                 {
-                    return Err(invalid("can_frame", "has fields incompatible with classic data"));
+                    return Err(invalid(
+                        "can_frame",
+                        "has fields incompatible with classic data",
+                    ));
                 }
                 let id = CanId::try_from(required(value.id, "can_frame.id")?)?;
                 CanFrame::classic_data(id, value.data)
@@ -167,7 +171,10 @@ impl TryFrom<v1::CanFrame> for CanFrame {
                     || value.bitrate_switch
                     || value.error_state_indicator
                 {
-                    return Err(invalid("can_frame", "has fields incompatible with an error frame"));
+                    return Err(invalid(
+                        "can_frame",
+                        "has fields incompatible with an error frame",
+                    ));
                 }
                 let classes = value
                     .error_classes
@@ -233,17 +240,15 @@ impl TryFrom<v1::CanTimestamp> for CanTimestamp {
     type Error = HalError;
 
     fn try_from(value: v1::CanTimestamp) -> HalResult<Self> {
-        let source = match required_enum::<v1::CanTimestampSource>(
-            value.source,
-            "can_timestamp.source",
-        )? {
-            v1::CanTimestampSource::Hardware => CanTimestampSource::Hardware,
-            v1::CanTimestampSource::Kernel => CanTimestampSource::Kernel,
-            v1::CanTimestampSource::HostMonotonic => CanTimestampSource::HostMonotonic,
-            v1::CanTimestampSource::Unspecified => {
-                return Err(invalid("can_timestamp.source", "is required"));
-            }
-        };
+        let source =
+            match required_enum::<v1::CanTimestampSource>(value.source, "can_timestamp.source")? {
+                v1::CanTimestampSource::Hardware => CanTimestampSource::Hardware,
+                v1::CanTimestampSource::Kernel => CanTimestampSource::Kernel,
+                v1::CanTimestampSource::HostMonotonic => CanTimestampSource::HostMonotonic,
+                v1::CanTimestampSource::Unspecified => {
+                    return Err(invalid("can_timestamp.source", "is required"));
+                }
+            };
         CanTimestamp::new(value.timestamp_ns, source, value.clock_domain)
             .map_err(|_| invalid("can_timestamp.clock_domain", "is invalid"))
     }
@@ -296,8 +301,7 @@ impl TryFrom<v1::CanBitTiming> for CanBitTiming {
         let sjw = value
             .sjw
             .map(|value| {
-                u16::try_from(value)
-                    .map_err(|_| invalid("can_bit_timing.sjw", "is out of range"))
+                u16::try_from(value).map_err(|_| invalid("can_bit_timing.sjw", "is out of range"))
             })
             .transpose()?;
         CanBitTiming::new(value.bitrate, sample_point_permill, sjw)
@@ -351,10 +355,8 @@ impl TryFrom<v1::CanConfigureConfig> for CanConfigureConfig {
 
     fn try_from(value: v1::CanConfigureConfig) -> HalResult<Self> {
         let mode = mode_from_proto(value.mode, "can_configure_config.mode")?;
-        let nominal = CanBitTiming::try_from(required(
-            value.nominal,
-            "can_configure_config.nominal",
-        )?)?;
+        let nominal =
+            CanBitTiming::try_from(required(value.nominal, "can_configure_config.nominal")?)?;
         let data = value.data.map(CanBitTiming::try_from).transpose()?;
         CanConfigureConfig::new_with_restart(
             mode,
@@ -386,12 +388,8 @@ impl TryFrom<v1::CanOpenConfig> for CanOpenConfig {
 
     fn try_from(value: v1::CanOpenConfig) -> HalResult<Self> {
         match required(value.config, "can_open_config.config")? {
-            v1::can_open_config::Config::Attach(value) => {
-                Ok(Self::Attach(value.try_into()?))
-            }
-            v1::can_open_config::Config::Configure(value) => {
-                Ok(Self::Configure(value.try_into()?))
-            }
+            v1::can_open_config::Config::Attach(value) => Ok(Self::Attach(value.try_into()?)),
+            v1::can_open_config::Config::Configure(value) => Ok(Self::Configure(value.try_into()?)),
         }
     }
 }
@@ -399,12 +397,8 @@ impl TryFrom<v1::CanOpenConfig> for CanOpenConfig {
 impl From<&CanOpenConfig> for v1::CanOpenConfig {
     fn from(value: &CanOpenConfig) -> Self {
         let config = match value {
-            CanOpenConfig::Attach(value) => {
-                v1::can_open_config::Config::Attach(value.into())
-            }
-            CanOpenConfig::Configure(value) => {
-                v1::can_open_config::Config::Configure(value.into())
-            }
+            CanOpenConfig::Attach(value) => v1::can_open_config::Config::Attach(value.into()),
+            CanOpenConfig::Configure(value) => v1::can_open_config::Config::Configure(value.into()),
         };
         Self {
             config: Some(config),
@@ -417,10 +411,8 @@ impl TryFrom<v1::CanActiveConfig> for CanActiveConfig {
 
     fn try_from(value: v1::CanActiveConfig) -> HalResult<Self> {
         let mode = mode_from_proto(value.mode, "can_active_config.mode")?;
-        let nominal = CanBitTiming::try_from(required(
-            value.nominal,
-            "can_active_config.nominal",
-        )?)?;
+        let nominal =
+            CanBitTiming::try_from(required(value.nominal, "can_active_config.nominal")?)?;
         let data = value.data.map(CanBitTiming::try_from).transpose()?;
         CanActiveConfig::new(
             mode,
@@ -430,7 +422,12 @@ impl TryFrom<v1::CanActiveConfig> for CanActiveConfig {
             value.loopback,
             value.clock_domain,
         )
-        .map_err(|_| invalid("can_active_config", "is inconsistent or has an invalid domain"))
+        .map_err(|_| {
+            invalid(
+                "can_active_config",
+                "is inconsistent or has an invalid domain",
+            )
+        })
     }
 }
 
@@ -467,10 +464,7 @@ impl TryFrom<v1::CanFilter> for CanFilter {
     type Error = HalError;
 
     fn try_from(value: v1::CanFilter) -> HalResult<Self> {
-        let format = match required_enum::<v1::CanIdFormat>(
-            value.format,
-            "can_filter.format",
-        )? {
+        let format = match required_enum::<v1::CanIdFormat>(value.format, "can_filter.format")? {
             v1::CanIdFormat::Standard => CanIdFormat::Standard,
             v1::CanIdFormat::Extended => CanIdFormat::Extended,
             v1::CanIdFormat::Either => CanIdFormat::Either,
@@ -479,13 +473,8 @@ impl TryFrom<v1::CanFilter> for CanFilter {
             }
         };
         let classes = CanFrameClasses::from(required(value.classes, "can_filter.classes")?);
-        CanFilter::new(
-            value.id,
-            value.mask,
-            format,
-            classes,
-        )
-        .map_err(|_| invalid("can_filter", "contains invalid bounds or frame classes"))
+        CanFilter::new(value.id, value.mask, format, classes)
+            .map_err(|_| invalid("can_filter", "contains invalid bounds or frame classes"))
     }
 }
 
@@ -509,15 +498,17 @@ impl TryFrom<v1::CanFilterSet> for CanFilterSet {
 
     fn try_from(value: v1::CanFilterSet) -> HalResult<Self> {
         if value.filters.len() > seeed_hal_can::MAX_CAN_FILTERS {
-            return Err(invalid("can_filter_set.filters", "exceeds the 64-filter bound"));
+            return Err(invalid(
+                "can_filter_set.filters",
+                "exceeds the 64-filter bound",
+            ));
         }
         let filters = value
             .filters
             .into_iter()
             .map(CanFilter::try_from)
             .collect::<HalResult<Vec<_>>>()?;
-        CanFilterSet::new(filters)
-            .map_err(|_| invalid("can_filter_set.filters", "is invalid"))
+        CanFilterSet::new(filters).map_err(|_| invalid("can_filter_set.filters", "is invalid"))
     }
 }
 
@@ -578,10 +569,7 @@ pub fn enumerate_can_response_from_proto(
         .map(|value| {
             let descriptor = ResourceDescriptor::try_from(value)?;
             if descriptor.transport() != seeed_hal_core::TransportKind::Can {
-                return Err(invalid(
-                    "enumerate_can.resources.transport",
-                    "must be CAN",
-                ));
+                return Err(invalid("enumerate_can.resources.transport", "must be CAN"));
             }
             Ok(descriptor)
         })
@@ -687,10 +675,7 @@ pub fn can_send_response_to_proto(
     }
 }
 
-pub fn can_receive_parameters(
-    max_frames: u32,
-    timeout_ms: u64,
-) -> HalResult<(usize, Duration)> {
+pub fn can_receive_parameters(max_frames: u32, timeout_ms: u64) -> HalResult<(usize, Duration)> {
     let max_frames = usize::try_from(max_frames)
         .map_err(|_| invalid("can_receive.max_frames", "is out of range"))?;
     if !(1..=MAX_CAN_BATCH_FRAMES).contains(&max_frames) {
@@ -737,10 +722,7 @@ pub fn replace_can_filters_request_from_proto(
     value: v1::ReplaceCanFiltersRequest,
 ) -> HalResult<(SessionId, LeaseToken, CanFilterSet)> {
     let (session, lease) = parse_session_lease(value.session_id, value.lease)?;
-    let filters = CanFilterSet::try_from(required(
-        value.filters,
-        "replace_can_filters.filters",
-    )?)?;
+    let filters = CanFilterSet::try_from(required(value.filters, "replace_can_filters.filters")?)?;
     Ok((session, lease, filters))
 }
 

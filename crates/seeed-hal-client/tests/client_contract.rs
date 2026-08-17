@@ -1,6 +1,8 @@
 #[cfg(unix)]
 use bytes::Bytes;
 #[cfg(unix)]
+use seeed_hal_can::{CanFrame, CanId};
+#[cfg(unix)]
 use seeed_hal_client::{ConnectionOptions, EventSubscription, HalClient};
 #[cfg(unix)]
 use seeed_hal_serial::SerialConfig;
@@ -152,7 +154,10 @@ mod fake {
             identity_quality: v1::IdentityQuality::Strong as i32,
             transport: v1::TransportKind::Can as i32,
             properties: Default::default(),
-            capabilities: capabilities.iter().map(|value| (*value).to_owned()).collect(),
+            capabilities: capabilities
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
         }
     }
 
@@ -596,11 +601,8 @@ async fn serial_open_rejects_can_selector_before_transmission() {
     let listener = fake::bind(&endpoint);
     let server = tokio::spawn(async move {
         let mut wire = fake::accept_and_handshake(listener).await;
-        let outbound = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            wire.next(),
-        )
-        .await;
+        let outbound =
+            tokio::time::timeout(std::time::Duration::from_millis(100), wire.next()).await;
         assert!(
             outbound.is_err(),
             "invalid local selector must not transmit an OpenSerial request",
@@ -1426,9 +1428,7 @@ async fn client_close_fans_out_to_multiple_pending_requests() {
 #[tokio::test]
 async fn rust_client_round_trips_can_through_virtual_broker_and_closes_locally() {
     use seeed_hal_broker::{Broker, StartupToken, listener::UnixBroker};
-    use seeed_hal_can::{
-        CanFilterSet, CanFrame, CanId, CanLinkExpectation, CanMode, CanOpenConfig,
-    };
+    use seeed_hal_can::{CanFilterSet, CanLinkExpectation, CanMode, CanOpenConfig};
     use seeed_hal_core::LeaseMode;
     use seeed_hal_runtime::HalRuntime;
     use seeed_hal_testkit::VirtualCanAdapter;
@@ -1437,10 +1437,8 @@ async fn rust_client_round_trips_can_through_virtual_broker_and_closes_locally()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let directory = std::path::PathBuf::from(format!(
-        "/tmp/shc-can-{}-{nonce}",
-        std::process::id()
-    ));
+    let directory =
+        std::path::PathBuf::from(format!("/tmp/shc-can-{}-{nonce}", std::process::id()));
     let adapter = VirtualCanAdapter::loopback("can:virtual:client");
     let runtime = HalRuntime::builder().can_adapter(adapter.clone()).build();
     let broker = UnixBroker::bind(
@@ -1548,10 +1546,8 @@ async fn real_broker_owner_disconnect_revokes_remote_can_session() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let directory = std::path::PathBuf::from(format!(
-        "/tmp/shc-can-owner-{}-{nonce}",
-        std::process::id()
-    ));
+    let directory =
+        std::path::PathBuf::from(format!("/tmp/shc-can-owner-{}-{nonce}", std::process::id()));
     let adapter = VirtualCanAdapter::loopback("can:virtual:owner-disconnect");
     let runtime = HalRuntime::builder().can_adapter(adapter).build();
     let broker = UnixBroker::bind(
@@ -1599,9 +1595,7 @@ async fn real_broker_owner_disconnect_revokes_remote_can_session() {
 #[cfg(unix)]
 #[tokio::test]
 async fn can_partial_send_preserves_nested_error_and_unsolicited_event() {
-    use seeed_hal_can::{
-        CanFilterSet, CanFrame, CanId, CanLinkExpectation, CanMode, CanOpenConfig,
-    };
+    use seeed_hal_can::{CanFilterSet, CanLinkExpectation, CanMode, CanOpenConfig};
     use seeed_hal_core::LeaseMode;
     use seeed_hal_protocol::v1::{self, envelope};
 
@@ -1609,12 +1603,8 @@ async fn can_partial_send_preserves_nested_error_and_unsolicited_event() {
     let listener = fake::bind(&endpoint);
     let server = tokio::spawn(async move {
         let mut wire = fake::accept_and_handshake_can(listener).await;
-        fake::respond_can_enumerate_and_open(
-            &mut wire,
-            "can:fake:partial",
-            v1::LeaseMode::Control,
-        )
-        .await;
+        fake::respond_can_enumerate_and_open(&mut wire, "can:fake:partial", v1::LeaseMode::Control)
+            .await;
         let send = fake::recv(&mut wire).await;
         let input_count = match send.payload.as_ref().unwrap() {
             envelope::Payload::CanSendRequest(request) => request.frames.len(),
@@ -1688,11 +1678,8 @@ async fn can_partial_send_preserves_nested_error_and_unsolicited_event() {
         .unwrap();
     let frames = [1, 2, 3]
         .map(|id| {
-            CanFrame::classic_data(
-                CanId::standard(id).unwrap(),
-                Bytes::from(vec![id as u8]),
-            )
-            .unwrap()
+            CanFrame::classic_data(CanId::standard(id).unwrap(), Bytes::from(vec![id as u8]))
+                .unwrap()
         })
         .to_vec();
     let partial = can.send_batch(frames).await.unwrap_err();
@@ -1711,9 +1698,7 @@ async fn can_partial_send_preserves_nested_error_and_unsolicited_event() {
 #[cfg(unix)]
 #[tokio::test]
 async fn malformed_can_prefix_fails_closed_and_fans_out_other_can_requests() {
-    use seeed_hal_can::{
-        CanFilterSet, CanFrame, CanId, CanLinkExpectation, CanMode, CanOpenConfig,
-    };
+    use seeed_hal_can::{CanFilterSet, CanLinkExpectation, CanMode, CanOpenConfig};
     use seeed_hal_core::LeaseMode;
     use seeed_hal_protocol::v1::{self, envelope};
     use std::sync::Arc;
@@ -1733,11 +1718,8 @@ async fn malformed_can_prefix_fails_closed_and_fans_out_other_can_requests() {
         let send_id = [first, second]
             .into_iter()
             .find_map(|request| {
-                matches!(
-                    request.payload,
-                    Some(envelope::Payload::CanSendRequest(_))
-                )
-                .then_some(request.request_id)
+                matches!(request.payload, Some(envelope::Payload::CanSendRequest(_)))
+                    .then_some(request.request_id)
             })
             .unwrap();
         fake::send(
@@ -1811,9 +1793,7 @@ async fn malformed_can_prefix_fails_closed_and_fans_out_other_can_requests() {
 #[cfg(unix)]
 #[tokio::test]
 async fn cancelled_can_receive_tombstone_discards_response_without_consuming_status() {
-    use seeed_hal_can::{
-        CanFilterSet, CanFrame, CanId, CanLinkExpectation, CanMode, CanOpenConfig,
-    };
+    use seeed_hal_can::{CanFilterSet, CanLinkExpectation, CanMode, CanOpenConfig};
     use seeed_hal_core::LeaseMode;
     use seeed_hal_protocol::v1::{self, envelope};
     use std::sync::Arc;
@@ -1823,12 +1803,8 @@ async fn cancelled_can_receive_tombstone_discards_response_without_consuming_sta
     let (admitted_tx, admitted_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let mut wire = fake::accept_and_handshake_can(listener).await;
-        fake::respond_can_enumerate_and_open(
-            &mut wire,
-            "can:fake:cancel",
-            v1::LeaseMode::Observe,
-        )
-        .await;
+        fake::respond_can_enumerate_and_open(&mut wire, "can:fake:cancel", v1::LeaseMode::Observe)
+            .await;
         let receive = fake::recv(&mut wire).await;
         admitted_tx.send(()).unwrap();
         let status = fake::recv(&mut wire).await;
@@ -1907,12 +1883,8 @@ async fn can_local_batch_and_frame_bounds_reject_before_writer_admission() {
     let listener = fake::bind(&endpoint);
     let server = tokio::spawn(async move {
         let mut wire = fake::accept_and_handshake_can(listener).await;
-        fake::respond_can_enumerate_and_open(
-            &mut wire,
-            "can:fake:bounds",
-            v1::LeaseMode::Control,
-        )
-        .await;
+        fake::respond_can_enumerate_and_open(&mut wire, "can:fake:bounds", v1::LeaseMode::Control)
+            .await;
         let close = fake::recv(&mut wire).await;
         assert!(matches!(
             close.payload,
@@ -2107,14 +2079,8 @@ async fn peer_frames_outside_active_can_profile_terminate_and_fan_out() {
                     descriptor.selector(),
                     LeaseMode::Control,
                     CanOpenConfig::Attach(
-                        CanLinkExpectation::new(
-                            Some(CanMode::Classic),
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
-                        .unwrap(),
+                        CanLinkExpectation::new(Some(CanMode::Classic), None, None, None, None)
+                            .unwrap(),
                     ),
                     CanFilterSet::new(Vec::new()).unwrap(),
                 )
@@ -2160,18 +2126,12 @@ async fn attach_without_mode_uses_selected_resource_for_tight_receive_bounds() {
         let mut wire = fake::accept_and_handshake_can(listener).await;
         let resources = vec![
             fake::can_descriptor("can:fake:tight-classic", &["can.classic/v1"]),
-            fake::can_descriptor(
-                "can:fake:tight-fd",
-                &["can.fd/v1", "can.rx-timestamp/v1"],
-            ),
+            fake::can_descriptor("can:fake:tight-fd", &["can.fd/v1", "can.rx-timestamp/v1"]),
         ];
         let enumerate = fake::recv(&mut wire).await;
         fake::send(
             &mut wire,
-            fake::enumerate_can_resources_response(
-                enumerate.request_id,
-                resources.clone(),
-            ),
+            fake::enumerate_can_resources_response(enumerate.request_id, resources.clone()),
         )
         .await;
 
@@ -2261,11 +2221,10 @@ async fn attach_without_mode_uses_selected_resource_for_tight_receive_bounds() {
         )
         .await;
     });
-    let client = HalClient::connect(
-        ConnectionOptions::new(&endpoint, TOKEN).with_byte_limits(512, 8, 64),
-    )
-    .await
-    .unwrap();
+    let client =
+        HalClient::connect(ConnectionOptions::new(&endpoint, TOKEN).with_byte_limits(512, 8, 64))
+            .await
+            .unwrap();
     let descriptors = client.enumerate_can().await.unwrap();
     let classic = descriptors
         .iter()
@@ -2275,9 +2234,8 @@ async fn attach_without_mode_uses_selected_resource_for_tight_receive_bounds() {
         .iter()
         .find(|descriptor| descriptor.id().as_str() == "can:fake:tight-fd")
         .unwrap();
-    let attach = || {
-        CanOpenConfig::Attach(CanLinkExpectation::new(None, None, None, None, None).unwrap())
-    };
+    let attach =
+        || CanOpenConfig::Attach(CanLinkExpectation::new(None, None, None, None, None).unwrap());
     let mut classic_handle = client
         .open_can(
             classic.selector(),
@@ -2345,18 +2303,17 @@ async fn cancelled_can_response_is_fully_validated_before_discard() {
             timestamp: None,
         }],
     });
-    let error_without_capability =
-        envelope::Payload::CanReceiveResponse(v1::CanReceiveResponse {
-            frames: vec![v1::ReceivedCanFrame {
-                frame: Some(v1::CanFrame {
-                    kind: v1::CanFrameKind::Error as i32,
-                    data: vec![0],
-                    error_classes: vec![v1::CanErrorClass::Controller as i32],
-                    ..Default::default()
-                }),
-                timestamp: None,
-            }],
-        });
+    let error_without_capability = envelope::Payload::CanReceiveResponse(v1::CanReceiveResponse {
+        frames: vec![v1::ReceivedCanFrame {
+            frame: Some(v1::CanFrame {
+                kind: v1::CanFrameKind::Error as i32,
+                data: vec![0],
+                error_classes: vec![v1::CanErrorClass::Controller as i32],
+                ..Default::default()
+            }),
+            timestamp: None,
+        }],
+    });
 
     for (label, capabilities, late_payload, expected_name) in [
         (
@@ -2389,7 +2346,10 @@ async fn cancelled_can_response_is_fully_validated_before_discard() {
                     &mut wire,
                     fake::enumerate_can_resources_response(
                         enumerate.request_id,
-                        vec![fake::can_descriptor("can:fake:cancel-profile", &capabilities)],
+                        vec![fake::can_descriptor(
+                            "can:fake:cancel-profile",
+                            &capabilities,
+                        )],
                     ),
                 )
                 .await;
@@ -2440,14 +2400,8 @@ async fn cancelled_can_response_is_fully_validated_before_discard() {
                     descriptor.selector(),
                     LeaseMode::Observe,
                     CanOpenConfig::Attach(
-                        CanLinkExpectation::new(
-                            Some(CanMode::Classic),
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
-                        .unwrap(),
+                        CanLinkExpectation::new(Some(CanMode::Classic), None, None, None, None)
+                            .unwrap(),
                     ),
                     CanFilterSet::new(Vec::new()).unwrap(),
                 )

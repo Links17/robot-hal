@@ -215,22 +215,19 @@ fn every_v1_envelope_payload_field_number_is_locked() {
         ),
         (
             58,
-            envelope::Payload::ReplaceCanFiltersRequest(
-                v1::ReplaceCanFiltersRequest::default(),
-            ),
+            envelope::Payload::ReplaceCanFiltersRequest(v1::ReplaceCanFiltersRequest::default()),
         ),
-        (59, envelope::Payload::ReplaceCanFiltersResponse(v1::Empty {})),
+        (
+            59,
+            envelope::Payload::ReplaceCanFiltersResponse(v1::Empty {}),
+        ),
         (
             60,
-            envelope::Payload::GetCanBusStatusRequest(
-                v1::GetCanBusStatusRequest::default(),
-            ),
+            envelope::Payload::GetCanBusStatusRequest(v1::GetCanBusStatusRequest::default()),
         ),
         (
             61,
-            envelope::Payload::GetCanBusStatusResponse(
-                v1::GetCanBusStatusResponse::default(),
-            ),
+            envelope::Payload::GetCanBusStatusResponse(v1::GetCanBusStatusResponse::default()),
         ),
         (100, envelope::Payload::Error(v1::Error::default())),
     ];
@@ -750,7 +747,7 @@ fn every_nested_wire_field_number_is_locked() {
     );
     assert_tags(
         &v1::CanOpenConfig {
-            config: Some(v1::can_open_config::Config::Configure(configure.clone())),
+            config: Some(v1::can_open_config::Config::Configure(configure)),
         },
         &[2],
     );
@@ -883,7 +880,10 @@ fn wire_one_keeps_legacy_exact_minor_zero_negotiation() {
         protocol_minor: 0,
         ..Default::default()
     };
-    assert_eq!(seeed_hal_protocol::handshake_minor_range(&legacy).unwrap(), (0, 0));
+    assert_eq!(
+        seeed_hal_protocol::handshake_minor_range(&legacy).unwrap(),
+        (0, 0)
+    );
     assert_eq!(
         seeed_hal_protocol::negotiate_protocol_minor(
             legacy.protocol_major,
@@ -908,14 +908,13 @@ fn can_types_round_trip_without_losing_presence_or_variants() {
         CanFrame::classic_data(CanId::standard(0x123).unwrap(), vec![1, 2]).unwrap(),
         CanFrame::classic_remote(CanId::extended(0x1fff).unwrap(), 0).unwrap(),
         CanFrame::fd_data(CanId::extended(0x12345).unwrap(), vec![0; 12], true, true).unwrap(),
-        CanFrame::error(
-            vec![CanErrorClass::BusOff, CanErrorClass::Other],
-            vec![9],
-        )
-        .unwrap(),
+        CanFrame::error(vec![CanErrorClass::BusOff, CanErrorClass::Other], vec![9]).unwrap(),
     ];
     for frame in frames {
-        assert_eq!(CanFrame::try_from(v1::CanFrame::from(&frame)).unwrap(), frame);
+        assert_eq!(
+            CanFrame::try_from(v1::CanFrame::from(&frame)).unwrap(),
+            frame
+        );
     }
 
     let timestamp = CanTimestamp::new(0, CanTimestampSource::HostMonotonic, "clock-a").unwrap();
@@ -960,15 +959,8 @@ fn can_types_round_trip_without_losing_presence_or_variants() {
         CanOpenConfig::try_from(v1::CanOpenConfig::from(&open)).unwrap(),
         open,
     );
-    let active = CanActiveConfig::new(
-        CanMode::Fd,
-        nominal,
-        Some(data),
-        false,
-        true,
-        "clock-a",
-    )
-    .unwrap();
+    let active =
+        CanActiveConfig::new(CanMode::Fd, nominal, Some(data), false, true, "clock-a").unwrap();
     assert_eq!(
         CanActiveConfig::try_from(v1::CanActiveConfig::from(&active)).unwrap(),
         active,
@@ -1005,7 +997,11 @@ fn can_transport_and_maintenance_lease_round_trip_through_legacy_types() {
         ResourceSelector::try_from(v1::ResourceSelector::from(&selector)).unwrap(),
         selector,
     );
-    let lease = LeaseToken::new(LeaseId::parse("lease-can").unwrap(), 7, LeaseMode::Maintenance);
+    let lease = LeaseToken::new(
+        LeaseId::parse("lease-can").unwrap(),
+        7,
+        LeaseMode::Maintenance,
+    );
     assert_eq!(
         LeaseToken::try_from(v1::LeaseToken::from(&lease)).unwrap(),
         lease,
@@ -1033,11 +1029,9 @@ fn serial_operation_decoders_reject_can_and_maintenance_values() {
         ..Default::default()
     };
     assert_invalid_message(
-        seeed_hal_protocol::enumerate_serial_response_from_proto(
-            v1::EnumerateSerialResponse {
-                resources: vec![can_descriptor],
-            },
-        )
+        seeed_hal_protocol::enumerate_serial_response_from_proto(v1::EnumerateSerialResponse {
+            resources: vec![can_descriptor],
+        })
         .unwrap_err(),
         "enumerate_serial resource",
     );
@@ -1156,42 +1150,52 @@ fn malformed_ids_and_frame_combinations_fail_closed() {
 
 #[test]
 fn exact_can_wire_bounds_accept_limits_and_reject_every_fd_gap() {
-    assert!(CanId::try_from(v1::CanId {
-        value: 0x7ff,
-        format: v1::CanIdFormat::Standard as i32,
-    })
-    .is_ok());
-    assert!(CanId::try_from(v1::CanId {
-        value: 0x1fff_ffff,
-        format: v1::CanIdFormat::Extended as i32,
-    })
-    .is_ok());
-    assert!(CanFrame::try_from(v1::CanFrame {
-        id: Some(standard_id(1)),
-        kind: v1::CanFrameKind::ClassicData as i32,
-        data: vec![0; 8],
-        ..Default::default()
-    })
-    .is_ok());
-    assert!(CanFrame::try_from(v1::CanFrame {
-        id: Some(standard_id(1)),
-        kind: v1::CanFrameKind::ClassicRemote as i32,
-        remote_dlc: 8,
-        ..Default::default()
-    })
-    .is_ok());
-    for length in [0, 1, 8, 12, 16, 20, 24, 32, 48, 64] {
-        assert!(CanFrame::try_from(v1::CanFrame {
+    assert!(
+        CanId::try_from(v1::CanId {
+            value: 0x7ff,
+            format: v1::CanIdFormat::Standard as i32,
+        })
+        .is_ok()
+    );
+    assert!(
+        CanId::try_from(v1::CanId {
+            value: 0x1fff_ffff,
+            format: v1::CanIdFormat::Extended as i32,
+        })
+        .is_ok()
+    );
+    assert!(
+        CanFrame::try_from(v1::CanFrame {
             id: Some(standard_id(1)),
-            kind: v1::CanFrameKind::FdData as i32,
-            data: vec![0; length],
+            kind: v1::CanFrameKind::ClassicData as i32,
+            data: vec![0; 8],
             ..Default::default()
         })
-        .is_ok());
+        .is_ok()
+    );
+    assert!(
+        CanFrame::try_from(v1::CanFrame {
+            id: Some(standard_id(1)),
+            kind: v1::CanFrameKind::ClassicRemote as i32,
+            remote_dlc: 8,
+            ..Default::default()
+        })
+        .is_ok()
+    );
+    for length in [0, 1, 8, 12, 16, 20, 24, 32, 48, 64] {
+        assert!(
+            CanFrame::try_from(v1::CanFrame {
+                id: Some(standard_id(1)),
+                kind: v1::CanFrameKind::FdData as i32,
+                data: vec![0; length],
+                ..Default::default()
+            })
+            .is_ok()
+        );
     }
-    for length in (0..=65).filter(|&length| {
-        !matches!(length, 0..=8 | 12 | 16 | 20 | 24 | 32 | 48 | 64)
-    }) {
+    for length in
+        (0..=65).filter(|&length| !matches!(length, 0..=8 | 12 | 16 | 20 | 24 | 32 | 48 | 64))
+    {
         assert_invalid_message(
             CanFrame::try_from(v1::CanFrame {
                 id: Some(standard_id(1)),
@@ -1203,15 +1207,17 @@ fn exact_can_wire_bounds_accept_limits_and_reject_every_fd_gap() {
             "can_frame.data",
         );
     }
-    assert!(CanFrame::try_from(v1::CanFrame {
-        kind: v1::CanFrameKind::Error as i32,
-        error_classes: vec![
-            v1::CanErrorClass::Other as i32;
-            seeed_hal_can::MAX_CAN_ERROR_CLASSES
-        ],
-        ..Default::default()
-    })
-    .is_ok());
+    assert!(
+        CanFrame::try_from(v1::CanFrame {
+            kind: v1::CanFrameKind::Error as i32,
+            error_classes: vec![
+                v1::CanErrorClass::Other as i32;
+                seeed_hal_can::MAX_CAN_ERROR_CLASSES
+            ],
+            ..Default::default()
+        })
+        .is_ok()
+    );
     assert_invalid_message(
         CanFrame::try_from(v1::CanFrame {
             kind: v1::CanFrameKind::Error as i32,
@@ -1224,28 +1230,36 @@ fn exact_can_wire_bounds_accept_limits_and_reject_every_fd_gap() {
         .unwrap_err(),
         "can_frame.error_classes/data",
     );
-    assert!(CanTimestamp::try_from(v1::CanTimestamp {
-        timestamp_ns: u64::MAX,
-        source: v1::CanTimestampSource::Hardware as i32,
-        clock_domain: "x".repeat(255),
-    })
-    .is_ok());
-    assert!(CanBitTiming::try_from(v1::CanBitTiming {
-        bitrate: u32::MAX,
-        sample_point_permill: Some(1),
-        sjw: Some(u32::from(u16::MAX)),
-    })
-    .is_ok());
-    assert!(CanBitTiming::try_from(v1::CanBitTiming {
-        bitrate: 1,
-        sample_point_permill: Some(999),
-        sjw: Some(1),
-    })
-    .is_ok());
-    assert!(CanFilterSet::try_from(v1::CanFilterSet {
-        filters: vec![valid_filter(); 64],
-    })
-    .is_ok());
+    assert!(
+        CanTimestamp::try_from(v1::CanTimestamp {
+            timestamp_ns: u64::MAX,
+            source: v1::CanTimestampSource::Hardware as i32,
+            clock_domain: "x".repeat(255),
+        })
+        .is_ok()
+    );
+    assert!(
+        CanBitTiming::try_from(v1::CanBitTiming {
+            bitrate: u32::MAX,
+            sample_point_permill: Some(1),
+            sjw: Some(u32::from(u16::MAX)),
+        })
+        .is_ok()
+    );
+    assert!(
+        CanBitTiming::try_from(v1::CanBitTiming {
+            bitrate: 1,
+            sample_point_permill: Some(999),
+            sjw: Some(1),
+        })
+        .is_ok()
+    );
+    assert!(
+        CanFilterSet::try_from(v1::CanFilterSet {
+            filters: vec![valid_filter(); 64],
+        })
+        .is_ok()
+    );
     assert!(seeed_hal_protocol::send_can_frames_from_proto(vec![classic_frame(); 64]).is_ok());
     assert!(seeed_hal_protocol::can_receive_parameters(64, u64::MAX).is_ok());
 }
@@ -1279,7 +1293,10 @@ fn malformed_timestamps_timings_and_configurations_fail_closed() {
             clock_domain: "x".repeat(256),
         },
     ] {
-        assert_invalid_message(CanTimestamp::try_from(timestamp).unwrap_err(), "can_timestamp");
+        assert_invalid_message(
+            CanTimestamp::try_from(timestamp).unwrap_err(),
+            "can_timestamp",
+        );
     }
 
     for timing in [
@@ -1308,7 +1325,10 @@ fn malformed_timestamps_timings_and_configurations_fail_closed() {
             sjw: Some(u32::from(u16::MAX) + 1),
         },
     ] {
-        assert_invalid_message(CanBitTiming::try_from(timing).unwrap_err(), "can_bit_timing");
+        assert_invalid_message(
+            CanBitTiming::try_from(timing).unwrap_err(),
+            "can_bit_timing",
+        );
     }
 
     let invalid_configs = [
@@ -1493,7 +1513,7 @@ fn open_request_rejects_missing_values_and_non_can_transport() {
         v1::OpenCanRequest {
             selector: None,
             mode: v1::LeaseMode::Observe as i32,
-            config: Some(attach.clone()),
+            config: Some(attach),
             filters: Some(filters.clone()),
         },
         v1::OpenCanRequest {
@@ -1503,7 +1523,7 @@ fn open_request_rejects_missing_values_and_non_can_transport() {
                 transport: v1::TransportKind::Serial as i32,
             }),
             mode: v1::LeaseMode::Observe as i32,
-            config: Some(attach.clone()),
+            config: Some(attach),
             filters: Some(filters.clone()),
         },
         v1::OpenCanRequest {
@@ -1513,7 +1533,7 @@ fn open_request_rejects_missing_values_and_non_can_transport() {
                 transport: v1::TransportKind::Can as i32,
             }),
             mode: v1::LeaseMode::Unspecified as i32,
-            config: Some(attach.clone()),
+            config: Some(attach),
             filters: Some(filters.clone()),
         },
         v1::OpenCanRequest {

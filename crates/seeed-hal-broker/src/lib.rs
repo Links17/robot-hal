@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
-mod connection;
 mod can_dispatch;
+mod connection;
 pub mod listener;
 
 use std::io;

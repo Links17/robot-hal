@@ -4,16 +4,17 @@ use std::io;
 use std::time::Duration;
 
 use can_hal::{
-    CanFdFrame as BackendFdFrame, CanFrame as BackendClassicFrame, CanId as BackendId,
-    ReceiveFd, Transmit, TransmitFd,
+    CanFdFrame as BackendFdFrame, CanFrame as BackendClassicFrame, CanId as BackendId, ReceiveFd,
+    Transmit, TransmitFd,
 };
 use can_hal_socketcan::{SocketCanChannel as BackendChannel, SocketCanDriver, SocketCanError};
-use socketcan::{CanAnyFrame, CanFdSocket, CanRemoteFrame, EmbeddedFrame, ExtendedId, Id,
-    Socket, StandardId};
 use seeed_hal_can::{
     CanActiveConfig, CanBusStatus, CanChannel, CanFrame, CanId, CanMode, ReceivedCanFrame,
 };
 use seeed_hal_core::{ErrorCategory, HalError, HalResult, ResourceDescriptor};
+use socketcan::{
+    CanAnyFrame, CanFdSocket, CanRemoteFrame, EmbeddedFrame, ExtendedId, Id, Socket, StandardId,
+};
 
 use crate::link::LinkLease;
 
@@ -59,10 +60,7 @@ impl NativeSockets {
 }
 
 impl NativeSocketCanChannel {
-    pub(crate) fn open(
-        descriptor: ResourceDescriptor,
-        mut link: LinkLease,
-    ) -> HalResult<Self> {
+    pub(crate) fn open(descriptor: ResourceDescriptor, mut link: LinkLease) -> HalResult<Self> {
         let interface = descriptor.endpoint().as_str().to_owned();
         let sockets = match NativeSockets::open(&interface, &descriptor) {
             Ok(sockets) => sockets,
@@ -171,9 +169,9 @@ fn receive_from_socket(
         {
             Ok(None)
         }
-        Err(error) => Err(
-            map_io_error("can.receive", error).with_resource_id(descriptor.id().clone()),
-        ),
+        Err(error) => {
+            Err(map_io_error("can.receive", error).with_resource_id(descriptor.id().clone()))
+        }
     }
 }
 
@@ -260,17 +258,20 @@ fn to_backend_id(id: CanId) -> BackendId {
 
 fn to_socketcan_id(id: CanId) -> Id {
     match id {
-        CanId::Standard(value) => Id::Standard(StandardId::new(value).expect("validated standard CAN ID")),
-        CanId::Extended(value) => Id::Extended(ExtendedId::new(value).expect("validated extended CAN ID")),
+        CanId::Standard(value) => {
+            Id::Standard(StandardId::new(value).expect("validated standard CAN ID"))
+        }
+        CanId::Extended(value) => {
+            Id::Extended(ExtendedId::new(value).expect("validated extended CAN ID"))
+        }
     }
 }
 
 fn from_socketcan_frame(frame: CanAnyFrame) -> HalResult<CanFrame> {
     match frame {
-        CanAnyFrame::Normal(frame) => CanFrame::classic_data(
-            from_embedded_id(frame.id())?,
-            frame.data().to_vec(),
-        ),
+        CanAnyFrame::Normal(frame) => {
+            CanFrame::classic_data(from_embedded_id(frame.id())?, frame.data().to_vec())
+        }
         CanAnyFrame::Fd(frame) => CanFrame::fd_data(
             from_embedded_id(frame.id())?,
             frame.data().to_vec(),
@@ -279,7 +280,8 @@ fn from_socketcan_frame(frame: CanAnyFrame) -> HalResult<CanFrame> {
         ),
         CanAnyFrame::Remote(frame) => CanFrame::classic_remote(
             from_embedded_id(frame.id())?,
-            u8::try_from(frame.dlc()).map_err(|_| invalid_frame("can.receive", "remote DLC exceeds u8"))?,
+            u8::try_from(frame.dlc())
+                .map_err(|_| invalid_frame("can.receive", "remote DLC exceeds u8"))?,
         ),
         CanAnyFrame::Error(frame) => {
             let bits = frame.error_bits();
@@ -350,9 +352,7 @@ fn map_send_backend_error(error: SocketCanError, descriptor: &ResourceDescriptor
 }
 
 fn map_send_io_error(error: io::Error, descriptor: &ResourceDescriptor) -> HalError {
-    if error.kind() == io::ErrorKind::WouldBlock
-        || error.raw_os_error() == Some(libc::ENOBUFS)
-    {
+    if error.kind() == io::ErrorKind::WouldBlock || error.raw_os_error() == Some(libc::ENOBUFS) {
         return queue_full(error.raw_os_error(), descriptor);
     }
     map_io_error("can.send", error).with_resource_id(descriptor.id().clone())
@@ -503,12 +503,10 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use seeed_hal_can::{
-        CanBusState, CanFilter, CanFilterSet, CanFrameClasses, CanIdFormat,
-        IdentityQuality, can_classic_capability, can_fd_capability,
+        CanBusState, CanFilter, CanFilterSet, CanFrameClasses, CanIdFormat, IdentityQuality,
+        can_classic_capability, can_fd_capability,
     };
-    use seeed_hal_core::{
-        CapabilitySet, Endpoint, ResourceId, ResourceProperties, TransportKind,
-    };
+    use seeed_hal_core::{CapabilitySet, Endpoint, ResourceId, ResourceProperties, TransportKind};
     use socketcan::nl::{CanInterface, Mtu};
 
     use super::*;
@@ -599,16 +597,10 @@ mod tests {
         let descriptor = descriptor(&fixture.name, false);
         let mut sockets = NativeSockets::open(&fixture.name, &descriptor)
             .expect("open adapter-private vcan sockets");
-        let accepted = CanFrame::classic_data(
-            CanId::standard(0x123).expect("valid ID"),
-            [1, 2, 3],
-        )
-        .expect("valid Classical frame");
-        let rejected = CanFrame::classic_data(
-            CanId::standard(0x223).expect("valid ID"),
-            [4, 5, 6],
-        )
-        .expect("valid Classical frame");
+        let accepted = CanFrame::classic_data(CanId::standard(0x123).expect("valid ID"), [1, 2, 3])
+            .expect("valid Classical frame");
+        let rejected = CanFrame::classic_data(CanId::standard(0x223).expect("valid ID"), [4, 5, 6])
+            .expect("valid Classical frame");
         send_with_mode(&mut sockets, &accepted, CanMode::Classic, &descriptor)
             .expect("send accepted frame");
         send_with_mode(&mut sockets, &rejected, CanMode::Classic, &descriptor)
@@ -648,16 +640,17 @@ mod tests {
 
         let status = crate::link::bus_status_for_interface(&fixture.name, &descriptor)
             .expect("query vcan status");
-        assert!(matches!(status.state(), CanBusState::Active | CanBusState::Unknown));
+        assert!(matches!(
+            status.state(),
+            CanBusState::Active | CanBusState::Unknown
+        ));
         assert!(status.tx_error_counter().is_none_or(|value| value == 0));
         assert!(status.rx_error_counter().is_none_or(|value| value == 0));
 
         let wrong_descriptor = descriptor("identity-mismatch", false);
-        let identity_error = crate::link::bus_status_for_interface(
-            &fixture.name,
-            &wrong_descriptor,
-        )
-        .expect_err("status must reject a stale canonical resource identity");
+        let identity_error =
+            crate::link::bus_status_for_interface(&fixture.name, &wrong_descriptor)
+                .expect_err("status must reject a stale canonical resource identity");
         assert_eq!(identity_error.name().as_str(), "runtime.resource.not_found");
         assert_eq!(identity_error.operation().as_str(), "can.status");
         assert_eq!(identity_error.resource_id(), Some(wrong_descriptor.id()));
@@ -684,8 +677,7 @@ mod tests {
         )
         .expect("valid FD frame");
 
-        send_with_mode(&mut sockets, &frame, CanMode::Fd, &descriptor)
-            .expect("send FD frame");
+        send_with_mode(&mut sockets, &frame, CanMode::Fd, &descriptor).expect("send FD frame");
         let received = receive_from_socket(
             &mut sockets.receiver,
             Duration::from_millis(100),
@@ -699,11 +691,8 @@ mod tests {
     #[test]
     fn permission_errors_are_stable_and_resource_scoped() {
         let descriptor = descriptor("can-test", false);
-        let error = map_io_error(
-            "can.open",
-            io::Error::from_raw_os_error(libc::EPERM),
-        )
-        .with_resource_id(descriptor.id().clone());
+        let error = map_io_error("can.open", io::Error::from_raw_os_error(libc::EPERM))
+            .with_resource_id(descriptor.id().clone());
 
         assert_eq!(error.name().as_str(), "runtime.transport.permission_denied");
         assert_eq!(error.category(), ErrorCategory::Conflict);

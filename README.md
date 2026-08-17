@@ -21,6 +21,7 @@ The implementation is library-first. Rust applications link the library directly
 - [Versioning contract](docs/contracts/versioning.md)
 - [v0.1 implementation plan](docs/superpowers/plans/2026-08-14-v0.1-core-serial.md)
 - [v0.1.0 acceptance evidence](docs/releases/v0.1.0-acceptance.md)
+- [v0.2.0 acceptance evidence](docs/releases/v0.2.0-acceptance.md)
 - [Physical Serial loopback runbook](docs/runbooks/serial-loopback.md)
 
 ## Status
@@ -32,8 +33,10 @@ device-protocol, workflow, and product behavior.
 
 Linux, macOS, and Windows are target platforms. Local macOS and cross-compile evidence is recorded in
 the v0.1 acceptance document; native Linux/Windows CI, physical Serial loopback, and release
-qualification remain pending external gates. CAN/CAN FD, USB, GPIO, Camera, Node bindings, and the
-camera frame data plane remain planned.
+qualification remain pending external gates. v0.2 adds CAN/CAN FD contracts, virtual conformance,
+broker and Rust/Python clients, Linux SocketCAN, and optional PCAN-Basic adapters. Native CAN
+hardware qualification remains an external gate. USB, GPIO, Camera, Node bindings, and the camera
+frame data plane remain planned.
 
 ## Verification
 

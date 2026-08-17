@@ -11,7 +11,7 @@ pub struct BrokerManifest {
     enabled: Enabled,
     msrv: &'static str,
     artifact_checksum: ArtifactChecksum,
-    required_vendor_runtime_libraries: [&'static str; 0],
+    required_vendor_runtime_libraries: Vec<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -30,8 +30,8 @@ struct Target {
 
 #[derive(Serialize)]
 struct Enabled {
-    adapters: &'static [&'static str],
-    features: &'static [&'static str],
+    adapters: Vec<&'static str>,
+    features: Vec<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -74,27 +74,39 @@ impl BrokerManifest {
                 algorithm: "sha256",
                 value: format!("{:x}", hasher.finalize()),
             },
-            required_vendor_runtime_libraries: [],
+            required_vendor_runtime_libraries: required_vendor_runtime_libraries(),
         })
     }
 }
 
-#[cfg(feature = "virtual-adapter")]
-fn enabled_adapters() -> &'static [&'static str] {
-    &["virtual-serial"]
+fn enabled_adapters() -> Vec<&'static str> {
+    let mut adapters = vec!["serialport"];
+    #[cfg(feature = "pcan")]
+    adapters.push("pcan");
+    #[cfg(feature = "socketcan")]
+    adapters.push("socketcan");
+    #[cfg(feature = "virtual-adapters")]
+    adapters.extend(["virtual-can", "virtual-serial"]);
+    adapters.sort_unstable();
+    adapters
 }
 
-#[cfg(not(feature = "virtual-adapter"))]
-fn enabled_adapters() -> &'static [&'static str] {
-    &["serialport"]
+#[allow(clippy::vec_init_then_push)] // Feature membership is compile-time conditional.
+fn enabled_features() -> Vec<&'static str> {
+    #[allow(unused_mut)]
+    let mut features = Vec::new();
+    #[cfg(feature = "pcan")]
+    features.push("pcan");
+    #[cfg(feature = "socketcan")]
+    features.push("socketcan");
+    #[cfg(feature = "virtual-adapters")]
+    features.push("virtual-adapters");
+    features
 }
 
-#[cfg(feature = "virtual-adapter")]
-fn enabled_features() -> &'static [&'static str] {
-    &["virtual-adapter"]
-}
-
-#[cfg(not(feature = "virtual-adapter"))]
-fn enabled_features() -> &'static [&'static str] {
-    &[]
+fn required_vendor_runtime_libraries() -> Vec<&'static str> {
+    #[cfg(feature = "pcan")]
+    return vec!["PCAN-Basic"];
+    #[cfg(not(feature = "pcan"))]
+    Vec::new()
 }

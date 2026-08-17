@@ -79,6 +79,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "autocfg"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
+
+[[package]]
 name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -106,16 +112,56 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
+name = "byteorder"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
+
+[[package]]
 name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
+name = "can-hal-pcan"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1582a1b68811620395fe236b34e1bb77377d4cb26351bfc8e609207e0be36eaf"
+dependencies = [
+ "can-hal-rs",
+ "libc",
+ "libloading",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "can-hal-rs"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c74dba2ef94139f60dc0e24fe26517e1416d3403f1b5ba3c8f1cdd36fc5de96f"
+
+[[package]]
+name = "can-hal-socketcan"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed4cd362a923f919051ecf9b4f24b7fe4f28603a2f71c1518be033f6a0c54b87"
+dependencies = [
+ "can-hal-rs",
+ "socketcan",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+
+[[package]]
+name = "cfg_aliases"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "clap"
@@ -213,6 +259,15 @@ name = "either"
 version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
+
+[[package]]
+name = "embedded-can"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9d2e857f87ac832df68fa498d18ddc679175cf3d2e4aa893988e5601baf9438"
+dependencies = [
+ "nb",
+]
 
 [[package]]
 name = "equivalent"
@@ -346,6 +401,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hex"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -370,6 +431,15 @@ name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
+
+[[package]]
+name = "itertools"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
+dependencies = [
+ "either",
+]
 
 [[package]]
 name = "itertools"
@@ -408,6 +478,16 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
 
 [[package]]
 name = "libudev"
@@ -466,6 +546,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -483,6 +572,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
+name = "nb"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d5439c4ad607c3c23abf66de8c8bf57ba8adcd1f129e699851a6e43935d339d"
+
+[[package]]
+name = "neli"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93062a0dce6da2517ea35f301dfc88184ce18d3601ec786a727a87bf535deca9"
+dependencies = [
+ "byteorder",
+ "libc",
+ "log",
+ "neli-proc-macros",
+]
+
+[[package]]
+name = "neli-proc-macros"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c8034b7fbb6f9455b2a96c19e6edf8dc9fc34c70449938d8ee3b4df363f61fe"
+dependencies = [
+ "either",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "syn 1.0.109",
+]
+
+[[package]]
 name = "nix"
 version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -491,6 +611,19 @@ dependencies = [
  "bitflags 1.3.2",
  "cfg-if",
  "libc",
+]
+
+[[package]]
+name = "nix"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+dependencies = [
+ "bitflags 2.13.1",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -579,7 +712,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph",
@@ -598,7 +731,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -753,6 +886,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "seeed-hal-adapter-pcan"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "can-hal-pcan",
+ "can-hal-rs",
+ "libloading",
+ "seeed-hal-can",
+ "seeed-hal-core",
+ "seeed-hal-testkit",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "seeed-hal-adapter-serialport"
 version = "0.1.0"
 dependencies = [
@@ -770,14 +918,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "seeed-hal-adapter-socketcan"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "can-hal-rs",
+ "can-hal-socketcan",
+ "libc",
+ "neli",
+ "percent-encoding",
+ "seeed-hal-can",
+ "seeed-hal-core",
+ "seeed-hal-testkit",
+ "socketcan",
+ "tokio",
+]
+
+[[package]]
 name = "seeed-hal-broker"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
  "futures-util",
  "getrandom 0.3.4",
  "prost",
+ "seeed-hal-can",
  "seeed-hal-core",
  "seeed-hal-protocol",
  "seeed-hal-runtime",
@@ -794,11 +960,13 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-broker-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "rustix",
+ "seeed-hal-adapter-pcan",
  "seeed-hal-adapter-serialport",
+ "seeed-hal-adapter-socketcan",
  "seeed-hal-broker",
  "seeed-hal-client",
  "seeed-hal-core",
@@ -821,13 +989,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "seeed-hal-can"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "seeed-hal-core",
+ "serde_json",
+]
+
+[[package]]
 name = "seeed-hal-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "futures-util",
  "prost",
  "seeed-hal-broker",
+ "seeed-hal-can",
  "seeed-hal-core",
  "seeed-hal-protocol",
  "seeed-hal-runtime",
@@ -849,11 +1028,12 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "prost",
  "prost-build",
  "protoc-bin-vendored",
+ "seeed-hal-can",
  "seeed-hal-core",
  "seeed-hal-runtime",
  "seeed-hal-serial",
@@ -861,10 +1041,11 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "seeed-hal-can",
  "seeed-hal-core",
  "seeed-hal-serial",
  "seeed-hal-testkit",
@@ -883,10 +1064,11 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-testkit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "seeed-hal-can",
  "seeed-hal-core",
  "seeed-hal-serial",
  "tokio",
@@ -976,7 +1158,7 @@ dependencies = [
  "io-kit-sys",
  "libudev",
  "mach2",
- "nix",
+ "nix 0.26.4",
  "scopeguard",
  "unescaper",
  "windows-sys 0.52.0",
@@ -1026,12 +1208,42 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "socket2"
+version = "0.5.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "socket2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "socketcan"
+version = "3.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7654092b2859221c29ac4b43dc502a8e156a7f2533e8617aaaa056b664d1230e"
+dependencies = [
+ "bitflags 2.13.1",
+ "embedded-can",
+ "hex",
+ "itertools 0.13.0",
+ "libc",
+ "libudev",
+ "log",
+ "nb",
+ "neli",
+ "nix 0.29.0",
+ "socket2 0.5.10",
+ "thiserror",
 ]
 
 [[package]]
@@ -1045,6 +1257,17 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "syn"
+version = "1.0.109"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b64191b275b66ffe2469e8af2c1cfe3bafa67b529ead792a6d0160888b4237"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
 
 [[package]]
 name = "syn"
@@ -1120,7 +1343,7 @@ dependencies = [
  "mio",
  "pin-project-lite",
  "signal-hook-registry",
- "socket2",
+ "socket2 0.6.5",
  "tokio-macros",
  "windows-sys 0.61.2",
 ]
@@ -1387,6 +1610,15 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
+dependencies = [
+ "windows-targets",
+]
+
+[[package]]
+name = "windows-sys"
+version = "0.59.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets",
 ]

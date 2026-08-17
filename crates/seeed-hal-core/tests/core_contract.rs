@@ -41,26 +41,31 @@ fn lease_token_carries_fencing_generation() {
 #[test]
 fn new_can_transport_and_maintenance_lease_round_trip() {
     let transport = TransportKind::Can;
-    let restored: TransportKind = serde_json::from_str(
-        &serde_json::to_string(&transport).unwrap(),
-    )
-    .unwrap();
+    let restored: TransportKind =
+        serde_json::from_str(&serde_json::to_string(&transport).unwrap()).unwrap();
     assert_eq!(restored, TransportKind::Can);
 
     let token = LeaseToken::new_for_test(9, LeaseMode::Maintenance);
-    let restored: LeaseToken = serde_json::from_str(
-        &serde_json::to_string(&token).unwrap(),
-    )
-    .unwrap();
+    let restored: LeaseToken =
+        serde_json::from_str(&serde_json::to_string(&token).unwrap()).unwrap();
     assert_eq!(restored.mode(), LeaseMode::Maintenance);
     assert_eq!(restored.generation(), 9);
 }
 
 #[test]
 fn legacy_core_enum_serialized_names_remain_stable() {
-    assert_eq!(serde_json::to_string(&TransportKind::Serial).unwrap(), "\"Serial\"");
-    assert_eq!(serde_json::to_string(&LeaseMode::Observe).unwrap(), "\"Observe\"");
-    assert_eq!(serde_json::to_string(&LeaseMode::Control).unwrap(), "\"Control\"");
+    assert_eq!(
+        serde_json::to_string(&TransportKind::Serial).unwrap(),
+        "\"Serial\""
+    );
+    assert_eq!(
+        serde_json::to_string(&LeaseMode::Observe).unwrap(),
+        "\"Observe\""
+    );
+    assert_eq!(
+        serde_json::to_string(&LeaseMode::Control).unwrap(),
+        "\"Control\""
+    );
 }
 
 #[test]

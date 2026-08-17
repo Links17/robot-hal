@@ -1,6 +1,4 @@
-use seeed_hal_adapter_pcan::identity::{
-    PcanChannelMetadata, identity_from_metadata,
-};
+use seeed_hal_adapter_pcan::identity::{PcanChannelMetadata, identity_from_metadata};
 use seeed_hal_can::IdentityQuality;
 
 #[test]

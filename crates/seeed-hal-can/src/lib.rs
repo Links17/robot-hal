@@ -6,9 +6,7 @@ mod filter;
 mod frame;
 
 pub use adapter::{CanActiveConfig, CanAdapter, CanBusState, CanBusStatus, CanChannel};
-pub use config::{
-    CanBitTiming, CanConfigureConfig, CanLinkExpectation, CanMode, CanOpenConfig,
-};
+pub use config::{CanBitTiming, CanConfigureConfig, CanLinkExpectation, CanMode, CanOpenConfig};
 pub use filter::{CanFilter, CanFilterSet, CanFrameClasses, CanIdFormat};
 pub use frame::{
     CanBatchSendError, CanErrorClass, CanFrame, CanId, CanTimestamp, CanTimestampSource,

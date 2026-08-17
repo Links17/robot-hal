@@ -15,9 +15,7 @@ use seeed_hal_core::{
 use tokio::sync::{oneshot, watch};
 use uuid::Uuid;
 
-use crate::can_actor::{
-    ActorSessionSpec, CanActorHandle, CanCommand, spawn_can_actor,
-};
+use crate::can_actor::{ActorSessionSpec, CanActorHandle, CanCommand, spawn_can_actor};
 use crate::can_lease_table::{CanLeaseTable, CanReservation};
 use crate::events::{EventPublisher, RuntimeEventKind};
 use crate::runtime_error;
@@ -251,12 +249,7 @@ impl CanManager {
             .map(|record| record.descriptor.clone())
             .collect();
         let required_capability = required_capability(&config);
-        let selected = resolve_resource(
-            &descriptors,
-            &selector,
-            &required_capability,
-            "can.open",
-        )?;
+        let selected = resolve_resource(&descriptors, &selector, &required_capability, "can.open")?;
         let selected_index = descriptors
             .iter()
             .position(|descriptor| std::ptr::eq(descriptor, selected))
@@ -354,7 +347,10 @@ impl CanManager {
                 )?;
                 state.actors.insert(
                     resource_id.clone(),
-                    ActorEntry { handle: actor.clone(), epoch },
+                    ActorEntry {
+                        handle: actor.clone(),
+                        epoch,
+                    },
                 );
                 (actor, epoch, reply_rx)
             };
@@ -392,7 +388,7 @@ impl CanManager {
             let mut state = lock_state(&self.state);
             self.reconcile_finished_actor(&mut state, &resource_id);
             match state.pending.remove(&session_id) {
-                Some(pending) => state.leases.commit(pending.reservation).map(|token| {
+                Some(pending) => state.leases.commit(pending.reservation).inspect(|token| {
                     let actor_epoch = pending
                         .actor_epoch
                         .expect("admitted CAN pending session has an actor epoch");
@@ -419,7 +415,6 @@ impl CanManager {
                     );
                     guard.activate(token.clone());
                     pending.done.send_replace(true);
-                    token
                 }),
                 None => Err(session_closed("can.open", &resource_id)),
             }
@@ -445,13 +440,16 @@ impl CanManager {
             .session_actor(&session_id, token, LeaseMode::Control, "can.send_batch")
             .map_err(CanBatchSendError::new)?;
         if frames.is_empty() || frames.len() > MAX_CAN_BATCH_FRAMES {
-            return Err(CanBatchSendError::new(runtime_error(
-                "can.frame.invalid",
-                ErrorCategory::InvalidArgument,
-                "can.send_batch",
-                false,
-                "a CAN send batch must contain 1..=64 frames",
-            ).with_resource_id(resource_id)));
+            return Err(CanBatchSendError::new(
+                runtime_error(
+                    "can.frame.invalid",
+                    ErrorCategory::InvalidArgument,
+                    "can.send_batch",
+                    false,
+                    "a CAN send batch must contain 1..=64 frames",
+                )
+                .with_resource_id(resource_id),
+            ));
         }
         for frame in &frames {
             frame.validate().map_err(|error| {
@@ -494,7 +492,8 @@ impl CanManager {
                 "can.receive",
                 false,
                 "CAN receive max_frames must be 1..=64",
-            ).with_resource_id(resource_id));
+            )
+            .with_resource_id(resource_id));
         }
         let (reply_tx, reply_rx) = oneshot::channel();
         actor
@@ -502,7 +501,9 @@ impl CanManager {
                 CanCommand::Receive {
                     session_id,
                     max_frames,
-                    deadline: Instant::now().checked_add(timeout).unwrap_or_else(Instant::now),
+                    deadline: Instant::now()
+                        .checked_add(timeout)
+                        .unwrap_or_else(Instant::now),
                     reply: reply_tx,
                 },
                 "can.receive",
@@ -578,11 +579,7 @@ impl CanManager {
         }
     }
 
-    pub(crate) async fn close(
-        &self,
-        session_id: SessionId,
-        token: &LeaseToken,
-    ) -> HalResult<()> {
+    pub(crate) async fn close(&self, session_id: SessionId, token: &LeaseToken) -> HalResult<()> {
         let (actor, resource_id, actor_epoch) = {
             let mut state = lock_state(&self.state);
             if let Some(resource_id) = state
@@ -613,37 +610,38 @@ impl CanManager {
             }
             let (reply_tx, reply_rx) = oneshot::channel();
             entry_actor
-                .try_cleanup(
-                    CanCommand::RemoveSession {
-                        session_id: session_id.clone(),
-                        cleanup_done: None,
-                        reply: reply_tx,
-                    },
-                )
+                .try_cleanup(CanCommand::RemoveSession {
+                    session_id: session_id.clone(),
+                    cleanup_done: None,
+                    reply: reply_tx,
+                })
                 .map_err(|error| error.with_resource_id(entry_resource.clone()))?;
             state
                 .active
                 .get_mut(&session_id)
                 .expect("validated CAN session remains present while manager state is locked")
                 .closing = true;
-            (
-                (entry_actor, reply_rx),
-                entry_resource,
-                entry_actor_epoch,
-            )
+            ((entry_actor, reply_rx), entry_resource, entry_actor_epoch)
         };
         let (actor_handle, reply_rx) = actor;
-        let (result, last_session) = match tokio::time::timeout(self.close_timeout, reply_rx).await {
+        let (result, last_session) = match tokio::time::timeout(self.close_timeout, reply_rx).await
+        {
             Ok(Ok(outcome)) => (outcome.result, outcome.last_session),
             Ok(Err(_)) => (Err(actor_unavailable("can.close", &resource_id)), false),
-            Err(_) => (Err(runtime_error(
-                "runtime.session.close_timeout",
-                ErrorCategory::Unavailable,
-                "can.close",
+            Err(_) => (
+                Err(runtime_error(
+                    "runtime.session.close_timeout",
+                    ErrorCategory::Unavailable,
+                    "can.close",
+                    false,
+                    format!(
+                        "CAN session close exceeded its {:?} deadline",
+                        self.close_timeout
+                    ),
+                )
+                .with_resource_id(resource_id.clone())),
                 false,
-                format!("CAN session close exceeded its {:?} deadline", self.close_timeout),
-            )
-            .with_resource_id(resource_id.clone())), false),
+            ),
         };
         if last_session {
             let _ = tokio::time::timeout(self.close_timeout, actor_handle.wait_finished()).await;
@@ -703,7 +701,7 @@ impl CanManager {
                     pending_done.push(entry.done.subscribe());
                 }
             }
-            let active = state
+            let active: Vec<_> = state
                 .active
                 .iter()
                 .filter(|(_, entry)| &entry.owner_id == owner_id)
@@ -771,7 +769,9 @@ impl CanManager {
                                 ErrorCategory::Unavailable,
                                 "can.enumerate",
                                 true,
-                                format!("CAN adapter discovery exceeded its {worker_timeout:?} deadline"),
+                                format!(
+                                    "CAN adapter discovery exceeded its {worker_timeout:?} deadline"
+                                ),
                             )),
                         }
                     }))
@@ -803,25 +803,25 @@ impl CanManager {
                 self.close_timeout.saturating_add(Duration::from_millis(20)),
                 receiver,
             )
-                .await
-                .map_err(|_| {
-                    runtime_error(
-                        "runtime.transport.timeout",
-                        ErrorCategory::Unavailable,
-                        operation,
-                        true,
-                        "CAN adapter discovery exceeded its finite deadline",
-                    )
-                })?
-                .map_err(|_| {
-                    runtime_error(
-                        "runtime.actor.unavailable",
-                        ErrorCategory::Internal,
-                        operation,
-                        false,
-                        "a CAN discovery worker exited without a reply",
-                    )
-                })??;
+            .await
+            .map_err(|_| {
+                runtime_error(
+                    "runtime.transport.timeout",
+                    ErrorCategory::Unavailable,
+                    operation,
+                    true,
+                    "CAN adapter discovery exceeded its finite deadline",
+                )
+            })?
+            .map_err(|_| {
+                runtime_error(
+                    "runtime.actor.unavailable",
+                    ErrorCategory::Internal,
+                    operation,
+                    false,
+                    "a CAN discovery worker exited without a reply",
+                )
+            })??;
             records.extend(descriptors.into_iter().map(|descriptor| DiscoveryRecord {
                 adapter_index,
                 descriptor,
@@ -870,9 +870,11 @@ impl CanManager {
     }
 
     fn reconcile_finished_actor(&self, state: &mut ManagerState, resource_id: &ResourceId) {
-        let Some(epoch) = state.actors.get(resource_id).and_then(|entry| {
-            entry.handle.is_finished().then_some(entry.epoch)
-        }) else {
+        let Some(epoch) = state
+            .actors
+            .get(resource_id)
+            .and_then(|entry| entry.handle.is_finished().then_some(entry.epoch))
+        else {
             return;
         };
         state.actors.remove(resource_id);
@@ -895,9 +897,7 @@ impl CanManager {
             let expected = session.termination_expected.load(Ordering::Acquire);
             let failed = session.termination_failed.load(Ordering::Acquire);
             if (!expected || failed)
-                && !session
-                    .terminal_health_emitted
-                    .swap(true, Ordering::AcqRel)
+                && !session.terminal_health_emitted.swap(true, Ordering::AcqRel)
             {
                 self.events.publish(
                     RuntimeEventKind::CanBusUnknown,
@@ -957,11 +957,7 @@ impl CanManager {
         if let Some(gate) = &self.close_event_gate {
             gate.wait();
         }
-        if close_failed
-            && !entry
-                .terminal_health_emitted
-                .swap(true, Ordering::AcqRel)
-        {
+        if close_failed && !entry.terminal_health_emitted.swap(true, Ordering::AcqRel) {
             self.events.publish(
                 RuntimeEventKind::CanBusUnknown,
                 resource_id.clone(),
@@ -981,9 +977,7 @@ impl CanManager {
             && state
                 .actors
                 .get(resource_id)
-                .is_some_and(|current| {
-                    current.epoch == actor_epoch && current.handle.is_finished()
-                })
+                .is_some_and(|current| current.epoch == actor_epoch && current.handle.is_finished())
         {
             state.actors.remove(resource_id);
         }
@@ -1002,7 +996,9 @@ fn remember_closed(
         }
     }
     state.closed_order.push_back(session_id.clone());
-    state.closed.insert(session_id, ClosedSession { token, resource_id });
+    state
+        .closed
+        .insert(session_id, ClosedSession { token, resource_id });
 }
 
 struct PendingCanOpen {
@@ -1155,13 +1151,16 @@ fn missing_session_error(
     validate_closed_token(&closed.token, supplied, operation)
         .err()
         .map(|error| error.with_resource_id(closed.resource_id.clone()))
-        .unwrap_or_else(|| runtime_error(
-            "runtime.session.closed",
-            ErrorCategory::Conflict,
-            operation,
-            false,
-            "the CAN session is closed",
-        ).with_resource_id(closed.resource_id.clone()))
+        .unwrap_or_else(|| {
+            runtime_error(
+                "runtime.session.closed",
+                ErrorCategory::Conflict,
+                operation,
+                false,
+                "the CAN session is closed",
+            )
+            .with_resource_id(closed.resource_id.clone())
+        })
 }
 
 fn validate_closed_token(
@@ -1223,7 +1222,9 @@ async fn reliable_actor_remove(
     done: watch::Sender<bool>,
     timeout: Duration,
 ) -> HalResult<()> {
-    let deadline = Instant::now().checked_add(timeout).unwrap_or_else(Instant::now);
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
     loop {
         if actor.is_finished() {
             done.send_replace(true);
@@ -1271,7 +1272,10 @@ fn lock_state(state: &Mutex<ManagerState>) -> std::sync::MutexGuard<'_, ManagerS
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn actor_unavailable(operation: &'static str, resource_id: &ResourceId) -> seeed_hal_core::HalError {
+fn actor_unavailable(
+    operation: &'static str,
+    resource_id: &ResourceId,
+) -> seeed_hal_core::HalError {
     runtime_error(
         "runtime.actor.unavailable",
         ErrorCategory::Internal,
@@ -1303,7 +1307,10 @@ fn session_not_found(operation: &'static str) -> seeed_hal_core::HalError {
     )
 }
 
-fn operation_timeout(operation: &'static str, resource_id: &ResourceId) -> seeed_hal_core::HalError {
+fn operation_timeout(
+    operation: &'static str,
+    resource_id: &ResourceId,
+) -> seeed_hal_core::HalError {
     runtime_error(
         "runtime.transport.timeout",
         ErrorCategory::Unavailable,
@@ -1324,8 +1331,7 @@ mod tests {
     use seeed_hal_testkit::VirtualCanAdapter;
 
     use super::{
-        CanManager, ManagerStateSignal, ManagerTestGate, ManagerThreadGate,
-        reliable_actor_remove,
+        CanManager, ManagerStateSignal, ManagerTestGate, ManagerThreadGate, reliable_actor_remove,
     };
     use crate::can_actor::CanActorHandle;
     use crate::events::{EventPublisher, RuntimeEventKind};
@@ -1374,16 +1380,14 @@ mod tests {
                 }
             }
         };
-        completion.send_replace(Some(Err(
-            HalError::new(
-                "test.actor.terminated",
-                ErrorCategory::Internal,
-                "can.actor",
-                false,
-                "injected actor termination",
-            )
-            .unwrap(),
-        )));
+        completion.send_replace(Some(Err(HalError::new(
+            "test.actor.terminated",
+            ErrorCategory::Internal,
+            "can.actor",
+            false,
+            "injected actor termination",
+        )
+        .unwrap())));
         tokio::time::timeout(Duration::from_millis(100), cleanup)
             .await
             .expect("confirmed actor termination must finish provisional cleanup")
@@ -1422,7 +1426,11 @@ mod tests {
         gate.release();
         assert!(opening.await.unwrap().is_err());
         revoke.await.unwrap();
-        assert!(tokio::time::timeout(Duration::from_millis(10), subscription.recv()).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), subscription.recv())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1435,7 +1443,13 @@ mod tests {
         let manager = Arc::new(manager);
         let mut subscription = events.subscribe();
         let (session, token) = manager
-            .open(owner("normal-close"), selector.clone(), LeaseMode::Observe, attach(), filters())
+            .open(
+                owner("normal-close"),
+                selector.clone(),
+                LeaseMode::Observe,
+                attach(),
+                filters(),
+            )
             .await
             .unwrap();
         let closing = {
@@ -1445,15 +1459,34 @@ mod tests {
         };
         gate.wait_reached().await;
         manager
-            .open(owner("normal-reuse"), selector, LeaseMode::Observe, attach(), filters())
+            .open(
+                owner("normal-reuse"),
+                selector,
+                LeaseMode::Observe,
+                attach(),
+                filters(),
+            )
             .await
             .unwrap();
         gate.release();
         closing.await.unwrap().unwrap();
-        assert_eq!(subscription.recv().await.unwrap().kind(), RuntimeEventKind::SessionOpened);
-        assert_eq!(subscription.recv().await.unwrap().kind(), RuntimeEventKind::SessionClosed);
-        assert_eq!(subscription.recv().await.unwrap().kind(), RuntimeEventKind::SessionOpened);
-        assert!(tokio::time::timeout(Duration::from_millis(10), subscription.recv()).await.is_err());
+        assert_eq!(
+            subscription.recv().await.unwrap().kind(),
+            RuntimeEventKind::SessionOpened
+        );
+        assert_eq!(
+            subscription.recv().await.unwrap().kind(),
+            RuntimeEventKind::SessionClosed
+        );
+        assert_eq!(
+            subscription.recv().await.unwrap().kind(),
+            RuntimeEventKind::SessionOpened
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), subscription.recv())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1476,7 +1509,13 @@ mod tests {
         let manager = Arc::new(manager);
         let mut subscription = events.subscribe();
         let (session, token) = manager
-            .open(owner("failed-close"), selector.clone(), LeaseMode::Observe, attach(), filters())
+            .open(
+                owner("failed-close"),
+                selector.clone(),
+                LeaseMode::Observe,
+                attach(),
+                filters(),
+            )
             .await
             .unwrap();
         let closing = {
@@ -1486,16 +1525,41 @@ mod tests {
         };
         gate.wait_reached().await;
         manager
-            .open(owner("failed-reuse"), selector, LeaseMode::Observe, attach(), filters())
+            .open(
+                owner("failed-reuse"),
+                selector,
+                LeaseMode::Observe,
+                attach(),
+                filters(),
+            )
             .await
             .unwrap();
         gate.release();
-        assert_eq!(closing.await.unwrap().unwrap_err().name().as_str(), "test.can.close");
-        assert_eq!(subscription.recv().await.unwrap().kind(), RuntimeEventKind::SessionOpened);
-        assert_eq!(subscription.recv().await.unwrap().kind(), RuntimeEventKind::CanBusUnknown);
-        assert_eq!(subscription.recv().await.unwrap().kind(), RuntimeEventKind::SessionClosed);
-        assert_eq!(subscription.recv().await.unwrap().kind(), RuntimeEventKind::SessionOpened);
-        assert!(tokio::time::timeout(Duration::from_millis(10), subscription.recv()).await.is_err());
+        assert_eq!(
+            closing.await.unwrap().unwrap_err().name().as_str(),
+            "test.can.close"
+        );
+        assert_eq!(
+            subscription.recv().await.unwrap().kind(),
+            RuntimeEventKind::SessionOpened
+        );
+        assert_eq!(
+            subscription.recv().await.unwrap().kind(),
+            RuntimeEventKind::CanBusUnknown
+        );
+        assert_eq!(
+            subscription.recv().await.unwrap().kind(),
+            RuntimeEventKind::SessionClosed
+        );
+        assert_eq!(
+            subscription.recv().await.unwrap().kind(),
+            RuntimeEventKind::SessionOpened
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), subscription.recv())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1520,7 +1584,13 @@ mod tests {
         let manager = Arc::new(manager);
         let mut subscription = events.subscribe();
         let (session, token) = manager
-            .open(owner("finish-first-close"), selector.clone(), LeaseMode::Observe, attach(), filters())
+            .open(
+                owner("finish-first-close"),
+                selector.clone(),
+                LeaseMode::Observe,
+                attach(),
+                filters(),
+            )
             .await
             .unwrap();
         reserve_signal.arm();
@@ -1534,19 +1604,44 @@ mod tests {
             let manager = Arc::clone(&manager);
             tokio::spawn(async move {
                 manager
-                    .open(owner("finish-first-reuse"), selector, LeaseMode::Observe, attach(), filters())
+                    .open(
+                        owner("finish-first-reuse"),
+                        selector,
+                        LeaseMode::Observe,
+                        attach(),
+                        filters(),
+                    )
                     .await
             })
         };
         reserve_signal.wait_reached().await;
         assert!(!reopening.is_finished());
         terminal_gate.release();
-        assert_eq!(closing.await.unwrap().unwrap_err().name().as_str(), "test.can.close");
+        assert_eq!(
+            closing.await.unwrap().unwrap_err().name().as_str(),
+            "test.can.close"
+        );
         reopening.await.unwrap().unwrap();
-        assert_eq!(subscription.recv().await.unwrap().kind(), RuntimeEventKind::SessionOpened);
-        assert_eq!(subscription.recv().await.unwrap().kind(), RuntimeEventKind::CanBusUnknown);
-        assert_eq!(subscription.recv().await.unwrap().kind(), RuntimeEventKind::SessionClosed);
-        assert_eq!(subscription.recv().await.unwrap().kind(), RuntimeEventKind::SessionOpened);
-        assert!(tokio::time::timeout(Duration::from_millis(10), subscription.recv()).await.is_err());
+        assert_eq!(
+            subscription.recv().await.unwrap().kind(),
+            RuntimeEventKind::SessionOpened
+        );
+        assert_eq!(
+            subscription.recv().await.unwrap().kind(),
+            RuntimeEventKind::CanBusUnknown
+        );
+        assert_eq!(
+            subscription.recv().await.unwrap().kind(),
+            RuntimeEventKind::SessionClosed
+        );
+        assert_eq!(
+            subscription.recv().await.unwrap().kind(),
+            RuntimeEventKind::SessionOpened
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), subscription.recv())
+                .await
+                .is_err()
+        );
     }
 }

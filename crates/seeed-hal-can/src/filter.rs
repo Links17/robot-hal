@@ -18,7 +18,11 @@ pub struct CanFrameClasses {
 
 impl CanFrameClasses {
     pub const fn new(data: bool, remote: bool, error: bool) -> Self {
-        Self { data, remote, error }
+        Self {
+            data,
+            remote,
+            error,
+        }
     }
 
     pub const fn data_only() -> Self {

@@ -2,10 +2,9 @@ use std::time::Duration;
 
 use prost::Message;
 use seeed_hal_can::{
-    CanBatchSendError, CanBusStatus, CanFilterSet, CanFrame, CanMode,
-    CanOpenConfig, ReceivedCanFrame, MAX_CAN_BATCH_FRAMES,
-    MAX_CAN_ERROR_CLASSES, MAX_CLASSIC_DATA_BYTES, MAX_FD_DATA_BYTES,
-    can_classic_capability, can_error_frames_capability, can_fd_capability,
+    CanBatchSendError, CanBusStatus, CanFilterSet, CanFrame, CanMode, CanOpenConfig,
+    MAX_CAN_BATCH_FRAMES, MAX_CAN_ERROR_CLASSES, MAX_CLASSIC_DATA_BYTES, MAX_FD_DATA_BYTES,
+    ReceivedCanFrame, can_classic_capability, can_error_frames_capability, can_fd_capability,
     can_rx_timestamp_capability,
 };
 use seeed_hal_core::{
@@ -18,8 +17,8 @@ use seeed_hal_protocol::{
     get_can_bus_status_response_from_proto, open_can_response_from_proto,
 };
 
-use crate::connection::{CanSessionProfile, ExpectedResponse};
 use crate::HalClient;
+use crate::connection::{CanSessionProfile, ExpectedResponse};
 
 /// A broker-owned CAN session. Dropping the handle never leaks a native CAN
 /// handle; the owning broker connection remains responsible for revocation.
@@ -78,7 +77,8 @@ impl RemoteCanHandle {
     }
 
     pub async fn send_batch(&self, frames: Vec<CanFrame>) -> Result<(), CanBatchSendError> {
-        self.ensure_open("can.send_batch").map_err(CanBatchSendError::new)?;
+        self.ensure_open("can.send_batch")
+            .map_err(CanBatchSendError::new)?;
         if !(1..=MAX_CAN_BATCH_FRAMES).contains(&frames.len()) {
             return Err(CanBatchSendError::new(self.local_error(
                 "runtime.argument.invalid",
@@ -112,15 +112,17 @@ impl RemoteCanHandle {
                     "the negotiated broker protocol does not advertise the frame capability",
                 )));
             }
-            payload_bytes = payload_bytes.checked_add(frame.data().len()).ok_or_else(|| {
-                CanBatchSendError::new(self.local_error(
-                    "runtime.argument.invalid",
-                    ErrorCategory::InvalidArgument,
-                    "can.send_batch",
-                    false,
-                    "CAN send payload byte count overflows usize",
-                ))
-            })?;
+            payload_bytes = payload_bytes
+                .checked_add(frame.data().len())
+                .ok_or_else(|| {
+                    CanBatchSendError::new(self.local_error(
+                        "runtime.argument.invalid",
+                        ErrorCategory::InvalidArgument,
+                        "can.send_batch",
+                        false,
+                        "CAN send payload byte count overflows usize",
+                    ))
+                })?;
         }
         let max_write = self.client.limits().2;
         if payload_bytes > max_write {
@@ -275,11 +277,8 @@ impl RemoteCanHandle {
             filters: Some((&filters).into()),
         };
         let payload = envelope::Payload::ReplaceCanFiltersRequest(request);
-        self.client.ensure_can_payload_fits(
-            &payload,
-            "can.replace_filters",
-            &self.resource_id,
-        )?;
+        self.client
+            .ensure_can_payload_fits(&payload, "can.replace_filters", &self.resource_id)?;
         self.client
             .send(
                 payload,

@@ -1,13 +1,15 @@
 [package]
 name = "seeed-hal-broker-app"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 build = "build.rs"
 
 [features]
-virtual-adapter = ["dep:seeed-hal-testkit"]
+pcan = ["dep:seeed-hal-adapter-pcan"]
+socketcan = ["dep:seeed-hal-adapter-socketcan"]
+virtual-adapters = ["dep:seeed-hal-testkit"]
 
 [[bin]]
 name = "seeed-hal-broker"
@@ -16,6 +18,8 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 seeed-hal-adapter-serialport = { path = "../../adapters/serialport" }
+seeed-hal-adapter-pcan = { path = "../../adapters/pcan", optional = true }
+seeed-hal-adapter-socketcan = { path = "../../adapters/socketcan", optional = true }
 seeed-hal-broker = { path = "../../crates/seeed-hal-broker" }
 seeed-hal-core = { path = "../../crates/seeed-hal-core" }
 seeed-hal-protocol = { path = "../../crates/seeed-hal-protocol" }

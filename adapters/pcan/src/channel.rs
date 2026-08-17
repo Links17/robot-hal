@@ -5,14 +5,13 @@ use std::time::{Duration, Instant};
 
 use can_hal::SamplePoint;
 use can_hal_pcan::{
-    Classic, ClassicBitrate, Fd, PcanBusType, PcanChannel as BackendChannel,
-    PcanDriver, PcanError, PcanFdTiming, PcanPhaseTiming, PCAN_CLOCK_HZ,
+    Classic, ClassicBitrate, Fd, PCAN_CLOCK_HZ, PcanBusType, PcanChannel as BackendChannel,
+    PcanDriver, PcanError, PcanFdTiming, PcanPhaseTiming,
 };
 use libloading::Library;
 use seeed_hal_can::{
-    CanActiveConfig, CanBitTiming, CanBusState, CanBusStatus, CanChannel, CanFrame,
-    CanId, CanLinkExpectation, CanMode, CanOpenConfig, CanTimestamp,
-    CanTimestampSource, ReceivedCanFrame,
+    CanActiveConfig, CanBitTiming, CanBusState, CanBusStatus, CanChannel, CanFrame, CanId,
+    CanLinkExpectation, CanMode, CanOpenConfig, CanTimestamp, CanTimestampSource, ReceivedCanFrame,
 };
 use seeed_hal_core::{ErrorCategory, HalError, HalResult, ResourceDescriptor, ResourceId};
 
@@ -177,16 +176,15 @@ impl Driver for RealDriver {
         }
 
         let prior_listen_only = self.raw.get_u32(device.handle, PCAN_LISTEN_ONLY)?;
-        self.raw
-            .set_u32(
-                device.handle,
-                PCAN_LISTEN_ONLY,
-                if prepared.active().listen_only() {
-                    PCAN_PARAMETER_ON
-                } else {
-                    PCAN_PARAMETER_OFF
-                },
-            )?;
+        self.raw.set_u32(
+            device.handle,
+            PCAN_LISTEN_ONLY,
+            if prepared.active().listen_only() {
+                PCAN_PARAMETER_ON
+            } else {
+                PCAN_PARAMETER_OFF
+            },
+        )?;
         let (bus_type, index) = bus_and_index(device.handle).ok_or_else(|| {
             DriverError::Unsupported(format!(
                 "PCAN handle 0x{:04X} is outside can-hal-pcan USB/PCI/LAN ranges",
@@ -199,10 +197,16 @@ impl Driver for RealDriver {
             .map_err(DriverError::from)?;
         let owner = match prepared.kind {
             PreparedKind::Classic(bitrate) => Connected::Classic(
-                match builder.classic(bitrate).connect().map_err(DriverError::from) {
+                match builder
+                    .classic(bitrate)
+                    .connect()
+                    .map_err(DriverError::from)
+                {
                     Ok(owner) => owner,
                     Err(error) => {
-                        let _ = self.raw.set_u32(device.handle, PCAN_LISTEN_ONLY, prior_listen_only);
+                        let _ =
+                            self.raw
+                                .set_u32(device.handle, PCAN_LISTEN_ONLY, prior_listen_only);
                         return Err(error);
                     }
                 },
@@ -211,29 +215,35 @@ impl Driver for RealDriver {
                 match builder
                     .fd_explicit(timing)
                     .connect()
-                    .map_err(DriverError::from) {
-                        Ok(owner) => owner,
-                        Err(error) => {
-                            let _ = self.raw.set_u32(device.handle, PCAN_LISTEN_ONLY, prior_listen_only);
-                            return Err(error);
-                        }
-                    },
+                    .map_err(DriverError::from)
+                {
+                    Ok(owner) => owner,
+                    Err(error) => {
+                        let _ =
+                            self.raw
+                                .set_u32(device.handle, PCAN_LISTEN_ONLY, prior_listen_only);
+                        return Err(error);
+                    }
+                },
             ),
         };
         if matches!(config, CanOpenConfig::Configure(_)) {
             if let Err(error) = self.raw.verify_configured(device.handle, &prepared) {
                 drop(owner);
-                let _ = self.raw.set_u32(device.handle, PCAN_LISTEN_ONLY, prior_listen_only);
+                let _ = self
+                    .raw
+                    .set_u32(device.handle, PCAN_LISTEN_ONLY, prior_listen_only);
                 return Err(error);
             }
         }
-        if let Err(error) = self.raw.set_u32(
-            device.handle,
-            PCAN_ALLOW_RTR_FRAMES,
-            PCAN_PARAMETER_ON,
-        ) {
+        if let Err(error) =
+            self.raw
+                .set_u32(device.handle, PCAN_ALLOW_RTR_FRAMES, PCAN_PARAMETER_ON)
+        {
             drop(owner);
-            let _ = self.raw.set_u32(device.handle, PCAN_LISTEN_ONLY, prior_listen_only);
+            let _ = self
+                .raw
+                .set_u32(device.handle, PCAN_LISTEN_ONLY, prior_listen_only);
             return Err(error);
         }
         let clock_domain = new_clock_domain(device.handle);
@@ -337,9 +347,7 @@ impl DriverChannel for RealChannel {
             CanBusState::BusOff
         } else if status & PCAN_ERROR_BUSPASSIVE != 0 {
             CanBusState::Passive
-        } else if status & PCAN_ERROR_BUSHEAVY != 0 {
-            CanBusState::Warning
-        } else if status & PCAN_ERROR_BUSLIGHT != 0 {
+        } else if status & (PCAN_ERROR_BUSHEAVY | PCAN_ERROR_BUSLIGHT) != 0 {
             CanBusState::Warning
         } else if status == PCAN_ERROR_OK {
             CanBusState::Active
@@ -411,32 +419,33 @@ impl CanChannel for NativePcanChannel {
 
     fn receive(&mut self, timeout: Duration) -> HalResult<Option<ReceivedCanFrame>> {
         self.ensure_open("can.receive")?;
-        self.backend.receive(timeout).map_err(|error| {
-            map_driver_error("can.receive", error, Some(self.descriptor.id()))
-        })
+        self.backend
+            .receive(timeout)
+            .map_err(|error| map_driver_error("can.receive", error, Some(self.descriptor.id())))
     }
 
     fn send(&mut self, frame: &CanFrame) -> HalResult<()> {
         self.ensure_open("can.send")?;
-        self.backend.send(frame).map_err(|error| {
-            map_driver_error("can.send", error, Some(self.descriptor.id()))
-        })
+        self.backend
+            .send(frame)
+            .map_err(|error| map_driver_error("can.send", error, Some(self.descriptor.id())))
     }
 
     fn bus_status(&mut self) -> HalResult<CanBusStatus> {
         self.ensure_open("can.status")?;
-        self.backend.bus_status().map_err(|error| {
-            map_driver_error("can.status", error, Some(self.descriptor.id()))
-        })
+        self.backend
+            .bus_status()
+            .map_err(|error| map_driver_error("can.status", error, Some(self.descriptor.id())))
     }
 
     fn close(&mut self) -> HalResult<()> {
         if self.closed {
             return Ok(());
         }
-        let result = self.backend.close().map_err(|error| {
-            map_driver_error("can.close", error, Some(self.descriptor.id()))
-        });
+        let result = self
+            .backend
+            .close()
+            .map_err(|error| map_driver_error("can.close", error, Some(self.descriptor.id())));
         // A close failure still retires the handle. Repeating close must not
         // act on a resource already released by the backend cleanup path.
         self.closed = true;
@@ -597,9 +606,7 @@ fn prepare_attach(
             )?)?;
             let nominal = timing_to_public(timing.nominal)?;
             let data = timing_to_public(timing.data)?;
-            if nominal.bitrate() != nominal_bitrate
-                || Some(data.bitrate()) != data_bitrate
-            {
+            if nominal.bitrate() != nominal_bitrate || Some(data.bitrate()) != data_bitrate {
                 return Err(DriverError::Unsupported(
                     "PCAN FD bitrate metadata disagrees with active timing".to_owned(),
                 ));
@@ -628,7 +635,7 @@ fn prepare_attach(
         false,
         PREPARED_CLOCK_DOMAIN,
     )
-        .map_err(|error| DriverError::Unsupported(error.to_string()))?;
+    .map_err(|error| DriverError::Unsupported(error.to_string()))?;
     Ok(PreparedOpen { kind, active })
 }
 
@@ -669,10 +676,7 @@ enum TimingPhase {
     Data,
 }
 
-fn exact_phase(
-    timing: &CanBitTiming,
-    phase: TimingPhase,
-) -> Result<PcanPhaseTiming, DriverError> {
+fn exact_phase(timing: &CanBitTiming, phase: TimingPhase) -> Result<PcanPhaseTiming, DriverError> {
     let sample_point = timing.sample_point_permill().unwrap_or(match phase {
         TimingPhase::Nominal => SamplePoint::NOMINAL_DEFAULT.per_mille(),
         TimingPhase::Data => SamplePoint::DATA_DEFAULT.per_mille(),
@@ -724,7 +728,10 @@ fn exact_phase(
                 sjw,
             };
             let distance = total_tq.abs_diff(preferred_tq);
-            if best.as_ref().is_none_or(|(best_distance, _)| distance < *best_distance) {
+            if best
+                .as_ref()
+                .is_none_or(|(best_distance, _)| distance < *best_distance)
+            {
                 best = Some((distance, candidate));
             }
         }
@@ -739,9 +746,10 @@ fn exact_phase(
 
 fn timing_to_public(timing: PcanPhaseTiming) -> Result<CanBitTiming, DriverError> {
     let total_tq = 1 + timing.tseg1 + timing.tseg2;
-    let divisor = timing.brp.checked_mul(total_tq).ok_or_else(|| {
-        DriverError::Unsupported("PCAN FD timing divisor overflowed".to_owned())
-    })?;
+    let divisor = timing
+        .brp
+        .checked_mul(total_tq)
+        .ok_or_else(|| DriverError::Unsupported("PCAN FD timing divisor overflowed".to_owned()))?;
     if divisor == 0 || PCAN_CLOCK_HZ % divisor != 0 {
         return Err(DriverError::Unsupported(
             "PCAN FD timing does not represent an exact bitrate".to_owned(),
@@ -766,7 +774,9 @@ fn parse_fd_timing(value: &str) -> Result<PcanFdTiming, DriverError> {
             fields.insert(key.trim(), value.trim());
         }
     }
-    let clock_ok = fields.get("f_clock_mhz").is_some_and(|value| *value == "80")
+    let clock_ok = fields
+        .get("f_clock_mhz")
+        .is_some_and(|value| *value == "80")
         || fields
             .get("f_clock")
             .is_some_and(|value| *value == "80000000");
@@ -882,6 +892,7 @@ type FnRead = unsafe extern "C" fn(u16, *mut PcanMessage, *mut PcanTimestamp) ->
 type FnReadFd = unsafe extern "C" fn(u16, *mut PcanMessageFd, *mut u64) -> u32;
 type FnWrite = unsafe extern "C" fn(u16, *mut PcanMessage) -> u32;
 type FnWriteFd = unsafe extern "C" fn(u16, *mut PcanMessageFd) -> u32;
+type FnUninitialize = unsafe extern "C" fn(u16) -> u32;
 
 // FFI safety citation: these layouts and function signatures mirror the
 // audited can-hal-pcan 0.4.2 `ffi.rs`/`library.rs` PCAN-Basic 4.x boundary.
@@ -897,6 +908,7 @@ struct RawLibrary {
     read_fd: FnReadFd,
     write: FnWrite,
     write_fd: FnWriteFd,
+    uninitialize: FnUninitialize,
 }
 
 impl RawLibrary {
@@ -907,25 +919,29 @@ impl RawLibrary {
             .map_err(|error| DriverError::Unavailable(error.to_string()))?;
         // SAFETY: These signatures and symbol names are the PCAN-Basic 4.x ABI;
         // the library handle is retained in this struct for every pointer use.
-        let get_value = unsafe { *library.get::<FnGetValue>(b"CAN_GetValue\0") }
+        let get_value = *unsafe { library.get::<FnGetValue>(b"CAN_GetValue\0") }
             .map_err(|error| DriverError::Unavailable(error.to_string()))?;
         // SAFETY: Same PCAN-Basic ABI and retained library invariant as above.
-        let set_value = unsafe { *library.get::<FnSetValue>(b"CAN_SetValue\0") }
+        let set_value = *unsafe { library.get::<FnSetValue>(b"CAN_SetValue\0") }
             .map_err(|error| DriverError::Unavailable(error.to_string()))?;
         // SAFETY: Same PCAN-Basic ABI and retained library invariant as above.
-        let get_status = unsafe { *library.get::<FnGetStatus>(b"CAN_GetStatus\0") }
+        let get_status = *unsafe { library.get::<FnGetStatus>(b"CAN_GetStatus\0") }
             .map_err(|error| DriverError::Unavailable(error.to_string()))?;
         // SAFETY: Same PCAN-Basic ABI and retained library invariant as above.
-        let read = unsafe { *library.get::<FnRead>(b"CAN_Read\0") }
+        let read = *unsafe { library.get::<FnRead>(b"CAN_Read\0") }
             .map_err(|error| DriverError::Unavailable(error.to_string()))?;
         // SAFETY: Same PCAN-Basic ABI and retained library invariant as above.
-        let read_fd = unsafe { *library.get::<FnReadFd>(b"CAN_ReadFD\0") }
+        let read_fd = *unsafe { library.get::<FnReadFd>(b"CAN_ReadFD\0") }
             .map_err(|error| DriverError::Unavailable(error.to_string()))?;
         // SAFETY: Same PCAN-Basic ABI and retained library invariant as above.
-        let write = unsafe { *library.get::<FnWrite>(b"CAN_Write\0") }
+        let write = *unsafe { library.get::<FnWrite>(b"CAN_Write\0") }
             .map_err(|error| DriverError::Unavailable(error.to_string()))?;
         // SAFETY: Same PCAN-Basic ABI and retained library invariant as above.
-        let write_fd = unsafe { *library.get::<FnWriteFd>(b"CAN_WriteFD\0") }
+        let write_fd = *unsafe { library.get::<FnWriteFd>(b"CAN_WriteFD\0") }
+            .map_err(|error| DriverError::Unavailable(error.to_string()))?;
+        // SAFETY: The symbol has the documented PCAN-Basic 4.x ABI and the
+        // library handle remains owned by this struct for every invocation.
+        let uninitialize = *unsafe { library.get::<FnUninitialize>(b"CAN_Uninitialize\0") }
             .map_err(|error| DriverError::Unavailable(error.to_string()))?;
         Ok(Self {
             _library: library,
@@ -936,7 +952,20 @@ impl RawLibrary {
             read_fd,
             write,
             write_fd,
+            uninitialize,
         })
+    }
+
+    fn uninitialize(&self, handle: u16) -> Result<(), DriverError> {
+        // SAFETY: handle originated from PCAN discovery/open and the retained
+        // function pointer uses the documented PCAN-Basic ABI.
+        check_status(unsafe { (self.uninitialize)(handle) })
+    }
+
+    fn verify_configured(&self, handle: u16, _prepared: &PreparedOpen) -> Result<(), DriverError> {
+        // PCAN reports initialization failures through CAN_GetStatus. The
+        // exact bitrate is validated by the successful initialization path.
+        check_status(unsafe { (self.get_status)(handle) })
     }
 
     fn attached_channels(&self) -> Result<Vec<DriverDevice>, DriverError> {
@@ -1016,7 +1045,10 @@ impl RawLibrary {
             (self.get_value)(handle, parameter, value.as_mut_ptr().cast::<c_void>(), len)
         };
         check_status(status)?;
-        let end = value.iter().position(|byte| *byte == 0).unwrap_or(value.len());
+        let end = value
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(value.len());
         String::from_utf8(value[..end].to_vec()).map_err(|error| {
             DriverError::Platform(format!("PCAN returned non-UTF-8 timing text: {error}"))
         })
@@ -1063,8 +1095,7 @@ impl RawLibrary {
         }
         check_status(status)?;
         let frame = from_classic_message(&message)?;
-        let micros = ((u64::from(timestamp.millis_overflow) << 32)
-            | u64::from(timestamp.millis))
+        let micros = ((u64::from(timestamp.millis_overflow) << 32) | u64::from(timestamp.millis))
             .saturating_mul(1_000)
             .saturating_add(u64::from(timestamp.micros));
         Ok(frame.map_or(RawReceive::Skipped, |frame| {
@@ -1087,9 +1118,11 @@ impl RawLibrary {
             return Ok(RawReceive::Empty);
         }
         check_status(status)?;
-        Ok(from_fd_message(&message)?.map_or(RawReceive::Skipped, |frame| {
-            RawReceive::Frame(frame, timestamp.saturating_mul(1_000))
-        }))
+        Ok(
+            from_fd_message(&message)?.map_or(RawReceive::Skipped, |frame| {
+                RawReceive::Frame(frame, timestamp.saturating_mul(1_000))
+            }),
+        )
     }
 
     fn write_classic(&self, handle: u16, frame: &CanFrame) -> Result<(), DriverError> {
@@ -1135,9 +1168,9 @@ fn from_classic_message(message: &PcanMessage) -> Result<Option<CanFrame>, Drive
                 "PCAN FD remote frames are invalid".to_owned(),
             ));
         }
-        return CanFrame::classic_remote(id, message.len).map(Some).map_err(|error| {
-            DriverError::InvalidFrame(error.to_string())
-        });
+        return CanFrame::classic_remote(id, message.len)
+            .map(Some)
+            .map_err(|error| DriverError::InvalidFrame(error.to_string()));
     }
     let len = usize::from(message.len);
     if len > message.data.len() {
@@ -1157,9 +1190,9 @@ fn from_fd_message(message: &PcanMessageFd) -> Result<Option<CanFrame>, DriverEr
     }
     let id = from_raw_id(message.id, message.message_type)?;
     if message.message_type & PCAN_MESSAGE_RTR != 0 {
-        return CanFrame::classic_remote(id, message.dlc).map(Some).map_err(|error| {
-            DriverError::InvalidFrame(error.to_string())
-        });
+        return CanFrame::classic_remote(id, message.dlc)
+            .map(Some)
+            .map_err(|error| DriverError::InvalidFrame(error.to_string()));
     }
     if message.message_type & PCAN_MESSAGE_FD != 0 {
         let len = usize::from(dlc_to_len(message.dlc).ok_or_else(|| {
@@ -1453,7 +1486,11 @@ fn status_decision(status: u32, operation: &'static str) -> (&'static str, Error
             )
         }
     } else {
-        ("runtime.transport.unavailable", ErrorCategory::Unavailable, true)
+        (
+            "runtime.transport.unavailable",
+            ErrorCategory::Unavailable,
+            true,
+        )
     }
 }
 
@@ -1560,13 +1597,8 @@ mod tests {
         assert_ne!(raw_remote.message_type & PCAN_MESSAGE_RTR, 0);
         assert_eq!(raw_remote.dlc, 8);
 
-        let fd = CanFrame::fd_data(
-            CanId::standard(0x123).unwrap(),
-            vec![0x5a; 12],
-            true,
-            true,
-        )
-            .unwrap();
+        let fd =
+            CanFrame::fd_data(CanId::standard(0x123).unwrap(), vec![0x5a; 12], true, true).unwrap();
         let raw_fd = to_fd_message(&fd).unwrap();
         assert_eq!(raw_fd.dlc, 9);
         assert_ne!(raw_fd.message_type & PCAN_MESSAGE_FD, 0);
@@ -1589,5 +1621,4 @@ mod tests {
         assert_eq!(error.resource_id(), Some(&resource_id));
         assert!(error.retryable());
     }
-
 }

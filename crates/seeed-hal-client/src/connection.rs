@@ -204,12 +204,16 @@ pub(crate) struct CanSessionProfile {
 pub(crate) enum ExpectedResponse {
     EnumerateSerial,
     OpenSerial,
-    SerialRead { max_bytes: usize },
+    SerialRead {
+        max_bytes: usize,
+    },
     SerialWrite,
     SerialFlush,
     SetControlLines,
     CloseSession,
-    CloseCan { profile: CanSessionProfile },
+    CloseCan {
+        profile: CanSessionProfile,
+    },
     EnumerateCan,
     OpenCan {
         mode: LeaseMode,
@@ -224,8 +228,12 @@ pub(crate) enum ExpectedResponse {
         max_read_bytes: usize,
         profile: CanSessionProfile,
     },
-    ReplaceCanFilters { profile: CanSessionProfile },
-    CanBusStatus { profile: CanSessionProfile },
+    ReplaceCanFilters {
+        profile: CanSessionProfile,
+    },
+    CanBusStatus {
+        profile: CanSessionProfile,
+    },
 }
 
 impl ExpectedResponse {
@@ -293,6 +301,8 @@ struct Limits {
     can_fd: bool,
     can_configure: bool,
     can_error_frames: bool,
+    #[allow(dead_code)]
+    // Retained negotiated limit for the forthcoming timestamped receive surface.
     can_rx_timestamp: bool,
 }
 
@@ -1236,10 +1246,11 @@ where
                         .map(|_| ())
                         .map_err(|error| attach_expected(error, &expected)),
                     Some(payload) => validate_response(expected.clone(), &payload),
-                    None => Err(expected.resource_id().map_or_else(
-                        unexpected_response,
-                        |resource_id| unexpected_response().with_resource_id(resource_id.clone()),
-                    )),
+                    None => Err(expected
+                        .resource_id()
+                        .map_or_else(unexpected_response, |resource_id| {
+                            unexpected_response().with_resource_id(resource_id.clone())
+                        })),
                 };
                 if let Err(error) = validation {
                     terminate(&shared, error);
@@ -1251,12 +1262,17 @@ where
         let result = match envelope.payload {
             Some(envelope::Payload::Error(error)) => error_from_proto(error)
                 .map(|error| {
-                    pending.expected.resource_id().map_or(error.clone(), |resource_id| {
-                        attach_resource(error, resource_id)
-                    })
+                    pending
+                        .expected
+                        .resource_id()
+                        .map_or(error.clone(), |resource_id| {
+                            attach_resource(error, resource_id)
+                        })
                 })
                 .and_then(Err),
-            Some(payload) => validate_response(pending.expected.clone(), &payload).map(|()| payload),
+            Some(payload) => {
+                validate_response(pending.expected.clone(), &payload).map(|()| payload)
+            }
             None => Err(unexpected_response()),
         };
         let terminal = result
@@ -1538,10 +1554,7 @@ fn validate_response(expected: ExpectedResponse, payload: &envelope::Payload) ->
             envelope::Payload::SetSerialControlLinesResponse(_),
         )
         | (ExpectedResponse::CloseSession, envelope::Payload::CloseSessionResponse(_)) => Ok(()),
-        (
-            ExpectedResponse::CloseCan { .. },
-            envelope::Payload::CloseSessionResponse(_),
-        )
+        (ExpectedResponse::CloseCan { .. }, envelope::Payload::CloseSessionResponse(_))
         | (
             ExpectedResponse::ReplaceCanFilters { .. },
             envelope::Payload::ReplaceCanFiltersResponse(_),
@@ -1575,12 +1588,14 @@ fn validate_response(expected: ExpectedResponse, payload: &envelope::Payload) ->
             let frames = can_receive_response_from_proto(response.clone(), max_frames)
                 .map_err(|error| attach_profile(error, &profile))?;
             let payload_bytes = frames.iter().try_fold(0_usize, |total, received| {
-                total.checked_add(received.frame().data().len()).ok_or_else(|| {
-                    invalid_profile_message(
-                        &profile,
-                        "CAN receive response payload byte count overflows usize",
-                    )
-                })
+                total
+                    .checked_add(received.frame().data().len())
+                    .ok_or_else(|| {
+                        invalid_profile_message(
+                            &profile,
+                            "CAN receive response payload byte count overflows usize",
+                        )
+                    })
             })?;
             if payload_bytes > max_read_bytes {
                 return Err(invalid_profile_message(
@@ -1593,7 +1608,7 @@ fn validate_response(expected: ExpectedResponse, payload: &envelope::Payload) ->
         (
             ExpectedResponse::CanBusStatus { profile },
             envelope::Payload::GetCanBusStatusResponse(response),
-        ) => get_can_bus_status_response_from_proto(response.clone())
+        ) => get_can_bus_status_response_from_proto(*response)
             .map(|_| ())
             .map_err(|error| attach_profile(error, &profile)),
         _ => Err(resource_id.map_or_else(unexpected_response, |resource_id| {
@@ -1636,9 +1651,9 @@ fn attach_profile(error: HalError, profile: &CanSessionProfile) -> HalError {
 }
 
 fn attach_expected(error: HalError, expected: &ExpectedResponse) -> HalError {
-    expected
-        .resource_id()
-        .map_or(error.clone(), |resource_id| attach_resource(error, resource_id))
+    expected.resource_id().map_or(error.clone(), |resource_id| {
+        attach_resource(error, resource_id)
+    })
 }
 
 fn invalid_profile_message(profile: &CanSessionProfile, message: &'static str) -> HalError {
