@@ -494,11 +494,13 @@ impl HalRuntime {
         let serial_result = self.revoke_serial_owner(owner).await;
         let can_result = self.inner.can_manager.revoke_owner(owner).await;
         let usb_result = self.inner.usb_manager.revoke_owner(owner).await;
-        match (serial_result, can_result, usb_result) {
-            (Err(error), _, _) => Err(error),
-            (Ok(()), Err(error), _) => Err(error),
-            (Ok(()), Ok(()), Err(error)) => Err(error),
-            (Ok(()), Ok(()), Ok(())) => Ok(()),
+        let gpio_result = self.inner.gpio_manager.revoke_owner(owner).await;
+        match (serial_result, can_result, usb_result, gpio_result) {
+            (Err(error), _, _, _) => Err(error),
+            (Ok(()), Err(error), _, _) => Err(error),
+            (Ok(()), Ok(()), Err(error), _) => Err(error),
+            (Ok(()), Ok(()), Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(()), Ok(()), Ok(())) => Ok(()),
         }
     }
 

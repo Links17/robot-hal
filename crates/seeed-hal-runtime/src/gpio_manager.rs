@@ -172,4 +172,30 @@ impl GpioManager {
             .await
             .map_err(|x| x.with_resource_id(e.resource))
     }
+    pub(crate) async fn revoke_owner(&self, owner: &OwnerId) -> HalResult<()> {
+        let entries = {
+            let mut state = self.state.lock().await;
+            let ids = state
+                .sessions
+                .iter()
+                .filter(|(_, entry)| &entry.owner == owner)
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            let mut entries = Vec::new();
+            for id in ids {
+                if let Some(entry) = state.sessions.remove(&id) {
+                    state.leases.release(&entry.resource, &id);
+                    state
+                        .closed
+                        .insert(id, (entry.resource.clone(), entry.owner.clone()));
+                    entries.push(entry);
+                }
+            }
+            entries
+        };
+        for mut entry in entries {
+            entry.session.close().await?;
+        }
+        Ok(())
+    }
 }

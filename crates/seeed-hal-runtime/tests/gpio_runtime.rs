@@ -41,3 +41,35 @@ async fn gpio_runtime_releases_owner_lines_and_fences_old_generation() {
     );
     second.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn gpio_owner_revoke_releases_lines_for_another_owner() {
+    let adapter = VirtualGpioAdapter::line_bank("gpio:runtime:revoke", 1);
+    let runtime = HalRuntime::builder().gpio_adapter(adapter).build();
+    let descriptor = runtime.enumerate_gpio().await.unwrap().remove(0);
+    let owner = OwnerId::parse("owner:gpio-revoked").unwrap();
+    let handle = runtime
+        .open_gpio(
+            owner.clone(),
+            descriptor.selector(),
+            vec![0],
+            GpioLineConfig::input(false, GpioBias::Disabled).unwrap(),
+        )
+        .await
+        .unwrap();
+    runtime.revoke_owner(&owner).await.unwrap();
+    assert_eq!(
+        handle.read().await.unwrap_err().name().as_str(),
+        "runtime.session.closed"
+    );
+    let mut replacement = runtime
+        .open_gpio(
+            OwnerId::parse("owner:gpio-new").unwrap(),
+            descriptor.selector(),
+            vec![0],
+            GpioLineConfig::input(false, GpioBias::Disabled).unwrap(),
+        )
+        .await
+        .unwrap();
+    replacement.close().await.unwrap();
+}
