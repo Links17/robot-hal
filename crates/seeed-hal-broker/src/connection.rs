@@ -883,8 +883,8 @@ async fn dispatch_operation_inner(
                 .enumerate_usb()
                 .await?
                 .iter()
-                .map(v1::ResourceDescriptor::from)
-                .collect();
+                .map(TryInto::try_into)
+                .collect::<HalResult<Vec<_>>>()?;
             Ok(envelope::Payload::EnumerateUsbResponse(
                 v1::EnumerateUsbResponse { resources },
             ))
@@ -894,8 +894,8 @@ async fn dispatch_operation_inner(
                 .enumerate_gpio()
                 .await?
                 .iter()
-                .map(v1::ResourceDescriptor::from)
-                .collect();
+                .map(TryInto::try_into)
+                .collect::<HalResult<Vec<_>>>()?;
             Ok(envelope::Payload::EnumerateGpioResponse(
                 v1::EnumerateGpioResponse { resources },
             ))
@@ -941,8 +941,8 @@ async fn dispatch_operation_inner(
                 .enumerate_serial()
                 .await?
                 .iter()
-                .map(v1::ResourceDescriptor::from)
-                .collect();
+                .map(TryInto::try_into)
+                .collect::<HalResult<Vec<_>>>()?;
             Ok(envelope::Payload::EnumerateSerialResponse(
                 v1::EnumerateSerialResponse { resources },
             ))

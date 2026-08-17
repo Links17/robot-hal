@@ -181,8 +181,8 @@ async fn enumerate(runtime: HalRuntime) -> HalResult<envelope::Payload> {
         .enumerate_can()
         .await?
         .iter()
-        .map(v1::ResourceDescriptor::from)
-        .collect();
+        .map(TryInto::try_into)
+        .collect::<HalResult<Vec<_>>>()?;
     Ok(envelope::Payload::EnumerateCanResponse(
         v1::EnumerateCanResponse { resources },
     ))

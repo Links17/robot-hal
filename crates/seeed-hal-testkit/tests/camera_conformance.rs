@@ -1,7 +1,7 @@
 use seeed_hal_camera::{
-    CameraAdapter, CameraControlKind, CameraControlValue, CameraFormat, CameraPixelFormat,
-    CameraRequest, DEFAULT_CAMERA_SLOT_COUNT, MAX_CAMERA_FRAME_BYTES, MAX_CAMERA_HEIGHT,
-    MAX_CAMERA_WIDTH,
+    CameraAdapter, CameraControlKind, CameraControlValue, CameraFormat, CameraFrame,
+    CameraFrameMetadata, CameraPixelFormat, CameraPlaneLayout, CameraRequest,
+    DEFAULT_CAMERA_SLOT_COUNT, MAX_CAMERA_FRAME_BYTES, MAX_CAMERA_HEIGHT, MAX_CAMERA_WIDTH,
 };
 use seeed_hal_core::{ErrorCategory, HalError};
 use seeed_hal_testkit::{VirtualCameraAdapter, run_camera_adapter_conformance};
@@ -41,6 +41,76 @@ fn camera_format_and_request_enforce_public_bounds() {
     let slots = CameraRequest::new(format, DEFAULT_CAMERA_SLOT_COUNT - 1)
         .expect_err("fewer than four slots must fail");
     assert_eq!(slots.name().as_str(), "camera.request.invalid");
+}
+
+#[test]
+fn camera_frames_reject_invalid_plane_count_overlap_and_bounds() {
+    let nv12 = CameraFormat::new(CameraPixelFormat::Nv12, 640, 480).unwrap();
+    let yuyv = CameraFormat::new(CameraPixelFormat::Yuyv, 320, 240).unwrap();
+    let y_plane = CameraPlaneLayout::new(0, 640 * 480, 640).unwrap();
+    let uv_plane = CameraPlaneLayout::new(640 * 480, 640 * 240, 640).unwrap();
+
+    let wrong_nv12_count =
+        CameraFrameMetadata::new(nv12.clone(), vec![y_plane], 1, 1, "monotonic", 0)
+            .expect_err("NV12 requires exactly two planes");
+    assert_eq!(wrong_nv12_count.name().as_str(), "camera.frame.invalid");
+
+    let wrong_yuyv_count = CameraFrameMetadata::new(
+        yuyv.clone(),
+        vec![
+            CameraPlaneLayout::new(0, 320 * 240 * 2, 640).unwrap(),
+            CameraPlaneLayout::new(320 * 240 * 2, 1, 1).unwrap(),
+        ],
+        1,
+        1,
+        "monotonic",
+        0,
+    )
+    .expect_err("YUYV requires exactly one plane");
+    assert_eq!(wrong_yuyv_count.name().as_str(), "camera.frame.invalid");
+
+    let overlapping = CameraFrameMetadata::new(
+        nv12,
+        vec![
+            y_plane,
+            CameraPlaneLayout::new(640 * 480 - 1, 640 * 240, 640).unwrap(),
+        ],
+        1,
+        1,
+        "monotonic",
+        0,
+    )
+    .expect_err("camera planes must not overlap");
+    assert_eq!(overlapping.name().as_str(), "camera.frame.invalid");
+
+    let valid_metadata = CameraFrameMetadata::new(
+        yuyv,
+        vec![CameraPlaneLayout::new(0, 320 * 240 * 2, 640).unwrap()],
+        1,
+        1,
+        "monotonic",
+        0,
+    )
+    .unwrap();
+    let out_of_bounds = CameraFrame::new(valid_metadata, bytes::Bytes::from(vec![0; 1]))
+        .expect_err("camera planes must remain within the payload");
+    assert_eq!(out_of_bounds.name().as_str(), "camera.frame.invalid");
+
+    let overflow = CameraPlaneLayout::new(usize::MAX, 1, 1)
+        .expect_err("plane range arithmetic must not overflow");
+    assert_eq!(overflow.name().as_str(), "camera.frame.invalid");
+
+    let valid_nv12 = CameraFrameMetadata::new(
+        CameraFormat::new(CameraPixelFormat::Nv12, 640, 480).unwrap(),
+        vec![y_plane, uv_plane],
+        1,
+        1,
+        "virtual-camera",
+        0,
+    )
+    .expect("the virtual adapter NV12 layout remains valid");
+    CameraFrame::new(valid_nv12, bytes::Bytes::from(vec![0; 640 * 480 * 3 / 2]))
+        .expect("the virtual adapter NV12 payload remains valid");
 }
 
 #[tokio::test]
@@ -170,4 +240,39 @@ async fn virtual_camera_controls_faults_and_hot_unplug_are_deterministic() {
         .await
         .expect_err("hot-unplug retires the active session");
     assert_eq!(unplugged.name().as_str(), "camera.session.unplugged");
+}
+
+#[tokio::test]
+async fn virtual_camera_does_not_publish_after_unplug_between_validation_and_publication() {
+    let adapter = VirtualCameraAdapter::pattern("virtual-camera-race");
+    let descriptor = adapter.enumerate().await.unwrap().pop().unwrap();
+    let request = CameraRequest::new(
+        CameraFormat::new(CameraPixelFormat::Nv12, 640, 480).unwrap(),
+        DEFAULT_CAMERA_SLOT_COUNT,
+    )
+    .unwrap();
+    let mut session = adapter
+        .open(&descriptor.selector(), &request)
+        .await
+        .unwrap();
+
+    adapter.unplug_before_next_publication();
+    let error = session
+        .capture(Duration::ZERO)
+        .await
+        .expect_err("capture must fail closed when unplugged before frame publication");
+    assert_eq!(error.name().as_str(), "camera.session.unplugged");
+
+    let control_adapter = VirtualCameraAdapter::pattern("virtual-camera-control-race");
+    let control_descriptor = control_adapter.enumerate().await.unwrap().pop().unwrap();
+    let mut control_session = control_adapter
+        .open(&control_descriptor.selector(), &request)
+        .await
+        .unwrap();
+    control_adapter.unplug_before_next_publication();
+    let error = control_session
+        .controls()
+        .await
+        .expect_err("controls must fail closed when unplugged before publication");
+    assert_eq!(error.name().as_str(), "camera.session.unplugged");
 }

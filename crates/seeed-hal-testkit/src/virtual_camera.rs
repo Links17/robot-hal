@@ -27,6 +27,7 @@ struct State {
     present: bool,
     claimed: bool,
     next_capture: Option<HalError>,
+    unplug_before_next_publication: bool,
     controls: BTreeMap<CameraControlKind, ControlState>,
 }
 
@@ -78,6 +79,7 @@ impl VirtualCameraAdapter {
                 present: true,
                 claimed: false,
                 next_capture: None,
+                unplug_before_next_publication: false,
                 controls,
             })),
         }
@@ -95,6 +97,13 @@ impl VirtualCameraAdapter {
             .lock()
             .expect("virtual camera mutex poisoned")
             .present = false;
+    }
+
+    pub fn unplug_before_next_publication(&self) {
+        self.state
+            .lock()
+            .expect("virtual camera mutex poisoned")
+            .unplug_before_next_publication = true;
     }
 }
 
@@ -171,8 +180,10 @@ impl CameraCaptureSession for VirtualCameraSession {
     }
 
     async fn capture(&mut self, _timeout: Duration) -> HalResult<CameraFrame> {
-        self.ensure_active("camera.capture")?;
         let mut state = self.state.lock().expect("virtual camera mutex poisoned");
+        ensure_active_locked(self.closed, &state, "camera.capture", &self.descriptor)?;
+        unplug_before_publication(&mut state);
+        ensure_active_locked(self.closed, &state, "camera.capture", &self.descriptor)?;
         if let Some(error) = state.next_capture.take() {
             return Err(error.with_resource_id(self.descriptor.id().clone()));
         }
@@ -195,8 +206,10 @@ impl CameraCaptureSession for VirtualCameraSession {
     }
 
     async fn controls(&mut self) -> HalResult<Vec<CameraControlDescriptor>> {
-        self.ensure_active("camera.controls")?;
-        let state = self.state.lock().expect("virtual camera mutex poisoned");
+        let mut state = self.state.lock().expect("virtual camera mutex poisoned");
+        ensure_active_locked(self.closed, &state, "camera.controls", &self.descriptor)?;
+        unplug_before_publication(&mut state);
+        ensure_active_locked(self.closed, &state, "camera.controls", &self.descriptor)?;
         Ok(state
             .controls
             .values()
@@ -205,8 +218,8 @@ impl CameraCaptureSession for VirtualCameraSession {
     }
 
     async fn get_control(&mut self, kind: CameraControlKind) -> HalResult<CameraControlValue> {
-        self.ensure_active("camera.control.get")?;
         let state = self.state.lock().expect("virtual camera mutex poisoned");
+        ensure_active_locked(self.closed, &state, "camera.control.get", &self.descriptor)?;
         let control = state
             .controls
             .get(&kind)
@@ -222,8 +235,8 @@ impl CameraCaptureSession for VirtualCameraSession {
         kind: CameraControlKind,
         value: CameraControlValue,
     ) -> HalResult<()> {
-        self.ensure_active("camera.control.set")?;
         let mut state = self.state.lock().expect("virtual camera mutex poisoned");
+        ensure_active_locked(self.closed, &state, "camera.control.set", &self.descriptor)?;
         let control = state
             .controls
             .get_mut(&kind)
@@ -244,8 +257,8 @@ impl CameraCaptureSession for VirtualCameraSession {
     }
 
     async fn set_auto(&mut self, kind: CameraControlKind, enabled: bool) -> HalResult<()> {
-        self.ensure_active("camera.control.auto")?;
         let mut state = self.state.lock().expect("virtual camera mutex poisoned");
+        ensure_active_locked(self.closed, &state, "camera.control.auto", &self.descriptor)?;
         let control = state
             .controls
             .get_mut(&kind)
@@ -264,23 +277,6 @@ impl CameraCaptureSession for VirtualCameraSession {
                 .expect("virtual camera mutex poisoned")
                 .claimed = false;
             self.closed = true;
-        }
-        Ok(())
-    }
-}
-
-impl VirtualCameraSession {
-    fn ensure_active(&self, operation: &'static str) -> HalResult<()> {
-        if self.closed {
-            return Err(closed(operation, &self.descriptor));
-        }
-        if !self
-            .state
-            .lock()
-            .expect("virtual camera mutex poisoned")
-            .present
-        {
-            return Err(unplugged(operation, &self.descriptor));
         }
         Ok(())
     }
@@ -378,6 +374,28 @@ fn plane_layout(format: &CameraFormat, payload_length: usize) -> HalResult<Vec<C
         CameraPixelFormat::Yuyv | CameraPixelFormat::Mjpeg => {
             Ok(vec![CameraPlaneLayout::new(0, payload_length, width * 2)?])
         }
+    }
+}
+
+fn ensure_active_locked(
+    closed_session: bool,
+    state: &State,
+    operation: &'static str,
+    descriptor: &ResourceDescriptor,
+) -> HalResult<()> {
+    if closed_session {
+        return Err(closed(operation, descriptor));
+    }
+    if !state.present {
+        return Err(unplugged(operation, descriptor));
+    }
+    Ok(())
+}
+
+fn unplug_before_publication(state: &mut State) {
+    if state.unplug_before_next_publication {
+        state.unplug_before_next_publication = false;
+        state.present = false;
     }
 }
 

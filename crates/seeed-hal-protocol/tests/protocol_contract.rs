@@ -1382,7 +1382,7 @@ fn can_transport_and_maintenance_lease_round_trip_through_legacy_types() {
         TransportKind::Can,
     );
     assert_eq!(
-        ResourceSelector::try_from(v1::ResourceSelector::from(&selector)).unwrap(),
+        ResourceSelector::try_from(v1::ResourceSelector::try_from(&selector).unwrap()).unwrap(),
         selector,
     );
     let lease = LeaseToken::new(
@@ -1394,6 +1394,32 @@ fn can_transport_and_maintenance_lease_round_trip_through_legacy_types() {
         LeaseToken::try_from(v1::LeaseToken::from(&lease)).unwrap(),
         lease,
     );
+}
+
+#[test]
+fn camera_resources_fail_closed_until_the_protocol_defines_camera_transport() {
+    let selector = ResourceSelector::exact(
+        ResourceId::parse("camera:virtual:protocol-boundary").unwrap(),
+        IdentityQuality::Strong,
+        TransportKind::Camera,
+    );
+    let error = v1::ResourceSelector::try_from(&selector)
+        .expect_err("protocol minor two must not encode Camera as Unspecified");
+    assert_eq!(error.name().as_str(), "runtime.protocol.invalid_message");
+
+    let descriptor = seeed_hal_core::ResourceDescriptor::new(
+        selector.id().clone(),
+        seeed_hal_core::Endpoint::new("virtual://camera/protocol-boundary").unwrap(),
+        IdentityQuality::Strong,
+        TransportKind::Camera,
+        seeed_hal_core::ResourceProperties::default(),
+        seeed_hal_core::CapabilitySet::new(vec![
+            seeed_hal_core::CapabilityId::parse("camera.capture/v1").unwrap(),
+        ]),
+    );
+    let error = v1::ResourceDescriptor::try_from(&descriptor)
+        .expect_err("protocol minor two must reject Camera descriptors");
+    assert_eq!(error.name().as_str(), "runtime.protocol.invalid_message");
 }
 
 #[test]

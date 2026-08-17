@@ -218,6 +218,7 @@ impl CameraFrameMetadata {
                 "camera frames must declare one or more planes",
             ));
         }
+        validate_plane_layouts(&format, &planes)?;
         Ok(Self {
             format,
             planes,
@@ -269,6 +270,11 @@ impl CameraFrame {
                 "camera frame payload or plane layout exceeds public bounds",
             ));
         }
+        validate_plane_layouts_against_payload(
+            metadata.format(),
+            metadata.planes(),
+            payload.len(),
+        )?;
         Ok(Self { metadata, payload })
     }
 
@@ -453,6 +459,106 @@ fn invalid_frame(operation: &'static str, message: &'static str) -> HalError {
         message,
     )
     .expect("static camera frame error metadata is valid")
+}
+
+fn validate_plane_layouts(format: &CameraFormat, planes: &[CameraPlaneLayout]) -> HalResult<()> {
+    let expected_plane_count = match format.pixel_format() {
+        CameraPixelFormat::Nv12 => 2,
+        CameraPixelFormat::Yuyv | CameraPixelFormat::Mjpeg => 1,
+    };
+    if planes.len() != expected_plane_count {
+        return Err(invalid_frame(
+            "camera.frame_metadata",
+            "camera plane count does not match the pixel format",
+        ));
+    }
+
+    let width = format.width() as usize;
+    let height = format.height() as usize;
+    match format.pixel_format() {
+        CameraPixelFormat::Nv12 => {
+            let y = &planes[0];
+            let uv = &planes[1];
+            if y.stride() < width
+                || uv.stride() < width
+                || y.length()
+                    < y.stride().checked_mul(height).ok_or_else(|| {
+                        invalid_frame("camera.frame_metadata", "camera Y plane layout overflows")
+                    })?
+                || uv.length()
+                    < uv.stride().checked_mul(height.div_ceil(2)).ok_or_else(|| {
+                        invalid_frame("camera.frame_metadata", "camera UV plane layout overflows")
+                    })?
+            {
+                return Err(invalid_frame(
+                    "camera.frame_metadata",
+                    "NV12 plane layout is smaller than its format dimensions",
+                ));
+            }
+        }
+        CameraPixelFormat::Yuyv => {
+            let plane = &planes[0];
+            let minimum_stride = width.checked_mul(2).ok_or_else(|| {
+                invalid_frame("camera.frame_metadata", "camera YUYV stride overflows")
+            })?;
+            if plane.stride() < minimum_stride
+                || plane.length()
+                    < plane.stride().checked_mul(height).ok_or_else(|| {
+                        invalid_frame(
+                            "camera.frame_metadata",
+                            "camera YUYV plane layout overflows",
+                        )
+                    })?
+            {
+                return Err(invalid_frame(
+                    "camera.frame_metadata",
+                    "YUYV plane layout is smaller than its format dimensions",
+                ));
+            }
+        }
+        CameraPixelFormat::Mjpeg => {}
+    }
+
+    let mut ranges = planes
+        .iter()
+        .map(|plane| {
+            plane
+                .offset()
+                .checked_add(plane.length())
+                .map(|end| (plane.offset(), end))
+                .ok_or_else(|| {
+                    invalid_frame("camera.frame_metadata", "camera plane range overflows")
+                })
+        })
+        .collect::<HalResult<Vec<_>>>()?;
+    ranges.sort_unstable_by_key(|(start, _)| *start);
+    if ranges.windows(2).any(|ranges| ranges[0].1 > ranges[1].0) {
+        return Err(invalid_frame(
+            "camera.frame_metadata",
+            "camera plane ranges must not overlap",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_plane_layouts_against_payload(
+    format: &CameraFormat,
+    planes: &[CameraPlaneLayout],
+    payload_length: usize,
+) -> HalResult<()> {
+    validate_plane_layouts(format, planes)?;
+    if planes.iter().any(|plane| {
+        plane
+            .offset()
+            .checked_add(plane.length())
+            .is_none_or(|end| end > payload_length)
+    }) {
+        return Err(invalid_frame(
+            "camera.frame",
+            "camera plane layout exceeds payload bounds",
+        ));
+    }
+    Ok(())
 }
 
 fn invalid_control_descriptor(operation: &'static str, message: &'static str) -> HalError {

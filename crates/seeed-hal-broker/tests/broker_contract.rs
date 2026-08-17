@@ -2485,7 +2485,7 @@ fn resource_descriptor_selector_conversion_is_canonical() {
         .block_on(runtime.enumerate_serial())
         .unwrap()
         .remove(0);
-    let wire = v1::ResourceDescriptor::from(&descriptor);
+    let wire = v1::ResourceDescriptor::try_from(&descriptor).unwrap();
     let selector = ResourceSelector::try_from(v1::ResourceSelector {
         resource_id: wire.resource_id,
         minimum_identity_quality: wire.identity_quality,

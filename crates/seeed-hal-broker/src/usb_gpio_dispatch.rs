@@ -117,8 +117,8 @@ async fn enumerate_usb(runtime: HalRuntime) -> HalResult<envelope::Payload> {
                 .enumerate_usb()
                 .await?
                 .iter()
-                .map(v1::ResourceDescriptor::from)
-                .collect(),
+                .map(TryInto::try_into)
+                .collect::<HalResult<Vec<_>>>()?,
         },
     ))
 }
@@ -130,8 +130,8 @@ async fn enumerate_gpio(runtime: HalRuntime) -> HalResult<envelope::Payload> {
                 .enumerate_gpio()
                 .await?
                 .iter()
-                .map(v1::ResourceDescriptor::from)
-                .collect(),
+                .map(TryInto::try_into)
+                .collect::<HalResult<Vec<_>>>()?,
         },
     ))
 }

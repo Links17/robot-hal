@@ -426,13 +426,15 @@ impl TryFrom<v1::ResourceSelector> for ResourceSelector {
     }
 }
 
-impl From<&ResourceSelector> for v1::ResourceSelector {
-    fn from(value: &ResourceSelector) -> Self {
-        Self {
+impl TryFrom<&ResourceSelector> for v1::ResourceSelector {
+    type Error = HalError;
+
+    fn try_from(value: &ResourceSelector) -> HalResult<Self> {
+        Ok(Self {
             resource_id: value.id().as_str().to_owned(),
             minimum_identity_quality: quality_to_proto(value.minimum_identity_quality()) as i32,
-            transport: transport_to_proto(value.transport()) as i32,
-        }
+            transport: transport_to_proto(value.transport())? as i32,
+        })
     }
 }
 
@@ -479,13 +481,15 @@ impl TryFrom<v1::ResourceDescriptor> for ResourceDescriptor {
     }
 }
 
-impl From<&ResourceDescriptor> for v1::ResourceDescriptor {
-    fn from(value: &ResourceDescriptor) -> Self {
-        Self {
+impl TryFrom<&ResourceDescriptor> for v1::ResourceDescriptor {
+    type Error = HalError;
+
+    fn try_from(value: &ResourceDescriptor) -> HalResult<Self> {
+        Ok(Self {
             resource_id: value.id().as_str().to_owned(),
             endpoint: value.endpoint().as_str().to_owned(),
             identity_quality: quality_to_proto(value.minimum_identity_quality()) as i32,
-            transport: transport_to_proto(value.transport()) as i32,
+            transport: transport_to_proto(value.transport())? as i32,
             properties: value
                 .properties()
                 .iter()
@@ -497,7 +501,7 @@ impl From<&ResourceDescriptor> for v1::ResourceDescriptor {
                 .iter()
                 .map(|capability| capability.as_str().to_owned())
                 .collect(),
-        }
+        })
     }
 }
 
@@ -827,12 +831,16 @@ fn quality_to_proto(value: IdentityQuality) -> v1::IdentityQuality {
     }
 }
 
-fn transport_to_proto(value: TransportKind) -> v1::TransportKind {
-    match value {
+fn transport_to_proto(value: TransportKind) -> HalResult<v1::TransportKind> {
+    Ok(match value {
         TransportKind::Serial => v1::TransportKind::Serial,
         TransportKind::Can => v1::TransportKind::Can,
         TransportKind::Usb => v1::TransportKind::Usb,
         TransportKind::Gpio => v1::TransportKind::Gpio,
-        TransportKind::Camera => v1::TransportKind::Unspecified,
-    }
+        TransportKind::Camera => {
+            return Err(invalid_message(
+                "Camera transport is unavailable before its protocol definition",
+            ));
+        }
+    })
 }

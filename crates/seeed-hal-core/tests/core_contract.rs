@@ -32,6 +32,31 @@ fn capability_requires_contract_version() {
 }
 
 #[test]
+fn capability_accepts_nonempty_multi_segment_contract_names() {
+    for capability in [
+        "serial.bytes/v1",
+        "camera.frames.shm/v1",
+        "camera.capture/v42",
+    ] {
+        assert!(
+            CapabilityId::parse(capability).is_ok(),
+            "{capability} must remain a valid capability"
+        );
+    }
+
+    for capability in [
+        "camera..capture/v1",
+        "camera.capture./v1",
+        "camera...capture/v1",
+    ] {
+        assert!(
+            CapabilityId::parse(capability).is_err(),
+            "{capability} must reject empty dot segments"
+        );
+    }
+}
+
+#[test]
 fn lease_token_carries_fencing_generation() {
     let token = LeaseToken::new_for_test(7, LeaseMode::Control);
     assert_eq!(token.generation(), 7);

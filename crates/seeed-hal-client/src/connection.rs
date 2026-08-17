@@ -570,7 +570,7 @@ impl HalClient {
         let payload = self
             .request(
                 envelope::Payload::OpenSerialRequest(v1::OpenSerialRequest {
-                    selector: Some((&selector).into()),
+                    selector: Some((&selector).try_into()?),
                     config: Some((&config).into()),
                 }),
                 ExpectedResponse::OpenSerial,
@@ -648,7 +648,7 @@ impl HalClient {
         }
         self.require_minor_two("usb.open", Some(selector.id()), |limits| limits.usb_control)?;
         let payload = envelope::Payload::OpenUsbRequest(v1::OpenUsbRequest {
-            selector: Some((&selector).into()),
+            selector: Some((&selector).try_into()?),
             interface_number: u32::from(claim.number()),
         });
         self.ensure_payload_for_resource(&payload, "usb.open", selector.id())?;
@@ -713,7 +713,7 @@ impl HalClient {
         }
         self.require_minor_two("gpio.open", Some(selector.id()), |limits| limits.gpio_lines)?;
         let payload = envelope::Payload::OpenGpioRequest(v1::OpenGpioRequest {
-            selector: Some((&selector).into()),
+            selector: Some((&selector).try_into()?),
             lines: lines.clone(),
             config: Some((&config).into()),
         });
@@ -780,7 +780,7 @@ impl HalClient {
         validate_can_open_capabilities(&descriptor, &config, &filters)?;
 
         let request = v1::OpenCanRequest {
-            selector: Some((&selector).into()),
+            selector: Some((&selector).try_into()?),
             mode: lease_mode_to_proto(mode) as i32,
             config: Some((&config).into()),
             filters: Some((&filters).into()),
