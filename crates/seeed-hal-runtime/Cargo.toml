@@ -10,6 +10,7 @@ bytes = { workspace = true }
 seeed-hal-core = { path = "../seeed-hal-core" }
 seeed-hal-can = { path = "../seeed-hal-can" }
 seeed-hal-serial = { path = "../seeed-hal-serial" }
+seeed-hal-usb = { path = "../seeed-hal-usb" }
 tokio = { workspace = true }
 uuid = { workspace = true }
 

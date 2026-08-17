@@ -1057,6 +1057,7 @@ dependencies = [
  "seeed-hal-core",
  "seeed-hal-serial",
  "seeed-hal-testkit",
+ "seeed-hal-usb",
  "tokio",
  "uuid",
 ]

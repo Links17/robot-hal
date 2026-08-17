@@ -7,6 +7,7 @@ mod events;
 mod lease_table;
 mod registry;
 mod serial_actor;
+mod usb_manager;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,8 +25,10 @@ use seeed_hal_core::{
     ResourceSelector, SessionId,
 };
 use seeed_hal_serial::{ControlLines, SerialAdapter, SerialConfig};
+use seeed_hal_usb::{UsbAdapter, UsbInterfaceClaim, UsbTransfer};
 use serial_actor::{ActorMetadata, SerialCommand, spawn_serial_actor};
 use tokio::sync::{Mutex, oneshot, watch};
+use usb_manager::UsbManager;
 use uuid::Uuid;
 
 pub struct HalRuntimeBuilder {
@@ -35,6 +38,7 @@ pub struct HalRuntimeBuilder {
     can_rx_capacity: usize,
     can_tx_capacity: usize,
     can_close_timeout: Duration,
+    usb_adapter: Option<Arc<dyn UsbAdapter>>,
 }
 
 /// Maximum configurable frames in one session's software receive ring.
@@ -51,6 +55,7 @@ impl Default for HalRuntimeBuilder {
             can_rx_capacity: DEFAULT_CAN_RX_CAPACITY,
             can_tx_capacity: DEFAULT_CAN_TX_CAPACITY,
             can_close_timeout: Duration::from_secs(2),
+            usb_adapter: None,
         }
     }
 }
@@ -80,6 +85,14 @@ impl HalRuntimeBuilder {
         A: CanAdapter + 'static,
     {
         self.can_adapters.push(Arc::new(adapter));
+        self
+    }
+
+    pub fn usb_adapter<A>(mut self, adapter: A) -> Self
+    where
+        A: UsbAdapter + 'static,
+    {
+        self.usb_adapter = Some(Arc::new(adapter));
         self
     }
 
@@ -122,6 +135,7 @@ impl HalRuntimeBuilder {
                 events,
                 serial_close_timeout: self.serial_close_timeout,
                 can_manager,
+                usb_manager: UsbManager::new(self.usb_adapter),
             }),
         }
     }
@@ -133,6 +147,7 @@ struct RuntimeInner {
     events: events::EventPublisher,
     serial_close_timeout: Duration,
     can_manager: CanManager,
+    usb_manager: UsbManager,
 }
 
 #[derive(Clone)]
@@ -151,6 +166,42 @@ impl HalRuntime {
 
     pub async fn enumerate_can(&self) -> HalResult<Vec<ResourceDescriptor>> {
         self.inner.can_manager.enumerate().await
+    }
+    pub async fn enumerate_usb(&self) -> HalResult<Vec<ResourceDescriptor>> {
+        self.inner.usb_manager.enumerate().await
+    }
+    pub async fn open_usb(
+        &self,
+        owner: OwnerId,
+        selector: ResourceSelector,
+        interface: u8,
+    ) -> HalResult<UsbHandle> {
+        let (session_id, lease) = self
+            .inner
+            .usb_manager
+            .open(owner, selector, UsbInterfaceClaim::new(interface as usize)?)
+            .await?;
+        Ok(UsbHandle {
+            runtime: self.clone(),
+            session_id,
+            lease,
+            closed: false,
+        })
+    }
+    pub async fn usb_transfer(
+        &self,
+        session: SessionId,
+        lease: &LeaseToken,
+        transfer: UsbTransfer,
+        timeout: Duration,
+    ) -> HalResult<Bytes> {
+        self.inner
+            .usb_manager
+            .transfer(session, lease, transfer, timeout)
+            .await
+    }
+    pub async fn close_usb(&self, session: SessionId, lease: &LeaseToken) -> HalResult<()> {
+        self.inner.usb_manager.close(session, lease).await
     }
 
     pub async fn open_can(
@@ -510,6 +561,33 @@ pub struct CanHandle {
     session_id: SessionId,
     lease: LeaseToken,
     closed: bool,
+}
+
+pub struct UsbHandle {
+    runtime: HalRuntime,
+    session_id: SessionId,
+    lease: LeaseToken,
+    closed: bool,
+}
+impl UsbHandle {
+    pub fn session_id(&self) -> SessionId {
+        self.session_id.clone()
+    }
+    pub fn lease_token(&self) -> &LeaseToken {
+        &self.lease
+    }
+    pub async fn transfer(&self, transfer: UsbTransfer, timeout: Duration) -> HalResult<Bytes> {
+        self.runtime
+            .usb_transfer(self.session_id(), &self.lease, transfer, timeout)
+            .await
+    }
+    pub async fn close(&mut self) -> HalResult<()> {
+        let result = self.runtime.close_usb(self.session_id(), &self.lease).await;
+        if result.is_ok() {
+            self.closed = true;
+        }
+        result
+    }
 }
 
 impl CanHandle {
