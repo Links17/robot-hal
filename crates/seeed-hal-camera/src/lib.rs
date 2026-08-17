@@ -5,7 +5,7 @@ use bytes::Bytes;
 use seeed_hal_core::{
     CapabilityId, ErrorCategory, HalError, HalResult, ResourceDescriptor, ResourceSelector,
 };
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 pub use seeed_hal_core::{
     CapabilitySet, Endpoint, IdentityQuality, ResourceId, ResourceProperties, TransportKind,
@@ -286,6 +286,18 @@ impl CameraFrame {
     }
 }
 
+/// A broker-owned bounded frame destination.
+///
+/// Adapters receive this only for the duration of `capture_into`; native adapters
+/// may therefore copy directly from a locked platform buffer into the data plane.
+pub trait CameraFrameSink: Send + Sync {
+    fn publish(
+        &self,
+        metadata: CameraFrameMetadata,
+        copy_payload: &mut dyn FnMut(&mut [u8]) -> HalResult<usize>,
+    ) -> HalResult<()>;
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CameraControlKind {
     Exposure,
@@ -428,6 +440,25 @@ pub trait CameraCaptureSession: Send {
     fn descriptor(&self) -> &ResourceDescriptor;
     fn format(&self) -> &CameraFormat;
     async fn capture(&mut self, timeout: Duration) -> HalResult<CameraFrame>;
+    async fn capture_into(
+        &mut self,
+        timeout: Duration,
+        sink: Arc<dyn CameraFrameSink>,
+    ) -> HalResult<()> {
+        let frame = self.capture(timeout).await?;
+        let metadata = frame.metadata().clone();
+        let payload = frame.payload().clone();
+        sink.publish(metadata, &mut |destination| {
+            if payload.len() > destination.len() {
+                return Err(invalid_frame(
+                    "camera.capture_into",
+                    "camera frame payload exceeds the provided sink capacity",
+                ));
+            }
+            destination[..payload.len()].copy_from_slice(&payload);
+            Ok(payload.len())
+        })
+    }
     async fn controls(&mut self) -> HalResult<Vec<CameraControlDescriptor>>;
     async fn get_control(&mut self, kind: CameraControlKind) -> HalResult<CameraControlValue>;
     async fn set_control(

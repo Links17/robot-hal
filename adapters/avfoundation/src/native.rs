@@ -19,7 +19,6 @@ pub(super) fn open_sync(
 #[cfg(target_os = "macos")]
 mod macos {
     use async_trait::async_trait;
-    use bytes::Bytes;
     use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
     use objc2::{
         AnyThread, DefinedClass, define_class,
@@ -44,8 +43,8 @@ mod macos {
     use objc2_foundation::{NSDictionary, NSString};
     use seeed_hal_camera::{
         CameraCaptureSession, CameraControlDescriptor, CameraControlKind, CameraControlValue,
-        CameraFormat, CameraFrame, CameraFrameMetadata, CameraPixelFormat, CameraPlaneLayout,
-        CameraRequest, camera_capture_capability, camera_frames_shm_capability,
+        CameraFormat, CameraFrame, CameraFrameMetadata, CameraFrameSink, CameraPixelFormat,
+        CameraPlaneLayout, CameraRequest, camera_capture_capability, camera_frames_shm_capability,
     };
     use seeed_hal_core::{
         CapabilitySet, Endpoint, ErrorCategory, HalError, HalResult, IdentityQuality,
@@ -53,13 +52,15 @@ mod macos {
     };
     use std::{
         collections::BTreeMap,
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, mpsc},
         time::Duration,
     };
+    use tokio::sync::oneshot;
 
-    use super::super::encode_resource_id;
+    use super::super::{encode_resource_id, quarantine_claim_until_worker_exits};
 
     const CLOCK_DOMAIN: &str = "avfoundation";
+    const AVFOUNDATION_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
     pub fn enumerate_sync() -> HalResult<Vec<ResourceDescriptor>> {
         autoreleasepool(|_| {
@@ -130,32 +131,6 @@ mod macos {
                 .properties()
                 .get("camera.unique_id")
                 .ok_or_else(|| platform_error("camera.open", "camera identity is missing"))?;
-            let native_id = NSString::from_str(unique_id);
-            // SAFETY: The unique ID originates from the freshly enumerated,
-            // selected descriptor and is passed to objc2's generated binding.
-            let device = unsafe { AVCaptureDevice::deviceWithUniqueID(&native_id) }
-                .ok_or_else(|| platform_error("camera.open", "selected camera disappeared"))?;
-            // SAFETY: Device state and identity access use generated getters on
-            // the retained device resolved immediately above.
-            if !unsafe { device.isConnected() }
-                || unsafe { device.uniqueID() }.to_string() != *unique_id
-            {
-                return Err(
-                    platform_error("camera.open", "selected camera identity changed")
-                        .with_resource_id(descriptor.id().clone()),
-                );
-            }
-            let media_type = video_media_type("camera.open")?;
-            // SAFETY: The generated AVFoundation query is passed only the
-            // verified AVMediaTypeVideo singleton.
-            if unsafe { AVCaptureDevice::authorizationStatusForMediaType(media_type) }
-                != AVAuthorizationStatus::Authorized
-            {
-                return Err(
-                    permission_denied("camera.open").with_resource_id(descriptor.id().clone())
-                );
-            }
-            ensure_active_format(&device, request.format(), &descriptor)?;
             {
                 let mut claimed = claims.lock().expect("AVFoundation claim mutex poisoned");
                 if !claimed.insert(descriptor.id().clone()) {
@@ -163,9 +138,9 @@ mod macos {
                 }
             }
             match configure_session(
-                device,
                 descriptor.clone(),
                 request.format().clone(),
+                unique_id.to_owned(),
                 Arc::clone(&claims),
             ) {
                 Ok(session) => Ok(session),
@@ -212,62 +187,37 @@ mod macos {
     }
 
     fn configure_session(
-        device: Retained<AVCaptureDevice>,
         descriptor: ResourceDescriptor,
         format: CameraFormat,
+        unique_id: String,
         claims: Arc<Mutex<std::collections::BTreeSet<seeed_hal_core::ResourceId>>>,
     ) -> HalResult<Box<dyn CameraCaptureSession>> {
-        // SAFETY: Generated factory invoked with a retained, freshly resolved
-        // camera; NSError is mapped to a structured fail-closed error.
-        let input = unsafe { AVCaptureDeviceInput::deviceInputWithDevice_error(&device) }
+        let (commands, command_rx) = mpsc::sync_channel(8);
+        let (opened_tx, opened_rx) = mpsc::sync_channel(1);
+        let thread_descriptor = descriptor.clone();
+        let thread_format = format.clone();
+        let worker = std::thread::Builder::new()
+            .name("seeed-hal-avfoundation-capture".to_owned())
+            .spawn(move || {
+                native_capture_worker(
+                    thread_descriptor,
+                    thread_format,
+                    unique_id,
+                    command_rx,
+                    opened_tx,
+                );
+            })
             .map_err(|error| platform_error("camera.open", error.to_string()))?;
-        // SAFETY: Generated constructors take no external ABI arguments.
-        let session = unsafe { AVCaptureSession::new() };
-        // SAFETY: See session constructor rationale.
-        let output = unsafe { AVCaptureVideoDataOutput::new() };
-        configure_output(&output, &format, &descriptor)?;
-        let frames = Arc::new(Mutex::new(FrameState::default()));
-        let delegate = FrameDelegate::new(Arc::clone(&frames));
-        let callback_queue = DispatchQueue::new(
-            "io.seeed.hal.avfoundation.capture",
-            DispatchQueueAttr::SERIAL,
-        );
-        let protocol: &ProtocolObject<dyn AVCaptureVideoDataOutputSampleBufferDelegate> =
-            ProtocolObject::from_ref(&*delegate);
-        // SAFETY: The output retains the delegate while callbacks are enabled;
-        // this session additionally retains it and serializes callbacks on its
-        // dedicated serial queue.
-        unsafe { output.setSampleBufferDelegate_queue(Some(protocol), Some(&callback_queue)) };
-        // SAFETY: The documented preconditions for `addInput:` and `addOutput:`
-        // are checked by `canAdd*` before calls are made.
-        unsafe {
-            session.beginConfiguration();
-            if !session.canAddInput(&input) || !session.canAddOutput(&output) {
-                session.commitConfiguration();
-                return Err(platform_error(
-                    "camera.open",
-                    "AVFoundation cannot add selected camera input or video output",
-                )
-                .with_resource_id(descriptor.id().clone()));
-            }
-            session.addInput(&input);
-            session.addOutput(&output);
-            session.commitConfiguration();
-            session.startRunning();
-        }
+        opened_rx
+            .recv()
+            .map_err(|_| platform_error("camera.open", "AVFoundation capture thread exited"))??;
         Ok(Box::new(AvFoundationSession {
             descriptor,
             format,
-            native: Some(NativeSession {
-                session,
-                input,
-                output,
-                _delegate: delegate,
-                _callback_queue: callback_queue,
-            }),
-            frames,
-            next_sequence: 1,
+            commands: Some(commands),
+            worker: Some(worker),
             claims,
+            next_capture_id: 1,
             closed: false,
         }))
     }
@@ -292,28 +242,24 @@ mod macos {
         Ok(())
     }
 
-    #[derive(Default)]
-    struct FrameState {
-        frame: Option<NativeFrame>,
+    struct CaptureState {
+        pending: Option<PendingCapture>,
         dropped_count: u64,
+        next_sequence: u64,
+        descriptor: ResourceDescriptor,
+        format: CameraFormat,
     }
 
-    struct NativeFrame {
-        pixel_format: u32,
-        width: usize,
-        height: usize,
-        planes: Vec<NativePlane>,
-        timestamp_ns: u64,
-    }
-
-    struct NativePlane {
-        bytes: Vec<u8>,
-        stride: usize,
+    struct PendingCapture {
+        id: u64,
+        sink: Arc<dyn CameraFrameSink>,
+        response: oneshot::Sender<HalResult<()>>,
+        deadline: std::time::Instant,
     }
 
     define_class!(
         #[unsafe(super(NSObject))]
-        #[ivars = Arc<Mutex<FrameState>>]
+        #[ivars = Arc<Mutex<CaptureState>>]
         struct FrameDelegate;
 
         unsafe impl NSObjectProtocol for FrameDelegate {}
@@ -326,11 +272,26 @@ mod macos {
                 sample_buffer: &CMSampleBuffer,
                 _connection: &AVCaptureConnection,
             ) {
-                if let Ok(frame) = copy_native_frame(sample_buffer) {
-                    let mut state = self.ivars().lock().expect("AVFoundation frame mutex poisoned");
-                    if state.frame.replace(frame).is_some() {
-                        state.dropped_count = state.dropped_count.saturating_add(1);
+                let pending = self
+                    .ivars()
+                    .lock()
+                    .expect("AVFoundation capture mutex poisoned")
+                    .pending
+                    .take();
+                if let Some(pending) = pending {
+                    let result = publish_sample_buffer_into(
+                        sample_buffer,
+                        pending.sink.as_ref(),
+                        self.ivars(),
+                    );
+                    if result.is_ok() {
+                        let mut state = self
+                            .ivars()
+                            .lock()
+                            .expect("AVFoundation capture mutex poisoned");
+                        state.next_sequence = state.next_sequence.saturating_add(1);
                     }
+                    let _ = pending.response.send(result);
                 }
             }
 
@@ -341,41 +302,51 @@ mod macos {
                 _sample_buffer: &CMSampleBuffer,
                 _connection: &AVCaptureConnection,
             ) {
-                let mut state = self.ivars().lock().expect("AVFoundation frame mutex poisoned");
+                let mut state = self.ivars().lock().expect("AVFoundation capture mutex poisoned");
                 state.dropped_count = state.dropped_count.saturating_add(1);
             }
         }
     );
 
     impl FrameDelegate {
-        fn new(state: Arc<Mutex<FrameState>>) -> Retained<Self> {
+        fn new(state: Arc<Mutex<CaptureState>>) -> Retained<Self> {
             // SAFETY: objc2's documented define_class pattern initializes the
             // declared ivar before NSObject `init`.
             unsafe { objc2::msg_send![super(Self::alloc().set_ivars(state)), init] }
         }
     }
 
-    fn copy_native_frame(sample_buffer: &CMSampleBuffer) -> Result<NativeFrame, ()> {
+    fn publish_sample_buffer_into(
+        sample_buffer: &CMSampleBuffer,
+        sink: &dyn CameraFrameSink,
+        state: &Arc<Mutex<CaptureState>>,
+    ) -> HalResult<()> {
         // SAFETY: The delegate owns the callback's valid sample buffer. objc2
         // retains the returned image buffer until this function returns.
-        let image = unsafe { sample_buffer.image_buffer() }.ok_or(())?;
+        let image = unsafe { sample_buffer.image_buffer() }
+            .ok_or_else(|| platform_error("camera.capture", "sample buffer has no image buffer"))?;
         let pixel_buffer: &CVPixelBuffer = &image;
         let flags = CVPixelBufferLockFlags::ReadOnly;
         // SAFETY: The pixel buffer is valid for this callback scope and only
         // read access is requested.
         if unsafe { CVPixelBufferLockBaseAddress(pixel_buffer, flags) } != 0 {
-            return Err(());
+            return Err(platform_error(
+                "camera.capture",
+                "could not lock AVFoundation pixel buffer",
+            ));
         }
-        let result = copy_locked_pixel_buffer(pixel_buffer, sample_buffer);
+        let result = publish_locked_pixel_buffer(pixel_buffer, sample_buffer, sink, state);
         // SAFETY: This exactly matches the successful read-only lock above.
         let _ = unsafe { CVPixelBufferUnlockBaseAddress(pixel_buffer, flags) };
         result
     }
 
-    fn copy_locked_pixel_buffer(
+    fn publish_locked_pixel_buffer(
         pixel_buffer: &CVPixelBuffer,
         sample_buffer: &CMSampleBuffer,
-    ) -> Result<NativeFrame, ()> {
+        sink: &dyn CameraFrameSink,
+        state: &Arc<Mutex<CaptureState>>,
+    ) -> HalResult<()> {
         // SAFETY: All CoreVideo queries operate on this read-locked buffer.
         let pixel_format = unsafe { CVPixelBufferGetPixelFormatType(pixel_buffer) };
         // SAFETY: See preceding CoreVideo query.
@@ -385,37 +356,43 @@ mod macos {
         // SAFETY: See preceding CoreVideo query.
         let plane_count = unsafe { CVPixelBufferGetPlaneCount(pixel_buffer) };
         let mut planes = Vec::with_capacity(plane_count.max(1));
+        let mut source_planes = Vec::with_capacity(plane_count.max(1));
         if plane_count == 0 {
             // SAFETY: The buffer remains read-locked.
             let length = unsafe { CVPixelBufferGetDataSize(pixel_buffer) };
             // SAFETY: The buffer remains read-locked.
             let base = unsafe { CVPixelBufferGetBaseAddress(pixel_buffer) }.cast::<u8>();
             if base.is_null() || length == 0 {
-                return Err(());
+                return Err(platform_error(
+                    "camera.capture",
+                    "pixel buffer has no readable bytes",
+                ));
             }
-            // SAFETY: CoreVideo supplied `base` and `length` for this locked
-            // buffer; bytes are copied before the matching unlock.
-            let bytes = unsafe { std::slice::from_raw_parts(base, length) }.to_vec();
             // SAFETY: The buffer remains read-locked.
             let stride = unsafe { CVPixelBufferGetBytesPerRow(pixel_buffer) };
-            planes.push(NativePlane { bytes, stride });
+            planes.push(CameraPlaneLayout::new(0, length, stride)?);
+            source_planes.push((base, length));
         } else {
             for index in 0..plane_count {
                 // SAFETY: `index` is bounded by this buffer's plane count.
                 let stride = unsafe { CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, index) };
                 // SAFETY: `index` is bounded by this buffer's plane count.
                 let rows = unsafe { CVPixelBufferGetHeightOfPlane(pixel_buffer, index) };
-                let length = stride.checked_mul(rows).ok_or(())?;
+                let length = stride.checked_mul(rows).ok_or_else(|| {
+                    platform_error("camera.capture", "pixel-buffer plane length overflow")
+                })?;
                 // SAFETY: `index` is bounded by this buffer's plane count.
                 let base =
                     unsafe { CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, index) }.cast::<u8>();
                 if base.is_null() || length == 0 {
-                    return Err(());
+                    return Err(platform_error(
+                        "camera.capture",
+                        "pixel buffer plane has no readable bytes",
+                    ));
                 }
-                // SAFETY: CoreVideo supplied the plane's address and
-                // overflow-checked extent while the matching lock is held.
-                let bytes = unsafe { std::slice::from_raw_parts(base, length) }.to_vec();
-                planes.push(NativePlane { bytes, stride });
+                let offset = source_planes.iter().map(|(_, length)| *length).sum();
+                planes.push(CameraPlaneLayout::new(offset, length, stride)?);
+                source_planes.push((base, length));
             }
         }
         // SAFETY: The valid callback buffer remains owned for this call.
@@ -425,12 +402,61 @@ mod macos {
         } else {
             0
         };
-        Ok(NativeFrame {
-            pixel_format,
-            width,
-            height,
+        let state = state.lock().expect("AVFoundation capture mutex poisoned");
+        let actual_format = if (pixel_format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            || pixel_format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+            && planes.len() == 2
+        {
+            CameraPixelFormat::Nv12
+        } else if pixel_format == kCVPixelFormatType_422YpCbCr8_yuvs && planes.len() == 1 {
+            CameraPixelFormat::Yuyv
+        } else {
+            return Err(format_unsupported("camera.capture", &state.descriptor));
+        };
+        let width = u32::try_from(width)
+            .map_err(|_| format_unsupported("camera.capture", &state.descriptor))?;
+        let height = u32::try_from(height)
+            .map_err(|_| format_unsupported("camera.capture", &state.descriptor))?;
+        if actual_format != state.format.pixel_format()
+            || width != state.format.width()
+            || height != state.format.height()
+        {
+            return Err(format_unsupported("camera.capture", &state.descriptor));
+        }
+        let metadata = CameraFrameMetadata::new(
+            state.format.clone(),
             planes,
+            state.next_sequence,
             timestamp_ns,
+            CLOCK_DOMAIN,
+            state.dropped_count,
+        )?;
+        drop(state);
+        sink.publish(metadata, &mut |destination| {
+            let length = source_planes
+                .iter()
+                .map(|(_, length)| *length)
+                .sum::<usize>();
+            if length > destination.len() {
+                return Err(platform_error(
+                    "camera.capture",
+                    "shared-memory slot is smaller than the locked pixel buffer",
+                ));
+            }
+            let mut offset = 0;
+            for (source, length) in &source_planes {
+                // SAFETY: CoreVideo supplied each source extent while this function retains
+                // the matching read-only pixel-buffer lock; destination is capacity-checked.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        *source,
+                        destination.as_mut_ptr().add(offset),
+                        *length,
+                    );
+                }
+                offset += length;
+            }
+            Ok(length)
         })
     }
 
@@ -442,21 +468,273 @@ mod macos {
         _callback_queue: DispatchRetained<DispatchQueue>,
     }
 
+    fn native_capture_worker(
+        descriptor: ResourceDescriptor,
+        format: CameraFormat,
+        unique_id: String,
+        commands: mpsc::Receiver<Command>,
+        opened: mpsc::SyncSender<HalResult<()>>,
+    ) {
+        let setup = autoreleasepool(|_| {
+            let native_id = NSString::from_str(&unique_id);
+            // SAFETY: The capture thread resolves only the selected immutable device identity.
+            let device = unsafe { AVCaptureDevice::deviceWithUniqueID(&native_id) }
+                .ok_or_else(|| platform_error("camera.open", "selected camera disappeared"))?;
+            // SAFETY: Generated getters read the retained device selected above.
+            if !unsafe { device.isConnected() }
+                || unsafe { device.uniqueID() }.to_string() != unique_id
+            {
+                return Err(
+                    platform_error("camera.open", "selected camera identity changed")
+                        .with_resource_id(descriptor.id().clone()),
+                );
+            }
+            let media_type = video_media_type("camera.open")?;
+            // SAFETY: The static media-type constant is valid for this generated API.
+            if unsafe { AVCaptureDevice::authorizationStatusForMediaType(media_type) }
+                != AVAuthorizationStatus::Authorized
+            {
+                return Err(
+                    permission_denied("camera.open").with_resource_id(descriptor.id().clone())
+                );
+            }
+            ensure_active_format(&device, &format, &descriptor)?;
+            // SAFETY: Generated factory accepts the retained selected camera.
+            let input = unsafe { AVCaptureDeviceInput::deviceInputWithDevice_error(&device) }
+                .map_err(|error| platform_error("camera.open", error.to_string()))?;
+            // SAFETY: Generated constructors have no caller-provided ABI values.
+            let session = unsafe { AVCaptureSession::new() };
+            // SAFETY: See the session constructor rationale.
+            let output = unsafe { AVCaptureVideoDataOutput::new() };
+            configure_output(&output, &format, &descriptor)?;
+            let captures = Arc::new(Mutex::new(CaptureState {
+                pending: None,
+                dropped_count: 0,
+                next_sequence: 1,
+                descriptor: descriptor.clone(),
+                format: format.clone(),
+            }));
+            let delegate = FrameDelegate::new(Arc::clone(&captures));
+            let callback_queue = DispatchQueue::new(
+                "io.seeed.hal.avfoundation.capture",
+                DispatchQueueAttr::SERIAL,
+            );
+            let protocol: &ProtocolObject<dyn AVCaptureVideoDataOutputSampleBufferDelegate> =
+                ProtocolObject::from_ref(&*delegate);
+            // SAFETY: The native thread owns graph setup and the serial callback queue.
+            unsafe {
+                output.setSampleBufferDelegate_queue(Some(protocol), Some(&callback_queue));
+                session.beginConfiguration();
+                if !session.canAddInput(&input) || !session.canAddOutput(&output) {
+                    session.commitConfiguration();
+                    return Err(platform_error(
+                        "camera.open",
+                        "AVFoundation cannot add selected camera input or video output",
+                    )
+                    .with_resource_id(descriptor.id().clone()));
+                }
+                session.addInput(&input);
+                session.addOutput(&output);
+                session.commitConfiguration();
+                session.startRunning();
+            }
+            Ok((
+                NativeSession {
+                    session,
+                    input,
+                    output,
+                    _delegate: delegate,
+                    _callback_queue: callback_queue,
+                },
+                captures,
+            ))
+        });
+        let Ok((native, captures)) = setup else {
+            let _ = opened.send(setup.map(|_| ()));
+            return;
+        };
+        let _ = opened.send(Ok(()));
+        while let Ok(command) = commands.recv() {
+            match command {
+                Command::Capture {
+                    id,
+                    timeout,
+                    sink,
+                    response,
+                } => {
+                    {
+                        let mut state = captures
+                            .lock()
+                            .expect("AVFoundation capture mutex poisoned");
+                        if state.pending.is_some() {
+                            let _ = response.send(Err(platform_error(
+                                "camera.capture",
+                                "a capture request is already pending",
+                            )));
+                            continue;
+                        }
+                        state.pending = Some(PendingCapture {
+                            id,
+                            sink,
+                            response,
+                            deadline: std::time::Instant::now() + timeout,
+                        });
+                    }
+                    if wait_for_capture_command(&commands, &captures, &native, &descriptor) {
+                        return;
+                    }
+                }
+                Command::Close { response } => {
+                    cancel_pending_capture(&captures, closed_error("camera.capture", &descriptor));
+                    let result = teardown_native_session(native);
+                    let _ = response.send(result);
+                    return;
+                }
+                Command::Cancel { id } => {
+                    cancel_capture_by_id(
+                        &captures,
+                        id,
+                        timeout_error("camera.capture", &descriptor),
+                    );
+                }
+            }
+        }
+        cancel_pending_capture(&captures, closed_error("camera.capture", &descriptor));
+        let _ = teardown_native_session(native);
+    }
+
+    /// Returns true after it tears down the graph in response to a close command.
+    fn wait_for_capture_command(
+        commands: &mpsc::Receiver<Command>,
+        captures: &Arc<Mutex<CaptureState>>,
+        native: &NativeSession,
+        descriptor: &ResourceDescriptor,
+    ) -> bool {
+        loop {
+            let deadline = captures
+                .lock()
+                .expect("AVFoundation capture mutex poisoned")
+                .pending
+                .as_ref()
+                .map(|pending| pending.deadline);
+            let Some(deadline) = deadline else {
+                return false;
+            };
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                cancel_pending_capture(captures, timeout_error("camera.capture", descriptor));
+                return false;
+            }
+            match commands.recv_timeout(
+                deadline
+                    .saturating_duration_since(now)
+                    .min(Duration::from_millis(10)),
+            ) {
+                Ok(Command::Cancel { id }) => {
+                    cancel_capture_by_id(captures, id, timeout_error("camera.capture", descriptor));
+                }
+                Ok(Command::Close { response }) => {
+                    cancel_pending_capture(captures, closed_error("camera.capture", descriptor));
+                    let result = teardown_native_session_ref(native);
+                    let _ = response.send(result);
+                    return true;
+                }
+                Ok(Command::Capture { response, .. }) => {
+                    let _ = response.send(Err(platform_error(
+                        "camera.capture",
+                        "a capture request is already pending",
+                    )));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if std::time::Instant::now() >= deadline {
+                        cancel_pending_capture(
+                            captures,
+                            timeout_error("camera.capture", descriptor),
+                        );
+                        return false;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    cancel_pending_capture(captures, closed_error("camera.capture", descriptor));
+                    let _ = teardown_native_session_ref(native);
+                    return true;
+                }
+            }
+        }
+    }
+
+    fn cancel_capture_by_id(captures: &Arc<Mutex<CaptureState>>, id: u64, error: HalError) {
+        let pending = {
+            let mut captures = captures
+                .lock()
+                .expect("AVFoundation capture mutex poisoned");
+            if captures
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.id == id)
+            {
+                captures.pending.take()
+            } else {
+                None
+            }
+        };
+        if let Some(pending) = pending {
+            let _ = pending.response.send(Err(error));
+        }
+    }
+
+    fn cancel_pending_capture(captures: &Arc<Mutex<CaptureState>>, error: HalError) {
+        let pending = captures
+            .lock()
+            .expect("AVFoundation capture mutex poisoned")
+            .pending
+            .take();
+        if let Some(pending) = pending {
+            let _ = pending.response.send(Err(error));
+        }
+    }
+
+    fn teardown_native_session(native: NativeSession) -> HalResult<()> {
+        teardown_native_session_ref(&native)
+    }
+
+    fn teardown_native_session_ref(native: &NativeSession) -> HalResult<()> {
+        // SAFETY: The native thread owns this graph. Removing the delegate then using a
+        // synchronous barrier drains callbacks queued before graph teardown.
+        unsafe {
+            native.output.setSampleBufferDelegate_queue(None, None);
+            native.session.stopRunning();
+            native.session.removeOutput(&native.output);
+            native.session.removeInput(&native.input);
+        }
+        native._callback_queue.barrier_sync(|| {});
+        Ok(())
+    }
+
+    enum Command {
+        Capture {
+            id: u64,
+            timeout: Duration,
+            sink: Arc<dyn CameraFrameSink>,
+            response: oneshot::Sender<HalResult<()>>,
+        },
+        Cancel {
+            id: u64,
+        },
+        Close {
+            response: oneshot::Sender<HalResult<()>>,
+        },
+    }
+
     struct AvFoundationSession {
         descriptor: ResourceDescriptor,
         format: CameraFormat,
-        native: Option<NativeSession>,
-        frames: Arc<Mutex<FrameState>>,
-        next_sequence: u64,
+        commands: Option<mpsc::SyncSender<Command>>,
+        worker: Option<std::thread::JoinHandle<()>>,
         claims: Arc<Mutex<std::collections::BTreeSet<seeed_hal_core::ResourceId>>>,
+        next_capture_id: u64,
         closed: bool,
     }
-
-    // SAFETY: CameraCaptureSession methods are invoked by the runtime's
-    // single native camera worker. AVCaptureSession itself is confined to that
-    // worker after creation; callbacks use a dedicated serial GCD queue and
-    // communicate only through the Send+Sync bounded FrameState mutex.
-    unsafe impl Send for AvFoundationSession {}
 
     #[async_trait]
     impl CameraCaptureSession for AvFoundationSession {
@@ -469,34 +747,43 @@ mod macos {
         }
 
         async fn capture(&mut self, timeout: Duration) -> HalResult<CameraFrame> {
+            let _ = timeout;
+            Err(platform_error(
+                "camera.capture",
+                "AVFoundation frames are published only through the shared-memory capture sink",
+            )
+            .with_resource_id(self.descriptor.id().clone()))
+        }
+
+        async fn capture_into(
+            &mut self,
+            timeout: Duration,
+            sink: Arc<dyn CameraFrameSink>,
+        ) -> HalResult<()> {
             ensure_open(self.closed, "camera.capture", &self.descriptor)?;
-            let started = std::time::Instant::now();
-            loop {
-                let candidate = {
-                    let mut frames = self
-                        .frames
-                        .lock()
-                        .expect("AVFoundation frame mutex poisoned");
-                    frames
-                        .frame
-                        .take()
-                        .map(|frame| (frame, frames.dropped_count))
-                };
-                if let Some((frame, dropped_count)) = candidate {
-                    let published = publish_frame(
-                        frame,
-                        &self.format,
-                        self.next_sequence,
-                        dropped_count,
-                        &self.descriptor,
-                    )?;
-                    self.next_sequence = self.next_sequence.saturating_add(1);
-                    return Ok(published);
+            let (response_sender, response_receiver) = oneshot::channel();
+            let id = self.next_capture_id;
+            self.next_capture_id = self.next_capture_id.saturating_add(1);
+            self.commands
+                .as_ref()
+                .ok_or_else(|| closed_error("camera.capture", &self.descriptor))?
+                .try_send(Command::Capture {
+                    id,
+                    timeout,
+                    sink,
+                    response: response_sender,
+                })
+                .map_err(|_| closed_error("camera.capture", &self.descriptor))?;
+            match tokio::time::timeout(timeout, response_receiver).await {
+                Ok(result) => {
+                    result.map_err(|_| closed_error("camera.capture", &self.descriptor))?
                 }
-                if started.elapsed() >= timeout {
-                    return Err(timeout_error("camera.capture", &self.descriptor));
+                Err(_) => {
+                    if let Some(commands) = &self.commands {
+                        let _ = commands.try_send(Command::Cancel { id });
+                    }
+                    Err(timeout_error("camera.capture", &self.descriptor))
                 }
-                std::thread::sleep(Duration::from_millis(1));
             }
         }
 
@@ -525,99 +812,83 @@ mod macos {
         }
 
         async fn close(&mut self) -> HalResult<()> {
-            if let Some(native) = self.native.take() {
-                // SAFETY: The session owns the installed output/delegate. It
-                // disables callbacks and stops the capture graph before the
-                // Objective-C handles are dropped.
-                unsafe {
-                    native.output.setSampleBufferDelegate_queue(None, None);
-                    native.session.stopRunning();
-                    native.session.removeOutput(&native.output);
-                    native.session.removeInput(&native.input);
-                }
-                self.closed = true;
-                self.frames
-                    .lock()
-                    .expect("AVFoundation frame mutex poisoned")
-                    .frame = None;
-            }
-            self.claims
-                .lock()
-                .expect("AVFoundation claim mutex poisoned")
-                .remove(self.descriptor.id());
+            close_session(
+                &mut self.commands,
+                &mut self.worker,
+                Arc::clone(&self.claims),
+                self.descriptor.id().clone(),
+                self.closed,
+            )
+            .await?;
+            self.closed = true;
             Ok(())
         }
     }
 
     impl Drop for AvFoundationSession {
         fn drop(&mut self) {
-            if let Some(native) = self.native.take() {
-                // SAFETY: Drop owns the capture graph and disables callback
-                // delivery before its Rust-backed delegate may be released.
-                unsafe {
-                    native.output.setSampleBufferDelegate_queue(None, None);
-                    native.session.stopRunning();
+            if let Some(worker) = self.worker.take() {
+                let claims = Arc::clone(&self.claims);
+                let resource_id = self.descriptor.id().clone();
+                if let Some(commands) = self.commands.take() {
+                    let (response, _) = oneshot::channel();
+                    let _ = commands.try_send(Command::Close { response });
                 }
+                std::thread::spawn(move || {
+                    let _ = worker.join();
+                    claims
+                        .lock()
+                        .expect("AVFoundation claim mutex poisoned")
+                        .remove(&resource_id);
+                });
+            } else {
+                self.claims
+                    .lock()
+                    .expect("AVFoundation claim mutex poisoned")
+                    .remove(self.descriptor.id());
             }
-            self.claims
-                .lock()
-                .expect("AVFoundation claim mutex poisoned")
-                .remove(self.descriptor.id());
         }
     }
 
-    fn publish_frame(
-        frame: NativeFrame,
-        requested: &CameraFormat,
-        sequence: u64,
-        dropped_count: u64,
-        descriptor: &ResourceDescriptor,
-    ) -> HalResult<CameraFrame> {
-        let actual_format = if (frame.pixel_format
-            == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-            || frame.pixel_format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
-            && frame.planes.len() == 2
-        {
-            CameraPixelFormat::Nv12
-        } else if frame.pixel_format == kCVPixelFormatType_422YpCbCr8_yuvs
-            && frame.planes.len() == 1
-        {
-            CameraPixelFormat::Yuyv
+    async fn close_session(
+        commands: &mut Option<mpsc::SyncSender<Command>>,
+        worker: &mut Option<std::thread::JoinHandle<()>>,
+        claims: Arc<Mutex<std::collections::BTreeSet<seeed_hal_core::ResourceId>>>,
+        resource_id: seeed_hal_core::ResourceId,
+        already_closed: bool,
+    ) -> HalResult<()> {
+        if already_closed {
+            return Ok(());
+        }
+        if let Some(commands) = commands.take() {
+            let (response_sender, response_receiver) = oneshot::channel();
+            let _ = commands.try_send(Command::Close {
+                response: response_sender,
+            });
+            let _ = tokio::time::timeout(AVFOUNDATION_CLOSE_TIMEOUT, response_receiver).await;
+        }
+        if let Some(worker) = worker.take() {
+            let mut reaper = quarantine_claim_until_worker_exits(
+                worker,
+                Arc::clone(&claims),
+                resource_id.clone(),
+            );
+            match tokio::time::timeout(AVFOUNDATION_CLOSE_TIMEOUT, &mut reaper).await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(_))) => Err(platform_error(
+                    "camera.close",
+                    "AVFoundation capture thread panicked during teardown",
+                )),
+                Ok(Err(error)) => Err(platform_error("camera.close", error.to_string())),
+                Err(_) => Err(close_timeout_error(&resource_id)),
+            }
         } else {
-            return Err(format_unsupported("camera.capture", descriptor));
-        };
-        let width = u32::try_from(frame.width)
-            .map_err(|_| format_unsupported("camera.capture", descriptor))?;
-        let height = u32::try_from(frame.height)
-            .map_err(|_| format_unsupported("camera.capture", descriptor))?;
-        if actual_format != requested.pixel_format()
-            || width != requested.width()
-            || height != requested.height()
-        {
-            return Err(format_unsupported("camera.capture", descriptor));
+            claims
+                .lock()
+                .expect("AVFoundation claim mutex poisoned")
+                .remove(&resource_id);
+            Ok(())
         }
-        let mut payload = Vec::new();
-        let mut planes = Vec::with_capacity(frame.planes.len());
-        for plane in frame.planes {
-            let offset = payload.len();
-            payload.extend_from_slice(&plane.bytes);
-            planes.push(CameraPlaneLayout::new(
-                offset,
-                plane.bytes.len(),
-                plane.stride,
-            )?);
-        }
-        CameraFrame::new(
-            CameraFrameMetadata::new(
-                requested.clone(),
-                planes,
-                sequence,
-                frame.timestamp_ns,
-                CLOCK_DOMAIN,
-                dropped_count,
-            )?,
-            Bytes::from(payload),
-        )
     }
 
     fn video_media_type(operation: &'static str) -> HalResult<&'static AVMediaType> {
@@ -680,6 +951,30 @@ mod macos {
         )
         .expect("static AVFoundation timeout error metadata is valid")
         .with_resource_id(descriptor.id().clone())
+    }
+
+    fn closed_error(operation: &'static str, descriptor: &ResourceDescriptor) -> HalError {
+        HalError::new(
+            "runtime.session.closed",
+            ErrorCategory::Conflict,
+            operation,
+            false,
+            "AVFoundation camera session is closed",
+        )
+        .expect("static AVFoundation closed error metadata is valid")
+        .with_resource_id(descriptor.id().clone())
+    }
+
+    fn close_timeout_error(descriptor: &seeed_hal_core::ResourceId) -> HalError {
+        HalError::new(
+            "runtime.adapter.close_timeout",
+            ErrorCategory::Unavailable,
+            "camera.close",
+            true,
+            "AVFoundation capture thread did not finish native teardown before close timed out",
+        )
+        .expect("static AVFoundation close timeout metadata is valid")
+        .with_resource_id(descriptor.clone())
     }
 
     fn permission_denied(operation: &'static str) -> HalError {

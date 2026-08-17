@@ -89,6 +89,35 @@ mod tests {
     }
 
     #[test]
+    fn producer_copies_directly_into_one_ring_slot() {
+        let mut broker = BrokerMapping::create(config()).unwrap();
+        let mut copies = 0;
+        broker
+            .writer()
+            .publish_with(metadata(1, 1), &mut |destination| {
+                copies += 1;
+                destination[..8].copy_from_slice(&[7; 8]);
+                Ok(8)
+            })
+            .unwrap();
+
+        let frame = broker.acquire().unwrap().unwrap();
+        assert_eq!(copies, 1);
+        assert_eq!(frame.payload(), &[7; 8]);
+    }
+
+    #[test]
+    fn producer_rejects_a_payload_length_larger_than_the_destination() {
+        let mut broker = BrokerMapping::create(config()).unwrap();
+        let error = broker
+            .writer()
+            .publish_with(metadata(1, 1), &mut |destination| Ok(destination.len() + 1))
+            .expect_err("a producer may not claim bytes beyond its provided slot");
+
+        assert_eq!(error.name().as_str(), "shared_memory.invalid");
+    }
+
+    #[test]
     fn independently_reopened_mapping_only_returns_an_owned_copy() {
         let mut broker = BrokerMapping::create(config()).unwrap();
         let descriptor = broker.descriptor().clone();

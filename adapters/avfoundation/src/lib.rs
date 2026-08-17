@@ -11,9 +11,35 @@ use std::{
 #[cfg(target_os = "macos")]
 mod native;
 
+type Claims = Arc<Mutex<BTreeSet<ResourceId>>>;
+
 #[derive(Clone, Debug)]
 pub struct AvFoundationAdapter {
-    claims: Arc<Mutex<BTreeSet<ResourceId>>>,
+    claims: Claims,
+}
+
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn quarantine_claim_until_worker_exits(
+    worker: std::thread::JoinHandle<()>,
+    claims: Claims,
+    resource_id: ResourceId,
+) -> tokio::task::JoinHandle<std::thread::Result<()>> {
+    tokio::task::spawn_blocking(move || {
+        let result = worker.join();
+        claims
+            .lock()
+            .expect("AVFoundation claim mutex poisoned")
+            .remove(&resource_id);
+        result
+    })
+}
+
+#[cfg(test)]
+fn claim_conflict(claims: &Claims, resource_id: &ResourceId) -> bool {
+    claims
+        .lock()
+        .expect("AVFoundation claim mutex poisoned")
+        .contains(resource_id)
 }
 
 impl AvFoundationAdapter {
@@ -128,7 +154,12 @@ fn worker_failed(operation: &'static str, error: tokio::task::JoinError) -> HalE
 
 #[cfg(test)]
 mod tests {
-    use super::encode_resource_id;
+    use super::{claim_conflict, encode_resource_id, quarantine_claim_until_worker_exits};
+    use seeed_hal_core::ResourceId;
+    use std::{
+        collections::BTreeSet,
+        sync::{Arc, Mutex, mpsc},
+    };
 
     #[test]
     fn resource_id_percent_encodes_avfoundation_unique_id() {
@@ -144,6 +175,52 @@ mod tests {
     fn resource_id_rejects_empty_avfoundation_unique_id() {
         let error = encode_resource_id("").expect_err("empty native ID is not a stable identity");
         assert_eq!(error.name().as_str(), "runtime.resource.invalid");
+    }
+
+    #[tokio::test]
+    async fn close_timeout_quarantines_the_claim_until_the_native_worker_exits() {
+        let resource_id =
+            ResourceId::parse("camera:avfoundation:teardown-test").expect("valid resource ID");
+        let claims = Arc::new(Mutex::new(BTreeSet::from([resource_id.clone()])));
+        let (release_sender, release_worker) = mpsc::channel();
+        let (worker_exited, worker_exit_wait) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            release_worker
+                .recv()
+                .expect("test must release the simulated native worker");
+            worker_exited
+                .send(())
+                .expect("test must observe the simulated native worker exit");
+        });
+
+        let mut reaped =
+            quarantine_claim_until_worker_exits(worker, Arc::clone(&claims), resource_id.clone());
+
+        assert!(
+            claim_conflict(&claims, &resource_id),
+            "a second session must not open while the timed-out native worker can own the camera"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut reaped)
+                .await
+                .is_err(),
+            "the claim reaper must wait for native worker teardown"
+        );
+
+        release_sender
+            .send(())
+            .expect("test must release the simulated native worker");
+        worker_exit_wait
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("simulated worker must exit");
+        reaped
+            .await
+            .expect("claim reaper task must finish")
+            .expect("simulated worker must not panic");
+        assert!(
+            !claim_conflict(&claims, &resource_id),
+            "claim must be released only after the native worker exits"
+        );
     }
 
     #[cfg(not(target_os = "macos"))]

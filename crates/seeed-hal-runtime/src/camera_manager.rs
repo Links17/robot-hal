@@ -4,8 +4,8 @@ use seeed_hal_adapter_shared_memory::{
     RingConfig,
 };
 use seeed_hal_camera::{
-    CameraAdapter, CameraControlDescriptor, CameraControlKind, CameraControlValue, CameraRequest,
-    camera_capture_capability,
+    CameraAdapter, CameraControlDescriptor, CameraControlKind, CameraControlValue, CameraFrameSink,
+    CameraRequest, camera_capture_capability,
 };
 use seeed_hal_core::{
     ErrorCategory, HalError, HalResult, LeaseToken, OwnerId, ResourceId, ResourceSelector,
@@ -14,7 +14,7 @@ use seeed_hal_core::{
 use std::{
     collections::HashMap,
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
@@ -203,7 +203,7 @@ fn spawn_worker(
                     request.slot_count(),
                     session.format().worst_case_frame_bytes()?,
                 )?;
-                let mut mapping = match BrokerMapping::create(config) {
+                let mapping = match BrokerMapping::create(config) {
                     Ok(mapping) => mapping,
                     Err(error) => {
                         let _ = opened_tx.send(Err(error.clone()));
@@ -211,6 +211,7 @@ fn spawn_worker(
                         return Err(error);
                     }
                 };
+                let mapping = Arc::new(StdMutex::new(mapping));
                 let _ = opened_tx.send(Ok(()));
                 let mut terminal_error = None;
                 while !*worker_shutdown.borrow() {
@@ -236,13 +237,11 @@ fn spawn_worker(
                             if reply.is_closed() {
                                 None
                             } else {
-                                let result =
-                                    runtime
-                                        .block_on(session.capture(timeout))
-                                        .and_then(|frame| {
-                                            let metadata = frame_metadata(&frame, generation)?;
-                                            mapping.writer().publish(metadata, frame.payload())
-                                        });
+                                let sink: Arc<dyn CameraFrameSink> = Arc::new(RuntimeFrameSink {
+                                    mapping: Arc::clone(&mapping),
+                                    generation,
+                                });
+                                let result = runtime.block_on(session.capture_into(timeout, sink));
                                 let terminal = result
                                     .as_ref()
                                     .err()
@@ -253,14 +252,18 @@ fn spawn_worker(
                             }
                         }
                         CameraCommand::MappingDescriptor { reply } => {
+                            let mapping = mapping.lock().expect("camera mapping mutex poisoned");
                             let _ = reply.send(Ok(mapping.descriptor().clone()));
                             None
                         }
                         CameraCommand::NextFrameLease { reply } => {
+                            let mut mapping =
+                                mapping.lock().expect("camera mapping mutex poisoned");
                             let _ = reply.send(mapping.next_frame_lease());
                             None
                         }
                         CameraCommand::DroppedCount { reply } => {
+                            let mapping = mapping.lock().expect("camera mapping mutex poisoned");
                             let _ = reply.send(Ok(mapping.dropped_count()));
                             None
                         }
@@ -315,7 +318,10 @@ fn spawn_worker(
                         break;
                     }
                 }
-                let mapping_result = mapping.close();
+                let mapping_result = mapping
+                    .lock()
+                    .expect("camera mapping mutex poisoned")
+                    .close();
                 let close_result = runtime.block_on(session.close());
                 while let Ok(command) = command_rx.try_recv() {
                     command.reject_closed();
@@ -335,6 +341,11 @@ fn spawn_worker(
                 }
             }))
             .unwrap_or_else(|_| Err(actor_unavailable("camera.worker")));
+            if let Err(error) = &result {
+                if terminal_error_tx.borrow().is_none() {
+                    let _ = terminal_error_tx.send(Some(error.clone()));
+                }
+            }
             let _ = completion_tx.send(Some(result));
         })
         .map_err(|error| {
@@ -358,25 +369,37 @@ fn spawn_worker(
     ))
 }
 
-fn frame_metadata(
-    frame: &seeed_hal_camera::CameraFrame,
+struct RuntimeFrameSink {
+    mapping: Arc<StdMutex<BrokerMapping>>,
     generation: u64,
-) -> HalResult<FrameMetadata> {
-    FrameMetadata::new(
-        PixelFormat::from(frame.metadata().format().pixel_format()),
-        frame.metadata().format().width(),
-        frame.metadata().format().height(),
-        frame.metadata().sequence(),
-        generation,
-        frame.metadata().monotonic_timestamp_ns(),
-        frame.metadata().dropped_count(),
-        frame
-            .metadata()
-            .planes()
-            .iter()
-            .map(|plane| PlaneLayout::new(plane.offset(), plane.length(), plane.stride()))
-            .collect::<HalResult<Vec<_>>>()?,
-    )
+}
+
+impl CameraFrameSink for RuntimeFrameSink {
+    fn publish(
+        &self,
+        metadata: seeed_hal_camera::CameraFrameMetadata,
+        copy_payload: &mut dyn FnMut(&mut [u8]) -> HalResult<usize>,
+    ) -> HalResult<()> {
+        let metadata = FrameMetadata::new(
+            PixelFormat::from(metadata.format().pixel_format()),
+            metadata.format().width(),
+            metadata.format().height(),
+            metadata.sequence(),
+            self.generation,
+            metadata.monotonic_timestamp_ns(),
+            metadata.dropped_count(),
+            metadata
+                .planes()
+                .iter()
+                .map(|plane| PlaneLayout::new(plane.offset(), plane.length(), plane.stride()))
+                .collect::<HalResult<Vec<_>>>()?,
+        )?;
+        self.mapping
+            .lock()
+            .expect("camera mapping mutex poisoned")
+            .writer()
+            .publish_with(metadata, copy_payload)
+    }
 }
 
 fn is_terminal(error: &HalError) -> bool {

@@ -46,6 +46,11 @@ pub struct BrokerMapping {
     pinned: Option<FrameLease>,
 }
 
+// SAFETY: BrokerMapping has a unique owner until it is placed behind a mutex. All mapping
+// mutation continues to require an exclusive `&mut BrokerMapping` and an OS mapping lock, so
+// moving ownership to the native capture thread cannot create concurrent raw-pointer access.
+unsafe impl Send for BrokerMapping {}
+
 impl BrokerMapping {
     pub fn create(config: RingConfig) -> HalResult<Self> {
         let identity = MappingIdentity::generate()?;
@@ -431,20 +436,24 @@ pub struct SlotWriter<'a> {
 
 impl SlotWriter<'_> {
     pub fn publish(&mut self, metadata: FrameMetadata, payload: &[u8]) -> HalResult<()> {
-        if payload.len() > self.broker.config.payload_capacity() {
-            return Err(invalid(
-                "shared_memory.publish",
-                "payload exceeds the negotiated slot capacity",
-            ));
-        }
+        self.publish_with(metadata, &mut |destination| {
+            if payload.len() > destination.len() {
+                return Err(invalid(
+                    "shared_memory.publish",
+                    "payload exceeds the negotiated slot capacity",
+                ));
+            }
+            destination[..payload.len()].copy_from_slice(payload);
+            Ok(payload.len())
+        })
+    }
+
+    pub fn publish_with(
+        &mut self,
+        metadata: FrameMetadata,
+        copy_payload: &mut dyn FnMut(&mut [u8]) -> HalResult<usize>,
+    ) -> HalResult<()> {
         validate_dimensions(metadata.format(), metadata.width(), metadata.height())?;
-        validate_planes(
-            metadata.format(),
-            metadata.width(),
-            metadata.height(),
-            metadata.planes(),
-            payload.len(),
-        )?;
         match self.broker.mapping.try_lock_exclusive() {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -453,7 +462,7 @@ impl SlotWriter<'_> {
             }
             Err(error) => return Err(unavailable("shared_memory.publish", error.to_string())),
         }
-        let result = self.publish_locked(metadata, payload);
+        let result = self.publish_locked_with(metadata, copy_payload);
         self.broker
             .mapping
             .unlock()
@@ -461,7 +470,11 @@ impl SlotWriter<'_> {
         result
     }
 
-    fn publish_locked(&mut self, metadata: FrameMetadata, payload: &[u8]) -> HalResult<()> {
+    fn publish_locked_with(
+        &mut self,
+        metadata: FrameMetadata,
+        copy_payload: &mut dyn FnMut(&mut [u8]) -> HalResult<usize>,
+    ) -> HalResult<()> {
         let Some(index) = self.broker.select_writable_slot()? else {
             self.broker.increment_dropped_locked()?;
             return Ok(());
@@ -471,13 +484,37 @@ impl SlotWriter<'_> {
         }
         self.broker.write_slot_state(index, SlotState::Writing)?;
         let base = self.broker.slot_base(index);
+        let payload = {
+            // SAFETY: the selected writable slot has at least its negotiated payload capacity
+            // after SLOT_HEADER_BYTES; it remains Writing and the exclusive mapping lock is held.
+            unsafe {
+                std::slice::from_raw_parts_mut(
+                    base.add(SLOT_HEADER_BYTES),
+                    self.broker.config.payload_capacity(),
+                )
+            }
+        };
+        let payload_length = copy_payload(payload)?;
+        if payload_length > payload.len() {
+            return Err(invalid(
+                "shared_memory.publish",
+                "payload copier exceeded the negotiated slot capacity",
+            ));
+        }
+        validate_planes(
+            metadata.format(),
+            metadata.width(),
+            metadata.height(),
+            metadata.planes(),
+            payload_length,
+        )?;
         // SAFETY: the broker owns the writable slot, marked Writing before these accesses.
         // RingConfig bounds header and payload storage, and metadata plane count is validated.
         unsafe {
             write_u64(base.add(SLOT_GENERATION), metadata.generation());
             write_u64(base.add(SLOT_TIMESTAMP), metadata.monotonic_timestamp_ns());
             write_u64(base.add(SLOT_DROPPED), self.broker.dropped_count_locked());
-            write_u64(base.add(SLOT_PAYLOAD_LENGTH), payload.len() as u64);
+            write_u64(base.add(SLOT_PAYLOAD_LENGTH), payload_length as u64);
             write_u64(base.add(SLOT_PLANE_COUNT), metadata.planes().len() as u64);
             for (index, plane) in metadata.planes().iter().enumerate() {
                 let offset = SLOT_PLANES + index * PLANE_BYTES;
@@ -485,19 +522,11 @@ impl SlotWriter<'_> {
                 write_u32(base.add(offset + 4), plane.length() as u32);
                 write_u32(base.add(offset + 8), plane.stride() as u32);
             }
-            std::ptr::copy_nonoverlapping(
-                payload.as_ptr(),
-                base.add(SLOT_HEADER_BYTES),
-                payload.len(),
-            );
-        }
-        // SAFETY: exclusive OS lock excludes every reader; sequence is written before Ready.
-        unsafe {
             write_u64(
                 self.broker.slot_base(index).add(SLOT_SEQUENCE),
                 metadata.sequence(),
-            )
-        };
+            );
+        }
         self.broker.write_slot_state(index, SlotState::Ready)?;
         Ok(())
     }
