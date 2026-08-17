@@ -13,7 +13,8 @@ use seeed_hal_can::{
     CanMode, CanOpenConfig,
 };
 use seeed_hal_core::{
-    CapabilityId, CapabilitySet, HalResult, OwnerId, ResourceDescriptor, ResourceSelector,
+    CapabilityId, CapabilitySet, ErrorCategory, HalError, HalResult, OwnerId, ResourceDescriptor,
+    ResourceSelector,
 };
 use seeed_hal_gpio::GpioEdge;
 use seeed_hal_protocol::v1::{self, envelope};
@@ -471,6 +472,13 @@ fn usb_gpio_broker() -> Broker {
 fn usb_gpio_broker_with_adapters() -> (Broker, VirtualUsbAdapter, VirtualGpioAdapter) {
     let usb = VirtualUsbAdapter::loopback("usb:virtual:broker");
     let gpio = VirtualGpioAdapter::line_bank("gpio:virtual:broker", 2);
+    usb_gpio_broker_with_adapters_inner(usb, gpio)
+}
+
+fn usb_gpio_broker_with_adapters_inner(
+    usb: VirtualUsbAdapter,
+    gpio: VirtualGpioAdapter,
+) -> (Broker, VirtualUsbAdapter, VirtualGpioAdapter) {
     let runtime = HalRuntime::builder()
         .usb_adapter(usb.clone())
         .gpio_adapter(gpio.clone())
@@ -488,6 +496,102 @@ fn minor_two_handshake() -> v1::HandshakeRequest {
     handshake.protocol_minor_minimum = 2;
     handshake.protocol_minor_maximum = 2;
     handshake
+}
+
+async fn enumerate_usb<T>(client: &mut Client<T>) -> v1::ResourceDescriptor
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    match client
+        .request(envelope::Payload::EnumerateUsbRequest(
+            v1::EnumerateUsbRequest {},
+        ))
+        .await
+        .payload
+    {
+        Some(envelope::Payload::EnumerateUsbResponse(response)) => {
+            response.resources.into_iter().next().unwrap()
+        }
+        other => panic!("expected USB enumeration, got {other:?}"),
+    }
+}
+
+async fn enumerate_gpio<T>(client: &mut Client<T>) -> v1::ResourceDescriptor
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    match client
+        .request(envelope::Payload::EnumerateGpioRequest(
+            v1::EnumerateGpioRequest {},
+        ))
+        .await
+        .payload
+    {
+        Some(envelope::Payload::EnumerateGpioResponse(response)) => {
+            response.resources.into_iter().next().unwrap()
+        }
+        other => panic!("expected GPIO enumeration, got {other:?}"),
+    }
+}
+
+fn selector(descriptor: &v1::ResourceDescriptor) -> v1::ResourceSelector {
+    v1::ResourceSelector {
+        resource_id: descriptor.resource_id.clone(),
+        minimum_identity_quality: descriptor.identity_quality,
+        transport: descriptor.transport,
+    }
+}
+
+async fn open_usb<T>(
+    client: &mut Client<T>,
+    descriptor: &v1::ResourceDescriptor,
+) -> v1::OpenUsbResponse
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    match client
+        .request(envelope::Payload::OpenUsbRequest(v1::OpenUsbRequest {
+            selector: Some(selector(descriptor)),
+            interface_number: 0,
+        }))
+        .await
+        .payload
+    {
+        Some(envelope::Payload::OpenUsbResponse(response)) => response,
+        other => panic!("expected USB open, got {other:?}"),
+    }
+}
+
+async fn open_gpio<T>(
+    client: &mut Client<T>,
+    descriptor: &v1::ResourceDescriptor,
+    line: u32,
+    direction: v1::GpioDirection,
+) -> v1::OpenGpioResponse
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    match client
+        .request(envelope::Payload::OpenGpioRequest(v1::OpenGpioRequest {
+            selector: Some(selector(descriptor)),
+            lines: vec![line],
+            config: Some(v1::GpioLineConfig {
+                direction: direction as i32,
+                active_low: false,
+                bias: v1::GpioBias::Disabled as i32,
+                drive: match direction {
+                    v1::GpioDirection::Output => v1::GpioDrive::PushPull as i32,
+                    _ => v1::GpioDrive::Unspecified as i32,
+                },
+                initial_value: (direction == v1::GpioDirection::Output).then_some(false),
+            }),
+        }))
+        .await
+        .payload
+    {
+        Some(envelope::Payload::OpenGpioResponse(response)) => response,
+        other => panic!("expected GPIO open, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -789,6 +893,256 @@ async fn minor_two_broker_dispatches_owner_scoped_usb_and_gpio_sessions() {
 
     drop(client);
     assert!(server.await.unwrap().cleanup_error().is_none());
+}
+
+#[tokio::test]
+async fn usb_and_gpio_sessions_reject_cross_connection_and_stale_leases_before_adapter_io() {
+    let (broker, usb, gpio) = usb_gpio_broker_with_adapters();
+    let (first_server_io, first_client_io) = tokio::io::duplex(64 * 1024);
+    let first_server = tokio::spawn(async move { broker.serve_connection(first_server_io).await });
+    let mut first = Client::new(first_client_io);
+    first
+        .request(envelope::Payload::HandshakeRequest(minor_two_handshake()))
+        .await;
+    let usb_descriptor = enumerate_usb(&mut first).await;
+    let gpio_descriptor = enumerate_gpio(&mut first).await;
+    let usb_session = open_usb(&mut first, &usb_descriptor).await;
+    let gpio_session = open_gpio(&mut first, &gpio_descriptor, 0, v1::GpioDirection::Output).await;
+
+    let (second_server_io, second_client_io) = tokio::io::duplex(64 * 1024);
+    let second_broker = Broker::with_startup_token(
+        HalRuntime::builder()
+            .usb_adapter(usb.clone())
+            .gpio_adapter(gpio.clone())
+            .build(),
+        StartupToken::from_bytes(TOKEN),
+    );
+    let second_server =
+        tokio::spawn(async move { second_broker.serve_connection(second_server_io).await });
+    let mut second = Client::new(second_client_io);
+    second
+        .request(envelope::Payload::HandshakeRequest(minor_two_handshake()))
+        .await;
+
+    usb.fail_next_transfer(
+        HalError::new(
+            "test.usb.adapter_touched",
+            ErrorCategory::Internal,
+            "usb.transfer",
+            false,
+            "foreign USB request reached the adapter",
+        )
+        .unwrap(),
+    );
+    let foreign_usb = second
+        .request(envelope::Payload::UsbTransferRequest(
+            v1::UsbTransferRequest {
+                session_id: usb_session.session_id.clone(),
+                lease: usb_session.lease.clone(),
+                kind: v1::UsbTransferKind::BulkOut as i32,
+                endpoint: 1,
+                data: b"forbidden".to_vec(),
+                timeout_ms: 10,
+                ..Default::default()
+            },
+        ))
+        .await;
+    assert_eq!(error_name(&foreign_usb), "runtime.session.not_found");
+    let owner_usb = first
+        .request(envelope::Payload::UsbTransferRequest(
+            v1::UsbTransferRequest {
+                session_id: usb_session.session_id.clone(),
+                lease: usb_session.lease.clone(),
+                kind: v1::UsbTransferKind::BulkOut as i32,
+                endpoint: 1,
+                data: vec![],
+                timeout_ms: 10,
+                ..Default::default()
+            },
+        ))
+        .await;
+    assert_eq!(error_name(&owner_usb), "test.usb.adapter_touched");
+    gpio.fail_next_read(
+        HalError::new(
+            "test.gpio.adapter_touched",
+            ErrorCategory::Internal,
+            "gpio.read",
+            false,
+            "foreign GPIO request reached the adapter",
+        )
+        .unwrap(),
+    );
+    let foreign_gpio = second
+        .request(envelope::Payload::GpioWriteRequest(v1::GpioWriteRequest {
+            session_id: gpio_session.session_id.clone(),
+            lease: gpio_session.lease.clone(),
+            values: vec![true],
+        }))
+        .await;
+    assert_eq!(error_name(&foreign_gpio), "runtime.session.not_found");
+    let owner_gpio = first
+        .request(envelope::Payload::GpioReadRequest(v1::GpioReadRequest {
+            session_id: gpio_session.session_id.clone(),
+            lease: gpio_session.lease.clone(),
+        }))
+        .await;
+    assert_eq!(error_name(&owner_gpio), "test.gpio.adapter_touched");
+
+    let stale_usb_lease = usb_session.lease.clone().unwrap();
+    assert!(matches!(
+        first
+            .request(envelope::Payload::CloseUsbRequest(v1::CloseUsbRequest {
+                session_id: usb_session.session_id,
+                lease: usb_session.lease,
+            }))
+            .await
+            .payload,
+        Some(envelope::Payload::CloseUsbResponse(_))
+    ));
+    let reopened_usb = open_usb(&mut first, &usb_descriptor).await;
+    let stale_usb = first
+        .request(envelope::Payload::UsbTransferRequest(
+            v1::UsbTransferRequest {
+                session_id: reopened_usb.session_id,
+                lease: Some(stale_usb_lease),
+                kind: v1::UsbTransferKind::BulkOut as i32,
+                endpoint: 1,
+                data: b"stale".to_vec(),
+                timeout_ms: 10,
+                ..Default::default()
+            },
+        ))
+        .await;
+    assert_eq!(error_name(&stale_usb), "runtime.lease.stale_generation");
+
+    let stale_gpio_lease = gpio_session.lease.clone().unwrap();
+    assert!(matches!(
+        first
+            .request(envelope::Payload::CloseGpioRequest(v1::CloseGpioRequest {
+                session_id: gpio_session.session_id,
+                lease: gpio_session.lease,
+            }))
+            .await
+            .payload,
+        Some(envelope::Payload::CloseGpioResponse(_))
+    ));
+    let reopened_gpio = open_gpio(&mut first, &gpio_descriptor, 0, v1::GpioDirection::Output).await;
+    let stale_gpio = first
+        .request(envelope::Payload::GpioWriteRequest(v1::GpioWriteRequest {
+            session_id: reopened_gpio.session_id,
+            lease: Some(stale_gpio_lease),
+            values: vec![true],
+        }))
+        .await;
+    assert_eq!(error_name(&stale_gpio), "runtime.lease.stale_generation");
+
+    drop(first);
+    drop(second);
+    assert!(first_server.await.unwrap().cleanup_error().is_none());
+    assert!(second_server.await.unwrap().cleanup_error().is_none());
+}
+
+#[tokio::test]
+async fn gpio_lag_is_delivered_as_a_structured_broker_error() {
+    let usb = VirtualUsbAdapter::loopback("usb:virtual:broker-lag");
+    let gpio = VirtualGpioAdapter::line_bank_with_event_capacity("gpio:virtual:broker-lag", 1, 1);
+    let (broker, _, gpio) = usb_gpio_broker_with_adapters_inner(usb, gpio);
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    client
+        .request(envelope::Payload::HandshakeRequest(minor_two_handshake()))
+        .await;
+    let descriptor = enumerate_gpio(&mut client).await;
+    let session = open_gpio(&mut client, &descriptor, 0, v1::GpioDirection::Input).await;
+    gpio.inject_edge(0, GpioEdge::Rising, 1).unwrap();
+    gpio.inject_edge(0, GpioEdge::Falling, 2).unwrap();
+
+    let lagged = client
+        .request(envelope::Payload::GpioNextEdgeRequest(
+            v1::GpioNextEdgeRequest {
+                session_id: session.session_id.clone(),
+                lease: session.lease.clone(),
+                rising: true,
+                falling: true,
+                capacity: 1,
+                timeout_ms: 100,
+            },
+        ))
+        .await;
+    assert_eq!(error_name(&lagged), "gpio.edge.lagged");
+    let error = match lagged.payload {
+        Some(envelope::Payload::Error(error)) => error,
+        other => panic!("expected lag error, got {other:?}"),
+    };
+    assert_eq!(
+        error.context.get("dropped_count").map(String::as_str),
+        Some("1")
+    );
+    let retained = client
+        .request(envelope::Payload::GpioNextEdgeRequest(
+            v1::GpioNextEdgeRequest {
+                session_id: session.session_id,
+                lease: session.lease,
+                rising: true,
+                falling: true,
+                capacity: 1,
+                timeout_ms: 100,
+            },
+        ))
+        .await;
+    match retained.payload {
+        Some(envelope::Payload::GpioNextEdgeResponse(response)) => {
+            assert_eq!(response.event.unwrap().monotonic_ns, 2);
+        }
+        other => panic!("expected retained GPIO edge, got {other:?}"),
+    }
+    drop(client);
+    assert!(server.await.unwrap().cleanup_error().is_none());
+}
+
+#[tokio::test]
+async fn disconnect_releases_usb_and_gpio_for_a_new_broker_connection() {
+    let (broker, usb, gpio) = usb_gpio_broker_with_adapters();
+    let (first_server_io, first_client_io) = tokio::io::duplex(64 * 1024);
+    let first_server = tokio::spawn(async move { broker.serve_connection(first_server_io).await });
+    let mut first = Client::new(first_client_io);
+    first
+        .request(envelope::Payload::HandshakeRequest(minor_two_handshake()))
+        .await;
+    let usb_descriptor = enumerate_usb(&mut first).await;
+    let gpio_descriptor = enumerate_gpio(&mut first).await;
+    let _usb = open_usb(&mut first, &usb_descriptor).await;
+    let _gpio = open_gpio(&mut first, &gpio_descriptor, 0, v1::GpioDirection::Output).await;
+    drop(first);
+    assert!(first_server.await.unwrap().cleanup_error().is_none());
+    assert!(usb.claimed_interfaces().is_empty());
+    assert!(gpio.claimed_lines().is_empty());
+
+    let second_broker = Broker::with_startup_token(
+        HalRuntime::builder()
+            .usb_adapter(usb.clone())
+            .gpio_adapter(gpio.clone())
+            .build(),
+        StartupToken::from_bytes(TOKEN),
+    );
+    let (second_server_io, second_client_io) = tokio::io::duplex(64 * 1024);
+    let second_server =
+        tokio::spawn(async move { second_broker.serve_connection(second_server_io).await });
+    let mut second = Client::new(second_client_io);
+    second
+        .request(envelope::Payload::HandshakeRequest(minor_two_handshake()))
+        .await;
+    assert!(matches!(
+        open_usb(&mut second, &usb_descriptor).await,
+        v1::OpenUsbResponse { .. }
+    ));
+    assert!(matches!(
+        open_gpio(&mut second, &gpio_descriptor, 0, v1::GpioDirection::Output).await,
+        v1::OpenGpioResponse { .. }
+    ));
+    drop(second);
+    assert!(second_server.await.unwrap().cleanup_error().is_none());
 }
 
 fn can_handshake() -> v1::HandshakeRequest {
