@@ -9,6 +9,7 @@ use seeed_hal_core::{
     ErrorCategory, ErrorContext, HalError, IdentityQuality, LeaseId, LeaseMode, LeaseToken,
     ResourceId, ResourceSelector, TransportKind,
 };
+use seeed_hal_gpio::{GpioDrive, GpioEdge, GpioEdgeEvent, GpioLineConfig};
 use seeed_hal_protocol::v1::{self, envelope};
 
 #[test]
@@ -55,6 +56,66 @@ fn usb_transfer_decoder_rejects_payload_over_public_bound() {
 fn gpio_config_decoder_rejects_unspecified_direction() {
     let error =
         seeed_hal_protocol::gpio_config_from_proto(v1::GpioLineConfig::default()).unwrap_err();
+    assert_eq!(error.name().as_str(), "runtime.protocol.invalid_message");
+}
+
+#[test]
+fn usb_and_gpio_minor_two_responses_round_trip_sessions_and_domain_values() {
+    let session = seeed_hal_core::SessionId::parse("session-usb-gpio").unwrap();
+    let lease = LeaseToken::new(
+        LeaseId::parse("lease-usb-gpio").unwrap(),
+        7,
+        LeaseMode::Control,
+    );
+    assert_eq!(
+        seeed_hal_protocol::open_usb_response_from_proto(
+            seeed_hal_protocol::open_usb_response_to_proto(&session, &lease)
+        )
+        .unwrap(),
+        (session.clone(), lease.clone())
+    );
+    assert_eq!(
+        seeed_hal_protocol::open_gpio_response_from_proto(
+            seeed_hal_protocol::open_gpio_response_to_proto(&session, &lease)
+        )
+        .unwrap(),
+        (session, lease)
+    );
+
+    let config = GpioLineConfig::output(true, true, GpioDrive::OpenDrain).unwrap();
+    assert_eq!(
+        seeed_hal_protocol::gpio_config_from_proto(v1::GpioLineConfig::from(&config)).unwrap(),
+        config
+    );
+    let event = GpioEdgeEvent::new(GpioEdge::Falling, 42, 3);
+    assert_eq!(
+        seeed_hal_protocol::gpio_edge_event_from_proto(v1::GpioEdgeEvent::from(&event)).unwrap(),
+        event
+    );
+}
+
+#[test]
+fn usb_and_gpio_minor_two_requests_reject_transport_and_public_bounds() {
+    let selector = v1::ResourceSelector {
+        resource_id: "gpio:wrong-transport".to_owned(),
+        minimum_identity_quality: v1::IdentityQuality::Strong as i32,
+        transport: v1::TransportKind::Gpio as i32,
+    };
+    assert_invalid_message(
+        seeed_hal_protocol::open_usb_request_from_proto(v1::OpenUsbRequest {
+            selector: Some(selector),
+            interface_number: 0,
+        })
+        .unwrap_err(),
+        "USB",
+    );
+
+    let error = seeed_hal_protocol::gpio_edge_request_from_proto(v1::GpioNextEdgeRequest {
+        rising: true,
+        capacity: 1025,
+        ..Default::default()
+    })
+    .unwrap_err();
     assert_eq!(error.name().as_str(), "runtime.protocol.invalid_message");
 }
 

@@ -6,10 +6,13 @@ use seeed_hal_core::{
     IdentityQuality, LeaseId, LeaseMode, LeaseToken, ResourceDescriptor, ResourceId,
     ResourceProperties, ResourceSelector, SessionId, TransportKind,
 };
-use seeed_hal_gpio::{GpioBias, GpioDrive, GpioLineConfig};
+use seeed_hal_gpio::{
+    EdgeMask, GpioBias, GpioDirection, GpioDrive, GpioEdge, GpioEdgeEvent, GpioEdgeRequest,
+    GpioLineConfig, MAX_GPIO_EVENTS,
+};
 use seeed_hal_runtime::{RuntimeEvent, RuntimeEventKind};
 use seeed_hal_serial::{DataBits, FlowControl, Parity, SerialConfig, StopBits};
-use seeed_hal_usb::UsbTransfer;
+use seeed_hal_usb::{MAX_USB_INTERFACE_NUMBER, UsbTransfer};
 
 use crate::v1;
 
@@ -97,6 +100,148 @@ pub fn gpio_config_from_proto(value: v1::GpioLineConfig) -> HalResult<GpioLineCo
         v1::GpioDirection::Unspecified => Err(invalid_message("gpio_config.direction is required")),
     }
     .map_err(|_| invalid_message("gpio_config violates the public GPIO configuration bounds"))
+}
+
+pub fn usb_selector_from_proto(value: v1::ResourceSelector) -> HalResult<ResourceSelector> {
+    selector_for_transport(value, TransportKind::Usb, "USB")
+}
+
+pub fn gpio_selector_from_proto(value: v1::ResourceSelector) -> HalResult<ResourceSelector> {
+    selector_for_transport(value, TransportKind::Gpio, "GPIO")
+}
+
+pub fn open_usb_request_from_proto(value: v1::OpenUsbRequest) -> HalResult<(ResourceSelector, u8)> {
+    let selector = value
+        .selector
+        .ok_or_else(|| invalid_message("open_usb selector is required"))?;
+    let interface = usize::try_from(value.interface_number)
+        .map_err(|_| invalid_message("open_usb interface_number is invalid"))?;
+    if interface > MAX_USB_INTERFACE_NUMBER {
+        return Err(invalid_message("open_usb interface_number exceeds u8"));
+    }
+    Ok((usb_selector_from_proto(selector)?, interface as u8))
+}
+
+pub fn open_gpio_request_from_proto(
+    value: v1::OpenGpioRequest,
+) -> HalResult<(ResourceSelector, Vec<u32>, GpioLineConfig)> {
+    let selector = value
+        .selector
+        .ok_or_else(|| invalid_message("open_gpio selector is required"))?;
+    if value.lines.is_empty() || value.lines.len() > MAX_GPIO_EVENTS {
+        return Err(invalid_message(
+            "open_gpio lines must be non-empty and bounded",
+        ));
+    }
+    let config = value
+        .config
+        .ok_or_else(|| invalid_message("open_gpio config is required"))?;
+    Ok((
+        gpio_selector_from_proto(selector)?,
+        value.lines,
+        gpio_config_from_proto(config)?,
+    ))
+}
+
+pub fn gpio_edge_request_from_proto(value: v1::GpioNextEdgeRequest) -> HalResult<GpioEdgeRequest> {
+    let edges = match (value.rising, value.falling) {
+        (true, true) => EdgeMask::BOTH,
+        (true, false) => EdgeMask::RISING,
+        (false, true) => EdgeMask::FALLING,
+        (false, false) => return Err(invalid_message("gpio_next_edge must select an edge")),
+    };
+    GpioEdgeRequest::new(
+        edges,
+        usize::try_from(value.capacity)
+            .map_err(|_| invalid_message("gpio_next_edge capacity is invalid"))?,
+    )
+    .map_err(|_| invalid_message("gpio_next_edge capacity violates public bounds"))
+}
+
+pub fn open_usb_response_from_proto(
+    value: v1::OpenUsbResponse,
+) -> HalResult<(SessionId, LeaseToken)> {
+    parse_control_session_lease(value.session_id, value.lease, "USB")
+}
+
+pub fn open_gpio_response_from_proto(
+    value: v1::OpenGpioResponse,
+) -> HalResult<(SessionId, LeaseToken)> {
+    parse_control_session_lease(value.session_id, value.lease, "GPIO")
+}
+
+pub fn open_usb_response_to_proto(session: &SessionId, lease: &LeaseToken) -> v1::OpenUsbResponse {
+    v1::OpenUsbResponse {
+        session_id: session.as_str().to_owned(),
+        lease: Some(lease.into()),
+    }
+}
+
+pub fn open_gpio_response_to_proto(
+    session: &SessionId,
+    lease: &LeaseToken,
+) -> v1::OpenGpioResponse {
+    v1::OpenGpioResponse {
+        session_id: session.as_str().to_owned(),
+        lease: Some(lease.into()),
+    }
+}
+
+pub fn gpio_edge_event_from_proto(value: v1::GpioEdgeEvent) -> HalResult<GpioEdgeEvent> {
+    let edge = match required_enum::<v1::GpioEdge>(value.edge, "gpio_edge_event.edge")? {
+        v1::GpioEdge::Rising => GpioEdge::Rising,
+        v1::GpioEdge::Falling => GpioEdge::Falling,
+        v1::GpioEdge::Unspecified => {
+            return Err(invalid_message("gpio_edge_event.edge is required"));
+        }
+    };
+    if value.sequence == 0 {
+        return Err(invalid_message(
+            "gpio_edge_event.sequence must be greater than zero",
+        ));
+    }
+    Ok(GpioEdgeEvent::new(edge, value.monotonic_ns, value.sequence))
+}
+
+impl From<&GpioLineConfig> for v1::GpioLineConfig {
+    fn from(value: &GpioLineConfig) -> Self {
+        let (direction, drive, initial_value) = match value.direction() {
+            GpioDirection::Input => (v1::GpioDirection::Input, v1::GpioDrive::Unspecified, None),
+            GpioDirection::Output => (
+                v1::GpioDirection::Output,
+                match value.drive().expect("output config carries drive") {
+                    GpioDrive::PushPull => v1::GpioDrive::PushPull,
+                    GpioDrive::OpenDrain => v1::GpioDrive::OpenDrain,
+                    GpioDrive::OpenSource => v1::GpioDrive::OpenSource,
+                },
+                value.initial_value(),
+            ),
+        };
+        Self {
+            direction: direction as i32,
+            active_low: value.active_low(),
+            bias: match value.bias() {
+                GpioBias::Disabled => v1::GpioBias::Disabled,
+                GpioBias::PullUp => v1::GpioBias::PullUp,
+                GpioBias::PullDown => v1::GpioBias::PullDown,
+            } as i32,
+            drive: drive as i32,
+            initial_value,
+        }
+    }
+}
+
+impl From<&GpioEdgeEvent> for v1::GpioEdgeEvent {
+    fn from(value: &GpioEdgeEvent) -> Self {
+        Self {
+            edge: match value.edge() {
+                GpioEdge::Rising => v1::GpioEdge::Rising,
+                GpioEdge::Falling => v1::GpioEdge::Falling,
+            } as i32,
+            monotonic_ns: value.monotonic_ns(),
+            sequence: value.sequence(),
+        }
+    }
 }
 
 pub(crate) fn required_enum<T: TryFrom<i32>>(value: i32, field: &'static str) -> HalResult<T> {
@@ -382,6 +527,34 @@ pub fn parse_serial_session_lease(
         return Err(invalid_message("Serial session lease mode must be Control"));
     }
     Ok((session, lease))
+}
+
+fn parse_control_session_lease(
+    session_id: String,
+    lease: Option<v1::LeaseToken>,
+    hardware_class: &'static str,
+) -> HalResult<(SessionId, LeaseToken)> {
+    let (session, lease) = parse_session_lease(session_id, lease)?;
+    if lease.mode() != LeaseMode::Control {
+        return Err(invalid_message(format!(
+            "{hardware_class} session lease mode must be Control"
+        )));
+    }
+    Ok((session, lease))
+}
+
+fn selector_for_transport(
+    value: v1::ResourceSelector,
+    expected: TransportKind,
+    label: &'static str,
+) -> HalResult<ResourceSelector> {
+    let selector = ResourceSelector::try_from(value)?;
+    if selector.transport() != expected {
+        return Err(invalid_message(format!(
+            "{label} resource selector transport does not match"
+        )));
+    }
+    Ok(selector)
 }
 
 pub fn open_serial_response_from_proto(
