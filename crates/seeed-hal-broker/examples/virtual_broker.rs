@@ -2,7 +2,9 @@
 
 use seeed_hal_broker::{Broker, StartupToken};
 use seeed_hal_runtime::HalRuntime;
-use seeed_hal_testkit::{VirtualCanAdapter, VirtualSerialAdapter};
+use seeed_hal_testkit::{
+    VirtualCanAdapter, VirtualGpioAdapter, VirtualSerialAdapter, VirtualUsbAdapter,
+};
 use zeroize::Zeroize;
 
 #[tokio::main]
@@ -34,6 +36,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = HalRuntime::builder()
         .serial_adapter(VirtualSerialAdapter::loopback("serial:virtual:python"))
         .can_adapter(VirtualCanAdapter::loopback("can:virtual:python"))
+        .usb_adapter(VirtualUsbAdapter::loopback("usb:virtual:python"))
+        .gpio_adapter(VirtualGpioAdapter::line_bank("gpio:virtual:python", 2))
         .build();
     let broker = Broker::with_startup_token(runtime, startup_token);
     serve_one(broker).await
