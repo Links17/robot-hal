@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, ValueEnum};
 #[cfg(feature = "pcan")]
 use seeed_hal_adapter_pcan::PcanAdapter;
+#[cfg(feature = "serialport")]
 use seeed_hal_adapter_serialport::SerialPortAdapter;
 #[cfg(feature = "socketcan")]
 use seeed_hal_adapter_socketcan::SocketCanAdapter;
@@ -18,7 +19,9 @@ use serde::Serialize;
 use tokio::task::JoinSet;
 
 #[cfg(feature = "virtual-adapters")]
-use seeed_hal_testkit::{VirtualCanAdapter, VirtualSerialAdapter};
+use seeed_hal_testkit::{
+    VirtualCanAdapter, VirtualGpioAdapter, VirtualSerialAdapter, VirtualUsbAdapter,
+};
 
 const MAX_CONNECTIONS: usize = 64;
 
@@ -92,7 +95,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn build_runtime(required: &[RequiredAdapter]) -> Result<HalRuntime, Box<dyn std::error::Error>> {
     #[allow(unused_mut)]
-    let mut builder = HalRuntime::builder().serial_adapter(SerialPortAdapter::new());
+    let mut builder = HalRuntime::builder();
+    #[cfg(feature = "serialport")]
+    {
+        builder = builder.serial_adapter(SerialPortAdapter::new());
+    }
     #[cfg(feature = "socketcan")]
     {
         builder = builder.can_adapter(SocketCanAdapter::new());
@@ -101,7 +108,9 @@ fn build_runtime(required: &[RequiredAdapter]) -> Result<HalRuntime, Box<dyn std
     {
         builder = builder
             .serial_adapter(VirtualSerialAdapter::loopback("serial:virtual:broker-app"))
-            .can_adapter(VirtualCanAdapter::loopback("can:virtual:broker-app"));
+            .can_adapter(VirtualCanAdapter::loopback("can:virtual:broker-app"))
+            .usb_adapter(VirtualUsbAdapter::loopback("usb:virtual:broker-app"))
+            .gpio_adapter(VirtualGpioAdapter::line_bank("gpio:virtual:broker-app", 2));
     }
     #[cfg(feature = "pcan")]
     {

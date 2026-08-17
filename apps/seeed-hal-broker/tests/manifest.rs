@@ -35,7 +35,7 @@ fn manifest_is_deterministic_business_independent_and_hardware_free() {
     assert_eq!(manifest["wire"]["major"], 1);
     assert_eq!(manifest["wire"]["minimum_minor"], 0);
     assert_eq!(manifest["broker_version"], "0.2.0");
-    assert_eq!(manifest["wire"]["maximum_minor"], 1);
+    assert_eq!(manifest["wire"]["maximum_minor"], 2);
     assert_eq!(manifest["target"]["triple"], env!("SEEED_HAL_TARGET"));
     assert_eq!(manifest["target"]["os"], std::env::consts::OS);
     assert_eq!(manifest["target"]["arch"], std::env::consts::ARCH);
@@ -53,7 +53,12 @@ fn manifest_is_deterministic_business_independent_and_hardware_free() {
     }
     #[cfg(feature = "virtual-adapters")]
     {
-        expected_adapters.extend(["virtual-can", "virtual-serial"]);
+        expected_adapters.extend([
+            "virtual-can",
+            "virtual-gpio",
+            "virtual-serial",
+            "virtual-usb",
+        ]);
         expected_features.push("virtual-adapters");
     }
     expected_adapters.sort_unstable();

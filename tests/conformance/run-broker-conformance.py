@@ -26,12 +26,17 @@ from seeed_hal.transport_unix import UnixFramedTransport  # noqa: E402
 
 
 PROTOCOL_MAJOR = 1
-PROTOCOL_MINOR_MINIMUM = 1
-PROTOCOL_MINOR_MAXIMUM = 1
+PROTOCOL_MINOR_MINIMUM = 2
+PROTOCOL_MINOR_MAXIMUM = 2
 PROTOCOL_MINOR = PROTOCOL_MINOR_MAXIMUM
 SERIAL_CAPABILITY = "serial.bytes/v1"
 CAN_CLASSIC_CAPABILITY = "can.classic/v1"
 CAN_FD_CAPABILITY = "can.fd/v1"
+USB_CONTROL_CAPABILITY = "usb.control/v1"
+USB_BULK_CAPABILITY = "usb.bulk/v1"
+USB_INTERRUPT_CAPABILITY = "usb.interrupt/v1"
+GPIO_LINES_CAPABILITY = "gpio.lines/v1"
+GPIO_EDGES_CAPABILITY = "gpio.edges/v1"
 TRANSFER_LIMIT = 64 * 1024
 FRAME_LIMIT = 1024 * 1024
 DIAGNOSTIC_LIMIT = 64 * 1024
@@ -218,7 +223,16 @@ class RawClient:
                 startup_token=token,
                 protocol_major=PROTOCOL_MAJOR,
                 protocol_minor=PROTOCOL_MINOR,
-                required_capabilities=[SERIAL_CAPABILITY, CAN_CLASSIC_CAPABILITY, CAN_FD_CAPABILITY],
+                required_capabilities=[
+                    SERIAL_CAPABILITY,
+                    CAN_CLASSIC_CAPABILITY,
+                    CAN_FD_CAPABILITY,
+                    USB_CONTROL_CAPABILITY,
+                    USB_BULK_CAPABILITY,
+                    USB_INTERRUPT_CAPABILITY,
+                    GPIO_LINES_CAPABILITY,
+                    GPIO_EDGES_CAPABILITY,
+                ],
                 max_frame_bytes=FRAME_LIMIT,
                 max_read_bytes=TRANSFER_LIMIT,
                 max_write_bytes=TRANSFER_LIMIT,
@@ -236,6 +250,11 @@ class RawClient:
         _require(SERIAL_CAPABILITY in handshake.capabilities, "Serial capability missing")
         _require(CAN_CLASSIC_CAPABILITY in handshake.capabilities, "Classic CAN capability missing")
         _require(CAN_FD_CAPABILITY in handshake.capabilities, "CAN FD capability missing")
+        _require(USB_CONTROL_CAPABILITY in handshake.capabilities, "USB Control capability missing")
+        _require(USB_BULK_CAPABILITY in handshake.capabilities, "USB Bulk capability missing")
+        _require(USB_INTERRUPT_CAPABILITY in handshake.capabilities, "USB Interrupt capability missing")
+        _require(GPIO_LINES_CAPABILITY in handshake.capabilities, "GPIO lines capability missing")
+        _require(GPIO_EDGES_CAPABILITY in handshake.capabilities, "GPIO edges capability missing")
         self.transport.set_frame_limit(handshake.max_frame_bytes)
 
     async def close(self) -> None:
@@ -319,6 +338,105 @@ async def _exercise_can(client: RawClient) -> None:
     )
 
 
+async def _exercise_usb(client: RawClient) -> None:
+    enumerated = await client.request("enumerate_usb_request", hal_pb2.EnumerateUsbRequest())
+    resources = _expect_payload(enumerated, "enumerate_usb_response").resources
+    _require(len(resources) == 1, f"expected one virtual USB resource, got {len(resources)}")
+    descriptor = resources[0]
+    _require(descriptor.properties.get("adapter") == "virtual", "USB adapter was not virtual")
+    opened = _expect_payload(
+        await client.request(
+            "open_usb_request",
+            hal_pb2.OpenUsbRequest(selector=_selector(descriptor), interface_number=0),
+        ),
+        "open_usb_response",
+    )
+    payload = b"seeed-hal-usb-black-box"
+    _expect_payload(
+        await client.request(
+            "usb_transfer_request",
+            hal_pb2.UsbTransferRequest(
+                session_id=opened.session_id,
+                lease=_lease_copy(opened.lease),
+                kind=hal_pb2.USB_TRANSFER_KIND_BULK_OUT,
+                endpoint=1,
+                data=payload,
+                timeout_ms=250,
+            ),
+        ),
+        "usb_transfer_response",
+    )
+    received = _expect_payload(
+        await client.request(
+            "usb_transfer_request",
+            hal_pb2.UsbTransferRequest(
+                session_id=opened.session_id,
+                lease=_lease_copy(opened.lease),
+                kind=hal_pb2.USB_TRANSFER_KIND_BULK_IN,
+                endpoint=0x81,
+                max_bytes=len(payload),
+                timeout_ms=250,
+            ),
+        ),
+        "usb_transfer_response",
+    )
+    _require(received.data == payload, "virtual USB round trip changed payload bytes")
+    _expect_payload(
+        await client.request(
+            "close_usb_request",
+            hal_pb2.CloseUsbRequest(session_id=opened.session_id, lease=opened.lease),
+        ),
+        "close_usb_response",
+    )
+
+
+async def _exercise_gpio(client: RawClient) -> None:
+    enumerated = await client.request("enumerate_gpio_request", hal_pb2.EnumerateGpioRequest())
+    resources = _expect_payload(enumerated, "enumerate_gpio_response").resources
+    _require(len(resources) == 1, f"expected one virtual GPIO resource, got {len(resources)}")
+    descriptor = resources[0]
+    opened = _expect_payload(
+        await client.request(
+            "open_gpio_request",
+            hal_pb2.OpenGpioRequest(
+                selector=_selector(descriptor),
+                lines=[0],
+                config=hal_pb2.GpioLineConfig(
+                    direction=hal_pb2.GPIO_DIRECTION_OUTPUT,
+                    bias=hal_pb2.GPIO_BIAS_DISABLED,
+                    drive=hal_pb2.GPIO_DRIVE_PUSH_PULL,
+                    initial_value=False,
+                ),
+            ),
+        ),
+        "open_gpio_response",
+    )
+    _expect_payload(
+        await client.request(
+            "gpio_write_request",
+            hal_pb2.GpioWriteRequest(
+                session_id=opened.session_id, lease=_lease_copy(opened.lease), values=[True]
+            ),
+        ),
+        "gpio_write_response",
+    )
+    read = _expect_payload(
+        await client.request(
+            "gpio_read_request",
+            hal_pb2.GpioReadRequest(session_id=opened.session_id, lease=_lease_copy(opened.lease)),
+        ),
+        "gpio_read_response",
+    )
+    _require(list(read.values) == [True], "virtual GPIO write/read changed value")
+    _expect_payload(
+        await client.request(
+            "close_gpio_request",
+            hal_pb2.CloseGpioRequest(session_id=opened.session_id, lease=opened.lease),
+        ),
+        "close_gpio_response",
+    )
+
+
 async def exercise_contract(endpoint: str, token: bytes, timeout: float) -> None:
     first = RawClient(
         await _await_with_cap(connect_transport(endpoint), timeout), timeout
@@ -327,6 +445,8 @@ async def exercise_contract(endpoint: str, token: bytes, timeout: float) -> None
     try:
         await first.handshake(token)
         await _exercise_can(first)
+        await _exercise_usb(first)
+        await _exercise_gpio(first)
         enumerated = await first.request(
             "enumerate_serial_request", hal_pb2.EnumerateSerialRequest()
         )
@@ -518,7 +638,7 @@ def main() -> int:
     except (AssertionError, asyncio.TimeoutError, OSError) as error:
         print(f"broker conformance failed: {error}", file=sys.stderr)
         return 1
-    print("broker conformance passed: Serial and CAN contract checks")
+    print("broker conformance passed: Serial, CAN, USB, and GPIO contract checks")
     return 0
 
 

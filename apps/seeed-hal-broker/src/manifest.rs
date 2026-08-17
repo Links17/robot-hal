@@ -86,7 +86,12 @@ fn enabled_adapters() -> Vec<&'static str> {
     #[cfg(feature = "socketcan")]
     adapters.push("socketcan");
     #[cfg(feature = "virtual-adapters")]
-    adapters.extend(["virtual-can", "virtual-serial"]);
+    adapters.extend([
+        "virtual-can",
+        "virtual-gpio",
+        "virtual-serial",
+        "virtual-usb",
+    ]);
     adapters.sort_unstable();
     adapters
 }
