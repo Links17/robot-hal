@@ -20,4 +20,3 @@ tokio = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libgpiod = "=1.0.0"
-
