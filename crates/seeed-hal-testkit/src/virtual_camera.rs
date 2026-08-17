@@ -55,7 +55,19 @@ struct ControlState {
 
 impl VirtualCameraAdapter {
     pub fn pattern(resource_id: impl Into<String>) -> Self {
+        Self::new(resource_id, true)
+    }
+
+    pub fn capture_only(resource_id: impl Into<String>) -> Self {
+        Self::new(resource_id, false)
+    }
+
+    fn new(resource_id: impl Into<String>, controls_supported: bool) -> Self {
         let id = ResourceId::parse(resource_id.into()).expect("valid virtual camera resource id");
+        let mut capabilities = vec![camera_capture_capability(), camera_frames_shm_capability()];
+        if controls_supported {
+            capabilities.push(camera_controls_capability());
+        }
         let descriptor = ResourceDescriptor::new(
             id.clone(),
             seeed_hal_core::Endpoint::new(format!("virtual://camera/{}", id.as_str()))
@@ -70,24 +82,24 @@ impl VirtualCameraAdapter {
                 .into_iter()
                 .collect(),
             ),
-            CapabilitySet::new(vec![
-                camera_capture_capability(),
-                camera_frames_shm_capability(),
-                camera_controls_capability(),
-            ]),
+            CapabilitySet::new(capabilities),
         );
-        let controls = [
-            integer_control(CameraControlKind::Exposure, 1, 1_000, 1, 100),
-            integer_control(CameraControlKind::Gain, 0, 100, 1, 0),
-            enum_control(
-                CameraControlKind::WhiteBalance,
-                &["auto", "daylight", "tungsten"],
-                "auto",
-            ),
-            integer_control(CameraControlKind::Focus, 0, 255, 1, 0),
-        ]
-        .into_iter()
-        .collect();
+        let controls = controls_supported
+            .then(|| {
+                [
+                    integer_control(CameraControlKind::Exposure, 1, 1_000, 1, 100),
+                    integer_control(CameraControlKind::Gain, 0, 100, 1, 0),
+                    enum_control(
+                        CameraControlKind::WhiteBalance,
+                        &["auto", "daylight", "tungsten"],
+                        "auto",
+                    ),
+                    integer_control(CameraControlKind::Focus, 0, 255, 1, 0),
+                ]
+                .into_iter()
+                .collect()
+            })
+            .unwrap_or_default();
         Self {
             descriptor,
             state: Arc::new(Mutex::new(State {
@@ -305,6 +317,7 @@ impl CameraCaptureSession for VirtualCameraSession {
     async fn controls(&mut self) -> HalResult<Vec<CameraControlDescriptor>> {
         let mut state = self.state.lock().expect("virtual camera mutex poisoned");
         ensure_active_locked(self.closed, &state, "camera.controls", &self.descriptor)?;
+        ensure_controls_supported("camera.controls", &self.descriptor)?;
         unplug_before_publication(&mut state);
         ensure_active_locked(self.closed, &state, "camera.controls", &self.descriptor)?;
         Ok(state
@@ -317,6 +330,7 @@ impl CameraCaptureSession for VirtualCameraSession {
     async fn get_control(&mut self, kind: CameraControlKind) -> HalResult<CameraControlValue> {
         let state = self.state.lock().expect("virtual camera mutex poisoned");
         ensure_active_locked(self.closed, &state, "camera.control.get", &self.descriptor)?;
+        ensure_controls_supported("camera.control.get", &self.descriptor)?;
         let control = state
             .controls
             .get(&kind)
@@ -334,6 +348,7 @@ impl CameraCaptureSession for VirtualCameraSession {
     ) -> HalResult<()> {
         let mut state = self.state.lock().expect("virtual camera mutex poisoned");
         ensure_active_locked(self.closed, &state, "camera.control.set", &self.descriptor)?;
+        ensure_controls_supported("camera.control.set", &self.descriptor)?;
         let control = state
             .controls
             .get_mut(&kind)
@@ -357,6 +372,7 @@ impl CameraCaptureSession for VirtualCameraSession {
     async fn set_auto(&mut self, kind: CameraControlKind, enabled: bool) -> HalResult<()> {
         let mut state = self.state.lock().expect("virtual camera mutex poisoned");
         ensure_active_locked(self.closed, &state, "camera.control.auto", &self.descriptor)?;
+        ensure_controls_supported("camera.control.auto", &self.descriptor)?;
         let control = state
             .controls
             .get_mut(&kind)
@@ -506,6 +522,19 @@ fn unplug_before_publication(state: &mut State) {
     }
 }
 
+fn ensure_controls_supported(
+    operation: &'static str,
+    descriptor: &ResourceDescriptor,
+) -> HalResult<()> {
+    if !descriptor
+        .capabilities()
+        .contains(&camera_controls_capability())
+    {
+        return Err(unsupported(operation, descriptor));
+    }
+    Ok(())
+}
+
 fn conflict(operation: &'static str, descriptor: &ResourceDescriptor) -> HalError {
     HalError::new(
         "runtime.adapter.conflict",
@@ -606,15 +635,47 @@ pub async fn run_camera_adapter_conformance<A: CameraAdapter>(adapter: &A) -> Ha
     );
     assert!(!second.metadata().clock_domain().is_empty());
 
-    let controls = session.controls().await?;
-    for kind in [
-        CameraControlKind::Exposure,
-        CameraControlKind::Gain,
-        CameraControlKind::WhiteBalance,
-        CameraControlKind::Focus,
-    ] {
-        assert!(controls.iter().any(|descriptor| descriptor.kind() == kind));
-        let _ = session.get_control(kind).await?;
+    if descriptor
+        .capabilities()
+        .contains(&camera_controls_capability())
+    {
+        let controls = session.controls().await?;
+        for kind in [
+            CameraControlKind::Exposure,
+            CameraControlKind::Gain,
+            CameraControlKind::WhiteBalance,
+            CameraControlKind::Focus,
+        ] {
+            assert!(controls.iter().any(|descriptor| descriptor.kind() == kind));
+            let _ = session.get_control(kind).await?;
+        }
+    } else {
+        assert_unsupported_control(session.controls().await.expect_err(
+            "controls discovery must fail when the descriptor lacks camera.controls/v1",
+        ));
+        assert_unsupported_control(
+            session
+                .get_control(CameraControlKind::Exposure)
+                .await
+                .expect_err("control get must fail when the descriptor lacks camera.controls/v1"),
+        );
+        assert_unsupported_control(
+            session
+                .set_control(
+                    CameraControlKind::Exposure,
+                    CameraControlValue::Integer(100),
+                )
+                .await
+                .expect_err("control set must fail when the descriptor lacks camera.controls/v1"),
+        );
+        assert_unsupported_control(
+            session
+                .set_auto(CameraControlKind::Exposure, true)
+                .await
+                .expect_err(
+                    "control auto mode must fail when the descriptor lacks camera.controls/v1",
+                ),
+        );
     }
 
     session.close().await?;
@@ -634,4 +695,9 @@ pub async fn run_camera_adapter_conformance<A: CameraAdapter>(adapter: &A) -> Ha
     };
     assert_eq!(error.name().as_str(), "camera.format.unsupported");
     Ok(())
+}
+
+fn assert_unsupported_control(error: HalError) {
+    assert_eq!(error.name().as_str(), "camera.control.unsupported");
+    assert_eq!(error.category(), ErrorCategory::InvalidArgument);
 }

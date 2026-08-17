@@ -16,6 +16,37 @@ async fn virtual_camera_passes_public_adapter_conformance() {
         .expect("virtual camera must satisfy the public conformance contract");
 }
 
+#[tokio::test]
+async fn capture_only_camera_passes_public_adapter_conformance() {
+    let adapter = VirtualCameraAdapter::capture_only("capture-only-camera");
+    let descriptor = adapter
+        .enumerate()
+        .await
+        .expect("enumeration succeeds")
+        .pop()
+        .expect("capture-only camera is present");
+
+    assert!(
+        descriptor
+            .capabilities()
+            .contains(&seeed_hal_camera::camera_capture_capability())
+    );
+    assert!(
+        descriptor
+            .capabilities()
+            .contains(&seeed_hal_camera::camera_frames_shm_capability())
+    );
+    assert!(
+        !descriptor
+            .capabilities()
+            .contains(&seeed_hal_camera::camera_controls_capability())
+    );
+
+    run_camera_adapter_conformance(&adapter)
+        .await
+        .expect("a capture-only camera must satisfy the public conformance contract");
+}
+
 #[test]
 fn camera_format_and_request_enforce_public_bounds() {
     let format = CameraFormat::new(CameraPixelFormat::Nv12, 640, 480)
