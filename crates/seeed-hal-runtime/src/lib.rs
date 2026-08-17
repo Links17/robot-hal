@@ -4,6 +4,7 @@ mod can_actor;
 mod can_lease_table;
 mod can_manager;
 mod events;
+mod gpio_manager;
 mod lease_table;
 mod registry;
 mod serial_actor;
@@ -15,6 +16,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use can_manager::CanManager;
 pub use events::{EventSubscription, RuntimeEvent, RuntimeEventKind};
+use gpio_manager::GpioManager;
 use registry::{CloseAction, Registry};
 use seeed_hal_can::{
     CanAdapter, CanBatchSendError, CanBusStatus, CanFilterSet, CanFrame, CanOpenConfig,
@@ -24,6 +26,7 @@ use seeed_hal_core::{
     ErrorCategory, HalError, HalResult, LeaseMode, LeaseToken, OwnerId, ResourceDescriptor,
     ResourceSelector, SessionId,
 };
+use seeed_hal_gpio::{GpioAdapter, GpioEdgeEvent, GpioEdgeRequest, GpioLineConfig};
 use seeed_hal_serial::{ControlLines, SerialAdapter, SerialConfig};
 use seeed_hal_usb::{UsbAdapter, UsbInterfaceClaim, UsbTransfer};
 use serial_actor::{ActorMetadata, SerialCommand, spawn_serial_actor};
@@ -39,6 +42,7 @@ pub struct HalRuntimeBuilder {
     can_tx_capacity: usize,
     can_close_timeout: Duration,
     usb_adapter: Option<Arc<dyn UsbAdapter>>,
+    gpio_adapter: Option<Arc<dyn GpioAdapter>>,
 }
 
 /// Maximum configurable frames in one session's software receive ring.
@@ -56,6 +60,7 @@ impl Default for HalRuntimeBuilder {
             can_tx_capacity: DEFAULT_CAN_TX_CAPACITY,
             can_close_timeout: Duration::from_secs(2),
             usb_adapter: None,
+            gpio_adapter: None,
         }
     }
 }
@@ -93,6 +98,13 @@ impl HalRuntimeBuilder {
         A: UsbAdapter + 'static,
     {
         self.usb_adapter = Some(Arc::new(adapter));
+        self
+    }
+    pub fn gpio_adapter<A>(mut self, adapter: A) -> Self
+    where
+        A: GpioAdapter + 'static,
+    {
+        self.gpio_adapter = Some(Arc::new(adapter));
         self
     }
 
@@ -136,6 +148,7 @@ impl HalRuntimeBuilder {
                 serial_close_timeout: self.serial_close_timeout,
                 can_manager,
                 usb_manager: UsbManager::new(self.usb_adapter),
+                gpio_manager: GpioManager::new(self.gpio_adapter),
             }),
         }
     }
@@ -148,6 +161,7 @@ struct RuntimeInner {
     serial_close_timeout: Duration,
     can_manager: CanManager,
     usb_manager: UsbManager,
+    gpio_manager: GpioManager,
 }
 
 #[derive(Clone)]
@@ -202,6 +216,55 @@ impl HalRuntime {
     }
     pub async fn close_usb(&self, session: SessionId, lease: &LeaseToken) -> HalResult<()> {
         self.inner.usb_manager.close(session, lease).await
+    }
+
+    pub async fn enumerate_gpio(&self) -> HalResult<Vec<ResourceDescriptor>> {
+        self.inner.gpio_manager.enumerate().await
+    }
+    pub async fn open_gpio(
+        &self,
+        owner: OwnerId,
+        selector: ResourceSelector,
+        lines: Vec<u32>,
+        config: GpioLineConfig,
+    ) -> HalResult<GpioHandle> {
+        let (session_id, lease) = self
+            .inner
+            .gpio_manager
+            .open(owner, selector, lines, config)
+            .await?;
+        Ok(GpioHandle {
+            runtime: self.clone(),
+            session_id,
+            lease,
+            closed: false,
+        })
+    }
+    pub async fn gpio_read(&self, session: SessionId, lease: &LeaseToken) -> HalResult<Vec<bool>> {
+        self.inner.gpio_manager.read(session, lease).await
+    }
+    pub async fn gpio_write(
+        &self,
+        session: SessionId,
+        lease: &LeaseToken,
+        values: Vec<bool>,
+    ) -> HalResult<()> {
+        self.inner.gpio_manager.write(session, lease, values).await
+    }
+    pub async fn gpio_next_edge(
+        &self,
+        session: SessionId,
+        lease: &LeaseToken,
+        request: GpioEdgeRequest,
+        timeout: Duration,
+    ) -> HalResult<Option<GpioEdgeEvent>> {
+        self.inner
+            .gpio_manager
+            .next_edge(session, lease, request, timeout)
+            .await
+    }
+    pub async fn close_gpio(&self, session: SessionId, lease: &LeaseToken) -> HalResult<()> {
+        self.inner.gpio_manager.close(session, lease).await
     }
 
     pub async fn open_can(
@@ -568,6 +631,48 @@ pub struct UsbHandle {
     session_id: SessionId,
     lease: LeaseToken,
     closed: bool,
+}
+
+pub struct GpioHandle {
+    runtime: HalRuntime,
+    session_id: SessionId,
+    lease: LeaseToken,
+    closed: bool,
+}
+impl GpioHandle {
+    pub fn session_id(&self) -> SessionId {
+        self.session_id.clone()
+    }
+    pub fn lease_token(&self) -> &LeaseToken {
+        &self.lease
+    }
+    pub async fn read(&self) -> HalResult<Vec<bool>> {
+        self.runtime.gpio_read(self.session_id(), &self.lease).await
+    }
+    pub async fn write(&self, values: Vec<bool>) -> HalResult<()> {
+        self.runtime
+            .gpio_write(self.session_id(), &self.lease, values)
+            .await
+    }
+    pub async fn next_edge(
+        &self,
+        request: GpioEdgeRequest,
+        timeout: Duration,
+    ) -> HalResult<Option<GpioEdgeEvent>> {
+        self.runtime
+            .gpio_next_edge(self.session_id(), &self.lease, request, timeout)
+            .await
+    }
+    pub async fn close(&mut self) -> HalResult<()> {
+        let result = self
+            .runtime
+            .close_gpio(self.session_id(), &self.lease)
+            .await;
+        if result.is_ok() {
+            self.closed = true;
+        }
+        result
+    }
 }
 impl UsbHandle {
     pub fn session_id(&self) -> SessionId {

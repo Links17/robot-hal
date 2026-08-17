@@ -1055,6 +1055,7 @@ dependencies = [
  "bytes",
  "seeed-hal-can",
  "seeed-hal-core",
+ "seeed-hal-gpio",
  "seeed-hal-serial",
  "seeed-hal-testkit",
  "seeed-hal-usb",
