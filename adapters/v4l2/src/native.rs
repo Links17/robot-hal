@@ -35,8 +35,7 @@ use v4l::{
 };
 
 use super::{
-    encode_resource_id,
-    quarantine_claim_until_worker_exits,
+    encode_resource_id, quarantine_claim_until_worker_exits,
     wait::{WaitResult, bounded_wait},
 };
 
@@ -606,7 +605,10 @@ impl CameraCaptureSession for V4l2Session {
             );
             match tokio::time::timeout(V4L2_CLOSE_TIMEOUT, &mut reaped).await {
                 Ok(Ok(Ok(()))) => Ok(()),
-                Ok(Ok(Err(_))) => Err(platform_error("camera.close", "V4L2 capture worker panicked")),
+                Ok(Ok(Err(_))) => Err(platform_error(
+                    "camera.close",
+                    "V4L2 capture worker panicked",
+                )),
                 Ok(Err(error)) => Err(worker_failed("camera.close", error)),
                 Err(_) => Err(close_timeout_error(&self.descriptor)),
             }?;
