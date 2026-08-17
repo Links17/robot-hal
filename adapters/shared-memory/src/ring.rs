@@ -479,56 +479,64 @@ impl SlotWriter<'_> {
             self.broker.increment_dropped_locked()?;
             return Ok(());
         };
-        if self.broker.slot_state(index)? == SlotState::Ready {
+        let previous_state = self.broker.slot_state(index)?;
+        if previous_state == SlotState::Ready {
             self.broker.increment_dropped_locked()?;
         }
         self.broker.write_slot_state(index, SlotState::Writing)?;
-        let base = self.broker.slot_base(index);
-        let payload = {
-            // SAFETY: the selected writable slot has at least its negotiated payload capacity
-            // after SLOT_HEADER_BYTES; it remains Writing and the exclusive mapping lock is held.
+        let result = (|| {
+            let base = self.broker.slot_base(index);
+            let payload = {
+                // SAFETY: the selected writable slot has at least its negotiated payload capacity
+                // after SLOT_HEADER_BYTES; it remains Writing and the exclusive mapping lock is held.
+                unsafe {
+                    std::slice::from_raw_parts_mut(
+                        base.add(SLOT_HEADER_BYTES),
+                        self.broker.config.payload_capacity(),
+                    )
+                }
+            };
+            let payload_length = copy_payload(payload)?;
+            if payload_length > payload.len() {
+                return Err(invalid(
+                    "shared_memory.publish",
+                    "payload copier exceeded the negotiated slot capacity",
+                ));
+            }
+            validate_planes(
+                metadata.format(),
+                metadata.width(),
+                metadata.height(),
+                metadata.planes(),
+                payload_length,
+            )?;
+            // SAFETY: the broker owns the writable slot, marked Writing before these accesses.
+            // RingConfig bounds header and payload storage, and metadata plane count is validated.
             unsafe {
-                std::slice::from_raw_parts_mut(
-                    base.add(SLOT_HEADER_BYTES),
-                    self.broker.config.payload_capacity(),
-                )
+                write_u64(base.add(SLOT_GENERATION), metadata.generation());
+                write_u64(base.add(SLOT_TIMESTAMP), metadata.monotonic_timestamp_ns());
+                write_u64(base.add(SLOT_DROPPED), self.broker.dropped_count_locked());
+                write_u64(base.add(SLOT_PAYLOAD_LENGTH), payload_length as u64);
+                write_u64(base.add(SLOT_PLANE_COUNT), metadata.planes().len() as u64);
+                for (index, plane) in metadata.planes().iter().enumerate() {
+                    let offset = SLOT_PLANES + index * PLANE_BYTES;
+                    write_u32(base.add(offset), plane.offset() as u32);
+                    write_u32(base.add(offset + 4), plane.length() as u32);
+                    write_u32(base.add(offset + 8), plane.stride() as u32);
+                }
+                write_u64(
+                    self.broker.slot_base(index).add(SLOT_SEQUENCE),
+                    metadata.sequence(),
+                );
             }
-        };
-        let payload_length = copy_payload(payload)?;
-        if payload_length > payload.len() {
-            return Err(invalid(
-                "shared_memory.publish",
-                "payload copier exceeded the negotiated slot capacity",
-            ));
+            Ok(())
+        })();
+        if result.is_ok() {
+            self.broker.write_slot_state(index, SlotState::Ready)?;
+        } else {
+            self.broker.write_slot_state(index, previous_state)?;
         }
-        validate_planes(
-            metadata.format(),
-            metadata.width(),
-            metadata.height(),
-            metadata.planes(),
-            payload_length,
-        )?;
-        // SAFETY: the broker owns the writable slot, marked Writing before these accesses.
-        // RingConfig bounds header and payload storage, and metadata plane count is validated.
-        unsafe {
-            write_u64(base.add(SLOT_GENERATION), metadata.generation());
-            write_u64(base.add(SLOT_TIMESTAMP), metadata.monotonic_timestamp_ns());
-            write_u64(base.add(SLOT_DROPPED), self.broker.dropped_count_locked());
-            write_u64(base.add(SLOT_PAYLOAD_LENGTH), payload_length as u64);
-            write_u64(base.add(SLOT_PLANE_COUNT), metadata.planes().len() as u64);
-            for (index, plane) in metadata.planes().iter().enumerate() {
-                let offset = SLOT_PLANES + index * PLANE_BYTES;
-                write_u32(base.add(offset), plane.offset() as u32);
-                write_u32(base.add(offset + 4), plane.length() as u32);
-                write_u32(base.add(offset + 8), plane.stride() as u32);
-            }
-            write_u64(
-                self.broker.slot_base(index).add(SLOT_SEQUENCE),
-                metadata.sequence(),
-            );
-        }
-        self.broker.write_slot_state(index, SlotState::Ready)?;
-        Ok(())
+        result
     }
 }
 

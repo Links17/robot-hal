@@ -42,6 +42,15 @@ fn claim_conflict(claims: &Claims, resource_id: &ResourceId) -> bool {
         .contains(resource_id)
 }
 
+fn release_claim_after_drop(claims: &Claims, resource_id: &ResourceId, claim_quarantined: bool) {
+    if !claim_quarantined {
+        claims
+            .lock()
+            .expect("AVFoundation claim mutex poisoned")
+            .remove(resource_id);
+    }
+}
+
 impl AvFoundationAdapter {
     #[must_use]
     pub fn new() -> Self {
@@ -154,7 +163,10 @@ fn worker_failed(operation: &'static str, error: tokio::task::JoinError) -> HalE
 
 #[cfg(test)]
 mod tests {
-    use super::{claim_conflict, encode_resource_id, quarantine_claim_until_worker_exits};
+    use super::{
+        claim_conflict, encode_resource_id, quarantine_claim_until_worker_exits,
+        release_claim_after_drop,
+    };
     use seeed_hal_core::ResourceId;
     use std::{
         collections::BTreeSet,
@@ -220,6 +232,20 @@ mod tests {
         assert!(
             !claim_conflict(&claims, &resource_id),
             "claim must be released only after the native worker exits"
+        );
+    }
+
+    #[test]
+    fn dropping_a_quarantined_session_keeps_its_claim() {
+        let resource_id =
+            ResourceId::parse("camera:avfoundation:quarantined-drop").expect("valid resource ID");
+        let claims = Arc::new(Mutex::new(BTreeSet::from([resource_id.clone()])));
+
+        release_claim_after_drop(&claims, &resource_id, true);
+
+        assert!(
+            claim_conflict(&claims, &resource_id),
+            "Drop must not reopen a resource while its reaper owns the claim"
         );
     }
 

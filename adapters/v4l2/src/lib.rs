@@ -138,6 +138,20 @@ fn claim_conflict(claims: &Arc<Mutex<BTreeSet<ResourceId>>>, resource_id: &Resou
         .contains(resource_id)
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn release_claim_after_drop(
+    claims: &Arc<Mutex<BTreeSet<ResourceId>>>,
+    resource_id: &ResourceId,
+    claim_quarantined: bool,
+) {
+    if !claim_quarantined {
+        claims
+            .lock()
+            .expect("V4L2 claim mutex poisoned")
+            .remove(resource_id);
+    }
+}
+
 #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 fn quarantine_claim_until_worker_exits(
     worker: thread::JoinHandle<()>,
@@ -170,7 +184,7 @@ fn unavailable(operation: &'static str) -> HalError {
 mod tests {
     use super::{
         CameraAdapter, V4l2Adapter, claim_conflict, encode_resource_id,
-        quarantine_claim_until_worker_exits,
+        quarantine_claim_until_worker_exits, release_claim_after_drop,
     };
     use seeed_hal_camera::{CameraFormat, CameraPixelFormat, CameraRequest};
     use seeed_hal_core::{IdentityQuality, ResourceId, ResourceSelector, TransportKind};
@@ -270,6 +284,19 @@ mod tests {
         assert!(
             !claim_conflict(&claims, &resource_id),
             "the claim must release only after the old V4L2 worker exits"
+        );
+    }
+
+    #[test]
+    fn dropping_a_quarantined_session_keeps_its_claim() {
+        let resource_id = ResourceId::parse("camera:v4l2:quarantined-drop").expect("valid ID");
+        let claims = Arc::new(Mutex::new(BTreeSet::from([resource_id.clone()])));
+
+        release_claim_after_drop(&claims, &resource_id, true);
+
+        assert!(
+            claim_conflict(&claims, &resource_id),
+            "Drop must not reopen a resource while its reaper owns the claim"
         );
     }
 

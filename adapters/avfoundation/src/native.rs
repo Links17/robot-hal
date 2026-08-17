@@ -57,7 +57,9 @@ mod macos {
     };
     use tokio::sync::oneshot;
 
-    use super::super::{encode_resource_id, quarantine_claim_until_worker_exits};
+    use super::super::{
+        encode_resource_id, quarantine_claim_until_worker_exits, release_claim_after_drop,
+    };
 
     const CLOCK_DOMAIN: &str = "avfoundation";
     const AVFOUNDATION_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -217,6 +219,7 @@ mod macos {
             commands: Some(commands),
             worker: Some(worker),
             claims,
+            claim_quarantined: false,
             next_capture_id: 1,
             closed: false,
         }))
@@ -732,6 +735,7 @@ mod macos {
         commands: Option<mpsc::SyncSender<Command>>,
         worker: Option<std::thread::JoinHandle<()>>,
         claims: Arc<Mutex<std::collections::BTreeSet<seeed_hal_core::ResourceId>>>,
+        claim_quarantined: bool,
         next_capture_id: u64,
         closed: bool,
     }
@@ -818,6 +822,7 @@ mod macos {
                 Arc::clone(&self.claims),
                 self.descriptor.id().clone(),
                 self.closed,
+                &mut self.claim_quarantined,
             )
             .await?;
             self.closed = true;
@@ -842,10 +847,11 @@ mod macos {
                         .remove(&resource_id);
                 });
             } else {
-                self.claims
-                    .lock()
-                    .expect("AVFoundation claim mutex poisoned")
-                    .remove(self.descriptor.id());
+                release_claim_after_drop(
+                    &self.claims,
+                    self.descriptor.id(),
+                    self.claim_quarantined,
+                );
             }
         }
     }
@@ -856,6 +862,7 @@ mod macos {
         claims: Arc<Mutex<std::collections::BTreeSet<seeed_hal_core::ResourceId>>>,
         resource_id: seeed_hal_core::ResourceId,
         already_closed: bool,
+        claim_quarantined: &mut bool,
     ) -> HalResult<()> {
         if already_closed {
             return Ok(());
@@ -868,6 +875,7 @@ mod macos {
             let _ = tokio::time::timeout(AVFOUNDATION_CLOSE_TIMEOUT, response_receiver).await;
         }
         if let Some(worker) = worker.take() {
+            *claim_quarantined = true;
             let mut reaper = quarantine_claim_until_worker_exits(
                 worker,
                 Arc::clone(&claims),
@@ -883,10 +891,7 @@ mod macos {
                 Err(_) => Err(close_timeout_error(&resource_id)),
             }
         } else {
-            claims
-                .lock()
-                .expect("AVFoundation claim mutex poisoned")
-                .remove(&resource_id);
+            release_claim_after_drop(&claims, &resource_id, *claim_quarantined);
             Ok(())
         }
     }

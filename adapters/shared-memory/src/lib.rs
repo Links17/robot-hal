@@ -118,6 +118,49 @@ mod tests {
     }
 
     #[test]
+    fn failed_direct_copy_restores_the_slot_for_a_later_frame() {
+        let mut broker = BrokerMapping::create(config()).unwrap();
+        for sequence in 1..=4 {
+            let error = broker
+                .writer()
+                .publish_with(metadata(sequence, 1), &mut |destination| {
+                    destination[..4].copy_from_slice(&[9; 4]);
+                    Err(invalid(
+                        "shared_memory.publish",
+                        "simulated native-copy failure",
+                    ))
+                })
+                .expect_err("native copier failure must be reported");
+            assert_eq!(error.name().as_str(), "shared_memory.invalid");
+        }
+
+        broker.writer().publish(metadata(5, 1), &[7; 8]).unwrap();
+        let frame = broker.acquire().unwrap().unwrap();
+        assert_eq!(frame.metadata().sequence(), 5);
+        assert_eq!(frame.payload(), &[7; 8]);
+    }
+
+    #[test]
+    fn oversized_direct_copy_result_restores_the_slot_for_a_later_frame() {
+        let mut broker = BrokerMapping::create(config()).unwrap();
+        for sequence in 1..=4 {
+            let error = broker
+                .writer()
+                .publish_with(metadata(sequence, 1), &mut |destination| {
+                    destination[..8].copy_from_slice(&[9; 8]);
+                    Ok(destination.len() + 1)
+                })
+                .expect_err("native copier may not report more bytes than its slot");
+            assert_eq!(error.name().as_str(), "shared_memory.invalid");
+        }
+
+        broker.writer().publish(metadata(5, 1), &[7; 8]).unwrap();
+        let frame = broker.acquire().unwrap().unwrap();
+        assert_eq!(frame.metadata().sequence(), 5);
+        assert_eq!(frame.payload(), &[7; 8]);
+    }
+
+    #[test]
     fn independently_reopened_mapping_only_returns_an_owned_copy() {
         let mut broker = BrokerMapping::create(config()).unwrap();
         let descriptor = broker.descriptor().clone();

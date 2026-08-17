@@ -35,7 +35,7 @@ use v4l::{
 };
 
 use super::{
-    encode_resource_id, quarantine_claim_until_worker_exits,
+    encode_resource_id, quarantine_claim_until_worker_exits, release_claim_after_drop,
     wait::{WaitResult, bounded_wait},
 };
 
@@ -87,6 +87,7 @@ pub(super) fn open_sync(
             worker: Some(worker),
             shutdown,
             claims,
+            claim_quarantined: false,
             closed: false,
         })),
         Err(error) => {
@@ -531,6 +532,7 @@ struct V4l2Session {
     worker: Option<thread::JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
     claims: Arc<Mutex<BTreeSet<seeed_hal_core::ResourceId>>>,
+    claim_quarantined: bool,
     closed: bool,
 }
 
@@ -598,6 +600,7 @@ impl CameraCaptureSession for V4l2Session {
             let _ = sender.try_send(Command::Close);
         }
         if let Some(worker) = self.worker.take() {
+            self.claim_quarantined = true;
             let mut reaped = quarantine_claim_until_worker_exits(
                 worker,
                 Arc::clone(&self.claims),
@@ -635,10 +638,7 @@ impl Drop for V4l2Session {
                 self.descriptor.id().clone(),
             );
         } else {
-            self.claims
-                .lock()
-                .expect("V4L2 claim mutex poisoned")
-                .remove(self.descriptor.id());
+            release_claim_after_drop(&self.claims, self.descriptor.id(), self.claim_quarantined);
         }
     }
 }
