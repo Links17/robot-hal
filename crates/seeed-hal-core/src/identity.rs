@@ -146,6 +146,8 @@ impl IdentityQuality {
 pub enum TransportKind {
     Serial,
     Can,
+    Usb,
+    Gpio,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]

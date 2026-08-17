@@ -1027,6 +1027,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "seeed-hal-gpio"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "seeed-hal-core",
+]
+
+[[package]]
 name = "seeed-hal-protocol"
 version = "0.2.0"
 dependencies = [
@@ -1072,6 +1080,15 @@ dependencies = [
  "seeed-hal-core",
  "seeed-hal-serial",
  "tokio",
+]
+
+[[package]]
+name = "seeed-hal-usb"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "seeed-hal-core",
 ]
 
 [[package]]
