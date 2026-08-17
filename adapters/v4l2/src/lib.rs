@@ -3,10 +3,10 @@ use seeed_hal_camera::{CameraAdapter, CameraCaptureSession, CameraRequest};
 use seeed_hal_core::{
     ErrorCategory, HalError, HalResult, ResourceDescriptor, ResourceId, ResourceSelector,
 };
-#[cfg(target_os = "linux")]
 use std::{
     collections::BTreeSet,
     sync::{Arc, Mutex},
+    thread,
 };
 
 #[cfg(target_os = "linux")]
@@ -130,6 +130,30 @@ fn worker_failed(operation: &'static str, error: tokio::task::JoinError) -> HalE
     .expect("static V4L2 worker error metadata is valid")
 }
 
+#[cfg(test)]
+fn claim_conflict(claims: &Arc<Mutex<BTreeSet<ResourceId>>>, resource_id: &ResourceId) -> bool {
+    claims
+        .lock()
+        .expect("V4L2 claim mutex poisoned")
+        .contains(resource_id)
+}
+
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn quarantine_claim_until_worker_exits(
+    worker: thread::JoinHandle<()>,
+    claims: Arc<Mutex<BTreeSet<ResourceId>>>,
+    resource_id: ResourceId,
+) -> tokio::task::JoinHandle<thread::Result<()>> {
+    tokio::task::spawn_blocking(move || {
+        let result = worker.join();
+        claims
+            .lock()
+            .expect("V4L2 claim mutex poisoned")
+            .remove(&resource_id);
+        result
+    })
+}
+
 #[cfg(not(target_os = "linux"))]
 fn unavailable(operation: &'static str) -> HalError {
     HalError::new(
@@ -144,9 +168,16 @@ fn unavailable(operation: &'static str) -> HalError {
 
 #[cfg(test)]
 mod tests {
-    use super::{CameraAdapter, V4l2Adapter, encode_resource_id};
+    use super::{
+        CameraAdapter, V4l2Adapter, claim_conflict, encode_resource_id,
+        quarantine_claim_until_worker_exits,
+    };
     use seeed_hal_camera::{CameraFormat, CameraPixelFormat, CameraRequest};
     use seeed_hal_core::{IdentityQuality, ResourceId, ResourceSelector, TransportKind};
+    use std::{
+        collections::BTreeSet,
+        sync::{Arc, Mutex, mpsc},
+    };
 
     #[cfg(not(target_os = "linux"))]
     #[tokio::test]
@@ -194,6 +225,51 @@ mod tests {
         assert_eq!(
             encode_resource_id("").unwrap_err().name().as_str(),
             "runtime.resource.invalid"
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_close_quarantines_the_claim_until_the_worker_exits() {
+        let resource_id = ResourceId::parse("camera:v4l2:teardown-test").expect("valid ID");
+        let claims = Arc::new(Mutex::new(BTreeSet::from([resource_id.clone()])));
+        let (release_sender, release_worker) = mpsc::channel();
+        let (worker_exited, worker_exit_wait) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            release_worker
+                .recv()
+                .expect("test must release the simulated native worker");
+            worker_exited
+                .send(())
+                .expect("test must observe simulated native worker exit");
+        });
+
+        let mut reaped =
+            quarantine_claim_until_worker_exits(worker, Arc::clone(&claims), resource_id.clone());
+
+        assert!(
+            claim_conflict(&claims, &resource_id),
+            "a second open must conflict while a timed-out V4L2 worker owns the device"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut reaped)
+                .await
+                .is_err(),
+            "the reaper must not release the claim before its worker exits"
+        );
+
+        release_sender
+            .send(())
+            .expect("test must release the simulated native worker");
+        worker_exit_wait
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("simulated worker must exit");
+        reaped
+            .await
+            .expect("quarantine reaper task must finish")
+            .expect("simulated worker must not panic");
+        assert!(
+            !claim_conflict(&claims, &resource_id),
+            "the claim must release only after the old V4L2 worker exits"
         );
     }
 

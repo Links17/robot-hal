@@ -36,6 +36,7 @@ use v4l::{
 
 use super::{
     encode_resource_id,
+    quarantine_claim_until_worker_exits,
     wait::{WaitResult, bounded_wait},
 };
 
@@ -598,14 +599,18 @@ impl CameraCaptureSession for V4l2Session {
             let _ = sender.try_send(Command::Close);
         }
         if let Some(worker) = self.worker.take() {
-            tokio::time::timeout(
-                V4L2_CLOSE_TIMEOUT,
-                tokio::task::spawn_blocking(move || worker.join()),
-            )
-            .await
-            .map_err(|_| timeout_error("camera.close", &self.descriptor))?
-            .map_err(|error| worker_failed("camera.close", error))?
-            .map_err(|_| platform_error("camera.close", "V4L2 capture worker panicked"))?;
+            let mut reaped = quarantine_claim_until_worker_exits(
+                worker,
+                Arc::clone(&self.claims),
+                self.descriptor.id().clone(),
+            );
+            match tokio::time::timeout(V4L2_CLOSE_TIMEOUT, &mut reaped).await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(_))) => Err(platform_error("camera.close", "V4L2 capture worker panicked")),
+                Ok(Err(error)) => Err(worker_failed("camera.close", error)),
+                Err(_) => Err(close_timeout_error(&self.descriptor)),
+            }?;
+            return Ok(());
         }
         self.claims
             .lock()
@@ -621,10 +626,18 @@ impl Drop for V4l2Session {
         if let Some(sender) = self.sender.take() {
             let _ = sender.try_send(Command::Close);
         }
-        self.claims
-            .lock()
-            .expect("V4L2 claim mutex poisoned")
-            .remove(self.descriptor.id());
+        if let Some(worker) = self.worker.take() {
+            let _ = quarantine_claim_until_worker_exits(
+                worker,
+                Arc::clone(&self.claims),
+                self.descriptor.id().clone(),
+            );
+        } else {
+            self.claims
+                .lock()
+                .expect("V4L2 claim mutex poisoned")
+                .remove(self.descriptor.id());
+        }
     }
 }
 
@@ -708,6 +721,18 @@ fn timeout_error(operation: &'static str, descriptor: &ResourceDescriptor) -> Ha
         "timed out waiting for a V4L2 video frame",
     )
     .expect("static V4L2 timeout metadata is valid")
+    .with_resource_id(descriptor.id().clone())
+}
+
+fn close_timeout_error(descriptor: &ResourceDescriptor) -> HalError {
+    HalError::new(
+        "runtime.adapter.close_timeout",
+        ErrorCategory::Unavailable,
+        "camera.close",
+        true,
+        "V4L2 worker did not release the camera before close timed out",
+    )
+    .expect("static V4L2 close timeout metadata is valid")
     .with_resource_id(descriptor.id().clone())
 }
 
