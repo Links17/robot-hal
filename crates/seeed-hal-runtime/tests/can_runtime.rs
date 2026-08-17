@@ -901,6 +901,9 @@ async fn management_pressure_does_not_starve_receive_deadline() {
                 let _ = runtime
                     .replace_can_filters(session.clone(), &token, all_frames())
                     .await;
+                // Queue-full admission completes synchronously. Yield so this
+                // synthetic pressure source cannot starve the test coordinator.
+                tokio::task::yield_now().await;
             }
         }));
     }

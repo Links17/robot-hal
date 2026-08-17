@@ -176,21 +176,49 @@ impl VirtualCanAdapter {
         self.wait_transition(timeout, false)
     }
 
+    pub fn open_transition(&self) -> usize {
+        self.state
+            .inner
+            .lock()
+            .expect("virtual CAN mutex poisoned")
+            .open_count
+    }
+
+    pub fn close_transition(&self) -> usize {
+        self.state
+            .inner
+            .lock()
+            .expect("virtual CAN mutex poisoned")
+            .close_count
+    }
+
+    pub fn wait_for_open_after(&self, transition: usize, timeout: Duration) -> bool {
+        self.wait_for_transition_after(transition, timeout, true)
+    }
+
+    pub fn wait_for_close_after(&self, transition: usize, timeout: Duration) -> bool {
+        self.wait_for_transition_after(transition, timeout, false)
+    }
+
     fn wait_transition(&self, timeout: Duration, open: bool) -> bool {
+        let transition = if open {
+            self.open_transition()
+        } else {
+            self.close_transition()
+        };
+        self.wait_for_transition_after(transition, timeout, open)
+    }
+
+    fn wait_for_transition_after(&self, transition: usize, timeout: Duration, open: bool) -> bool {
         let deadline = Instant::now() + timeout;
         let mut guard = self.state.inner.lock().expect("virtual CAN mutex poisoned");
-        let baseline = if open {
-            guard.open_count
-        } else {
-            guard.close_count
-        };
         loop {
             let current = if open {
                 guard.open_count
             } else {
                 guard.close_count
             };
-            if current > baseline {
+            if current > transition {
                 return true;
             }
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
