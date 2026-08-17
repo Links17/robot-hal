@@ -104,7 +104,18 @@ impl Mapping {
         }
         // SAFETY: mmap returned a non-null, non-MAP_FAILED valid base address.
         let address: NonNull<u8> = unsafe { NonNull::new_unchecked(address.cast()) };
-        let lock_fd = create_lock_file(name.as_c_str())?;
+        let lock_fd = match create_lock_file(name.as_c_str()) {
+            Ok(lock_fd) => lock_fd,
+            Err(error) => {
+                // SAFETY: this function still owns the mapping, descriptor, and object name.
+                unsafe {
+                    libc::munmap(address.as_ptr().cast(), length);
+                    libc::close(fd);
+                    libc::shm_unlink(name.as_ptr());
+                }
+                return Err(error);
+            }
+        };
         Ok(Self {
             address,
             length,
@@ -168,7 +179,17 @@ impl Mapping {
         }
         // SAFETY: mmap returned a non-null, non-MAP_FAILED valid base address.
         let address: NonNull<u8> = unsafe { NonNull::new_unchecked(address.cast()) };
-        let lock_fd = open_lock_file(name.as_c_str())?;
+        let lock_fd = match open_lock_file(name.as_c_str()) {
+            Ok(lock_fd) => lock_fd,
+            Err(error) => {
+                // SAFETY: this function still owns the reopened mapping and descriptor.
+                unsafe {
+                    libc::munmap(address.as_ptr().cast(), length);
+                    libc::close(fd);
+                }
+                return Err(error);
+            }
+        };
         Ok(Self {
             address,
             length,
@@ -214,58 +235,108 @@ impl Mapping {
                 "shared-memory name contains an interior NUL",
             )
         })?;
-        let lock_path = lock_path(name.as_c_str())?;
-        // SAFETY: lock_path is valid and unlink retains no pointer.
-        if unsafe { libc::unlink(lock_path.as_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
         // SAFETY: name is valid and shm_unlink retains no pointer.
-        if unsafe { libc::shm_unlink(name.as_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        let shm_result = if unsafe { libc::shm_unlink(name.as_ptr()) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        } else {
+            Ok(())
+        };
+        let lock_result = lock_path(name.as_c_str()).and_then(|lock_path| {
+            // SAFETY: lock_path is valid and unlink retains no pointer.
+            if unsafe { libc::unlink(lock_path.as_ptr()) } != 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::NotFound {
+                    return Err(error);
+                }
+            }
+            Ok(())
+        });
+        shm_result?;
+        lock_result
     }
 }
 
 #[cfg(unix)]
 fn lock_path(name: &std::ffi::CStr) -> io::Result<CString> {
-    let name = name
-        .to_str()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 mapping name"))?;
-    CString::new(format!("/tmp/{name}.lock")).map_err(|_| {
-        io::Error::new(
+    let name = name.to_bytes();
+    const PREFIX: &[u8] = b"/seeed-hal-";
+    if !name.starts_with(PREFIX)
+        || name.len() != PREFIX.len() + 18
+        || !name[PREFIX.len()..].iter().all(u8::is_ascii_hexdigit)
+    {
+        return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "shared-memory name contains an interior NUL",
-        )
-    })
+            "invalid private shared-memory mapping name",
+        ));
+    }
+    CString::new(format!("/tmp/{}.lock", &name[1..].escape_ascii())).map_err(|_| unreachable!())
 }
 
 #[cfg(unix)]
 fn create_lock_file(name: &std::ffi::CStr) -> io::Result<libc::c_int> {
     let path = lock_path(name)?;
-    // SAFETY: path is NUL-terminated and O_EXCL creates a private 0600 advisory-lock inode.
+    // SAFETY: path is NUL-terminated and O_EXCL creates a private advisory-lock inode.
     let fd = unsafe {
         libc::open(
             path.as_ptr(),
-            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
             (libc::S_IRUSR | libc::S_IWUSR) as libc::c_uint,
         )
     };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(fd)
+    verify_private_lock_file(fd).map(|()| fd).inspect_err(|_| {
+        // SAFETY: this function owns the descriptor on its error path.
+        let _ = unsafe { libc::close(fd) };
+    })
 }
 
 #[cfg(unix)]
 fn open_lock_file(name: &std::ffi::CStr) -> io::Result<libc::c_int> {
     let path = lock_path(name)?;
-    // SAFETY: path is NUL-terminated and opens the broker-created private lock inode.
-    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR) };
+    // SAFETY: path is NUL-terminated; O_NOFOLLOW rejects a substituted symbolic link.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(fd)
+    verify_private_lock_file(fd).map(|()| fd).inspect_err(|_| {
+        // SAFETY: this function owns the descriptor on its error path.
+        let _ = unsafe { libc::close(fd) };
+    })
+}
+
+#[cfg(unix)]
+fn verify_private_lock_file(fd: libc::c_int) -> io::Result<()> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `stat` is writable storage and `fd` remains owned by the caller.
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstat returned success and initialized stat.
+    let stat = unsafe { stat.assume_init() };
+    let expected_mode = (libc::S_IRUSR | libc::S_IWUSR) as libc::mode_t;
+    if (stat.st_mode & libc::S_IFMT) != libc::S_IFREG
+        || stat.st_uid != unsafe { libc::geteuid() }
+        || (stat.st_mode & 0o777) != expected_mode
+        || stat.st_nlink != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "lock file ownership, mode, or type verification failed",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -308,7 +379,7 @@ mod tests {
             unsafe { libc::_exit(0) };
         }
 
-        let name = format!("/seeed-hal-flock-{}", std::process::id());
+        let name = test_mapping_name("flock");
         let mapping = Mapping::create(&name, 4096).unwrap();
         let status = Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
@@ -322,6 +393,82 @@ mod tests {
         assert!(mapping.try_lock_exclusive().is_ok());
         mapping.unlock().unwrap();
         Mapping::unlink(&name).unwrap();
+    }
+
+    #[test]
+    fn rejects_non_basename_shared_memory_names() {
+        for name in [
+            "seeed-hal-invalid",
+            "/seeed-hal/nested",
+            "/seeed-hal-../escape",
+        ] {
+            assert!(super::lock_path(CString::new(name).unwrap().as_c_str()).is_err());
+        }
+    }
+
+    #[test]
+    fn lock_creation_failure_removes_shared_memory_object() {
+        let name = test_mapping_name("lock-failure");
+        let name_c = CString::new(name.as_str()).unwrap();
+        let lock_path = super::lock_path(name_c.as_c_str()).unwrap();
+        // SAFETY: this test creates an owned, unique lock path to force O_EXCL failure.
+        let lock_fd = unsafe {
+            libc::open(
+                lock_path.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                (libc::S_IRUSR | libc::S_IWUSR) as libc::c_uint,
+            )
+        };
+        assert!(lock_fd >= 0);
+
+        assert!(Mapping::create(&name, 4096).is_err());
+
+        // SAFETY: creation would fail with EEXIST if Mapping::create leaked its shm object.
+        let shm_fd = unsafe {
+            libc::shm_open(
+                name_c.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                (libc::S_IRUSR | libc::S_IWUSR) as libc::c_uint,
+            )
+        };
+        assert!(shm_fd >= 0);
+        // SAFETY: both descriptors and their corresponding test objects are owned here.
+        unsafe {
+            libc::close(shm_fd);
+            libc::shm_unlink(name_c.as_ptr());
+            libc::close(lock_fd);
+            libc::unlink(lock_path.as_ptr());
+        }
+    }
+
+    #[test]
+    fn refuses_symbolic_link_as_client_lock_file() {
+        let name = test_mapping_name("symlink");
+        let mapping = Mapping::create(&name, 4096).unwrap();
+        let name_c = CString::new(name.as_str()).unwrap();
+        let lock_path = super::lock_path(name_c.as_c_str()).unwrap();
+        // SAFETY: the broker-owned lock path is replaced only for this isolated test.
+        unsafe {
+            libc::unlink(lock_path.as_ptr());
+            assert_eq!(libc::symlink(c"/dev/null".as_ptr(), lock_path.as_ptr()), 0);
+        }
+
+        assert!(Mapping::open_read_only(&name, 4096).is_err());
+
+        drop(mapping);
+        Mapping::unlink(&name).unwrap();
+    }
+
+    fn test_mapping_name(label: &str) -> String {
+        let mut bytes = [0_u8; 9];
+        let seed = format!("{label}-{}", std::process::id());
+        for (index, byte) in seed.bytes().enumerate() {
+            bytes[index % bytes.len()] ^= byte;
+        }
+        format!(
+            "/seeed-hal-{}",
+            bytes.map(|byte| format!("{byte:02x}")).concat()
+        )
     }
 }
 
