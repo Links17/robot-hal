@@ -5,6 +5,10 @@ use std::sync::{Arc, Mutex};
 use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
+use seeed_hal_camera::{
+    CAMERA_CAPTURE_CAPABILITY, CAMERA_CONTROLS_CAPABILITY, CAMERA_FRAMES_SHM_CAPABILITY,
+    CameraRequest,
+};
 use seeed_hal_can::{
     CAN_CLASSIC_CAPABILITY, CAN_CONFIGURE_CAPABILITY, CAN_ERROR_FRAMES_CAPABILITY,
     CAN_FD_CAPABILITY, CAN_RX_TIMESTAMP_CAPABILITY, CanFilterSet, CanMode, CanOpenConfig,
@@ -41,7 +45,9 @@ use tokio::task::JoinHandle;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::{RemoteCanHandle, RemoteGpioHandle, RemoteSerialHandle, RemoteUsbHandle};
+use crate::{
+    RemoteCameraHandle, RemoteCanHandle, RemoteGpioHandle, RemoteSerialHandle, RemoteUsbHandle,
+};
 
 const DEFAULT_IO_CAPACITY: usize = 32;
 const DEFAULT_EVENT_CAPACITY: usize = 64;
@@ -198,6 +204,21 @@ fn event_closed_error() -> HalError {
     )
 }
 
+fn camera_request_to_proto(request: &CameraRequest) -> v1::CameraRequest {
+    v1::CameraRequest {
+        format: Some(v1::CameraFormat {
+            pixel_format: match request.format().pixel_format() {
+                seeed_hal_camera::CameraPixelFormat::Nv12 => v1::CameraPixelFormat::Nv12,
+                seeed_hal_camera::CameraPixelFormat::Yuyv => v1::CameraPixelFormat::Yuyv,
+                seeed_hal_camera::CameraPixelFormat::Mjpeg => v1::CameraPixelFormat::Mjpeg,
+            } as i32,
+            width: request.format().width(),
+            height: request.format().height(),
+        }),
+        slot_count: request.slot_count() as u32,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanSessionProfile {
     pub(crate) mode: CanMode,
@@ -272,6 +293,34 @@ pub(crate) enum ExpectedResponse {
     CloseGpio {
         resource_id: ResourceId,
     },
+    EnumerateCamera,
+    OpenCamera {
+        resource_id: ResourceId,
+    },
+    CaptureCamera {
+        resource_id: ResourceId,
+    },
+    CameraMappingDescriptor {
+        resource_id: ResourceId,
+    },
+    CameraNextFrameLease {
+        resource_id: ResourceId,
+    },
+    CameraDroppedCount {
+        resource_id: ResourceId,
+    },
+    CameraGetControl {
+        resource_id: ResourceId,
+    },
+    CameraSetControl {
+        resource_id: ResourceId,
+    },
+    CameraSetAuto {
+        resource_id: ResourceId,
+    },
+    CloseCamera {
+        resource_id: ResourceId,
+    },
 }
 
 impl ExpectedResponse {
@@ -290,7 +339,16 @@ impl ExpectedResponse {
             | Self::GpioRead { resource_id, .. }
             | Self::GpioWrite { resource_id }
             | Self::GpioNextEdge { resource_id }
-            | Self::CloseGpio { resource_id } => Some(resource_id),
+            | Self::CloseGpio { resource_id }
+            | Self::OpenCamera { resource_id }
+            | Self::CaptureCamera { resource_id }
+            | Self::CameraMappingDescriptor { resource_id }
+            | Self::CameraNextFrameLease { resource_id }
+            | Self::CameraDroppedCount { resource_id }
+            | Self::CameraGetControl { resource_id }
+            | Self::CameraSetControl { resource_id }
+            | Self::CameraSetAuto { resource_id }
+            | Self::CloseCamera { resource_id } => Some(resource_id),
             _ => None,
         }
     }
@@ -355,6 +413,9 @@ struct Limits {
     usb_interrupt: bool,
     gpio_lines: bool,
     gpio_edges: bool,
+    camera_capture: bool,
+    camera_frames_shm: bool,
+    camera_controls: bool,
 }
 
 struct Shared {
@@ -492,6 +553,9 @@ impl HalClient {
             usb_interrupt: false,
             gpio_lines: false,
             gpio_edges: false,
+            camera_capture: false,
+            camera_frames_shm: false,
+            camera_controls: false,
         };
         let mut framed = Framed::new(io, frame_codec(requested.frame));
         let negotiated = perform_handshake(&mut framed, &options, requested).await?;
@@ -736,6 +800,66 @@ impl HalClient {
             })
     }
 
+    pub async fn enumerate_camera(&self) -> HalResult<Vec<ResourceDescriptor>> {
+        self.require_camera_capability("camera.enumerate", None, |limits| limits.camera_capture)?;
+        let payload = self
+            .send(
+                envelope::Payload::EnumerateCameraRequest(v1::EnumerateCameraRequest {}),
+                ExpectedResponse::EnumerateCamera,
+            )
+            .await?;
+        let envelope::Payload::EnumerateCameraResponse(response) = payload else {
+            unreachable!()
+        };
+        let result: HalResult<Vec<ResourceDescriptor>> = response
+            .resources
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect();
+        if let Err(error) = &result {
+            self.fail(error.clone());
+        }
+        result
+    }
+
+    pub async fn open_camera(
+        &self,
+        selector: ResourceSelector,
+        request: CameraRequest,
+    ) -> HalResult<RemoteCameraHandle> {
+        if selector.transport() != seeed_hal_core::TransportKind::Camera {
+            return Err(client_error(
+                "runtime.argument.invalid",
+                ErrorCategory::InvalidArgument,
+                "camera.open",
+                false,
+                "camera resource selector transport must be Camera",
+            )
+            .with_resource_id(selector.id().clone()));
+        }
+        self.require_camera_capability("camera.open", Some(selector.id()), |limits| {
+            limits.camera_capture
+        })?;
+        let payload = envelope::Payload::OpenCameraRequest(v1::OpenCameraRequest {
+            selector: Some((&selector).try_into()?),
+            request: Some(camera_request_to_proto(&request)),
+        });
+        self.ensure_payload_for_resource(&payload, "camera.open", selector.id())?;
+        let payload = self
+            .send(
+                payload,
+                ExpectedResponse::OpenCamera {
+                    resource_id: selector.id().clone(),
+                },
+            )
+            .await?;
+        let envelope::Payload::OpenCameraResponse(response) = payload else {
+            unreachable!()
+        };
+        RemoteCameraHandle::from_response(self.clone(), selector.id().clone(), response)
+            .inspect_err(|error| self.fail(error.clone()))
+    }
+
     pub async fn open_can(
         &self,
         selector: ResourceSelector,
@@ -890,6 +1014,34 @@ impl HalClient {
         self.require_minor_two(operation, Some(resource_id), |limits| limits.gpio_edges)
     }
 
+    pub(crate) fn require_camera_capture(
+        &self,
+        operation: &'static str,
+        resource_id: &ResourceId,
+    ) -> HalResult<()> {
+        self.require_camera_capability(operation, Some(resource_id), |limits| limits.camera_capture)
+    }
+
+    pub(crate) fn require_camera_frames_shm(
+        &self,
+        operation: &'static str,
+        resource_id: &ResourceId,
+    ) -> HalResult<()> {
+        self.require_camera_capability(operation, Some(resource_id), |limits| {
+            limits.camera_frames_shm
+        })
+    }
+
+    pub(crate) fn require_camera_controls(
+        &self,
+        operation: &'static str,
+        resource_id: &ResourceId,
+    ) -> HalResult<()> {
+        self.require_camera_capability(operation, Some(resource_id), |limits| {
+            limits.camera_controls
+        })
+    }
+
     pub(crate) async fn send(
         &self,
         payload: envelope::Payload,
@@ -948,6 +1100,31 @@ impl HalClient {
             operation,
             false,
             "the negotiated broker protocol does not support this USB/GPIO operation",
+        );
+        Err(resource_id.map_or(error.clone(), |id| error.with_resource_id(id.clone())))
+    }
+
+    fn require_camera_capability(
+        &self,
+        operation: &'static str,
+        resource_id: Option<&ResourceId>,
+        supported: impl FnOnce(Limits) -> bool,
+    ) -> HalResult<()> {
+        let limits = *self
+            .inner
+            .shared
+            .limits
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if limits.protocol_minor >= 3 && supported(limits) {
+            return Ok(());
+        }
+        let error = client_error(
+            "runtime.protocol.capability_unsupported",
+            ErrorCategory::Conflict,
+            operation,
+            false,
+            "the negotiated broker protocol does not support this Camera operation",
         );
         Err(resource_id.map_or(error.clone(), |id| error.with_resource_id(id.clone())))
     }
@@ -1300,6 +1477,18 @@ where
                     .capabilities
                     .iter()
                     .any(|value| value == GPIO_EDGES_CAPABILITY),
+                camera_capture: response
+                    .capabilities
+                    .iter()
+                    .any(|value| value == CAMERA_CAPTURE_CAPABILITY),
+                camera_frames_shm: response
+                    .capabilities
+                    .iter()
+                    .any(|value| value == CAMERA_FRAMES_SHM_CAPABILITY),
+                camera_controls: response
+                    .capabilities
+                    .iter()
+                    .any(|value| value == CAMERA_CONTROLS_CAPABILITY),
             })
         }
         Some(envelope::Payload::Error(error)) => Err(error_from_proto(error)?),
@@ -1967,6 +2156,52 @@ fn validate_response(expected: ExpectedResponse, payload: &envelope::Payload) ->
             .map(|_| ())
             .map_err(|error| attach_resource(error, &resource_id)),
         (ExpectedResponse::CloseGpio { .. }, envelope::Payload::CloseGpioResponse(_)) => Ok(()),
+        (
+            ExpectedResponse::EnumerateCamera,
+            envelope::Payload::EnumerateCameraResponse(response),
+        ) => response.resources.iter().try_for_each(|resource| {
+            let descriptor: HalResult<ResourceDescriptor> = resource.clone().try_into();
+            descriptor.and_then(|descriptor| {
+                (descriptor.transport() == seeed_hal_core::TransportKind::Camera)
+                    .then_some(())
+                    .ok_or_else(|| {
+                        seeed_hal_protocol::invalid_message(
+                            "Camera enumeration returned a non-Camera descriptor",
+                        )
+                    })
+            })
+        }),
+        (
+            ExpectedResponse::OpenCamera { resource_id },
+            envelope::Payload::OpenCameraResponse(response),
+        ) => seeed_hal_protocol::camera_open_response_from_proto(response.clone())
+            .map(|_| ())
+            .map_err(|error| attach_resource(error, &resource_id)),
+        (ExpectedResponse::CaptureCamera { .. }, envelope::Payload::CaptureCameraResponse(_))
+        | (
+            ExpectedResponse::CameraMappingDescriptor { .. },
+            envelope::Payload::CameraMappingDescriptorResponse(_),
+        )
+        | (
+            ExpectedResponse::CameraNextFrameLease { .. },
+            envelope::Payload::CameraNextFrameLeaseResponse(_),
+        )
+        | (
+            ExpectedResponse::CameraDroppedCount { .. },
+            envelope::Payload::CameraDroppedCountResponse(_),
+        )
+        | (
+            ExpectedResponse::CameraGetControl { .. },
+            envelope::Payload::CameraGetControlResponse(_),
+        )
+        | (
+            ExpectedResponse::CameraSetControl { .. },
+            envelope::Payload::CameraSetControlResponse(_),
+        )
+        | (ExpectedResponse::CameraSetAuto { .. }, envelope::Payload::CameraSetAutoResponse(_))
+        | (ExpectedResponse::CloseCamera { .. }, envelope::Payload::CloseCameraResponse(_)) => {
+            Ok(())
+        }
         _ => Err(resource_id.map_or_else(unexpected_response, |resource_id| {
             unexpected_response().with_resource_id(resource_id)
         })),
@@ -2841,6 +3076,9 @@ mod tests {
                     usb_interrupt: true,
                     gpio_lines: true,
                     gpio_edges: true,
+                    camera_capture: true,
+                    camera_frames_shm: true,
+                    camera_controls: true,
                 }),
                 pending_capacity: 2,
                 tombstone_capacity: 1,

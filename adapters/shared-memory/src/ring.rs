@@ -511,6 +511,34 @@ pub struct FrameLease {
     generation: u64,
 }
 
+impl FrameLease {
+    pub fn slot_index(&self) -> usize {
+        self.slot_index
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn with_identity(
+        identity: MappingIdentity,
+        slot_index: usize,
+        sequence: u64,
+        generation: u64,
+    ) -> Self {
+        Self {
+            identity,
+            slot_index,
+            sequence,
+            generation,
+        }
+    }
+}
+
 /// Copy-only frame returned by a separately reopened mapping. It owns its payload, so it cannot
 /// escape the lease/pin lifetime as a zero-copy reference (the required Python-facing boundary).
 pub struct CopiedFrame {

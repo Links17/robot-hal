@@ -4,9 +4,20 @@ pub mod v1 {
     include!(concat!(env!("OUT_DIR"), "/seeed.hal.v1.rs"));
 }
 
+mod camera_conversion;
 mod can_conversion;
 mod conversion;
 
+pub use camera_conversion::{
+    camera_capture_request_from_proto, camera_control_descriptor_from_proto,
+    camera_control_descriptor_to_proto, camera_control_kind_from_proto,
+    camera_control_value_from_proto, camera_control_value_to_proto,
+    camera_controls_response_from_proto, camera_format_from_proto,
+    camera_mapping_descriptor_from_proto, camera_mapping_descriptor_to_proto,
+    camera_next_frame_lease_response_from_proto, camera_open_request_from_proto,
+    camera_open_response_from_proto, camera_open_response_to_proto, camera_selector_from_proto,
+    camera_session_lease_from_proto, frame_lease_to_proto,
+};
 pub use can_conversion::{
     can_receive_parameters, can_receive_request_from_proto, can_receive_response_from_proto,
     can_send_request_from_proto, can_send_response_from_proto, can_send_response_to_proto,
@@ -32,7 +43,7 @@ pub use conversion::{
 
 pub const PROTOCOL_MAJOR: u32 = 1;
 pub const PROTOCOL_MINOR_MINIMUM: u32 = 0;
-pub const PROTOCOL_MINOR_MAXIMUM: u32 = 2;
+pub const PROTOCOL_MINOR_MAXIMUM: u32 = 3;
 /// Legacy exact-minor field value sent to peers that predate range fields.
 pub const PROTOCOL_MINOR: u32 = PROTOCOL_MINOR_MAXIMUM;
 pub const SERIAL_CAPABILITY: &str = "serial.bytes/v1";

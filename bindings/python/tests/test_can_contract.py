@@ -459,7 +459,7 @@ def test_descriptor_endpoint_and_capability_exact_boundaries() -> None:
         "can.classic/v0",
         "can.classic/v",
         "can.classic/v18446744073709551616",
-        "can.classic.extra/v1",
+        "can..classic/v1",
         "can.classic/v1/extra",
         "é.classic/v1",
         f"n.{'x' * 251}/v1",

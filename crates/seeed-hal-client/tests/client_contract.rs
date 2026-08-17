@@ -66,7 +66,7 @@ mod fake {
         };
         assert_eq!(handshake.startup_token, super::TOKEN);
         assert_eq!(handshake.protocol_minor_minimum, 0);
-        assert_eq!(handshake.protocol_minor_maximum, 2);
+        assert_eq!(handshake.protocol_minor_maximum, 3);
         send(
             &mut wire,
             v1::Envelope {
@@ -101,7 +101,7 @@ mod fake {
         };
         assert_eq!(handshake.startup_token, super::TOKEN);
         assert_eq!(handshake.protocol_minor_minimum, 0);
-        assert_eq!(handshake.protocol_minor_maximum, 2);
+        assert_eq!(handshake.protocol_minor_maximum, 3);
         send(
             &mut wire,
             v1::Envelope {
@@ -306,7 +306,7 @@ async fn rust_client_round_trips_serial_through_broker() {
     let server = tokio::spawn(async move { broker.serve_one().await.unwrap() });
 
     let client = HalClient::connect(options).await.unwrap();
-    assert_eq!(client.protocol_minor(), 2);
+    assert_eq!(client.protocol_minor(), 3);
     let descriptor = client.enumerate_serial().await.unwrap().remove(0);
     let mut serial = client
         .open_serial(descriptor.selector(), SerialConfig::default())
@@ -1450,7 +1450,7 @@ async fn rust_client_round_trips_can_through_virtual_broker_and_closes_locally()
     let options = ConnectionOptions::new(broker.socket_path(), TOKEN);
     let server = tokio::spawn(async move { broker.serve_one().await.unwrap() });
     let client = HalClient::connect(options).await.unwrap();
-    assert_eq!(client.protocol_minor(), 2);
+    assert_eq!(client.protocol_minor(), 3);
 
     let descriptor = client.enumerate_can().await.unwrap().remove(0);
     let attach = CanOpenConfig::Attach(

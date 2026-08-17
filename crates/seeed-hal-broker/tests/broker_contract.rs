@@ -1513,9 +1513,9 @@ async fn broker_selects_highest_shared_minor_and_reports_its_supported_range() {
         Some(envelope::Payload::HandshakeResponse(response)) => response,
         other => panic!("expected handshake response, got {other:?}"),
     };
-    assert_eq!(accepted.protocol_minor, 2);
+    assert_eq!(accepted.protocol_minor, 3);
     assert_eq!(accepted.protocol_minor_minimum, 0);
-    assert_eq!(accepted.protocol_minor_maximum, 2);
+    assert_eq!(accepted.protocol_minor_maximum, 3);
 
     drop(client);
     assert!(server.await.unwrap().cleanup_error().is_none());

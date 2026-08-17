@@ -13,9 +13,9 @@ use seeed_hal_gpio::{GpioDrive, GpioEdge, GpioEdgeEvent, GpioLineConfig};
 use seeed_hal_protocol::v1::{self, envelope};
 
 #[test]
-fn wire_minor_two_is_the_latest_additive_protocol_version() {
-    assert_eq!(seeed_hal_protocol::PROTOCOL_MINOR_MAXIMUM, 2);
-    assert_eq!(seeed_hal_protocol::PROTOCOL_MINOR, 2);
+fn wire_minor_three_is_the_latest_additive_protocol_version() {
+    assert_eq!(seeed_hal_protocol::PROTOCOL_MINOR_MAXIMUM, 3);
+    assert_eq!(seeed_hal_protocol::PROTOCOL_MINOR, 3);
 }
 
 #[test]
@@ -848,11 +848,11 @@ fn malformed_error_details_reject_every_size_and_count_bound() {
 }
 
 #[test]
-fn wire_minor_two_range_and_additive_enum_values_are_locked() {
+fn wire_minor_three_range_and_additive_enum_values_are_locked() {
     assert_eq!(seeed_hal_protocol::PROTOCOL_MAJOR, 1);
     assert_eq!(seeed_hal_protocol::PROTOCOL_MINOR_MINIMUM, 0);
-    assert_eq!(seeed_hal_protocol::PROTOCOL_MINOR_MAXIMUM, 2);
-    assert_eq!(seeed_hal_protocol::PROTOCOL_MINOR, 2);
+    assert_eq!(seeed_hal_protocol::PROTOCOL_MINOR_MAXIMUM, 3);
+    assert_eq!(seeed_hal_protocol::PROTOCOL_MINOR, 3);
     assert_eq!(v1::IdentityQuality::Unspecified as i32, 0);
     assert_eq!(v1::IdentityQuality::Weak as i32, 1);
     assert_eq!(v1::IdentityQuality::Medium as i32, 2);
@@ -862,6 +862,7 @@ fn wire_minor_two_range_and_additive_enum_values_are_locked() {
     assert_eq!(v1::TransportKind::Can as i32, 2);
     assert_eq!(v1::TransportKind::Usb as i32, 3);
     assert_eq!(v1::TransportKind::Gpio as i32, 4);
+    assert_eq!(v1::TransportKind::Camera as i32, 5);
     assert_eq!(v1::DataBits::Unspecified as i32, 0);
     assert_eq!(v1::DataBits::Five as i32, 1);
     assert_eq!(v1::DataBits::Six as i32, 2);
@@ -1397,15 +1398,16 @@ fn can_transport_and_maintenance_lease_round_trip_through_legacy_types() {
 }
 
 #[test]
-fn camera_resources_fail_closed_until_the_protocol_defines_camera_transport() {
+fn camera_resources_round_trip_after_the_protocol_defines_camera_transport() {
     let selector = ResourceSelector::exact(
         ResourceId::parse("camera:virtual:protocol-boundary").unwrap(),
         IdentityQuality::Strong,
         TransportKind::Camera,
     );
-    let error = v1::ResourceSelector::try_from(&selector)
-        .expect_err("protocol minor two must not encode Camera as Unspecified");
-    assert_eq!(error.name().as_str(), "runtime.protocol.invalid_message");
+    assert_eq!(
+        ResourceSelector::try_from(v1::ResourceSelector::try_from(&selector).unwrap()).unwrap(),
+        selector
+    );
 
     let descriptor = seeed_hal_core::ResourceDescriptor::new(
         selector.id().clone(),
@@ -1417,9 +1419,128 @@ fn camera_resources_fail_closed_until_the_protocol_defines_camera_transport() {
             seeed_hal_core::CapabilityId::parse("camera.capture/v1").unwrap(),
         ]),
     );
-    let error = v1::ResourceDescriptor::try_from(&descriptor)
-        .expect_err("protocol minor two must reject Camera descriptors");
-    assert_eq!(error.name().as_str(), "runtime.protocol.invalid_message");
+    assert_eq!(
+        seeed_hal_core::ResourceDescriptor::try_from(
+            v1::ResourceDescriptor::try_from(&descriptor).unwrap()
+        )
+        .unwrap(),
+        descriptor
+    );
+}
+
+#[test]
+fn camera_minor_three_defines_additive_transport_and_payload_tags_without_frame_bytes() {
+    assert_eq!(seeed_hal_protocol::PROTOCOL_MINOR_MAXIMUM, 3);
+    assert_eq!(v1::TransportKind::Camera as i32, 5);
+    let cases = [
+        (
+            82,
+            envelope::Payload::EnumerateCameraRequest(v1::EnumerateCameraRequest {}),
+        ),
+        (
+            83,
+            envelope::Payload::EnumerateCameraResponse(v1::EnumerateCameraResponse::default()),
+        ),
+        (
+            84,
+            envelope::Payload::OpenCameraRequest(v1::OpenCameraRequest::default()),
+        ),
+        (
+            85,
+            envelope::Payload::OpenCameraResponse(v1::OpenCameraResponse::default()),
+        ),
+        (
+            86,
+            envelope::Payload::CaptureCameraRequest(v1::CaptureCameraRequest::default()),
+        ),
+        (
+            87,
+            envelope::Payload::CaptureCameraResponse(v1::CaptureCameraResponse {}),
+        ),
+        (
+            88,
+            envelope::Payload::CameraMappingDescriptorRequest(
+                v1::CameraMappingDescriptorRequest::default(),
+            ),
+        ),
+        (
+            89,
+            envelope::Payload::CameraMappingDescriptorResponse(
+                v1::CameraMappingDescriptorResponse::default(),
+            ),
+        ),
+        (
+            90,
+            envelope::Payload::CameraNextFrameLeaseRequest(
+                v1::CameraNextFrameLeaseRequest::default(),
+            ),
+        ),
+        (
+            91,
+            envelope::Payload::CameraNextFrameLeaseResponse(
+                v1::CameraNextFrameLeaseResponse::default(),
+            ),
+        ),
+        (
+            92,
+            envelope::Payload::CameraDroppedCountRequest(v1::CameraDroppedCountRequest::default()),
+        ),
+        (
+            93,
+            envelope::Payload::CameraDroppedCountResponse(v1::CameraDroppedCountResponse::default()),
+        ),
+        (
+            94,
+            envelope::Payload::CameraControlsRequest(v1::CameraControlsRequest::default()),
+        ),
+        (
+            95,
+            envelope::Payload::CameraControlsResponse(v1::CameraControlsResponse::default()),
+        ),
+        (
+            96,
+            envelope::Payload::CameraGetControlRequest(v1::CameraGetControlRequest::default()),
+        ),
+        (
+            97,
+            envelope::Payload::CameraGetControlResponse(v1::CameraGetControlResponse::default()),
+        ),
+        (
+            98,
+            envelope::Payload::CameraSetControlRequest(v1::CameraSetControlRequest::default()),
+        ),
+        (
+            99,
+            envelope::Payload::CameraSetControlResponse(v1::Empty {}),
+        ),
+        (
+            101,
+            envelope::Payload::CameraSetAutoRequest(v1::CameraSetAutoRequest::default()),
+        ),
+        (102, envelope::Payload::CameraSetAutoResponse(v1::Empty {})),
+        (
+            103,
+            envelope::Payload::CloseCameraRequest(v1::CloseCameraRequest::default()),
+        ),
+        (104, envelope::Payload::CloseCameraResponse(v1::Empty {})),
+    ];
+    for (tag, payload) in cases {
+        assert_eq!(
+            top_level_fields(&envelope_with(payload).encode_to_vec()),
+            vec![1, tag]
+        );
+    }
+    let descriptor = v1::MappingDescriptor {
+        mapping_name: "camera-shm".to_owned(),
+        mapping_identity: vec![7; 32],
+        capability_token: vec![9; 32],
+        total_length: 1024,
+    };
+    assert_tags(&descriptor, &[1, 2, 3, 4]);
+    assert!(!format!("{descriptor:?}").contains("payload"));
+    let secure_descriptor = seeed_hal_protocol::camera_mapping_descriptor_from_proto(descriptor)
+        .expect("bounded mapping descriptor is valid");
+    assert!(!format!("{secure_descriptor:?}").contains(&"09".repeat(32)));
 }
 
 #[test]

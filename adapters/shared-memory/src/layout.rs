@@ -198,6 +198,14 @@ impl MappingToken {
     pub(crate) fn hash(&self) -> [u8; 32] {
         Sha256::digest(self.0).into()
     }
+
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 }
 
 impl Clone for MappingToken {
@@ -229,8 +237,12 @@ impl MappingIdentity {
         Ok(Self(identity))
     }
 
-    pub(crate) const fn bytes(&self) -> &[u8; 32] {
+    pub const fn bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
     }
 }
 
@@ -253,12 +265,45 @@ pub struct MappingDescriptor {
 }
 
 impl MappingDescriptor {
+    pub fn new(
+        mapping_name: String,
+        mapping_identity: [u8; 32],
+        capability_token: [u8; 32],
+        total_length: usize,
+    ) -> HalResult<Self> {
+        if mapping_name.is_empty()
+            || !mapping_name.is_ascii()
+            || mapping_name.len() > 255
+            || total_length == 0
+            || total_length > MAX_MAPPING_BYTES
+        {
+            return Err(invalid(
+                "shared_memory.descriptor",
+                "mapping descriptor fields are invalid",
+            ));
+        }
+        Ok(Self {
+            name: mapping_name,
+            identity: MappingIdentity::from_bytes(mapping_identity),
+            token: MappingToken::from_bytes(capability_token),
+            total_length,
+        })
+    }
+
     pub fn mapping_name(&self) -> &str {
         &self.name
     }
 
     pub fn mapping_identity(&self) -> &MappingIdentity {
         &self.identity
+    }
+
+    pub fn capability_token_bytes(&self) -> &[u8; 32] {
+        self.token.bytes()
+    }
+
+    pub const fn total_length(&self) -> usize {
+        self.total_length
     }
 
     pub(crate) fn token(&self) -> &MappingToken {

@@ -60,6 +60,16 @@ from .gpio import (
     GpioLineConfig,
     GpioSession,
 )
+from .camera import (
+    BorrowedFrame,
+    CameraFormat,
+    CameraSession,
+    ControlKind,
+    ControlValue,
+    FrameLease,
+    MappingDescriptor,
+    PixelFormat,
+)
 
 __all__ = [
     "ControlLines",
@@ -83,6 +93,14 @@ __all__ = [
     "CanMode",
     "CanOpenConfig",
     "CanSession",
+    "BorrowedFrame",
+    "CameraFormat",
+    "CameraSession",
+    "ControlKind",
+    "ControlValue",
+    "FrameLease",
+    "MappingDescriptor",
+    "PixelFormat",
     "CanTimestamp",
     "CanTimestampSource",
     "ClassicDataFrame",

@@ -67,12 +67,21 @@ from .gpio import (
     GpioBias, GpioDirection, GpioDrive, GpioEdge, GpioEdgeEvent,
     GpioEdgeRequest, GpioLineConfig, GpioSession, MAX_GPIO_EVENTS,
 )
+from .camera import (
+    CameraFormat,
+    CameraSession,
+    ControlKind,
+    ControlValue,
+    FrameLease,
+    MappingDescriptor,
+    PixelFormat,
+)
 from .transport_unix import HARD_FRAME_BYTES, UnixFramedTransport
 
 
 PROTOCOL_MAJOR = 1
 PROTOCOL_MINOR_MINIMUM = 0
-PROTOCOL_MINOR_MAXIMUM = 2
+PROTOCOL_MINOR_MAXIMUM = 3
 PROTOCOL_MINOR = PROTOCOL_MINOR_MAXIMUM
 SERIAL_CAPABILITY = "serial.bytes/v1"
 CAN_CLASSIC_CAPABILITY = "can.classic/v1"
@@ -85,6 +94,9 @@ USB_BULK_CAPABILITY = "usb.bulk/v1"
 USB_INTERRUPT_CAPABILITY = "usb.interrupt/v1"
 GPIO_LINES_CAPABILITY = "gpio.lines/v1"
 GPIO_EDGES_CAPABILITY = "gpio.edges/v1"
+CAMERA_CAPTURE_CAPABILITY = "camera.capture/v1"
+CAMERA_FRAMES_SHM_CAPABILITY = "camera.frames.shm/v1"
+CAMERA_CONTROLS_CAPABILITY = "camera.controls/v1"
 DEFAULT_TRANSFER_BYTES = 64 * 1024
 DEFAULT_CAPACITY = 32
 DEFAULT_EVENT_CAPACITY = 64
@@ -115,6 +127,7 @@ class TransportKind(Enum):
     CAN = "can"
     USB = "usb"
     GPIO = "gpio"
+    CAMERA = "camera"
 
 
 class LeaseMode(Enum):
@@ -675,6 +688,70 @@ class HalClient:
             len(normalized_lines),
         )
 
+    async def enumerate_camera(self) -> list[ResourceDescriptor]:
+        self._require_camera_capability("camera.enumerate", CAMERA_CAPTURE_CAPABILITY)
+        response = await self._request(
+            "enumerate_camera_request",
+            hal_pb2.EnumerateCameraRequest(),
+            "enumerate_camera_response",
+        )
+        assert isinstance(response, hal_pb2.EnumerateCameraResponse)
+        return [
+            _decode_descriptor(item, expected=TransportKind.CAMERA)
+            for item in response.resources
+        ]
+
+    async def open_camera(
+        self, selector: ResourceSelector, request: CameraFormat, slot_count: int = 3
+    ) -> CameraSession:
+        if not isinstance(selector, ResourceSelector):
+            raise _argument_error("camera.open", "selector must be ResourceSelector")
+        if selector.transport is not TransportKind.CAMERA:
+            raise _resource_argument_error(
+                "camera.open",
+                "camera resource selector transport must be Camera",
+                selector.resource_id,
+            )
+        if not isinstance(request, CameraFormat):
+            raise _resource_argument_error(
+                "camera.open", "camera format is invalid", selector.resource_id
+            )
+        if not _is_plain_int(slot_count) or not 1 <= slot_count <= 64:
+            raise _resource_argument_error(
+                "camera.open", "camera slot count is invalid", selector.resource_id
+            )
+        self._require_camera_capability(
+            "camera.open", CAMERA_CAPTURE_CAPABILITY, selector.resource_id
+        )
+        response = await self._request(
+            "open_camera_request",
+            hal_pb2.OpenCameraRequest(
+                selector=_selector_to_proto(selector, "camera.open"),
+                request=hal_pb2.CameraRequest(
+                    format=hal_pb2.CameraFormat(
+                        pixel_format=_camera_pixel_format_to_proto(request.pixel_format),
+                        width=request.width,
+                        height=request.height,
+                    ),
+                    slot_count=slot_count,
+                ),
+            ),
+            "open_camera_response",
+            resource_id=selector.resource_id,
+        )
+        assert isinstance(response, hal_pb2.OpenCameraResponse)
+        session_id, lease_id, generation, mode = _decode_open_session_response(
+            response, "Camera"
+        )
+        return CameraSession(
+            self,
+            session_id,
+            lease_id,
+            generation,
+            selector.resource_id,
+            mode,
+        )
+
     async def close(self) -> None:
         async with self._close_lock:
             if self._terminal is None:
@@ -1154,6 +1231,166 @@ class HalClient:
             resource_id=session._resource_id,
         )
 
+    async def _camera_capture(self, session: CameraSession, timeout_ms: int) -> None:
+        if not _is_plain_int(timeout_ms) or not 0 < timeout_ms <= MAX_U64:
+            raise _resource_argument_error(
+                "camera.capture", "camera timeout is invalid", session._resource_id
+            )
+        self._require_camera_capability(
+            "camera.capture", CAMERA_CAPTURE_CAPABILITY, session._resource_id
+        )
+        await self._request(
+            "capture_camera_request",
+            hal_pb2.CaptureCameraRequest(
+                session_id=session._session_id,
+                lease=self._camera_lease(session),
+                timeout_ms=timeout_ms,
+            ),
+            "capture_camera_response",
+            resource_id=session._resource_id,
+        )
+
+    async def _camera_mapping_descriptor(
+        self, session: CameraSession
+    ) -> MappingDescriptor:
+        self._require_camera_capability(
+            "camera.mapping_descriptor",
+            CAMERA_FRAMES_SHM_CAPABILITY,
+            session._resource_id,
+        )
+        response = await self._request(
+            "camera_mapping_descriptor_request",
+            hal_pb2.CameraMappingDescriptorRequest(
+                session_id=session._session_id, lease=self._camera_lease(session)
+            ),
+            "camera_mapping_descriptor_response",
+            resource_id=session._resource_id,
+        )
+        assert isinstance(response, hal_pb2.CameraMappingDescriptorResponse)
+        if not response.HasField("descriptor"):
+            raise _invalid_message("broker returned invalid camera mapping descriptor")
+        return _camera_mapping_descriptor_from_proto(response.descriptor)
+
+    async def _camera_next_frame_lease(
+        self, session: CameraSession
+    ) -> FrameLease | None:
+        self._require_camera_capability(
+            "camera.next_frame_lease",
+            CAMERA_FRAMES_SHM_CAPABILITY,
+            session._resource_id,
+        )
+        response = await self._request(
+            "camera_next_frame_lease_request",
+            hal_pb2.CameraNextFrameLeaseRequest(
+                session_id=session._session_id, lease=self._camera_lease(session)
+            ),
+            "camera_next_frame_lease_response",
+            resource_id=session._resource_id,
+        )
+        assert isinstance(response, hal_pb2.CameraNextFrameLeaseResponse)
+        return (
+            _frame_lease_from_proto(response.lease)
+            if response.HasField("lease")
+            else None
+        )
+
+    async def _camera_dropped_count(self, session: CameraSession) -> int:
+        self._require_camera_capability(
+            "camera.dropped_count", CAMERA_CAPTURE_CAPABILITY, session._resource_id
+        )
+        response = await self._request(
+            "camera_dropped_count_request",
+            hal_pb2.CameraDroppedCountRequest(
+                session_id=session._session_id, lease=self._camera_lease(session)
+            ),
+            "camera_dropped_count_response",
+            resource_id=session._resource_id,
+        )
+        assert isinstance(response, hal_pb2.CameraDroppedCountResponse)
+        if response.dropped_count > MAX_U64:
+            raise _invalid_message("camera dropped count exceeds the wire bound")
+        return response.dropped_count
+
+    async def _camera_get_control(
+        self, session: CameraSession, kind: ControlKind
+    ) -> ControlValue:
+        self._require_camera_capability(
+            "camera.control.get", CAMERA_CONTROLS_CAPABILITY, session._resource_id
+        )
+        response = await self._request(
+            "camera_get_control_request",
+            hal_pb2.CameraGetControlRequest(
+                session_id=session._session_id,
+                lease=self._camera_lease(session),
+                kind=_camera_control_kind_to_proto(kind),
+            ),
+            "camera_get_control_response",
+            resource_id=session._resource_id,
+        )
+        assert isinstance(response, hal_pb2.CameraGetControlResponse)
+        if not response.HasField("value"):
+            raise _invalid_message("broker returned invalid camera control value")
+        return _camera_control_value_from_proto(response.value)
+
+    async def _camera_set_control(
+        self, session: CameraSession, kind: ControlKind, value: ControlValue
+    ) -> None:
+        self._require_camera_capability(
+            "camera.control.set", CAMERA_CONTROLS_CAPABILITY, session._resource_id
+        )
+        await self._request(
+            "camera_set_control_request",
+            hal_pb2.CameraSetControlRequest(
+                session_id=session._session_id,
+                lease=self._camera_lease(session),
+                kind=_camera_control_kind_to_proto(kind),
+                value=_camera_control_value_to_proto(value),
+            ),
+            "camera_set_control_response",
+            resource_id=session._resource_id,
+        )
+
+    async def _camera_set_auto(
+        self, session: CameraSession, kind: ControlKind, enabled: bool
+    ) -> None:
+        if not isinstance(enabled, bool):
+            raise _resource_argument_error(
+                "camera.control.auto",
+                "camera auto-control value is invalid",
+                session._resource_id,
+            )
+        self._require_camera_capability(
+            "camera.control.auto", CAMERA_CONTROLS_CAPABILITY, session._resource_id
+        )
+        await self._request(
+            "camera_set_auto_request",
+            hal_pb2.CameraSetAutoRequest(
+                session_id=session._session_id,
+                lease=self._camera_lease(session),
+                kind=_camera_control_kind_to_proto(kind),
+                enabled=enabled,
+            ),
+            "camera_set_auto_response",
+            resource_id=session._resource_id,
+        )
+
+    async def _camera_close(self, session: CameraSession) -> None:
+        await self._request(
+            "close_camera_request",
+            hal_pb2.CloseCameraRequest(
+                session_id=session._session_id, lease=self._camera_lease(session)
+            ),
+            "close_camera_response",
+            resource_id=session._resource_id,
+        )
+
+    def _camera_lease(self, session: CameraSession) -> hal_pb2.LeaseToken:
+        return hal_pb2.LeaseToken(
+            lease_id=session._lease_id,
+            generation=session._generation,
+            mode=session._mode,
+        )
+
     def _usb_gpio_lease(
         self, session: UsbSession | GpioSession
     ) -> hal_pb2.LeaseToken:
@@ -1162,6 +1399,20 @@ class HalClient:
             generation=session._generation,
             mode=session._mode,
         )
+
+    def _require_camera_capability(
+        self, operation: str, capability: str, resource_id: str | None = None
+    ) -> None:
+        if self._protocol_minor >= 3 and capability in self._capabilities:
+            return
+        error = client_error(
+            "runtime.protocol.capability_unsupported",
+            ErrorCategory.CONFLICT,
+            operation,
+            False,
+            "the negotiated broker protocol does not advertise the required camera capability",
+        )
+        raise error if resource_id is None else _attach_resource(error, resource_id)
 
     def _require_usb_gpio_capability(
         self, operation: str, capability: str, resource_id: str | None = None
@@ -1871,6 +2122,7 @@ def _decode_descriptor(
         hal_pb2.TRANSPORT_KIND_CAN: TransportKind.CAN,
         hal_pb2.TRANSPORT_KIND_USB: TransportKind.USB,
         hal_pb2.TRANSPORT_KIND_GPIO: TransportKind.GPIO,
+        hal_pb2.TRANSPORT_KIND_CAMERA: TransportKind.CAMERA,
     }
     transport = transports.get(value.transport)
     if quality is None or transport is None or (
@@ -1905,7 +2157,7 @@ def _valid_capability(value: str) -> str:
         raise _invalid_message("resource descriptor has an invalid capability")
     try:
         contract, version = value.split("/")
-        namespace, name = contract.split(".")
+        namespace, name = contract.split(".", 1)
     except ValueError as error:
         raise _invalid_message(
             "resource descriptor has an invalid capability"
@@ -1914,6 +2166,9 @@ def _valid_capability(value: str) -> str:
     if (
         not namespace
         or not name
+        or name.startswith(".")
+        or name.endswith(".")
+        or ".." in name
         or not number
         or not number.isascii()
         or not number.isdigit()
@@ -2039,6 +2294,8 @@ def _transport_to_proto(value: TransportKind) -> int:
         return hal_pb2.TRANSPORT_KIND_USB
     if value is TransportKind.GPIO:
         return hal_pb2.TRANSPORT_KIND_GPIO
+    if value is TransportKind.CAMERA:
+        return hal_pb2.TRANSPORT_KIND_CAMERA
     raise _argument_error("serial.open", "transport kind is invalid")
 
 
@@ -2061,7 +2318,71 @@ def _transport_to_proto_for_operation(value: TransportKind, operation: str) -> i
         return hal_pb2.TRANSPORT_KIND_USB
     if value is TransportKind.GPIO:
         return hal_pb2.TRANSPORT_KIND_GPIO
+    if value is TransportKind.CAMERA:
+        return hal_pb2.TRANSPORT_KIND_CAMERA
     raise _argument_error(operation, "transport kind is invalid")
+
+
+def _camera_pixel_format_to_proto(value: PixelFormat) -> int:
+    try:
+        return {
+            PixelFormat.NV12: hal_pb2.CAMERA_PIXEL_FORMAT_NV12,
+            PixelFormat.YUYV: hal_pb2.CAMERA_PIXEL_FORMAT_YUYV,
+            PixelFormat.MJPEG: hal_pb2.CAMERA_PIXEL_FORMAT_MJPEG,
+        }[value]
+    except (KeyError, TypeError) as error:
+        raise _argument_error("camera.open", "camera pixel format is invalid") from error
+
+
+def _camera_control_kind_to_proto(value: ControlKind) -> int:
+    try:
+        return {
+            ControlKind.EXPOSURE: hal_pb2.CAMERA_CONTROL_KIND_EXPOSURE,
+            ControlKind.GAIN: hal_pb2.CAMERA_CONTROL_KIND_GAIN,
+            ControlKind.WHITE_BALANCE: hal_pb2.CAMERA_CONTROL_KIND_WHITE_BALANCE,
+            ControlKind.FOCUS: hal_pb2.CAMERA_CONTROL_KIND_FOCUS,
+        }[value]
+    except (KeyError, TypeError) as error:
+        raise _argument_error("camera.control", "camera control kind is invalid") from error
+
+
+def _camera_control_value_to_proto(value: ControlValue) -> hal_pb2.CameraControlValue:
+    if not isinstance(value, ControlValue):
+        raise _argument_error("camera.control", "camera control value is invalid")
+    if value.integer is not None:
+        return hal_pb2.CameraControlValue(integer_value=value.integer)
+    assert value.enum is not None
+    return hal_pb2.CameraControlValue(enum_value=value.enum)
+
+
+def _camera_control_value_from_proto(value: hal_pb2.CameraControlValue) -> ControlValue:
+    kind = value.WhichOneof("value")
+    if kind == "integer_value":
+        return ControlValue(integer=value.integer_value)
+    if kind == "enum_value":
+        return ControlValue(enum=value.enum_value)
+    raise _invalid_message("broker returned invalid camera control value")
+
+
+def _camera_mapping_descriptor_from_proto(
+    value: hal_pb2.MappingDescriptor,
+) -> MappingDescriptor:
+    try:
+        return MappingDescriptor(
+            value.mapping_name,
+            bytes(value.mapping_identity),
+            bytes(value.capability_token),
+            value.total_length,
+        )
+    except HalError as error:
+        raise _invalid_message("broker returned invalid camera mapping descriptor") from error
+
+
+def _frame_lease_from_proto(value: hal_pb2.FrameLease) -> FrameLease:
+    try:
+        return FrameLease(value.slot_index, value.sequence, value.generation)
+    except HalError as error:
+        raise _invalid_message("broker returned invalid camera frame lease") from error
 
 
 _DATA_BITS_TO_PROTO = {

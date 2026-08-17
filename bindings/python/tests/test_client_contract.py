@@ -92,7 +92,7 @@ async def fake_broker(
                 assert hello.request_id == 1
                 assert hello.WhichOneof("payload") == "handshake_request"
                 assert hello.handshake_request.protocol_minor_minimum == 0
-                assert hello.handshake_request.protocol_minor_maximum == 2
+                assert hello.handshake_request.protocol_minor_maximum == 3
                 await send_frame(
                     writer_stream,
                     envelope(
@@ -157,7 +157,7 @@ def test_hal_error_structured_details_are_immutable_copies() -> None:
 
 
 @pytest.mark.asyncio
-async def test_python_client_accepts_overlap_selection_and_rejects_no_shared_minor() -> None:
+async def test_python_client_accepts_overlap_selection_including_minor_three() -> None:
     release = asyncio.Event()
 
     async def handler(_reader, _writer):
@@ -184,9 +184,10 @@ async def test_python_client_accepts_overlap_selection_and_rejects_no_shared_min
     async with fake_broker(
         handler, selected_minor=3, minimum_minor=3, maximum_minor=3
     ) as endpoint:
-        with pytest.raises(HalError) as caught:
-            await HalClient.connect(endpoint, TOKEN)
-        assert caught.value.name == "runtime.protocol.invalid_handshake"
+        client = await HalClient.connect(endpoint, TOKEN)
+        assert client.protocol_minor == 3
+        await client.close()
+        release.set()
 
 
 @pytest.mark.asyncio
@@ -212,7 +213,7 @@ async def test_invalid_python_arguments_use_stable_hal_errors() -> None:
 @pytest.mark.asyncio
 async def test_python_client_round_trips_complete_serial_contract(broker) -> None:
     client = await HalClient.connect(broker.endpoint, broker.token)
-    assert client.protocol_minor == 2
+    assert client.protocol_minor == 3
     events = client.subscribe()
     resources = await client.enumerate_serial()
     assert resources[0].identity_quality is IdentityQuality.STRONG

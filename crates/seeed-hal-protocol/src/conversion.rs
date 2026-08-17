@@ -418,6 +418,7 @@ impl TryFrom<v1::ResourceSelector> for ResourceSelector {
             v1::TransportKind::Can => TransportKind::Can,
             v1::TransportKind::Usb => TransportKind::Usb,
             v1::TransportKind::Gpio => TransportKind::Gpio,
+            v1::TransportKind::Camera => TransportKind::Camera,
             v1::TransportKind::Unspecified => {
                 return Err(invalid_message("transport is required"));
             }
@@ -837,10 +838,6 @@ fn transport_to_proto(value: TransportKind) -> HalResult<v1::TransportKind> {
         TransportKind::Can => v1::TransportKind::Can,
         TransportKind::Usb => v1::TransportKind::Usb,
         TransportKind::Gpio => v1::TransportKind::Gpio,
-        TransportKind::Camera => {
-            return Err(invalid_message(
-                "Camera transport is unavailable before its protocol definition",
-            ));
-        }
+        TransportKind::Camera => v1::TransportKind::Camera,
     })
 }

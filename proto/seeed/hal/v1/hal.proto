@@ -54,7 +54,29 @@ message Envelope {
     GpioNextEdgeResponse gpio_next_edge_response = 79;
     CloseGpioRequest close_gpio_request = 80;
     Empty close_gpio_response = 81;
+    EnumerateCameraRequest enumerate_camera_request = 82;
+    EnumerateCameraResponse enumerate_camera_response = 83;
+    OpenCameraRequest open_camera_request = 84;
+    OpenCameraResponse open_camera_response = 85;
+    CaptureCameraRequest capture_camera_request = 86;
+    CaptureCameraResponse capture_camera_response = 87;
+    CameraMappingDescriptorRequest camera_mapping_descriptor_request = 88;
+    CameraMappingDescriptorResponse camera_mapping_descriptor_response = 89;
+    CameraNextFrameLeaseRequest camera_next_frame_lease_request = 90;
+    CameraNextFrameLeaseResponse camera_next_frame_lease_response = 91;
+    CameraDroppedCountRequest camera_dropped_count_request = 92;
+    CameraDroppedCountResponse camera_dropped_count_response = 93;
+    CameraControlsRequest camera_controls_request = 94;
+    CameraControlsResponse camera_controls_response = 95;
+    CameraGetControlRequest camera_get_control_request = 96;
+    CameraGetControlResponse camera_get_control_response = 97;
+    CameraSetControlRequest camera_set_control_request = 98;
+    Empty camera_set_control_response = 99;
     Error error = 100;
+    CameraSetAutoRequest camera_set_auto_request = 101;
+    Empty camera_set_auto_response = 102;
+    CloseCameraRequest close_camera_request = 103;
+    Empty close_camera_response = 104;
   }
 }
 
@@ -144,7 +166,73 @@ enum TransportKind {
   TRANSPORT_KIND_CAN = 2;
   TRANSPORT_KIND_USB = 3;
   TRANSPORT_KIND_GPIO = 4;
+  TRANSPORT_KIND_CAMERA = 5;
 }
+
+enum CameraPixelFormat {
+  CAMERA_PIXEL_FORMAT_UNSPECIFIED = 0;
+  CAMERA_PIXEL_FORMAT_NV12 = 1;
+  CAMERA_PIXEL_FORMAT_YUYV = 2;
+  CAMERA_PIXEL_FORMAT_MJPEG = 3;
+}
+message CameraFormat { CameraPixelFormat pixel_format = 1; uint32 width = 2; uint32 height = 3; }
+message CameraRequest { CameraFormat format = 1; uint32 slot_count = 2; }
+message EnumerateCameraRequest {}
+message EnumerateCameraResponse { repeated ResourceDescriptor resources = 1; }
+message OpenCameraRequest { ResourceSelector selector = 1; CameraRequest request = 2; }
+message OpenCameraResponse { string session_id = 1; LeaseToken lease = 2; }
+message CaptureCameraRequest { string session_id = 1; LeaseToken lease = 2; uint64 timeout_ms = 3; }
+message CaptureCameraResponse {}
+message MappingDescriptor {
+  string mapping_name = 1;
+  bytes mapping_identity = 2;
+  bytes capability_token = 3;
+  uint64 total_length = 4;
+}
+message CameraMappingDescriptorRequest { string session_id = 1; LeaseToken lease = 2; }
+message CameraMappingDescriptorResponse { MappingDescriptor descriptor = 1; }
+message FrameLease { uint32 slot_index = 1; uint64 sequence = 2; uint64 generation = 3; }
+message CameraNextFrameLeaseRequest { string session_id = 1; LeaseToken lease = 2; }
+message CameraNextFrameLeaseResponse { FrameLease lease = 1; }
+message CameraDroppedCountRequest { string session_id = 1; LeaseToken lease = 2; }
+message CameraDroppedCountResponse { uint64 dropped_count = 1; }
+enum CameraControlKind {
+  CAMERA_CONTROL_KIND_UNSPECIFIED = 0;
+  CAMERA_CONTROL_KIND_EXPOSURE = 1;
+  CAMERA_CONTROL_KIND_GAIN = 2;
+  CAMERA_CONTROL_KIND_WHITE_BALANCE = 3;
+  CAMERA_CONTROL_KIND_FOCUS = 4;
+}
+enum CameraControlValueKind {
+  CAMERA_CONTROL_VALUE_KIND_UNSPECIFIED = 0;
+  CAMERA_CONTROL_VALUE_KIND_INTEGER = 1;
+  CAMERA_CONTROL_VALUE_KIND_ENUM = 2;
+}
+message CameraControlValue { oneof value { sint64 integer_value = 1; string enum_value = 2; } }
+message CameraControlValues {
+  oneof values {
+    CameraControlRange range = 1;
+    CameraControlEnumValues enumerated = 2;
+  }
+}
+message CameraControlRange { sint64 minimum = 1; sint64 maximum = 2; sint64 step = 3; }
+message CameraControlEnumValues { repeated CameraControlValue values = 1; }
+message CameraControlDescriptor {
+  CameraControlKind kind = 1;
+  bool readable = 2;
+  bool writable = 3;
+  bool auto_supported = 4;
+  CameraControlValues values = 5;
+  bool current_value_available = 6;
+  string diagnostic = 7;
+}
+message CameraControlsRequest { string session_id = 1; LeaseToken lease = 2; }
+message CameraControlsResponse { repeated CameraControlDescriptor controls = 1; }
+message CameraGetControlRequest { string session_id = 1; LeaseToken lease = 2; CameraControlKind kind = 3; }
+message CameraGetControlResponse { CameraControlValue value = 1; }
+message CameraSetControlRequest { string session_id = 1; LeaseToken lease = 2; CameraControlKind kind = 3; CameraControlValue value = 4; }
+message CameraSetAutoRequest { string session_id = 1; LeaseToken lease = 2; CameraControlKind kind = 3; bool enabled = 4; }
+message CloseCameraRequest { string session_id = 1; LeaseToken lease = 2; }
 
 message SerialConfig {
   uint32 baud_rate = 1;
