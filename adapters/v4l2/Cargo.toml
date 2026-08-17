@@ -1,0 +1,19 @@
+[package]
+name = "seeed-hal-adapter-v4l2"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+hardware-tests = []
+
+[dependencies]
+async-trait = { workspace = true }
+seeed-hal-camera = { path = "../../crates/seeed-hal-camera" }
+seeed-hal-core = { path = "../../crates/seeed-hal-core" }
+tokio = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bytes = { workspace = true }
+v4l = "=0.14.0"

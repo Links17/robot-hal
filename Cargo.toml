@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "adapters/avfoundation",
+    "adapters/v4l2",
     "adapters/pcan",
     "adapters/nusb",
     "adapters/shared-memory",

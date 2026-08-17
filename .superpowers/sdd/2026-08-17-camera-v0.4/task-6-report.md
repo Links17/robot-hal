@@ -1,5 +1,69 @@
 # Camera v0.4 Task 6 report
 
+## Linux V4L2 adapter slice
+
+- Added `seeed-hal-adapter-v4l2` to the root workspace. The crate uses the
+  current `v4l` 0.14 safe wrapper, whose `Stream::with_buffers` implements
+  kernel V4L2 mmap buffer allocation, queue/dequeue, streaming start/stop, and
+  unmapping. The crate's dependency graph resolved with Rust 1.85-compatible
+  package versions.
+- On Linux, discovery scans actual `/dev/video*` endpoints, verifies V4L2
+  capture plus streaming capability, and retains the `/dev/video*` node only as
+  a transient endpoint. Stable identity prefers an ancestor sysfs `serial`
+  value (`Strong`); when unavailable it uses the canonical sysfs device path
+  (`Medium`) and never represents it as `Strong`.
+- Open re-enumerates and resolves the selected identity, then applies the
+  requested pixel format and dimensions through V4L2. It accepts only an exact
+  NV12, YUYV, or MJPEG result with bounded `sizeimage` and valid stride. One
+  adapter instance permits exactly one active session per resource.
+- Capture owns a dedicated native worker thread. It holds the V4L2 device and
+  mmap stream there, validates every dequeued payload and layout, copies the
+  native bytes once into the owned `CameraFrame`, creates a receipt monotonic
+  timestamp, and publishes strict adapter sequence numbers. `close` terminates
+  the worker, drops the stream/device and releases the claim. Controls are not
+  advertised and every control operation fails closed.
+- Non-Linux calls return `runtime.adapter.unavailable` without native
+  discovery. A feature-gated ignored hardware test requires
+  `SEEED_HAL_CAMERA_RESOURCE_ID`.
+
+## TDD evidence
+
+- Red:
+  `cargo test -p seeed-hal-adapter-v4l2 --all-features` initially failed because
+  `V4l2Adapter::enumerate` was intentionally unimplemented and panicked instead
+  of returning the stable non-Linux unavailable error.
+- Green:
+  after adding platform gating and the identity encoder, the same command
+  passed the non-Linux unavailable and identity encoding tests.
+- The Linux implementation was then added behind `cfg(target_os = "linux")`;
+  its identity evidence helpers are unit-tested when compiled on Linux, and
+  its physical capture test is `hardware-tests`-gated and ignored.
+
+## Verification
+
+- Passed:
+  `cargo fmt --all --check`
+- Passed:
+  `cargo clippy -p seeed-hal-adapter-v4l2 --all-targets --all-features -- -D warnings`
+- Passed:
+  `cargo test -p seeed-hal-adapter-v4l2 --all-features`
+- Attempted Linux target check:
+  `cargo check -p seeed-hal-adapter-v4l2 --target x86_64-unknown-linux-gnu`
+  could not build in this macOS environment because the `v4l2-sys-mit` build
+  script requires the Linux kernel header `linux/videodev2.h`, which is absent.
+
+## Limitations
+
+- No physical Linux camera or Linux kernel sysroot was available here, so the
+  ignored `hardware-tests` capture qualification was not run.
+- This slice deliberately does not advertise controls. It does not map V4L2
+  controls until their standard descriptors and operations can be implemented
+  end-to-end without fabrication.
+- The safe `v4l` wrapper owns its internal mmap unsafe boundary. The adapter
+  adds no direct `unsafe`; the kernel streaming contract is the documented
+  V4L2 mmap `REQBUFS`/`QUERYBUF`/`QBUF`/`DQBUF`/`STREAMON` sequence.
+# Camera v0.4 Task 6 report
+
 ## Native adapter prerequisite
 
 Camera adapter conformance now reads the selected descriptor's
