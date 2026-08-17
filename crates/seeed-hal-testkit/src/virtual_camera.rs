@@ -11,7 +11,7 @@ use seeed_hal_core::{
     ResourceId, ResourceProperties, ResourceSelector, TransportKind, resolve_resource,
 };
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 const CLOCK_DOMAIN: &str = "virtual-camera";
@@ -27,8 +27,23 @@ struct State {
     present: bool,
     claimed: bool,
     next_capture: Option<HalError>,
+    next_close_error: bool,
     unplug_before_next_publication: bool,
+    blocked_capture: Option<Arc<CaptureGate>>,
+    control_set_count: u64,
     controls: BTreeMap<CameraControlKind, ControlState>,
+}
+
+#[derive(Debug)]
+struct CaptureGate {
+    state: Mutex<CaptureGateState>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct CaptureGateState {
+    entered: bool,
+    released: bool,
 }
 
 #[derive(Debug)]
@@ -79,7 +94,10 @@ impl VirtualCameraAdapter {
                 present: true,
                 claimed: false,
                 next_capture: None,
+                next_close_error: false,
                 unplug_before_next_publication: false,
+                blocked_capture: None,
+                control_set_count: 0,
                 controls,
             })),
         }
@@ -112,6 +130,60 @@ impl VirtualCameraAdapter {
             .lock()
             .expect("virtual camera mutex poisoned")
             .unplug_before_next_publication = true;
+    }
+
+    pub fn block_next_capture_until_released(&self) {
+        self.state
+            .lock()
+            .expect("virtual camera mutex poisoned")
+            .blocked_capture = Some(Arc::new(CaptureGate {
+            state: Mutex::new(CaptureGateState::default()),
+            changed: Condvar::new(),
+        }));
+    }
+
+    pub fn wait_for_blocked_capture(&self) {
+        let gate = self
+            .state
+            .lock()
+            .expect("virtual camera mutex poisoned")
+            .blocked_capture
+            .clone()
+            .expect("a capture gate must be installed");
+        let mut state = gate.state.lock().expect("capture gate mutex poisoned");
+        while !state.entered {
+            state = gate
+                .changed
+                .wait(state)
+                .expect("capture gate mutex poisoned");
+        }
+    }
+
+    pub fn release_blocked_capture(&self) {
+        let gate = self
+            .state
+            .lock()
+            .expect("virtual camera mutex poisoned")
+            .blocked_capture
+            .clone()
+            .expect("a capture gate must be installed");
+        let mut state = gate.state.lock().expect("capture gate mutex poisoned");
+        state.released = true;
+        gate.changed.notify_all();
+    }
+
+    pub fn control_set_count(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("virtual camera mutex poisoned")
+            .control_set_count
+    }
+
+    pub fn fail_next_close(&self) {
+        self.state
+            .lock()
+            .expect("virtual camera mutex poisoned")
+            .next_close_error = true;
     }
 }
 
@@ -188,6 +260,23 @@ impl CameraCaptureSession for VirtualCameraSession {
     }
 
     async fn capture(&mut self, _timeout: Duration) -> HalResult<CameraFrame> {
+        let gate = self
+            .state
+            .lock()
+            .expect("virtual camera mutex poisoned")
+            .blocked_capture
+            .clone();
+        if let Some(gate) = gate {
+            let mut state = gate.state.lock().expect("capture gate mutex poisoned");
+            state.entered = true;
+            gate.changed.notify_all();
+            while !state.released {
+                state = gate
+                    .changed
+                    .wait(state)
+                    .expect("capture gate mutex poisoned");
+            }
+        }
         let mut state = self.state.lock().expect("virtual camera mutex poisoned");
         ensure_active_locked(self.closed, &state, "camera.capture", &self.descriptor)?;
         unplug_before_publication(&mut state);
@@ -261,6 +350,7 @@ impl CameraCaptureSession for VirtualCameraSession {
         }
         control.value = value;
         control.auto = false;
+        state.control_set_count = state.control_set_count.saturating_add(1);
         Ok(())
     }
 
@@ -280,11 +370,20 @@ impl CameraCaptureSession for VirtualCameraSession {
 
     async fn close(&mut self) -> HalResult<()> {
         if !self.closed {
-            self.state
-                .lock()
-                .expect("virtual camera mutex poisoned")
-                .claimed = false;
+            let mut state = self.state.lock().expect("virtual camera mutex poisoned");
+            state.claimed = false;
             self.closed = true;
+            if state.next_close_error {
+                state.next_close_error = false;
+                return Err(HalError::new(
+                    "camera.session.close_failed",
+                    ErrorCategory::Unavailable,
+                    "camera.close",
+                    false,
+                    "virtual camera close failed",
+                )?
+                .with_resource_id(self.descriptor.id().clone()));
+            }
         }
         Ok(())
     }

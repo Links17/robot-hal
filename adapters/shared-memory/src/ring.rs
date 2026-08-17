@@ -117,9 +117,17 @@ impl BrokerMapping {
 
     pub fn close(&mut self) -> HalResult<()> {
         if !self.closed {
-            self.mapping
-                .try_lock_exclusive()
-                .map_err(|error| unavailable("shared_memory.close", error.to_string()))?;
+            loop {
+                match self.mapping.try_lock_exclusive() {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(error) => {
+                        return Err(unavailable("shared_memory.close", error.to_string()));
+                    }
+                }
+            }
             // SAFETY: the broker holds the exclusive mapping lock and the fixed terminal-state
             // field lies within the writable header.
             unsafe {
@@ -310,6 +318,7 @@ impl BrokerMapping {
                 base.add(HEADER_TOKEN_HASH),
                 32,
             );
+            write_u64(base.add(HEADER_TERMINAL_STATE), TERMINAL_STATE_OPEN);
         }
         Ok(())
     }

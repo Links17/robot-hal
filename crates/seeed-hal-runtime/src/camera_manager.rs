@@ -25,6 +25,7 @@ const COMMAND_QUEUE_CAPACITY: usize = 64;
 struct Entry {
     resource: ResourceId,
     owner: OwnerId,
+    lease: LeaseToken,
     worker: CameraWorker,
 }
 
@@ -37,7 +38,7 @@ struct State {
 
 struct ClosedEntry {
     resource: ResourceId,
-    owner: OwnerId,
+    lease: LeaseToken,
     terminal_error: Option<HalError>,
 }
 
@@ -115,6 +116,7 @@ impl CameraCommand {
 struct CameraWorker {
     commands: mpsc::Sender<CameraCommand>,
     shutdown: watch::Sender<bool>,
+    admission: Arc<Mutex<()>>,
     completion: watch::Receiver<Option<HalResult<()>>>,
     terminal_error: watch::Receiver<Option<HalError>>,
 }
@@ -135,7 +137,8 @@ impl CameraWorker {
             })
     }
 
-    fn request_close(&self) {
+    async fn request_close(&self) {
+        let _admission = self.admission.lock().await;
         let _ = self.shutdown.send(true);
     }
     fn is_closing(&self) -> bool {
@@ -181,6 +184,8 @@ fn spawn_worker(
     let (completion_tx, completion) = watch::channel(None);
     let (terminal_error_tx, terminal_error) = watch::channel(None);
     let (shutdown, worker_shutdown) = watch::channel(false);
+    let admission = Arc::new(Mutex::new(()));
+    let worker_admission = Arc::clone(&admission);
     let name = format!("seeed-hal-camera-{}", selector.id().as_str());
     std::thread::Builder::new()
         .name(name)
@@ -217,6 +222,11 @@ fn spawn_worker(
                         }
                         Err(mpsc::error::TryRecvError::Disconnected) => break,
                     };
+                    if *worker_shutdown.borrow() {
+                        command.reject_closed();
+                        break;
+                    }
+                    let _admission = runtime.block_on(worker_admission.lock());
                     if *worker_shutdown.borrow() {
                         command.reject_closed();
                         break;
@@ -311,11 +321,17 @@ fn spawn_worker(
                     command.reject_closed();
                 }
                 if let Some(error) = terminal_error {
-                    let _ = mapping_result;
-                    let _ = close_result;
+                    // The native terminal outcome has priority, but completion still retains
+                    // cleanup errors through the worker's result below when no native terminal
+                    // occurred.
+                    let _ = (mapping_result, close_result);
                     Err(error)
                 } else {
-                    close_result.and(mapping_result)
+                    let cleanup = close_result.and(mapping_result);
+                    if let Err(error) = &cleanup {
+                        let _ = terminal_error_tx.send(Some(error.clone()));
+                    }
+                    cleanup
                 }
             }))
             .unwrap_or_else(|_| Err(actor_unavailable("camera.worker")));
@@ -334,6 +350,7 @@ fn spawn_worker(
         CameraWorker {
             commands,
             shutdown,
+            admission,
             completion,
             terminal_error,
         },
@@ -490,7 +507,7 @@ impl CameraManager {
                 return Err(actor_unavailable("camera.open"));
             }
             Err(_) => {
-                worker.request_close();
+                worker.request_close().await;
                 self.release_reservation_when_finished(descriptor.id().clone(), id, lease, worker);
                 return Err(open_timeout("camera.open", self.close_timeout)
                     .with_resource_id(descriptor.id().clone()));
@@ -498,7 +515,7 @@ impl CameraManager {
         }
         let mut state = self.state.lock().await;
         if !state.leases.commit(descriptor.id(), &id, &lease) {
-            worker.request_close();
+            worker.request_close().await;
             drop(state);
             self.release_reservation_when_finished(descriptor.id().clone(), id, lease, worker);
             return Err(session_closed("camera.open").with_resource_id(descriptor.id().clone()));
@@ -508,6 +525,7 @@ impl CameraManager {
             Entry {
                 resource: descriptor.id().clone(),
                 owner,
+                lease: lease.clone(),
                 worker: worker.clone(),
             },
         );
@@ -524,14 +542,26 @@ impl CameraManager {
         let mut state = self.state.lock().await;
         let Some(entry) = state.sessions.get(id) else {
             if let Some(closed) = state.closed.get(id) {
-                if let Err(error) =
-                    state
-                        .leases
-                        .validate(&closed.resource, id, &closed.owner, lease, op)
-                {
-                    if error.name().as_str() == "runtime.lease.stale_generation" {
-                        return Err(error);
-                    }
+                let current_generation = state.leases.current_generation(&closed.resource);
+                if lease.generation() < current_generation {
+                    return Err(runtime_error(
+                        "runtime.lease.stale_generation",
+                        ErrorCategory::Conflict,
+                        op,
+                        false,
+                        "lease generation is older than the closed camera session generation",
+                    )
+                    .with_resource_id(closed.resource.clone()));
+                }
+                if lease != &closed.lease {
+                    return Err(runtime_error(
+                        "runtime.lease.invalid_token",
+                        ErrorCategory::Conflict,
+                        op,
+                        false,
+                        "the lease token does not match the closed camera session",
+                    )
+                    .with_resource_id(closed.resource.clone()));
                 }
                 if let Some(error) = &closed.terminal_error {
                     return Err(error.clone().with_resource_id(closed.resource.clone()));
@@ -549,7 +579,7 @@ impl CameraManager {
                 id.clone(),
                 ClosedEntry {
                     resource: entry.resource.clone(),
-                    owner: entry.owner,
+                    lease: entry.lease,
                     terminal_error: entry.worker.terminal_error(),
                 },
             );
@@ -671,7 +701,7 @@ impl CameraManager {
     }
     pub(crate) async fn close(&self, id: SessionId, lease: &LeaseToken) -> HalResult<()> {
         let (worker, resource) = self.worker(&id, lease, "camera.close").await?;
-        worker.request_close();
+        worker.request_close().await;
         self.reap_when_finished(id.clone(), worker.clone());
         match tokio::time::timeout(self.close_timeout, worker.wait_closed()).await {
             Ok(result) => {
@@ -691,12 +721,12 @@ impl CameraManager {
                 .sessions
                 .iter()
                 .filter(|(_, entry)| &entry.owner == owner)
-                .map(|(id, entry)| {
-                    entry.worker.request_close();
-                    (id.clone(), entry.worker.clone(), entry.resource.clone())
-                })
+                .map(|(id, entry)| (id.clone(), entry.worker.clone(), entry.resource.clone()))
                 .collect::<Vec<_>>()
         };
+        for (_, worker, _) in &workers {
+            worker.request_close().await;
+        }
         for (id, worker, _) in &workers {
             self.reap_when_finished(id.clone(), worker.clone());
         }
@@ -727,7 +757,7 @@ async fn finish_session(state: &Mutex<State>, id: &SessionId) {
             id.clone(),
             ClosedEntry {
                 resource: entry.resource.clone(),
-                owner: entry.owner,
+                lease: entry.lease,
                 terminal_error: entry.worker.terminal_error(),
             },
         );

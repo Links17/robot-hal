@@ -49,6 +49,11 @@ pub(crate) fn internal(operation: &'static str, message: String) -> HalError {
 mod tests {
     use super::*;
     use seeed_hal_camera::{CameraFormat, CameraPixelFormat};
+    use std::process::Command;
+
+    const CLOSE_READER_NAME: &str = "SEEED_HAL_CLOSE_READER_NAME";
+    const CLOSE_READER_LENGTH: &str = "SEEED_HAL_CLOSE_READER_LENGTH";
+    const CLOSE_READER_READY: &str = "SEEED_HAL_CLOSE_READER_READY";
 
     fn config() -> RingConfig {
         RingConfig::new(
@@ -108,6 +113,49 @@ mod tests {
         broker.close().unwrap();
 
         assert!(client.copy(lease).unwrap().is_none());
+    }
+
+    #[test]
+    fn close_waits_for_a_reader_then_unlinks_the_mapping() {
+        if let (Ok(name), Ok(length), Ok(ready)) = (
+            std::env::var(CLOSE_READER_NAME),
+            std::env::var(CLOSE_READER_LENGTH),
+            std::env::var(CLOSE_READER_READY),
+        ) {
+            let mapping =
+                crate::platform::Mapping::open_read_only(&name, length.parse().unwrap()).unwrap();
+            mapping.try_lock_shared().unwrap();
+            std::fs::write(ready, []).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            return;
+        }
+
+        let mut broker = BrokerMapping::create(config()).unwrap();
+        let descriptor = broker.descriptor().clone();
+        broker.writer().publish(metadata(1, 1), &[1; 8]).unwrap();
+        let lease = broker.next_frame_lease().unwrap().unwrap();
+
+        let mut reader = ReadOnlyMapping::open(&descriptor).unwrap();
+        let ready =
+            std::env::temp_dir().join(format!("seeed-hal-close-reader-{}", std::process::id()));
+        let _ = std::fs::remove_file(&ready);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::close_waits_for_a_reader_then_unlinks_the_mapping")
+            .arg("--nocapture")
+            .env(CLOSE_READER_NAME, &descriptor.name)
+            .env(CLOSE_READER_LENGTH, descriptor.total_length.to_string())
+            .env(CLOSE_READER_READY, &ready)
+            .spawn()
+            .unwrap();
+        while !ready.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        broker.close().unwrap();
+        assert!(child.wait().unwrap().success());
+        std::fs::remove_file(ready).unwrap();
+        assert!(reader.copy(lease).unwrap().is_none());
+        assert!(ReadOnlyMapping::open(&descriptor).is_err());
     }
 
     #[test]

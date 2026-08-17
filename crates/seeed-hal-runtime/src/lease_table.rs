@@ -191,7 +191,7 @@ impl LeaseTable {
     }
 
     #[cfg(test)]
-    fn current_generation(&self, resource_id: &ResourceId) -> u64 {
+    fn current_generation_for_test(&self, resource_id: &ResourceId) -> u64 {
         self.current_generations
             .get(resource_id)
             .copied()
@@ -200,6 +200,13 @@ impl LeaseTable {
 
     pub(crate) fn retained_generation_count(&self) -> usize {
         self.current_generations.len()
+    }
+
+    pub(crate) fn current_generation(&self, resource_id: &ResourceId) -> u64 {
+        self.current_generations
+            .get(resource_id)
+            .copied()
+            .unwrap_or_default()
     }
 }
 
@@ -233,7 +240,10 @@ mod tests {
             .unwrap();
 
         assert!(second.generation() > first.generation());
-        assert_eq!(leases.current_generation(&resource), second.generation());
+        assert_eq!(
+            leases.current_generation_for_test(&resource),
+            second.generation()
+        );
         assert_eq!(
             leases
                 .validate(&resource, &first_session, &owner, &first, "camera.capture",)
