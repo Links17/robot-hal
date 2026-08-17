@@ -16,13 +16,18 @@ pub use can_conversion::{
     replace_can_filters_request_from_proto, send_can_frames_from_proto,
 };
 pub use conversion::{
-    enumerate_serial_response_from_proto, error_from_proto, gpio_config_from_proto,
-    gpio_edge_event_from_proto, gpio_edge_request_from_proto, gpio_selector_from_proto,
+    enumerate_serial_response_from_proto, error_from_proto, gpio_close_request_from_proto,
+    gpio_config_from_proto, gpio_edge_event_from_proto, gpio_edge_request_from_proto,
+    gpio_next_edge_request_from_proto, gpio_next_edge_response_from_proto,
+    gpio_next_edge_response_to_proto, gpio_read_request_from_proto, gpio_read_response_from_proto,
+    gpio_read_response_to_proto, gpio_selector_from_proto, gpio_write_request_from_proto,
     invalid_message, open_gpio_request_from_proto, open_gpio_response_from_proto,
     open_gpio_response_to_proto, open_serial_request_from_proto, open_serial_response_from_proto,
     open_usb_request_from_proto, open_usb_response_from_proto, open_usb_response_to_proto,
     parse_serial_session_lease, parse_session_lease, serial_selector_from_proto,
-    usb_selector_from_proto, usb_transfer_from_proto,
+    usb_close_request_from_proto, usb_selector_from_proto, usb_transfer_from_proto,
+    usb_transfer_request_from_proto, usb_transfer_response_from_proto,
+    usb_transfer_response_to_proto,
 };
 
 pub const PROTOCOL_MAJOR: u32 = 1;

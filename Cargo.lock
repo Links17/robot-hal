@@ -1038,6 +1038,7 @@ dependencies = [
 name = "seeed-hal-protocol"
 version = "0.2.0"
 dependencies = [
+ "bytes",
  "prost",
  "prost-build",
  "protoc-bin-vendored",

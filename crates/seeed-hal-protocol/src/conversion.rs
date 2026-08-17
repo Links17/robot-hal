@@ -12,7 +12,7 @@ use seeed_hal_gpio::{
 };
 use seeed_hal_runtime::{RuntimeEvent, RuntimeEventKind};
 use seeed_hal_serial::{DataBits, FlowControl, Parity, SerialConfig, StopBits};
-use seeed_hal_usb::{MAX_USB_INTERFACE_NUMBER, UsbTransfer};
+use seeed_hal_usb::{MAX_USB_INTERFACE_NUMBER, MAX_USB_TRANSFER_BYTES, UsbTransfer};
 
 use crate::v1;
 
@@ -39,35 +39,100 @@ pub fn usb_transfer_from_proto(value: v1::UsbTransferRequest) -> HalResult<UsbTr
         .map_err(|_| invalid_message("usb_transfer.max_bytes is invalid"))?;
     let data = value.data.into();
     let transfer = match kind {
-        v1::UsbTransferKind::ControlOut => UsbTransfer::control_out(
-            byte(value.request_type, "usb_transfer.request_type")?,
-            byte(value.request, "usb_transfer.request")?,
-            u16_value(value.value, "usb_transfer.value")?,
-            u16_value(value.index, "usb_transfer.index")?,
-            data,
-        ),
-        v1::UsbTransferKind::ControlIn => UsbTransfer::control_in(
-            byte(value.request_type, "usb_transfer.request_type")?,
-            byte(value.request, "usb_transfer.request")?,
-            u16_value(value.value, "usb_transfer.value")?,
-            u16_value(value.index, "usb_transfer.index")?,
-            max,
-        ),
+        v1::UsbTransferKind::ControlOut => {
+            if value.endpoint != 0 || value.max_bytes != 0 {
+                return Err(invalid_message(
+                    "control-out transfer must not set endpoint or max_bytes",
+                ));
+            }
+            UsbTransfer::control_out(
+                byte(value.request_type, "usb_transfer.request_type")?,
+                byte(value.request, "usb_transfer.request")?,
+                u16_value(value.value, "usb_transfer.value")?,
+                u16_value(value.index, "usb_transfer.index")?,
+                data,
+            )
+        }
+        v1::UsbTransferKind::ControlIn => {
+            if value.endpoint != 0 || !data.is_empty() {
+                return Err(invalid_message(
+                    "control-in transfer must not set endpoint or data",
+                ));
+            }
+            UsbTransfer::control_in(
+                byte(value.request_type, "usb_transfer.request_type")?,
+                byte(value.request, "usb_transfer.request")?,
+                u16_value(value.value, "usb_transfer.value")?,
+                u16_value(value.index, "usb_transfer.index")?,
+                max,
+            )
+        }
         v1::UsbTransferKind::BulkOut => {
+            if value.request_type != 0
+                || value.request != 0
+                || value.value != 0
+                || value.index != 0
+                || value.max_bytes != 0
+            {
+                return Err(invalid_message(
+                    "bulk-out transfer has control or max_bytes fields",
+                ));
+            }
             UsbTransfer::bulk_out(byte(value.endpoint, "usb_transfer.endpoint")?, data)
         }
         v1::UsbTransferKind::BulkIn => {
+            if value.request_type != 0
+                || value.request != 0
+                || value.value != 0
+                || value.index != 0
+                || !data.is_empty()
+            {
+                return Err(invalid_message(
+                    "bulk-in transfer has control or data fields",
+                ));
+            }
             UsbTransfer::bulk_in(byte(value.endpoint, "usb_transfer.endpoint")?, max)
         }
         v1::UsbTransferKind::InterruptOut => {
+            if value.request_type != 0
+                || value.request != 0
+                || value.value != 0
+                || value.index != 0
+                || value.max_bytes != 0
+            {
+                return Err(invalid_message(
+                    "interrupt-out transfer has control or max_bytes fields",
+                ));
+            }
             UsbTransfer::interrupt_out(byte(value.endpoint, "usb_transfer.endpoint")?, data)
         }
         v1::UsbTransferKind::InterruptIn => {
+            if value.request_type != 0
+                || value.request != 0
+                || value.value != 0
+                || value.index != 0
+                || !data.is_empty()
+            {
+                return Err(invalid_message(
+                    "interrupt-in transfer has control or data fields",
+                ));
+            }
             UsbTransfer::interrupt_in(byte(value.endpoint, "usb_transfer.endpoint")?, max)
         }
         v1::UsbTransferKind::Unspecified => Err(invalid_message("usb_transfer.kind is required")),
     };
     transfer.map_err(|_| invalid_message("usb_transfer violates the public USB transfer bounds"))
+}
+
+pub fn usb_transfer_request_from_proto(
+    value: v1::UsbTransferRequest,
+) -> HalResult<(SessionId, LeaseToken, UsbTransfer, Duration)> {
+    let timeout = nonzero_timeout(value.timeout_ms, "usb_transfer.timeout_ms")?;
+    let session_id = value.session_id.clone();
+    let lease = value.lease.clone();
+    let (session, lease) = parse_control_session_lease(session_id, lease, "USB")?;
+    let transfer = usb_transfer_from_proto(value)?;
+    Ok((session, lease, transfer, timeout))
 }
 
 pub fn gpio_config_from_proto(value: v1::GpioLineConfig) -> HalResult<GpioLineConfig> {
@@ -156,6 +221,89 @@ pub fn gpio_edge_request_from_proto(value: v1::GpioNextEdgeRequest) -> HalResult
             .map_err(|_| invalid_message("gpio_next_edge capacity is invalid"))?,
     )
     .map_err(|_| invalid_message("gpio_next_edge capacity violates public bounds"))
+}
+
+pub fn gpio_read_request_from_proto(
+    value: v1::GpioReadRequest,
+) -> HalResult<(SessionId, LeaseToken)> {
+    parse_control_session_lease(value.session_id, value.lease, "GPIO")
+}
+
+pub fn usb_close_request_from_proto(
+    value: v1::CloseUsbRequest,
+) -> HalResult<(SessionId, LeaseToken)> {
+    parse_control_session_lease(value.session_id, value.lease, "USB")
+}
+
+pub fn gpio_close_request_from_proto(
+    value: v1::CloseGpioRequest,
+) -> HalResult<(SessionId, LeaseToken)> {
+    parse_control_session_lease(value.session_id, value.lease, "GPIO")
+}
+
+pub fn gpio_write_request_from_proto(
+    value: v1::GpioWriteRequest,
+) -> HalResult<(SessionId, LeaseToken, Vec<bool>)> {
+    let (session, lease) = parse_control_session_lease(value.session_id, value.lease, "GPIO")?;
+    if value.values.is_empty() || value.values.len() > MAX_GPIO_EVENTS {
+        return Err(invalid_message(
+            "gpio_write values must be non-empty and bounded",
+        ));
+    }
+    Ok((session, lease, value.values))
+}
+
+pub fn gpio_next_edge_request_from_proto(
+    value: v1::GpioNextEdgeRequest,
+) -> HalResult<(SessionId, LeaseToken, GpioEdgeRequest, Duration)> {
+    let timeout = nonzero_timeout(value.timeout_ms, "gpio_next_edge.timeout_ms")?;
+    let session_id = value.session_id.clone();
+    let lease_token = value.lease.clone();
+    let (session, lease) = parse_control_session_lease(session_id, lease_token, "GPIO")?;
+    let request = gpio_edge_request_from_proto(value)?;
+    Ok((session, lease, request, timeout))
+}
+
+pub fn usb_transfer_response_from_proto(value: v1::UsbTransferResponse) -> HalResult<bytes::Bytes> {
+    if value.data.len() > MAX_USB_TRANSFER_BYTES {
+        return Err(invalid_message(
+            "usb_transfer_response data exceeds the public USB transfer bound",
+        ));
+    }
+    Ok(value.data.into())
+}
+
+pub fn usb_transfer_response_to_proto(value: bytes::Bytes) -> v1::UsbTransferResponse {
+    v1::UsbTransferResponse {
+        data: value.to_vec(),
+    }
+}
+
+pub fn gpio_read_response_from_proto(value: v1::GpioReadResponse) -> HalResult<Vec<bool>> {
+    if value.values.is_empty() || value.values.len() > MAX_GPIO_EVENTS {
+        return Err(invalid_message(
+            "gpio_read_response values must be non-empty and bounded",
+        ));
+    }
+    Ok(value.values)
+}
+
+pub fn gpio_read_response_to_proto(values: &[bool]) -> v1::GpioReadResponse {
+    v1::GpioReadResponse {
+        values: values.to_vec(),
+    }
+}
+
+pub fn gpio_next_edge_response_from_proto(
+    value: v1::GpioNextEdgeResponse,
+) -> HalResult<Option<GpioEdgeEvent>> {
+    value.event.map(gpio_edge_event_from_proto).transpose()
+}
+
+pub fn gpio_next_edge_response_to_proto(value: Option<GpioEdgeEvent>) -> v1::GpioNextEdgeResponse {
+    v1::GpioNextEdgeResponse {
+        event: value.as_ref().map(Into::into),
+    }
 }
 
 pub fn open_usb_response_from_proto(
@@ -541,6 +689,15 @@ fn parse_control_session_lease(
         )));
     }
     Ok((session, lease))
+}
+
+fn nonzero_timeout(value: u64, field: &'static str) -> HalResult<Duration> {
+    if value == 0 {
+        return Err(invalid_message(format!(
+            "{field} must be greater than zero"
+        )));
+    }
+    Ok(Duration::from_millis(value))
 }
 
 fn selector_for_transport(

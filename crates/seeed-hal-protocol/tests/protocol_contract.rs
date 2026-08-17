@@ -119,6 +119,284 @@ fn usb_and_gpio_minor_two_requests_reject_transport_and_public_bounds() {
     assert_eq!(error.name().as_str(), "runtime.protocol.invalid_message");
 }
 
+#[test]
+fn usb_and_gpio_operations_validate_session_leases_timeouts_and_payloads() {
+    for lease in [None, Some(v1::LeaseToken::default())] {
+        let error = seeed_hal_protocol::usb_transfer_request_from_proto(v1::UsbTransferRequest {
+            session_id: "session-usb".to_owned(),
+            lease,
+            kind: v1::UsbTransferKind::BulkIn as i32,
+            endpoint: 0x81,
+            max_bytes: 1,
+            timeout_ms: 1,
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert_eq!(error.name().as_str(), "runtime.protocol.invalid_message");
+    }
+
+    for request in [
+        v1::UsbTransferRequest {
+            session_id: "session-usb".to_owned(),
+            lease: Some(valid_lease()),
+            kind: v1::UsbTransferKind::BulkOut as i32,
+            endpoint: 1,
+            data: vec![1],
+            max_bytes: 1,
+            timeout_ms: 1,
+            ..Default::default()
+        },
+        v1::UsbTransferRequest {
+            session_id: "session-usb".to_owned(),
+            lease: Some(valid_lease()),
+            kind: v1::UsbTransferKind::BulkIn as i32,
+            endpoint: 0x81,
+            data: vec![1],
+            max_bytes: 1,
+            timeout_ms: 1,
+            ..Default::default()
+        },
+        v1::UsbTransferRequest {
+            session_id: "session-usb".to_owned(),
+            lease: Some(valid_lease()),
+            kind: v1::UsbTransferKind::BulkIn as i32,
+            endpoint: 0x81,
+            max_bytes: 1,
+            timeout_ms: 0,
+            ..Default::default()
+        },
+    ] {
+        assert_eq!(
+            seeed_hal_protocol::usb_transfer_request_from_proto(request)
+                .unwrap_err()
+                .name()
+                .as_str(),
+            "runtime.protocol.invalid_message"
+        );
+    }
+
+    assert_eq!(
+        seeed_hal_protocol::gpio_read_request_from_proto(v1::GpioReadRequest {
+            session_id: String::new(),
+            lease: Some(valid_lease()),
+        })
+        .unwrap_err()
+        .name()
+        .as_str(),
+        "runtime.protocol.invalid_message"
+    );
+    assert_eq!(
+        seeed_hal_protocol::gpio_write_request_from_proto(v1::GpioWriteRequest {
+            session_id: "session-gpio".to_owned(),
+            lease: Some(valid_lease()),
+            values: vec![],
+        })
+        .unwrap_err()
+        .name()
+        .as_str(),
+        "runtime.protocol.invalid_message"
+    );
+    assert_eq!(
+        seeed_hal_protocol::gpio_next_edge_request_from_proto(v1::GpioNextEdgeRequest {
+            session_id: "session-gpio".to_owned(),
+            lease: Some(valid_lease()),
+            rising: true,
+            capacity: 1,
+            timeout_ms: 0,
+            ..Default::default()
+        })
+        .unwrap_err()
+        .name()
+        .as_str(),
+        "runtime.protocol.invalid_message"
+    );
+}
+
+#[test]
+fn all_usb_gpio_envelope_and_nested_field_tags_are_locked() {
+    let cases = [
+        (
+            62,
+            envelope::Payload::EnumerateUsbRequest(v1::EnumerateUsbRequest {}),
+        ),
+        (
+            63,
+            envelope::Payload::EnumerateUsbResponse(v1::EnumerateUsbResponse::default()),
+        ),
+        (
+            64,
+            envelope::Payload::OpenUsbRequest(v1::OpenUsbRequest::default()),
+        ),
+        (
+            65,
+            envelope::Payload::OpenUsbResponse(v1::OpenUsbResponse::default()),
+        ),
+        (
+            66,
+            envelope::Payload::UsbTransferRequest(v1::UsbTransferRequest::default()),
+        ),
+        (
+            67,
+            envelope::Payload::UsbTransferResponse(v1::UsbTransferResponse::default()),
+        ),
+        (
+            68,
+            envelope::Payload::CloseUsbRequest(v1::CloseUsbRequest::default()),
+        ),
+        (69, envelope::Payload::CloseUsbResponse(v1::Empty {})),
+        (
+            70,
+            envelope::Payload::EnumerateGpioRequest(v1::EnumerateGpioRequest {}),
+        ),
+        (
+            71,
+            envelope::Payload::EnumerateGpioResponse(v1::EnumerateGpioResponse::default()),
+        ),
+        (
+            72,
+            envelope::Payload::OpenGpioRequest(v1::OpenGpioRequest::default()),
+        ),
+        (
+            73,
+            envelope::Payload::OpenGpioResponse(v1::OpenGpioResponse::default()),
+        ),
+        (
+            74,
+            envelope::Payload::GpioReadRequest(v1::GpioReadRequest::default()),
+        ),
+        (
+            75,
+            envelope::Payload::GpioReadResponse(v1::GpioReadResponse::default()),
+        ),
+        (
+            76,
+            envelope::Payload::GpioWriteRequest(v1::GpioWriteRequest::default()),
+        ),
+        (77, envelope::Payload::GpioWriteResponse(v1::Empty {})),
+        (
+            78,
+            envelope::Payload::GpioNextEdgeRequest(v1::GpioNextEdgeRequest::default()),
+        ),
+        (
+            79,
+            envelope::Payload::GpioNextEdgeResponse(v1::GpioNextEdgeResponse::default()),
+        ),
+        (
+            80,
+            envelope::Payload::CloseGpioRequest(v1::CloseGpioRequest::default()),
+        ),
+        (81, envelope::Payload::CloseGpioResponse(v1::Empty {})),
+    ];
+    for (tag, payload) in cases {
+        assert_eq!(
+            top_level_fields(&envelope_with(payload).encode_to_vec()),
+            vec![1, tag]
+        );
+    }
+
+    assert_tags(
+        &v1::UsbTransferRequest {
+            session_id: "session".to_owned(),
+            lease: Some(valid_lease()),
+            kind: v1::UsbTransferKind::ControlOut as i32,
+            request_type: 1,
+            request: 1,
+            value: 1,
+            index: 1,
+            endpoint: 1,
+            data: vec![1],
+            max_bytes: 1,
+            timeout_ms: 1,
+        },
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+    );
+    assert_tags(&v1::UsbTransferResponse { data: vec![1] }, &[1]);
+    assert_tags(
+        &v1::GpioLineConfig {
+            direction: v1::GpioDirection::Output as i32,
+            active_low: true,
+            bias: v1::GpioBias::PullUp as i32,
+            drive: v1::GpioDrive::OpenDrain as i32,
+            initial_value: Some(true),
+        },
+        &[1, 2, 3, 4, 5],
+    );
+    assert_tags(
+        &v1::GpioNextEdgeRequest {
+            session_id: "session".to_owned(),
+            lease: Some(valid_lease()),
+            rising: true,
+            falling: true,
+            capacity: 1,
+            timeout_ms: 1,
+        },
+        &[1, 2, 3, 4, 5, 6],
+    );
+    assert_tags(
+        &v1::GpioEdgeEvent {
+            edge: v1::GpioEdge::Rising as i32,
+            monotonic_ns: 1,
+            sequence: 1,
+        },
+        &[1, 2, 3],
+    );
+}
+
+#[test]
+fn usb_gpio_response_and_close_conversions_round_trip_without_defaulting() {
+    let session = seeed_hal_core::SessionId::parse("session-usb-gpio-ops").unwrap();
+    let lease = LeaseToken::new(
+        LeaseId::parse("lease-usb-gpio-ops").unwrap(),
+        9,
+        LeaseMode::Control,
+    );
+    assert_eq!(
+        seeed_hal_protocol::usb_close_request_from_proto(v1::CloseUsbRequest {
+            session_id: session.as_str().to_owned(),
+            lease: Some((&lease).into()),
+        })
+        .unwrap(),
+        (session.clone(), lease.clone())
+    );
+    assert_eq!(
+        seeed_hal_protocol::gpio_close_request_from_proto(v1::CloseGpioRequest {
+            session_id: session.as_str().to_owned(),
+            lease: Some((&lease).into()),
+        })
+        .unwrap(),
+        (session.clone(), lease.clone())
+    );
+    assert_eq!(
+        seeed_hal_protocol::usb_transfer_response_from_proto(
+            seeed_hal_protocol::usb_transfer_response_to_proto(bytes::Bytes::from_static(b"usb"))
+        )
+        .unwrap(),
+        bytes::Bytes::from_static(b"usb")
+    );
+    assert_eq!(
+        seeed_hal_protocol::gpio_read_response_from_proto(
+            seeed_hal_protocol::gpio_read_response_to_proto(&[true, false])
+        )
+        .unwrap(),
+        vec![true, false]
+    );
+    let event = GpioEdgeEvent::new(GpioEdge::Rising, 7, 1);
+    assert_eq!(
+        seeed_hal_protocol::gpio_next_edge_response_from_proto(
+            seeed_hal_protocol::gpio_next_edge_response_to_proto(Some(event))
+        )
+        .unwrap(),
+        Some(event)
+    );
+    assert_eq!(
+        seeed_hal_protocol::gpio_next_edge_response_from_proto(
+            seeed_hal_protocol::gpio_next_edge_response_to_proto(None)
+        )
+        .unwrap(),
+        None
+    );
+}
+
 fn envelope_with(payload: envelope::Payload) -> v1::Envelope {
     v1::Envelope {
         request_id: 7,

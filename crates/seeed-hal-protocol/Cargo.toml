@@ -7,6 +7,7 @@ license.workspace = true
 build = "build.rs"
 
 [dependencies]
+bytes = { workspace = true }
 prost = { workspace = true }
 seeed-hal-can = { path = "../seeed-hal-can" }
 seeed-hal-core = { path = "../seeed-hal-core" }
