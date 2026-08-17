@@ -479,16 +479,63 @@ async fn minor_two_handshake_enumerates_usb_and_gpio() {
     client
         .request(envelope::Payload::HandshakeRequest(handshake))
         .await;
-    for payload in [
-        envelope::Payload::EnumerateUsbRequest(v1::EnumerateUsbRequest {}),
-        envelope::Payload::EnumerateGpioRequest(v1::EnumerateGpioRequest {}),
-    ] {
-        let response = client.request(payload).await;
-        assert!(!matches!(
-            response.payload,
-            Some(envelope::Payload::Error(_))
-        ));
-    }
+    let usb = client
+        .request(envelope::Payload::EnumerateUsbRequest(
+            v1::EnumerateUsbRequest {},
+        ))
+        .await;
+    let usb = match usb.payload {
+        Some(envelope::Payload::EnumerateUsbResponse(response)) => {
+            response.resources.into_iter().next().unwrap()
+        }
+        other => panic!("expected USB enumeration, got {other:?}"),
+    };
+    let gpio = client
+        .request(envelope::Payload::EnumerateGpioRequest(
+            v1::EnumerateGpioRequest {},
+        ))
+        .await;
+    let gpio = match gpio.payload {
+        Some(envelope::Payload::EnumerateGpioResponse(response)) => {
+            response.resources.into_iter().next().unwrap()
+        }
+        other => panic!("expected GPIO enumeration, got {other:?}"),
+    };
+    let usb_open = client
+        .request(envelope::Payload::OpenUsbRequest(v1::OpenUsbRequest {
+            selector: Some(v1::ResourceSelector {
+                resource_id: usb.resource_id,
+                minimum_identity_quality: usb.identity_quality,
+                transport: usb.transport,
+            }),
+            interface_number: 0,
+        }))
+        .await;
+    assert!(matches!(
+        usb_open.payload,
+        Some(envelope::Payload::OpenUsbResponse(_))
+    ));
+    let gpio_open = client
+        .request(envelope::Payload::OpenGpioRequest(v1::OpenGpioRequest {
+            selector: Some(v1::ResourceSelector {
+                resource_id: gpio.resource_id,
+                minimum_identity_quality: gpio.identity_quality,
+                transport: gpio.transport,
+            }),
+            lines: vec![0],
+            config: Some(v1::GpioLineConfig {
+                direction: v1::GpioDirection::Input as i32,
+                active_low: false,
+                bias: v1::GpioBias::Disabled as i32,
+                drive: v1::GpioDrive::Unspecified as i32,
+                initial_value: None,
+            }),
+        }))
+        .await;
+    assert!(matches!(
+        gpio_open.payload,
+        Some(envelope::Payload::OpenGpioResponse(_))
+    ));
     drop(client);
     assert!(server.await.unwrap().cleanup_error().is_none());
 }

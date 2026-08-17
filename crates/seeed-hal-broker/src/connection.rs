@@ -10,7 +10,7 @@ use seeed_hal_core::{ErrorCategory, HalError, HalResult, OwnerId, SessionId};
 use seeed_hal_protocol::v1::{self, envelope};
 use seeed_hal_protocol::{
     MAX_FRAME_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR_MAXIMUM, PROTOCOL_MINOR_MINIMUM,
-    handshake_minor_range, invalid_message, negotiate_protocol_minor,
+    gpio_config_from_proto, handshake_minor_range, invalid_message, negotiate_protocol_minor,
     open_serial_request_from_proto, parse_serial_session_lease, parse_session_lease,
 };
 use seeed_hal_runtime::{HalRuntime, RuntimeEvent, RuntimeEventKind};
@@ -873,6 +873,42 @@ async fn dispatch_operation_inner(
             Ok(envelope::Payload::EnumerateGpioResponse(
                 v1::EnumerateGpioResponse { resources },
             ))
+        }
+        Some(envelope::Payload::OpenUsbRequest(request)) => {
+            let selector = request
+                .selector
+                .ok_or_else(|| invalid_message("usb open selector is required"))?
+                .try_into()?;
+            let interface = u8::try_from(request.interface_number)
+                .map_err(|_| invalid_message("USB interface number exceeds u8"))?;
+            let handle = runtime.open_usb(owner, selector, interface).await?;
+            let (session_id, lease) = handle.into_parts();
+            Ok(envelope::Payload::OpenUsbResponse(v1::OpenUsbResponse {
+                session_id: session_id.as_str().to_owned(),
+                lease: Some((&lease).into()),
+            }))
+        }
+        Some(envelope::Payload::OpenGpioRequest(request)) => {
+            if request.lines.is_empty() {
+                return Err(invalid_message("GPIO open requires at least one line"));
+            }
+            let selector = request
+                .selector
+                .ok_or_else(|| invalid_message("GPIO open selector is required"))?
+                .try_into()?;
+            let config = gpio_config_from_proto(
+                request
+                    .config
+                    .ok_or_else(|| invalid_message("GPIO line configuration is required"))?,
+            )?;
+            let handle = runtime
+                .open_gpio(owner, selector, request.lines, config)
+                .await?;
+            let (session_id, lease) = handle.into_parts();
+            Ok(envelope::Payload::OpenGpioResponse(v1::OpenGpioResponse {
+                session_id: session_id.as_str().to_owned(),
+                lease: Some((&lease).into()),
+            }))
         }
         Some(envelope::Payload::EnumerateSerialRequest(_)) => {
             let resources = runtime

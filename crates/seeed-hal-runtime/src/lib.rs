@@ -650,6 +650,10 @@ impl GpioHandle {
     pub fn lease_token(&self) -> &LeaseToken {
         &self.lease
     }
+    pub fn into_parts(mut self) -> (SessionId, LeaseToken) {
+        self.closed = true;
+        (self.session_id.clone(), self.lease.clone())
+    }
     pub async fn read(&self) -> HalResult<Vec<bool>> {
         self.runtime.gpio_read(self.session_id(), &self.lease).await
     }
@@ -684,6 +688,10 @@ impl UsbHandle {
     }
     pub fn lease_token(&self) -> &LeaseToken {
         &self.lease
+    }
+    pub fn into_parts(mut self) -> (SessionId, LeaseToken) {
+        self.closed = true;
+        (self.session_id.clone(), self.lease.clone())
     }
     pub async fn transfer(&self, transfer: UsbTransfer, timeout: Duration) -> HalResult<Bytes> {
         self.runtime
