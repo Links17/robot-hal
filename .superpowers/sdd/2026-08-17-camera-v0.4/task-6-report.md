@@ -267,3 +267,50 @@ close behavior, and hot-unplug coverage were not relaxed.
   callback and `Flush` cancellation contract. Real-device qualification must
   still verify prompt driver cancellation/hot-unplug behavior and each
   advertised source format on supported Windows releases.
+
+## Media Foundation teardown remediation
+
+- Root cause: `MediaFoundationSession::close` returned a timeout from its
+  bounded join, then session `Drop` unconditionally removed the resource
+  claim. The original Media Foundation worker could therefore still own the
+  source and reader while a second session opened the same resource.
+- Close now transfers the worker handle to a dedicated native reaper before
+  awaiting the one-second close bound. The reaper joins the old worker and
+  releases the claim only after the worker has unwound and dropped its native
+  source/reader references. A timed-out close returns structured
+  `runtime.adapter.close_timeout` (`Unavailable`, retryable) while retaining
+  the claim as a quarantine fence. A successful join releases the claim
+  synchronously. `Drop` only signals shutdown and hands any remaining worker
+  to the same reaper; it never releases a claim for an unknown or running
+  worker.
+- The reaper is a dedicated OS thread, so neither joining nor the potentially
+  delayed worker teardown blocks a Tokio executor. It neither force-kills the
+  worker nor holds the claim mutex across an await. Ownership of the worker
+  handle moves exactly once to the reaper, preventing join detachment from
+  leaking claims or causing a double release.
+
+## Media Foundation teardown TDD evidence
+
+- Red:
+  `cargo test -p seeed-hal-adapter-mediafoundation --all-features
+  quarantine_retains_claim_until_the_old_worker_exits -- --exact` failed before
+  implementation because the portable quarantine/reaper API did not exist.
+- Green:
+  the same regression test passes after the reaper implementation. It models
+  a timed-out native worker, verifies the claim remains present and conflicts
+  with a second open attempt, then verifies release only after the worker has
+  actually exited.
+
+## Media Foundation teardown verification and limitation
+
+- Passed:
+  `cargo fmt --all --check`
+- Passed:
+  `cargo test -p seeed-hal-adapter-mediafoundation --all-features`
+- Passed:
+  `cargo clippy -p seeed-hal-adapter-mediafoundation --all-targets --all-features -- -D warnings`
+- Passed:
+  `cargo check -p seeed-hal-adapter-mediafoundation --target x86_64-pc-windows-gnu`
+- The cross-target check validates the Windows binding type path, but no
+  Windows runtime, camera device, or hardware test was available on this macOS
+  host to force a real Media Foundation worker join timeout.

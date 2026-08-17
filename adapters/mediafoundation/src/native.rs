@@ -10,9 +10,9 @@ use seeed_hal_core::{
     ResourceDescriptor, ResourceProperties, ResourceSelector, TransportKind, resolve_resource,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
@@ -37,7 +37,7 @@ use windows::{
     core::{HRESULT, implement},
 };
 
-use super::encode_resource_id;
+use super::{Claims, encode_resource_id, quarantine_claim_until_worker_exits};
 use windows::Win32::Media::MediaFoundation::IMFSourceReaderCallback_Impl;
 
 const CLOCK_DOMAIN: &str = "mediafoundation.receipt.monotonic";
@@ -55,7 +55,7 @@ pub(super) fn enumerate_sync() -> HalResult<Vec<ResourceDescriptor>> {
 pub(super) fn open_sync(
     selector: &ResourceSelector,
     request: &CameraRequest,
-    claims: Arc<Mutex<BTreeSet<seeed_hal_core::ResourceId>>>,
+    claims: Claims,
 ) -> HalResult<Box<dyn CameraCaptureSession>> {
     request.format().validate()?;
     let devices = devices()?;
@@ -78,9 +78,10 @@ pub(super) fn open_sync(
         let mut claimed = claims
             .lock()
             .expect("Media Foundation claim mutex poisoned");
-        if !claimed.insert(descriptor.id().clone()) {
+        if claimed.contains(descriptor.id()) {
             return Err(conflict("camera.open", &descriptor));
         }
+        claimed.insert(descriptor.id().clone());
     }
     match start_worker(
         device.symbolic_link,
@@ -676,7 +677,7 @@ struct MediaFoundationSession {
     sender: Option<SyncSender<Command>>,
     worker: Option<thread::JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
-    claims: Arc<Mutex<BTreeSet<seeed_hal_core::ResourceId>>>,
+    claims: Claims,
     closed: bool,
 }
 
@@ -741,19 +742,21 @@ impl CameraCaptureSession for MediaFoundationSession {
             let _ = sender.try_send(Command::Close);
         }
         if let Some(worker) = self.worker.take() {
-            tokio::time::timeout(
-                CLOSE_TIMEOUT,
-                tokio::task::spawn_blocking(move || worker.join()),
-            )
-            .await
-            .map_err(|_| timeout_error("camera.close", &self.descriptor))?
-            .map_err(|error| worker_failed("camera.close", error))?
-            .map_err(|_| platform_error("camera.close", "Media Foundation worker panicked"))?;
+            let mut reaped = quarantine_claim_until_worker_exits(
+                worker,
+                Arc::clone(&self.claims),
+                self.descriptor.id().clone(),
+            );
+            match tokio::time::timeout(CLOSE_TIMEOUT, &mut reaped).await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(_))) => Err(platform_error(
+                    "camera.close",
+                    "Media Foundation worker panicked",
+                )),
+                Ok(Err(_)) => Err(platform_error("camera.close", "quarantine reaper failed")),
+                Err(_) => Err(close_timeout_error(&self.descriptor)),
+            }?;
         }
-        self.claims
-            .lock()
-            .expect("Media Foundation claim mutex poisoned")
-            .remove(self.descriptor.id());
         Ok(())
     }
 }
@@ -764,10 +767,13 @@ impl Drop for MediaFoundationSession {
         if let Some(sender) = self.sender.take() {
             let _ = sender.try_send(Command::Close);
         }
-        self.claims
-            .lock()
-            .expect("Media Foundation claim mutex poisoned")
-            .remove(self.descriptor.id());
+        if let Some(worker) = self.worker.take() {
+            let _ = quarantine_claim_until_worker_exits(
+                worker,
+                Arc::clone(&self.claims),
+                self.descriptor.id().clone(),
+            );
+        }
     }
 }
 
@@ -869,6 +875,18 @@ fn timeout_error(operation: &'static str, descriptor: &ResourceDescriptor) -> Ha
     .with_resource_id(descriptor.id().clone())
 }
 
+fn close_timeout_error(descriptor: &ResourceDescriptor) -> HalError {
+    HalError::new(
+        "runtime.adapter.close_timeout",
+        ErrorCategory::Unavailable,
+        "camera.close",
+        true,
+        "Media Foundation worker did not release the camera before close timed out",
+    )
+    .expect("static Media Foundation close timeout metadata is valid")
+    .with_resource_id(descriptor.id().clone())
+}
+
 fn closed(operation: &'static str, descriptor: &ResourceDescriptor) -> HalError {
     HalError::new(
         "runtime.session.closed",
@@ -890,15 +908,4 @@ fn platform_error(operation: &'static str, error: impl std::fmt::Display) -> Hal
         format!("Media Foundation error: {error}"),
     )
     .expect("static Media Foundation platform metadata is valid")
-}
-
-fn worker_failed(operation: &'static str, error: tokio::task::JoinError) -> HalError {
-    HalError::new(
-        "runtime.internal.worker_failed",
-        ErrorCategory::Internal,
-        operation,
-        false,
-        format!("Media Foundation worker failed: {error}"),
-    )
-    .expect("static Media Foundation worker metadata is valid")
 }
