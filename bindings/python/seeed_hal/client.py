@@ -68,9 +68,12 @@ from .gpio import (
     GpioEdgeRequest, GpioLineConfig, GpioSession, MAX_GPIO_EVENTS,
 )
 from .camera import (
+    CameraControlDescriptor,
     CameraFormat,
     CameraSession,
+    ControlEnumValues,
     ControlKind,
+    ControlRange,
     ControlValue,
     FrameLease,
     MappingDescriptor,
@@ -1321,6 +1324,30 @@ class HalClient:
             raise error
         return response.dropped_count
 
+    async def _camera_controls(
+        self, session: CameraSession
+    ) -> list[CameraControlDescriptor]:
+        self._require_camera_capability(
+            "camera.controls", CAMERA_CONTROLS_CAPABILITY, session._resource_id
+        )
+        response = await self._request(
+            "camera_controls_request",
+            hal_pb2.CameraControlsRequest(
+                session_id=session._session_id, lease=self._camera_lease(session)
+            ),
+            "camera_controls_response",
+            resource_id=session._resource_id,
+        )
+        assert isinstance(response, hal_pb2.CameraControlsResponse)
+        try:
+            if len(response.controls) > 4:
+                raise ValueError
+            return [_camera_control_descriptor_from_proto(item) for item in response.controls]
+        except (ValueError, HalError) as error:
+            invalid = _invalid_message("broker returned invalid camera controls")
+            self._terminate(invalid)
+            raise invalid from error
+
     async def _camera_get_control(
         self, session: CameraSession, kind: ControlKind
     ) -> ControlValue:
@@ -2378,6 +2405,46 @@ def _camera_control_value_from_proto(value: hal_pb2.CameraControlValue) -> Contr
     if kind == "enum_value":
         return ControlValue(enum=value.enum_value)
     raise _invalid_message("broker returned invalid camera control value")
+
+
+def _camera_control_descriptor_from_proto(
+    value: hal_pb2.CameraControlDescriptor,
+) -> CameraControlDescriptor:
+    kinds = {
+        hal_pb2.CAMERA_CONTROL_KIND_EXPOSURE: ControlKind.EXPOSURE,
+        hal_pb2.CAMERA_CONTROL_KIND_GAIN: ControlKind.GAIN,
+        hal_pb2.CAMERA_CONTROL_KIND_WHITE_BALANCE: ControlKind.WHITE_BALANCE,
+        hal_pb2.CAMERA_CONTROL_KIND_FOCUS: ControlKind.FOCUS,
+    }
+    try:
+        if not value.HasField("values"):
+            raise ValueError
+        representation = value.values.WhichOneof("values")
+        if representation == "range":
+            range_values = value.values.range
+            values: ControlRange | ControlEnumValues = ControlRange(
+                range_values.minimum, range_values.maximum, range_values.step
+            )
+        elif representation == "enumerated":
+            values = ControlEnumValues(
+                tuple(
+                    _camera_control_value_from_proto(item)
+                    for item in value.values.enumerated.values
+                )
+            )
+        else:
+            raise ValueError
+        return CameraControlDescriptor(
+            kinds[value.kind],
+            value.readable,
+            value.writable,
+            value.auto_supported,
+            values,
+            value.current_value_available,
+            value.diagnostic or None,
+        )
+    except (KeyError, TypeError, ValueError, HalError) as error:
+        raise _invalid_message("broker returned invalid camera control descriptor") from error
 
 
 def _camera_mapping_descriptor_from_proto(

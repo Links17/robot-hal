@@ -63,6 +63,72 @@ class ControlValue:
             raise _invalid("camera enum control value is invalid")
 
 
+@dataclass(frozen=True, slots=True)
+class ControlRange:
+    minimum: int
+    maximum: int
+    step: int
+
+    def __post_init__(self) -> None:
+        if (
+            not all(_plain_int(value) for value in (self.minimum, self.maximum, self.step))
+            or self.minimum > self.maximum
+            or self.step <= 0
+        ):
+            raise _invalid("camera control range is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ControlEnumValues:
+    values: tuple[ControlValue, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.values, tuple)
+            or not self.values
+            or len(self.values) > 64
+            or any(not isinstance(value, ControlValue) for value in self.values)
+        ):
+            raise _invalid("camera control enum values are invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class CameraControlDescriptor:
+    kind: ControlKind
+    readable: bool
+    writable: bool
+    auto_supported: bool
+    values: ControlRange | ControlEnumValues
+    current_value_available: bool
+    diagnostic: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.kind, ControlKind)
+            or not all(
+                isinstance(value, bool)
+                for value in (
+                    self.readable,
+                    self.writable,
+                    self.auto_supported,
+                    self.current_value_available,
+                )
+            )
+            or not isinstance(self.values, (ControlRange, ControlEnumValues))
+            or (not self.readable and self.current_value_available)
+            or (
+                self.diagnostic is not None
+                and (
+                    not isinstance(self.diagnostic, str)
+                    or not self.diagnostic
+                    or not self.diagnostic.isascii()
+                    or len(self.diagnostic) > 255
+                )
+            )
+        ):
+            raise _invalid("camera control descriptor is invalid")
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class MappingDescriptor:
     mapping_name: str
@@ -241,6 +307,11 @@ class CameraSession:
         self._ensure_open("camera.dropped_count")
         assert self._client is not None
         return await self._client._camera_dropped_count(self)
+
+    async def controls(self) -> list[CameraControlDescriptor]:
+        self._ensure_open("camera.controls")
+        assert self._client is not None
+        return await self._client._camera_controls(self)
 
     async def get_control(self, kind: ControlKind) -> ControlValue:
         self._ensure_open("camera.control.get")

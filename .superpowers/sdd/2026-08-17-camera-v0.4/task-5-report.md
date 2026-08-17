@@ -102,3 +102,43 @@
   `cargo test -p seeed-hal-protocol`;
   `cargo test -p seeed-hal-adapter-shared-memory`; and
   `uv run pytest tests/test_camera_contract.py`.
+
+## Python controls discovery follow-up
+
+### API decision
+
+- Python now exposes immutable `CameraControlDescriptor`, `ControlRange`, and
+  `ControlEnumValues` values from `seeed_hal`. A descriptor keeps the
+  standardized `ControlKind`, access and auto flags, one validated range or
+  enum domain, current-value availability, and an optional adapter diagnostic.
+- `CameraSession.controls()` is the public discovery API. It delegates only to
+  the private `HalClient._camera_controls()` RPC path; existing `get_control`,
+  `set_control`, and `set_auto` behavior remains unchanged.
+- Discovery requires negotiated minor 3 and `camera.controls/v1`. It validates
+  every returned descriptor with the same contract as Rust/protobuf: at most
+  four descriptors; a known kind; exactly one values representation; ordered
+  ranges with positive steps; nonempty enumerations of at most 64 valid
+  `ControlValue` values; ASCII diagnostics of at most 255 bytes; and no
+  current value for an unreadable control. Invalid responses terminate the
+  Python client through its established protocol-invalid-message path.
+
+### TDD and verification
+
+- Red:
+  `uv run pytest tests/test_camera_contract.py -k 'control_discovery or fake_broker_wires_capture_mapping_lease_controls_and_close or malformed_camera_controls_response'`
+  failed at collection because `CameraControlDescriptor` was absent from the
+  public `seeed_hal` API.
+- Green: reran that command successfully after the minimum public models,
+  controls RPC, and strict response conversion were added: 3 passed.
+- Focused Camera coverage:
+  `uv run pytest tests/test_camera_contract.py` — 8 passed.
+- Python bindings suite:
+  `uv run pytest tests` — 187 passed.
+- Rust workspace formatting:
+  `cargo fmt --all --check` — passed. No Rust code changed for this follow-up.
+- Relevant edited-file lint diagnostics — no errors.
+
+### Scope retained
+
+- No Camera frame payload protobuf data, Python reader/native adapter, or
+  unrelated cleanup was added.
