@@ -11,6 +11,7 @@ use std::{
 
 #[cfg(target_os = "linux")]
 mod native;
+mod wait;
 
 #[cfg_attr(not(target_os = "linux"), derive(Clone, Copy, Debug, Default))]
 #[cfg_attr(target_os = "linux", derive(Clone, Debug))]

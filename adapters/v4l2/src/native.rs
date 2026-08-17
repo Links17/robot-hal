@@ -13,7 +13,11 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     path::Path,
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -23,14 +27,22 @@ use v4l::{
     buffer::{Flags as BufferFlags, Type},
     capability::Flags as CapabilityFlags,
     format::{Format as V4lFormat, FourCC},
-    io::{mmap::Stream, traits::CaptureStream},
+    io::{
+        mmap::Stream,
+        traits::{CaptureStream, Stream as V4lStream},
+    },
     video::traits::Capture,
 };
 
-use super::encode_resource_id;
+use super::{
+    encode_resource_id,
+    wait::{WaitResult, bounded_wait},
+};
 
 const CLOCK_DOMAIN: &str = "v4l2.receipt.monotonic";
 const V4L2_BUFFER_COUNT: u32 = 4;
+const V4L2_WAIT_QUANTUM: Duration = Duration::from_millis(20);
+const V4L2_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub(super) fn enumerate_sync() -> HalResult<Vec<ResourceDescriptor>> {
     let paths =
@@ -68,11 +80,12 @@ pub(super) fn open_sync(
         }
     }
     match start_worker(descriptor.clone(), request.format().clone()) {
-        Ok((sender, worker)) => Ok(Box::new(V4l2Session {
+        Ok((sender, worker, shutdown)) => Ok(Box::new(V4l2Session {
             descriptor,
             format: request.format().clone(),
             sender: Some(sender),
             worker: Some(worker),
+            shutdown,
             claims,
             closed: false,
         })),
@@ -210,21 +223,38 @@ fn identity_from_serial_or_sysfs_path(
 fn start_worker(
     descriptor: ResourceDescriptor,
     requested: CameraFormat,
-) -> HalResult<(mpsc::SyncSender<Command>, thread::JoinHandle<()>)> {
+) -> HalResult<(
+    mpsc::SyncSender<Command>,
+    thread::JoinHandle<()>,
+    Arc<AtomicBool>,
+)> {
     let (sender, receiver) = mpsc::sync_channel(1);
     let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let worker_shutdown = Arc::clone(&shutdown);
     let worker = thread::Builder::new()
         .name("seeed-hal-v4l2-capture".to_owned())
-        .spawn(move || capture_worker(requested, descriptor, receiver, ready_sender))
+        .spawn(move || {
+            capture_worker(
+                requested,
+                descriptor,
+                receiver,
+                ready_sender,
+                worker_shutdown,
+            )
+        })
         .map_err(|error| platform_error("camera.open", error))?;
     ready_receiver
         .recv()
         .map_err(|_| platform_error("camera.open", "V4L2 capture worker exited before setup"))??;
-    Ok((sender, worker))
+    Ok((sender, worker, shutdown))
 }
 
 enum Command {
-    Capture(oneshot::Sender<HalResult<CameraFrame>>),
+    Capture {
+        deadline: Instant,
+        response: oneshot::Sender<HalResult<CameraFrame>>,
+    },
     Close,
 }
 
@@ -233,6 +263,7 @@ fn capture_worker(
     descriptor: ResourceDescriptor,
     receiver: mpsc::Receiver<Command>,
     ready: mpsc::SyncSender<HalResult<usize>>,
+    shutdown: Arc<AtomicBool>,
 ) {
     let device = match Device::with_path(descriptor.endpoint().as_str()) {
         Ok(device) => device,
@@ -280,13 +311,46 @@ fn capture_worker(
     let mut sequence = 1_u64;
     while let Ok(command) = receiver.recv() {
         match command {
-            Command::Capture(response) => {
-                let result =
-                    capture_one(&mut stream, &format, stride, &descriptor, sequence, started);
-                if result.is_ok() {
-                    sequence = sequence.saturating_add(1);
+            Command::Capture { deadline, response } => {
+                let result = bounded_wait(
+                    deadline,
+                    V4L2_WAIT_QUANTUM,
+                    || shutdown.load(Ordering::Acquire),
+                    |wait_for| {
+                        stream.set_timeout(wait_for);
+                        let result = capture_one(
+                            &mut stream,
+                            &format,
+                            stride,
+                            &descriptor,
+                            sequence,
+                            started,
+                        );
+                        if result.as_ref().is_err_and(|error| {
+                            error.name().as_str() == "runtime.transport.timeout"
+                        }) {
+                            stream.stop().map_err(|error| {
+                                platform_error("camera.capture", error)
+                                    .with_resource_id(descriptor.id().clone())
+                            })?;
+                        }
+                        result
+                    },
+                    |error| error.name().as_str() == "runtime.transport.timeout",
+                );
+                match result {
+                    Ok(WaitResult::Ready(frame)) => {
+                        sequence = sequence.saturating_add(1);
+                        let _ = response.send(Ok(frame));
+                    }
+                    Ok(WaitResult::TimedOut) => {
+                        let _ = response.send(Err(timeout_error("camera.capture", &descriptor)));
+                    }
+                    Ok(WaitResult::Shutdown) => break,
+                    Err(error) => {
+                        let _ = response.send(Err(error));
+                    }
                 }
-                let _ = response.send(result);
             }
             Command::Close => break,
         }
@@ -302,7 +366,11 @@ fn capture_one(
     started: Instant,
 ) -> HalResult<CameraFrame> {
     let (native, metadata) = stream.next().map_err(|error| {
-        platform_error("camera.capture", error).with_resource_id(descriptor.id().clone())
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            timeout_error("camera.capture", descriptor)
+        } else {
+            platform_error("camera.capture", error).with_resource_id(descriptor.id().clone())
+        }
     })?;
     if metadata.flags.contains(BufferFlags::ERROR) {
         return Err(
@@ -461,6 +529,7 @@ struct V4l2Session {
     format: CameraFormat,
     sender: Option<mpsc::SyncSender<Command>>,
     worker: Option<thread::JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
     claims: Arc<Mutex<BTreeSet<seeed_hal_core::ResourceId>>>,
     closed: bool,
 }
@@ -478,10 +547,16 @@ impl CameraCaptureSession for V4l2Session {
     async fn capture(&mut self, timeout: Duration) -> HalResult<CameraFrame> {
         ensure_open(self.closed, "camera.capture", &self.descriptor)?;
         let (response_sender, response_receiver) = oneshot::channel();
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
         self.sender
             .as_ref()
             .ok_or_else(|| closed("camera.capture", &self.descriptor))?
-            .send(Command::Capture(response_sender))
+            .try_send(Command::Capture {
+                deadline,
+                response: response_sender,
+            })
             .map_err(|_| closed("camera.capture", &self.descriptor))?;
         tokio::time::timeout(timeout, response_receiver)
             .await
@@ -518,14 +593,19 @@ impl CameraCaptureSession for V4l2Session {
             return Ok(());
         }
         self.closed = true;
+        self.shutdown.store(true, Ordering::Release);
         if let Some(sender) = self.sender.take() {
-            let _ = sender.send(Command::Close);
+            let _ = sender.try_send(Command::Close);
         }
         if let Some(worker) = self.worker.take() {
-            tokio::task::spawn_blocking(move || worker.join())
-                .await
-                .map_err(|error| worker_failed("camera.close", error))?
-                .map_err(|_| platform_error("camera.close", "V4L2 capture worker panicked"))?;
+            tokio::time::timeout(
+                V4L2_CLOSE_TIMEOUT,
+                tokio::task::spawn_blocking(move || worker.join()),
+            )
+            .await
+            .map_err(|_| timeout_error("camera.close", &self.descriptor))?
+            .map_err(|error| worker_failed("camera.close", error))?
+            .map_err(|_| platform_error("camera.close", "V4L2 capture worker panicked"))?;
         }
         self.claims
             .lock()
@@ -537,8 +617,9 @@ impl CameraCaptureSession for V4l2Session {
 
 impl Drop for V4l2Session {
     fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
         if let Some(sender) = self.sender.take() {
-            let _ = sender.send(Command::Close);
+            let _ = sender.try_send(Command::Close);
         }
         self.claims
             .lock()

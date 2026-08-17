@@ -62,6 +62,53 @@
 - The safe `v4l` wrapper owns its internal mmap unsafe boundary. The adapter
   adds no direct `unsafe`; the kernel streaming contract is the documented
   V4L2 mmap `REQBUFS`/`QUERYBUF`/`QBUF`/`DQBUF`/`STREAMON` sequence.
+
+## Teardown remediation
+
+- Root cause: the initial capture worker called `Stream::next()` with its
+  default infinite poll wait. `CameraCaptureSession::capture` timed out only
+  while awaiting the oneshot reply; its native worker therefore remained
+  blocked and could not consume `Close`, leaving the join, mmap buffers, file
+  descriptor, and adapter claim indefinitely occupied.
+- Capture now supplies an absolute deadline to the native worker. The worker
+  uses the safe `v4l` stream timeout (which is backed by the already
+  non-blocking V4L2 descriptor and `poll`) in a 20 ms bounded wait loop. A
+  poll timeout is reported as stable `runtime.transport.timeout`; streaming is
+  stopped after that timeout so the next capture cleanly requeues all mmap
+  buffers and may proceed.
+- Close raises an atomic shutdown fence before attempting its bounded command
+  send. The same 20 ms wait loop observes that fence, exits the only owner
+  thread, and drops the stream/device on that thread. Joining remains in
+  `spawn_blocking` and is itself limited to one second. No Tokio executor
+  worker blocks and no thread is force-killed.
+- Non-timeout V4L2 errors, including unplug/driver errors, remain mapped to
+  `runtime.transport.unavailable`. Native buffer allocation, queue/dequeue,
+  requeue, and unmapping remain serialized in the capture worker.
+
+## Teardown TDD evidence
+
+- Red:
+  `cargo test -p seeed-hal-adapter-v4l2 --all-features` failed two new
+  portable wait-helper tests before the implementation: one observed an
+  unbounded native wait exceeding the capture deadline; the other observed a
+  stalled capture returning timeout instead of yielding to shutdown.
+- Green:
+  after the bounded deadline loop and shutdown fence, the same test target
+  passed all six tests, including a timed-out capture followed by a successful
+  next capture.
+
+## Teardown verification and limitation
+
+- Passed:
+  `cargo fmt --all --check`
+- Passed:
+  `cargo clippy -p seeed-hal-adapter-v4l2 --all-targets --all-features -- -D warnings`
+- Passed on this non-Linux macOS host:
+  `cargo test -p seeed-hal-adapter-v4l2 --all-features`
+- Linux target checking remains unavailable here. The macOS toolchain reaches
+  `v4l2-sys-mit` but cannot generate bindings because the Linux kernel header
+  `linux/videodev2.h` is absent. No Linux kernel sysroot or physical V4L2
+  camera was available to exercise the ignored hardware test.
 # Camera v0.4 Task 6 report
 
 ## Native adapter prerequisite
