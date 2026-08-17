@@ -8,9 +8,12 @@ build = "build.rs"
 
 [features]
 default = ["serialport"]
+avfoundation = ["dep:seeed-hal-adapter-avfoundation"]
+mediafoundation = ["dep:seeed-hal-adapter-mediafoundation"]
 pcan = ["dep:seeed-hal-adapter-pcan"]
 serialport = ["dep:seeed-hal-adapter-serialport"]
 socketcan = ["dep:seeed-hal-adapter-socketcan"]
+v4l2 = ["dep:seeed-hal-adapter-v4l2"]
 nusb = ["dep:seeed-hal-adapter-nusb"]
 linux-gpio = ["dep:seeed-hal-adapter-linux-gpio"]
 windows-gpio = ["dep:seeed-hal-adapter-windows-gpio"]
@@ -44,7 +47,14 @@ zeroize = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+seeed-hal-adapter-avfoundation = { path = "../../adapters/avfoundation", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+seeed-hal-adapter-v4l2 = { path = "../../adapters/v4l2", optional = true }
+
 [target.'cfg(windows)'.dependencies]
+seeed-hal-adapter-mediafoundation = { path = "../../adapters/mediafoundation", optional = true }
 seeed-hal-windows-file = { path = "../../adapters/windows-file" }
 seeed-hal-windows-security = { path = "../../adapters/windows-security" }
 windows-permissions = { workspace = true }

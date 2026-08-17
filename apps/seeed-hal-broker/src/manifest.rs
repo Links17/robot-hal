@@ -81,6 +81,18 @@ impl BrokerManifest {
 
 fn enabled_adapters() -> Vec<&'static str> {
     let mut adapters = vec!["serialport"];
+    #[cfg(all(
+        feature = "avfoundation",
+        target_os = "macos",
+        not(feature = "virtual-adapters")
+    ))]
+    adapters.push("avfoundation");
+    #[cfg(all(
+        feature = "mediafoundation",
+        windows,
+        not(feature = "virtual-adapters")
+    ))]
+    adapters.push("mediafoundation");
     #[cfg(feature = "pcan")]
     adapters.push("pcan");
     #[cfg(feature = "socketcan")]
@@ -95,9 +107,16 @@ fn enabled_adapters() -> Vec<&'static str> {
     adapters.push("linux-gpio");
     #[cfg(all(feature = "windows-gpio", windows, not(feature = "virtual-adapters")))]
     adapters.push("windows-gpio");
+    #[cfg(all(
+        feature = "v4l2",
+        target_os = "linux",
+        not(feature = "virtual-adapters")
+    ))]
+    adapters.push("v4l2");
     #[cfg(feature = "virtual-adapters")]
     adapters.extend([
         "virtual-can",
+        "virtual-camera",
         "virtual-gpio",
         "virtual-serial",
         "virtual-usb",
@@ -110,6 +129,18 @@ fn enabled_adapters() -> Vec<&'static str> {
 fn enabled_features() -> Vec<&'static str> {
     #[allow(unused_mut)]
     let mut features = Vec::new();
+    #[cfg(all(
+        feature = "avfoundation",
+        target_os = "macos",
+        not(feature = "virtual-adapters")
+    ))]
+    features.push("avfoundation");
+    #[cfg(all(
+        feature = "mediafoundation",
+        windows,
+        not(feature = "virtual-adapters")
+    ))]
+    features.push("mediafoundation");
     #[cfg(feature = "pcan")]
     features.push("pcan");
     #[cfg(feature = "socketcan")]
@@ -124,6 +155,12 @@ fn enabled_features() -> Vec<&'static str> {
     features.push("linux-gpio");
     #[cfg(all(feature = "windows-gpio", windows, not(feature = "virtual-adapters")))]
     features.push("windows-gpio");
+    #[cfg(all(
+        feature = "v4l2",
+        target_os = "linux",
+        not(feature = "virtual-adapters")
+    ))]
+    features.push("v4l2");
     #[cfg(feature = "virtual-adapters")]
     features.push("virtual-adapters");
     features

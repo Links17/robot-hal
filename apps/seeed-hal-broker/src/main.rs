@@ -8,11 +8,23 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, ValueEnum};
 #[cfg(all(
+    feature = "avfoundation",
+    target_os = "macos",
+    not(feature = "virtual-adapters")
+))]
+use seeed_hal_adapter_avfoundation::AvFoundationAdapter;
+#[cfg(all(
     feature = "linux-gpio",
     target_os = "linux",
     not(feature = "virtual-adapters")
 ))]
 use seeed_hal_adapter_linux_gpio::LinuxGpioAdapter;
+#[cfg(all(
+    feature = "mediafoundation",
+    windows,
+    not(feature = "virtual-adapters")
+))]
+use seeed_hal_adapter_mediafoundation::MediaFoundationAdapter;
 #[cfg(all(feature = "nusb", not(feature = "virtual-adapters")))]
 use seeed_hal_adapter_nusb::NusbAdapter;
 #[cfg(feature = "pcan")]
@@ -21,6 +33,12 @@ use seeed_hal_adapter_pcan::PcanAdapter;
 use seeed_hal_adapter_serialport::SerialPortAdapter;
 #[cfg(feature = "socketcan")]
 use seeed_hal_adapter_socketcan::SocketCanAdapter;
+#[cfg(all(
+    feature = "v4l2",
+    target_os = "linux",
+    not(feature = "virtual-adapters")
+))]
+use seeed_hal_adapter_v4l2::V4l2Adapter;
 #[cfg(all(feature = "windows-gpio", windows, not(feature = "virtual-adapters")))]
 use seeed_hal_adapter_windows_gpio::WindowsGpioAdapter;
 use seeed_hal_broker::Broker;
@@ -30,7 +48,8 @@ use tokio::task::JoinSet;
 
 #[cfg(feature = "virtual-adapters")]
 use seeed_hal_testkit::{
-    VirtualCanAdapter, VirtualGpioAdapter, VirtualSerialAdapter, VirtualUsbAdapter,
+    VirtualCameraAdapter, VirtualCanAdapter, VirtualGpioAdapter, VirtualSerialAdapter,
+    VirtualUsbAdapter,
 };
 
 const MAX_CONNECTIONS: usize = 64;
@@ -130,13 +149,38 @@ fn build_runtime(required: &[RequiredAdapter]) -> Result<HalRuntime, Box<dyn std
     {
         builder = builder.gpio_adapter(WindowsGpioAdapter::new());
     }
+    #[cfg(all(
+        feature = "avfoundation",
+        target_os = "macos",
+        not(feature = "virtual-adapters")
+    ))]
+    {
+        builder = builder.camera_adapter(AvFoundationAdapter::new());
+    }
+    #[cfg(all(
+        feature = "v4l2",
+        target_os = "linux",
+        not(feature = "virtual-adapters")
+    ))]
+    {
+        builder = builder.camera_adapter(V4l2Adapter::new());
+    }
+    #[cfg(all(
+        feature = "mediafoundation",
+        windows,
+        not(feature = "virtual-adapters")
+    ))]
+    {
+        builder = builder.camera_adapter(MediaFoundationAdapter::new());
+    }
     #[cfg(feature = "virtual-adapters")]
     {
         builder = builder
             .serial_adapter(VirtualSerialAdapter::loopback("serial:virtual:broker-app"))
             .can_adapter(VirtualCanAdapter::loopback("can:virtual:broker-app"))
             .usb_adapter(VirtualUsbAdapter::loopback("usb:virtual:broker-app"))
-            .gpio_adapter(VirtualGpioAdapter::line_bank("gpio:virtual:broker-app", 2));
+            .gpio_adapter(VirtualGpioAdapter::line_bank("gpio:virtual:broker-app", 2))
+            .camera_adapter(VirtualCameraAdapter::pattern("camera:virtual:broker-app"));
     }
     #[cfg(feature = "pcan")]
     {
@@ -434,6 +478,24 @@ mod connection_logging_tests {
         assert_eq!(fields.category, ErrorCategory::Conflict);
         assert!(!fields.retryable);
         assert!(!format!("{fields:?}").contains("secret-token-material"));
+    }
+}
+
+#[cfg(all(test, feature = "virtual-adapters"))]
+mod camera_composition_tests {
+    use super::build_runtime;
+
+    #[tokio::test]
+    async fn virtual_adapter_feature_registers_the_broker_camera() {
+        let runtime = build_runtime(&[]).expect("virtual broker runtime builds");
+
+        let cameras = runtime
+            .enumerate_camera()
+            .await
+            .expect("virtual camera is registered");
+
+        assert_eq!(cameras.len(), 1);
+        assert_eq!(cameras[0].id().as_str(), "camera:virtual:broker-app");
     }
 }
 

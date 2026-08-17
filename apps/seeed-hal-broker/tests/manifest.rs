@@ -35,7 +35,7 @@ fn manifest_is_deterministic_business_independent_and_hardware_free() {
     assert_eq!(manifest["wire"]["major"], 1);
     assert_eq!(manifest["wire"]["minimum_minor"], 0);
     assert_eq!(manifest["broker_version"], "0.2.0");
-    assert_eq!(manifest["wire"]["maximum_minor"], 2);
+    assert_eq!(manifest["wire"]["maximum_minor"], 3);
     assert_eq!(manifest["target"]["triple"], env!("SEEED_HAL_TARGET"));
     assert_eq!(manifest["target"]["os"], std::env::consts::OS);
     assert_eq!(manifest["target"]["arch"], std::env::consts::ARCH);
@@ -70,10 +70,38 @@ fn manifest_is_deterministic_business_independent_and_hardware_free() {
         expected_adapters.push("windows-gpio");
         expected_features.push("windows-gpio");
     }
+    #[cfg(all(
+        feature = "avfoundation",
+        target_os = "macos",
+        not(feature = "virtual-adapters")
+    ))]
+    {
+        expected_adapters.push("avfoundation");
+        expected_features.push("avfoundation");
+    }
+    #[cfg(all(
+        feature = "v4l2",
+        target_os = "linux",
+        not(feature = "virtual-adapters")
+    ))]
+    {
+        expected_adapters.push("v4l2");
+        expected_features.push("v4l2");
+    }
+    #[cfg(all(
+        feature = "mediafoundation",
+        windows,
+        not(feature = "virtual-adapters")
+    ))]
+    {
+        expected_adapters.push("mediafoundation");
+        expected_features.push("mediafoundation");
+    }
     #[cfg(feature = "virtual-adapters")]
     {
         expected_adapters.extend([
             "virtual-can",
+            "virtual-camera",
             "virtual-gpio",
             "virtual-serial",
             "virtual-usb",

@@ -314,3 +314,50 @@ close behavior, and hot-unplug coverage were not relaxed.
 - The cross-target check validates the Windows binding type path, but no
   Windows runtime, camera device, or hardware test was available on this macOS
   host to force a real Media Foundation worker join timeout.
+
+## Broker application composition and manifest correction
+
+- The broker app now exposes optional `avfoundation`, `v4l2`, and
+  `mediafoundation` features. Each native dependency is declared only in its
+  applicable macOS, Linux, or Windows target dependency scope.
+- Outside `virtual-adapters`, the broker registers exactly one camera adapter
+  for the active target: AVFoundation on macOS, V4L2 on Linux, or Media
+  Foundation on Windows. Other target builds neither depend on nor silently
+  register those native adapters.
+- With `virtual-adapters`, the broker instead registers
+  `VirtualCameraAdapter::pattern("camera:virtual:broker-app")`, which makes
+  broker-integrated camera enumeration usable in tests. Existing Serial, CAN,
+  USB, and GPIO composition remains unchanged.
+- The manifest reports compiled and registered camera adapter names under the
+  same target and virtual feature conditions. This is build composition only;
+  it makes no claim that a physical camera is present or authorized.
+- The manifest integration assertion now expects wire maximum minor `3`. The
+  existing range-negotiation tests remain the compatibility coverage for
+  additive minor negotiation.
+
+## Broker composition TDD evidence
+
+- Baseline red:
+  `cargo test --workspace --all-features` failed only at
+  `manifest_is_deterministic_business_independent_and_hardware_free`, where
+  the manifest emitted maximum minor `3` while the stale assertion expected
+  `2`.
+- Composition red:
+  `cargo test -p seeed-hal-broker-app --all-features camera_composition_tests::virtual_adapter_feature_registers_the_broker_camera -- --exact`
+  failed before registration with `runtime.adapter.not_configured` for
+  `camera.enumerate`.
+- Green:
+  after the target-gated registration and virtual camera composition, the
+  composition test enumerated exactly `camera:virtual:broker-app`; the
+  manifest test passed with maximum minor `3` and the virtual camera adapter
+  listed.
+
+## Broker composition verification and limitation
+
+- Passed:
+  `cargo test -p seeed-hal-broker-app --all-features camera_composition_tests::virtual_adapter_feature_registers_the_broker_camera -- --exact`
+- Passed:
+  `cargo test -p seeed-hal-broker-app --test manifest --all-features`
+- No physical camera qualification was performed. Native camera execution
+  remains limited to its target OS and requires a separate hardware-enabled
+  environment.
