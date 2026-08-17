@@ -95,6 +95,8 @@ enum TransportKind {
   TRANSPORT_KIND_UNSPECIFIED = 0;
   TRANSPORT_KIND_SERIAL = 1;
   TRANSPORT_KIND_CAN = 2;
+  TRANSPORT_KIND_USB = 3;
+  TRANSPORT_KIND_GPIO = 4;
 }
 
 message SerialConfig {

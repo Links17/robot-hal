@@ -46,6 +46,8 @@ impl TryFrom<v1::ResourceSelector> for ResourceSelector {
         let transport = match required_enum::<v1::TransportKind>(value.transport, "transport")? {
             v1::TransportKind::Serial => TransportKind::Serial,
             v1::TransportKind::Can => TransportKind::Can,
+            v1::TransportKind::Usb => TransportKind::Usb,
+            v1::TransportKind::Gpio => TransportKind::Gpio,
             v1::TransportKind::Unspecified => {
                 return Err(invalid_message("transport is required"));
             }
@@ -422,5 +424,7 @@ fn transport_to_proto(value: TransportKind) -> v1::TransportKind {
     match value {
         TransportKind::Serial => v1::TransportKind::Serial,
         TransportKind::Can => v1::TransportKind::Can,
+        TransportKind::Usb => v1::TransportKind::Usb,
+        TransportKind::Gpio => v1::TransportKind::Gpio,
     }
 }

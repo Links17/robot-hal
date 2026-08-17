@@ -23,7 +23,7 @@ pub use conversion::{
 
 pub const PROTOCOL_MAJOR: u32 = 1;
 pub const PROTOCOL_MINOR_MINIMUM: u32 = 0;
-pub const PROTOCOL_MINOR_MAXIMUM: u32 = 1;
+pub const PROTOCOL_MINOR_MAXIMUM: u32 = 2;
 /// Legacy exact-minor field value sent to peers that predate range fields.
 pub const PROTOCOL_MINOR: u32 = PROTOCOL_MINOR_MAXIMUM;
 pub const SERIAL_CAPABILITY: &str = "serial.bytes/v1";

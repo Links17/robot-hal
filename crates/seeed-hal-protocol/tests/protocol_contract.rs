@@ -11,6 +11,12 @@ use seeed_hal_core::{
 };
 use seeed_hal_protocol::v1::{self, envelope};
 
+#[test]
+fn wire_minor_two_is_the_latest_additive_protocol_version() {
+    assert_eq!(seeed_hal_protocol::PROTOCOL_MINOR_MAXIMUM, 2);
+    assert_eq!(seeed_hal_protocol::PROTOCOL_MINOR, 2);
+}
+
 fn envelope_with(payload: envelope::Payload) -> v1::Envelope {
     v1::Envelope {
         request_id: 7,
@@ -462,11 +468,11 @@ fn malformed_error_details_reject_every_size_and_count_bound() {
 }
 
 #[test]
-fn wire_minor_one_range_and_additive_enum_values_are_locked() {
+fn wire_minor_two_range_and_additive_enum_values_are_locked() {
     assert_eq!(seeed_hal_protocol::PROTOCOL_MAJOR, 1);
     assert_eq!(seeed_hal_protocol::PROTOCOL_MINOR_MINIMUM, 0);
-    assert_eq!(seeed_hal_protocol::PROTOCOL_MINOR_MAXIMUM, 1);
-    assert_eq!(seeed_hal_protocol::PROTOCOL_MINOR, 1);
+    assert_eq!(seeed_hal_protocol::PROTOCOL_MINOR_MAXIMUM, 2);
+    assert_eq!(seeed_hal_protocol::PROTOCOL_MINOR, 2);
     assert_eq!(v1::IdentityQuality::Unspecified as i32, 0);
     assert_eq!(v1::IdentityQuality::Weak as i32, 1);
     assert_eq!(v1::IdentityQuality::Medium as i32, 2);
@@ -474,6 +480,8 @@ fn wire_minor_one_range_and_additive_enum_values_are_locked() {
     assert_eq!(v1::TransportKind::Unspecified as i32, 0);
     assert_eq!(v1::TransportKind::Serial as i32, 1);
     assert_eq!(v1::TransportKind::Can as i32, 2);
+    assert_eq!(v1::TransportKind::Usb as i32, 3);
+    assert_eq!(v1::TransportKind::Gpio as i32, 4);
     assert_eq!(v1::DataBits::Unspecified as i32, 0);
     assert_eq!(v1::DataBits::Five as i32, 1);
     assert_eq!(v1::DataBits::Six as i32, 2);
