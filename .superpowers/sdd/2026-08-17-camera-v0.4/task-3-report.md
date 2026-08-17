@@ -1,66 +1,68 @@
-# Task 3 report: named shared-memory frame ring
+# Task 3 report: shared-memory frame-ring security remediation
 
 ## Delivered
 
-- Added the workspace crate `seeed-hal-adapter-shared-memory`, the sole new crate containing
-  mapping and atomic unsafe code. Runtime, broker, protocol, client, Camera core, and native
-  camera adapters were not changed.
-- The public safe API creates broker-owned named mappings, opens read-only mappings through a
-  descriptor carrying a distinct capability token, validates a fixed versioned header, publishes
-  bounded frame slots, acquires the latest committed broker lease, and exposes a lifetime-bounded
-  read view.
-- The mapping stores only SHA-256 capability-token material, never the token. Descriptor debug
-  output redacts the capability; neither descriptor nor token implements `Display`.
-- The broker owns the single active pin. `next_frame_lease` releases the preceding pin before
-  selecting and pinning the newest slot; read-only mappings cannot mutate shared slot state.
-  Writers choose a free slot or oldest unpinned slot, otherwise drop without blocking and advance
-  the monotonic session drop counter.
+- Reworked the adapter boundary only; runtime, broker, client, native camera, and plan files are
+  unchanged.
+- `BrokerMapping::acquire(&mut self) -> FrameView<'_>` now produces the only zero-copy view.
+  `FrameView` holds the exclusive mutable broker borrow, so Rust rejects another acquire, writer,
+  lease release, or broker operation until the view drops. The broker pin remains valid for that
+  entire borrow.
+- Independently reopened `ReadOnlyMapping` has no zero-copy API. `copy(&mut self, lease)` returns
+  `CopiedFrame` with owned bytes. Python bindings must expose only this copying boundary (and must
+  validate the broker-provided lease before copying); no foreign zero-copy buffer may escape.
+- Removed every `&AtomicU64` cast and all atomic object references over mapping bytes. POSIX uses a
+  named system semaphore for whole-operation exclusion. All mutable shared bytes are accessed only
+  while its lock is held; the producer uses `sem_trywait`, dropping immediately on contention.
+  This avoids Rust atomic-object creation and races on metadata or payload.
+- Leases carry mapping identity, slot, sequence, and generation. Release verifies all fields and
+  requires `Pinned` state. One `BrokerMapping` owns one pin; this is intentionally single-session
+  / single-owner scope until the broker control plane implements ownership.
 
-## Layout and validation
+## Validation and platform behavior
 
-- Header magic/version, total length, slot count, 64-byte-aligned stride, negotiated format and
-  dimensions, capacity, 256-bit session identity, and token hash are validated fail-closed.
-- Slot metadata includes state, sequence, generation, timestamp, dropped count, payload length,
-  plane count/layout, and payload. All layout arithmetic, dimensions, plane ranges, overlap,
-  payload bounds, and total-map limits are checked before safe views are exposed.
-- Writer payload/metadata writes precede release sequence/state publication; reader observes
-  acquire state/sequence, validates metadata and repeats sequence/generation checks before
-  returning a view.
+- The fixed, versioned layout remains bounded (4–8 slots), latest-wins avoids pinned slots, and
+  writers never wait for a reader. Header stores only the SHA-256 token hash.
+- POSIX reopen executes `fstat` before mapping and rejects an object smaller than descriptor
+  length; the header must still exactly agree with descriptor length. POSIX creation requests and
+  verifies `0600` plus effective-user ownership. macOS rejects `fchmod` on POSIX SHM (`EINVAL`);
+  its `shm_open(..., 0600)` creation mode and post-create ownership/mode verification are the
+  supported equivalent.
+- POSIX names use 72 random bits because Darwin's 30-character usable SHM-name limit prevents a
+  256-bit name. The name is not an authorization secret: identity and token are each 256-bit, and
+  `O_EXCL` rejects a collision.
+- Windows create/open explicitly return structured `shared_memory.unavailable` until a qualified
+  implementation performs post-create DACL and section/view-length verification. The Windows
+  target compiles, but cannot claim protected operational support.
+- Header validation computes identity and token-hash constant-time equality unconditionally and
+  combines both results without short-circuiting. Tokens are redacted from debug output, lack
+  `Display`, and zeroize when dropped; descriptor cloning creates another capability copy whose
+  lifetime is explicitly bounded by its own drop.
 
-## Unsafe boundary and SAFETY evidence
+## Unsafe audit
 
-- `platform.rs`: POSIX `shm_open`, `ftruncate`, `mmap`, `munmap`, `close`, and `shm_unlink` are
-  each adjacent to `SAFETY` invariants. macOS independent reopen testing exercises create,
-  writable broker map, separate read-only client map, and teardown.
-- `platform.rs`: Windows `CreateFileMappingW`, `MapViewOfFile`, `OpenFileMappingW`,
-  `UnmapViewOfFile`, and `CloseHandle` are adjacent to lifetime/ownership `SAFETY` invariants.
-  Creation derives a protected DACL granting current user, LocalSystem, and Administrators.
-  The Windows target compiles; its DACL behavior still requires OS qualification.
-- `ring.rs`: raw fixed-layout reads/writes, atomic field casts, payload slice creation, and
-  endian helpers are adjacent to layout, alignment, publication, and pinning invariants. Unit
-  tests cover malformed header, capacity/overflow, bad token, escaped plane, generation mismatch,
-  torn state, latest-wins replacement, pin/drop behavior, and independent reopen.
+- `platform.rs`: POSIX `shm_open`, permissions/stat calls, mapping, named semaphore operations,
+  unlink, unmap, close all have immediate `SAFETY` ownership/range contracts. The independent
+  reopen test exercises separate mapping and semaphore handles.
+- `ring.rs`: raw fixed-layout read/write helpers and payload slice construction have immediate
+  layout, lock, pin, and bounded-range contracts. A `FrameView` payload is created only under the
+  retained semaphore lock and broker pin; copied clients copy while locked.
+- No raw atomic intrinsics, `AtomicU64` casts, or safe references to mapped atomic objects remain.
 
-## Verification
+## RED / GREEN and verification
 
-- RED: `cargo test -p seeed-hal-adapter-shared-memory` initially failed because `layout`,
-  `platform`, and `ring` modules did not exist.
-- GREEN on macOS: `cargo test -p seeed-hal-adapter-shared-memory` — 7 unit tests passed.
+- RED: tests were first changed to require `BrokerMapping::acquire` and `ReadOnlyMapping::copy`;
+  compilation failed because neither API existed.
+- GREEN: `cargo test -p seeed-hal-adapter-shared-memory` — 8 unit tests passed on macOS, including
+  independently reopened copy access and broker-pinned zero-copy acquisition.
 - `cargo clippy -p seeed-hal-adapter-shared-memory --all-targets --all-features -- -D warnings`
   — passed.
-- `cargo fmt --all --check` and `git diff --check` — passed.
-- `cargo check -p seeed-hal-adapter-shared-memory --target x86_64-pc-windows-gnu` — passed after
-  installing that Rust target.
+- `cargo check -p seeed-hal-adapter-shared-memory --target x86_64-pc-windows-gnu` — passed.
 
-## Platform limits and follow-up gates
+## Remaining qualification gates
 
-- macOS uses POSIX shared memory with `O_CREAT | O_EXCL | O_RDWR` and `0600`; macOS constrains
-  POSIX shm names, so the name uses 64 random bits while the required session identity and
-  independently generated capability token remain 256 bits. The mapping name is not the security
-  credential.
-- Linux uses the same POSIX path but was not executed in this macOS environment.
-- Windows creation and protected DACL path compile but lack Windows runtime/DACL inspection
-  validation. This remains a release-qualification gate.
-- No broker protobuf, runtime/client integration, or native camera adapter was added. The later
-  control-plane task must transport descriptor/token and broker lease operations; clients remain
-  strictly read-only.
+- A process crash while holding a POSIX semaphore can leave it unavailable; robust recovery needs
+  a separately designed, broker-owned recovery protocol before production multi-process use.
+- Windows is deliberately unavailable rather than providing unverified DACL/length behavior.
+- Broker control-plane auto-release, session scoping across IPC, and Python binding integration
+  remain later tasks and must preserve the copy-only foreign-language boundary.

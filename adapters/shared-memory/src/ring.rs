@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fmt::Write, string::String};
 
 use getrandom::fill;
@@ -48,10 +47,11 @@ impl BrokerMapping {
     pub fn create(config: RingConfig) -> HalResult<Self> {
         let identity = MappingIdentity::generate()?;
         let token = crate::MappingToken::generate()?;
-        // Darwin limits POSIX shm names to 31 bytes. The 64-bit random name
-        // remains collision-resistant because O_EXCL rejects any collision;
-        // the independent 256-bit identity and capability remain full-length.
-        let mut name_bytes = [0_u8; 8];
+        // Darwin limits POSIX shm names to 30 usable bytes. The OS object name is not an
+        // authority: it is paired with a distinct 256-bit identity and capability token. The
+        // platform limit prevents a 256-bit name, so O_EXCL plus 72 random bits handles naming
+        // collisions; all authorization remains on the independent 256-bit capability.
+        let mut name_bytes = [0_u8; 9];
         fill(&mut name_bytes)
             .map_err(|error| internal("shared_memory.create", error.to_string()))?;
         let mut name = String::from("/seeed-hal-");
@@ -74,7 +74,11 @@ impl BrokerMapping {
             closed: false,
             pinned: None,
         };
-        result.write_header(&identity)?;
+        if let Err(error) = result.write_header(&identity) {
+            let unlink_result = Mapping::unlink(&result.descriptor.name);
+            result.closed = unlink_result.is_ok();
+            return Err(error);
+        }
         Ok(result)
     }
 
@@ -95,7 +99,17 @@ impl BrokerMapping {
     }
 
     pub fn dropped_count(&self) -> u64 {
-        self.dropped_counter().load(Ordering::Acquire)
+        self.mapping
+            .try_lock_shared()
+            .ok()
+            .map(|()| {
+                // SAFETY: a shared OS lock excludes the writer's exclusive lock. The fixed
+                // counter field is within the mapped header and is copied as raw bytes.
+                let value = unsafe { read_u64(self.mapping.as_ptr().add(HEADER_DROPPED_COUNT)) };
+                let _ = self.mapping.unlock();
+                value
+            })
+            .unwrap_or(0)
     }
 
     pub fn close(&mut self) -> HalResult<()> {
@@ -110,13 +124,24 @@ impl BrokerMapping {
     /// Releases the preceding broker-owned pin and returns the newest committed
     /// frame lease. The control plane passes this lease to a read-only client.
     pub fn next_frame_lease(&mut self) -> HalResult<Option<FrameLease>> {
-        self.release_pin()?;
+        self.mapping
+            .try_lock_exclusive()
+            .map_err(|error| unavailable("shared_memory.lease", error.to_string()))?;
+        let result = self.next_frame_lease_locked();
+        self.mapping
+            .unlock()
+            .map_err(|error| unavailable("shared_memory.lease", error.to_string()))?;
+        result
+    }
+
+    fn next_frame_lease_locked(&mut self) -> HalResult<Option<FrameLease>> {
+        self.release_pin_locked()?;
         let mut latest: Option<(usize, u64)> = None;
         for index in 0..self.config.slot_count() {
-            if self.slot_state(index).load(Ordering::Acquire) != SlotState::Ready.raw() {
+            if self.slot_state(index)? != SlotState::Ready {
                 continue;
             }
-            let sequence = self.slot_sequence(index).load(Ordering::Acquire);
+            let sequence = self.slot_sequence(index)?;
             if latest.is_none_or(|(_, current)| sequence > current) {
                 latest = Some((index, sequence));
             }
@@ -124,42 +149,111 @@ impl BrokerMapping {
         let Some((index, sequence)) = latest else {
             return Ok(None);
         };
-        let state = self.slot_state(index);
-        if state
-            .compare_exchange(
-                SlotState::Ready.raw(),
-                SlotState::Pinned.raw(),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
+        if self.slot_state(index)? != SlotState::Ready {
             return Ok(None);
         }
+        self.write_slot_state(index, SlotState::Pinned)?;
         let generation = self.slot_generation(index);
-        if self.slot_sequence(index).load(Ordering::Acquire) != sequence {
-            state.store(SlotState::Ready.raw(), Ordering::Release);
+        if self.slot_sequence(index)? != sequence {
+            self.write_slot_state(index, SlotState::Ready)?;
             return Ok(None);
         }
         let lease = FrameLease {
+            identity: self.descriptor.identity.clone(),
             slot_index: index,
             sequence,
             generation,
         };
-        self.pinned = Some(lease);
+        self.pinned = Some(lease.clone());
         Ok(Some(lease))
     }
 
     pub fn release_pin(&mut self) -> HalResult<()> {
+        self.mapping
+            .try_lock_exclusive()
+            .map_err(|error| unavailable("shared_memory.release", error.to_string()))?;
+        let result = self.release_pin_locked();
+        self.mapping
+            .unlock()
+            .map_err(|error| unavailable("shared_memory.release", error.to_string()))?;
+        result
+    }
+
+    fn release_pin_locked(&mut self) -> HalResult<()> {
         if let Some(lease) = self.pinned.take() {
-            if self.slot_sequence(lease.slot_index).load(Ordering::Acquire) == lease.sequence
+            if lease.identity == self.descriptor.identity
+                && self.slot_sequence(lease.slot_index)? == lease.sequence
                 && self.slot_generation(lease.slot_index) == lease.generation
+                && self.slot_state(lease.slot_index)? == SlotState::Pinned
             {
-                self.slot_state(lease.slot_index)
-                    .store(SlotState::Free.raw(), Ordering::Release);
+                self.write_slot_state(lease.slot_index, SlotState::Free)?;
             }
         }
         Ok(())
+    }
+
+    /// Returns a zero-copy frame while retaining the broker-owned pin and a shared OS lock.
+    /// The exclusive `&mut self` borrow prevents `writer`, `acquire`, `release_pin`, or any
+    /// subsequent lease operation until the `FrameView` is dropped.
+    pub fn acquire(&mut self) -> HalResult<Option<FrameView<'_>>> {
+        self.mapping
+            .try_lock_exclusive()
+            .map_err(|error| unavailable("shared_memory.acquire", error.to_string()))?;
+        let lease = match self.next_frame_lease_locked() {
+            Ok(lease) => lease,
+            Err(error) => {
+                let _ = self.mapping.unlock();
+                return Err(error);
+            }
+        };
+        let Some(lease) = lease else {
+            self.mapping
+                .unlock()
+                .map_err(|error| unavailable("shared_memory.acquire", error.to_string()))?;
+            return Ok(None);
+        };
+        self.mapping
+            .unlock()
+            .map_err(|error| unavailable("shared_memory.acquire", error.to_string()))?;
+        self.mapping
+            .try_lock_shared()
+            .map_err(|error| unavailable("shared_memory.acquire", error.to_string()))?;
+        let frame = self.frame_view(lease);
+        if frame.is_err() {
+            let _ = self.mapping.unlock();
+        }
+        frame.map(Some)
+    }
+
+    fn frame_view(&self, lease: FrameLease) -> HalResult<FrameView<'_>> {
+        if lease.identity != self.descriptor.identity
+            || self.slot_state(lease.slot_index)? != SlotState::Pinned
+            || self.slot_sequence(lease.slot_index)? != lease.sequence
+            || self.slot_generation(lease.slot_index) != lease.generation
+        {
+            return Err(invalid(
+                "shared_memory.acquire",
+                "pinned lease no longer matches slot",
+            ));
+        }
+        let metadata = read_metadata(
+            &self.mapping,
+            &self.config,
+            lease.slot_index,
+            lease.sequence,
+            lease.generation,
+        )?;
+        let payload_length = read_payload_length(&self.mapping, &self.config, lease.slot_index)?;
+        let base = self.slot_base(lease.slot_index);
+        // SAFETY: the retained broker pin prevents writer selection and FrameView retains the
+        // shared OS lock until Drop. The range was validated by read_metadata.
+        let payload =
+            unsafe { std::slice::from_raw_parts(base.add(SLOT_HEADER_BYTES), payload_length) };
+        Ok(FrameView {
+            metadata,
+            payload,
+            mapping: &self.mapping,
+        })
     }
 
     fn write_header(&mut self, identity: &MappingIdentity) -> HalResult<()> {
@@ -203,18 +297,6 @@ impl BrokerMapping {
         Ok(())
     }
 
-    fn dropped_counter(&self) -> &AtomicU64 {
-        // SAFETY: HEADER_BYTES is 192 bytes and HEADER_DROPPED_COUNT is 128, so
-        // this fixed header field is 8-byte aligned and never overlaps slot zero.
-        unsafe {
-            &*(self
-                .mapping
-                .as_ptr()
-                .add(HEADER_DROPPED_COUNT)
-                .cast::<AtomicU64>())
-        }
-    }
-
     fn slot_base(&self, index: usize) -> *mut u8 {
         // SAFETY: all callers validate index against slot_count; config validation proves
         // header + index * stride stays within the owned mapping.
@@ -225,14 +307,13 @@ impl BrokerMapping {
         }
     }
 
-    fn select_writable_slot(&mut self) -> Option<usize> {
+    fn select_writable_slot(&mut self) -> HalResult<Option<usize>> {
         let mut oldest: Option<(usize, u64)> = None;
         for index in 0..self.config.slot_count() {
-            let state = self.slot_state(index).load(Ordering::Acquire);
-            match SlotState::from_raw(state).ok()? {
-                SlotState::Free => return Some(index),
+            match self.slot_state(index)? {
+                SlotState::Free => return Ok(Some(index)),
                 SlotState::Ready => {
-                    let sequence = self.slot_sequence(index).load(Ordering::Acquire);
+                    let sequence = self.slot_sequence(index)?;
                     if oldest.is_none_or(|(_, oldest_sequence)| sequence < oldest_sequence) {
                         oldest = Some((index, sequence));
                     }
@@ -240,18 +321,52 @@ impl BrokerMapping {
                 SlotState::Writing | SlotState::Pinned => {}
             }
         }
-        oldest.map(|(index, _)| index)
+        Ok(oldest.map(|(index, _)| index))
     }
 
-    fn slot_state(&self, index: usize) -> &AtomicU64 {
-        // SAFETY: slot base is 64-byte aligned and SLOT_STATE is zero, satisfying atomic
-        // alignment; field lies inside the slot header validated by RingConfig.
-        unsafe { &*(self.slot_base(index).add(SLOT_STATE).cast::<AtomicU64>()) }
+    fn slot_state(&self, index: usize) -> HalResult<SlotState> {
+        // SAFETY: callers hold either the writer's exclusive OS lock or a reader's shared OS
+        // lock; fixed state field lies within the validated slot header.
+        SlotState::from_raw(unsafe { read_u64(self.slot_base(index).add(SLOT_STATE)) })
     }
 
-    fn slot_sequence(&self, index: usize) -> &AtomicU64 {
-        // SAFETY: slot base is aligned and SLOT_SEQUENCE is an 8-byte aligned fixed field.
-        unsafe { &*(self.slot_base(index).add(SLOT_SEQUENCE).cast::<AtomicU64>()) }
+    fn write_slot_state(&mut self, index: usize, state: SlotState) -> HalResult<()> {
+        // SAFETY: the broker is the only slot-state writer and callers hold its exclusive
+        // OS lock. The fixed field is inside the owned writable mapping.
+        unsafe { write_u64(self.slot_base(index).add(SLOT_STATE), state.raw()) };
+        Ok(())
+    }
+
+    fn dropped_count_locked(&self) -> u64 {
+        // SAFETY: caller holds the broker's exclusive OS lock; fixed counter field is valid.
+        unsafe { read_u64(self.mapping.as_ptr().add(HEADER_DROPPED_COUNT)) }
+    }
+
+    fn increment_dropped_locked(&mut self) -> HalResult<()> {
+        let next = self
+            .dropped_count_locked()
+            .checked_add(1)
+            .ok_or_else(|| invalid("shared_memory.publish", "dropped-frame counter overflow"))?;
+        // SAFETY: caller holds the broker's exclusive OS lock; fixed counter field is valid.
+        unsafe { write_u64(self.mapping.as_ptr().add(HEADER_DROPPED_COUNT), next) };
+        Ok(())
+    }
+
+    fn increment_dropped_unlocked(&mut self) -> HalResult<()> {
+        // A producer never blocks: a contended lock counts as an immediately dropped frame only
+        // when it can subsequently obtain the lock without waiting.
+        if self.mapping.try_lock_exclusive().is_ok() {
+            let result = self.increment_dropped_locked();
+            let unlock = self.mapping.unlock();
+            result?;
+            unlock.map_err(|error| unavailable("shared_memory.publish", error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn slot_sequence(&self, index: usize) -> HalResult<u64> {
+        // SAFETY: callers hold an OS lock excluding concurrent writers; field is fixed-layout.
+        Ok(unsafe { read_u64(self.slot_base(index).add(SLOT_SEQUENCE)) })
     }
 
     fn slot_generation(&self, index: usize) -> u64 {
@@ -267,15 +382,13 @@ impl BrokerMapping {
 
     #[cfg(test)]
     pub(crate) fn torn_slot_for_test(&mut self, index: usize) {
-        self.slot_state(index)
-            .store(SlotState::Writing.raw(), Ordering::Release);
+        self.write_slot_state(index, SlotState::Writing).unwrap();
     }
 
     #[cfg(test)]
     pub(crate) fn pin_all_slots_for_test(&mut self) {
         for index in 0..self.config.slot_count() {
-            self.slot_state(index)
-                .store(SlotState::Pinned.raw(), Ordering::Release);
+            self.write_slot_state(index, SlotState::Pinned).unwrap();
         }
     }
 }
@@ -306,23 +419,38 @@ impl SlotWriter<'_> {
             metadata.planes(),
             payload.len(),
         )?;
-        let Some(index) = self.broker.select_writable_slot() else {
-            self.broker.dropped_counter().fetch_add(1, Ordering::AcqRel);
+        match self.broker.mapping.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                self.broker.increment_dropped_unlocked()?;
+                return Ok(());
+            }
+            Err(error) => return Err(unavailable("shared_memory.publish", error.to_string())),
+        }
+        let result = self.publish_locked(metadata, payload);
+        self.broker
+            .mapping
+            .unlock()
+            .map_err(|error| unavailable("shared_memory.publish", error.to_string()))?;
+        result
+    }
+
+    fn publish_locked(&mut self, metadata: FrameMetadata, payload: &[u8]) -> HalResult<()> {
+        let Some(index) = self.broker.select_writable_slot()? else {
+            self.broker.increment_dropped_locked()?;
             return Ok(());
         };
-        if self.broker.slot_state(index).load(Ordering::Acquire) == SlotState::Ready.raw() {
-            self.broker.dropped_counter().fetch_add(1, Ordering::AcqRel);
+        if self.broker.slot_state(index)? == SlotState::Ready {
+            self.broker.increment_dropped_locked()?;
         }
-        self.broker
-            .slot_state(index)
-            .store(SlotState::Writing.raw(), Ordering::Release);
+        self.broker.write_slot_state(index, SlotState::Writing)?;
         let base = self.broker.slot_base(index);
         // SAFETY: the broker owns the writable slot, marked Writing before these accesses.
         // RingConfig bounds header and payload storage, and metadata plane count is validated.
         unsafe {
             write_u64(base.add(SLOT_GENERATION), metadata.generation());
             write_u64(base.add(SLOT_TIMESTAMP), metadata.monotonic_timestamp_ns());
-            write_u64(base.add(SLOT_DROPPED), self.broker.dropped_count());
+            write_u64(base.add(SLOT_DROPPED), self.broker.dropped_count_locked());
             write_u64(base.add(SLOT_PAYLOAD_LENGTH), payload.len() as u64);
             write_u64(base.add(SLOT_PLANE_COUNT), metadata.planes().len() as u64);
             for (index, plane) in metadata.planes().iter().enumerate() {
@@ -337,21 +465,41 @@ impl SlotWriter<'_> {
                 payload.len(),
             );
         }
-        self.broker
-            .slot_sequence(index)
-            .store(metadata.sequence(), Ordering::Release);
-        self.broker
-            .slot_state(index)
-            .store(SlotState::Ready.raw(), Ordering::Release);
+        // SAFETY: exclusive OS lock excludes every reader; sequence is written before Ready.
+        unsafe {
+            write_u64(
+                self.broker.slot_base(index).add(SLOT_SEQUENCE),
+                metadata.sequence(),
+            )
+        };
+        self.broker.write_slot_state(index, SlotState::Ready)?;
         Ok(())
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FrameLease {
+    identity: MappingIdentity,
     slot_index: usize,
     sequence: u64,
     generation: u64,
+}
+
+/// Copy-only frame returned by a separately reopened mapping. It owns its payload, so it cannot
+/// escape the lease/pin lifetime as a zero-copy reference (the required Python-facing boundary).
+pub struct CopiedFrame {
+    metadata: FrameMetadata,
+    payload: Vec<u8>,
+}
+
+impl CopiedFrame {
+    pub fn metadata(&self) -> &FrameMetadata {
+        &self.metadata
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
 }
 
 pub struct ReadOnlyMapping {
@@ -372,9 +520,25 @@ impl ReadOnlyMapping {
         })
     }
 
-    pub fn read(&self, lease: FrameLease) -> HalResult<Option<FrameView<'_>>> {
+    /// Copies a pinned frame under a shared OS lock. This API intentionally never yields a
+    /// mapping-backed byte slice; external language bindings must use this operation.
+    pub fn copy(&mut self, lease: FrameLease) -> HalResult<Option<CopiedFrame>> {
+        if lease.identity != *self.header.identity() {
+            return Ok(None);
+        }
+        self.mapping
+            .try_lock_shared()
+            .map_err(|error| unavailable("shared_memory.copy", error.to_string()))?;
+        let result = self.copy_locked(lease);
+        self.mapping
+            .unlock()
+            .map_err(|error| unavailable("shared_memory.copy", error.to_string()))?;
+        result
+    }
+
+    fn copy_locked(&self, lease: FrameLease) -> HalResult<Option<CopiedFrame>> {
         if lease.slot_index >= self.header.config().slot_count()
-            || self.slot_state(lease.slot_index).load(Ordering::Acquire) != SlotState::Pinned.raw()
+            || self.slot_state(lease.slot_index)? != SlotState::Pinned
         {
             return Ok(None);
         }
@@ -383,23 +547,26 @@ impl ReadOnlyMapping {
             .expected_generation
             .is_some_and(|value| value != generation)
             || generation != lease.generation
-            || self.slot_sequence(lease.slot_index).load(Ordering::Acquire) != lease.sequence
+            || self.slot_sequence(lease.slot_index)? != lease.sequence
         {
             return Ok(None);
         }
         let metadata = self.read_metadata(lease.slot_index, lease.sequence, generation)?;
-        if self.slot_sequence(lease.slot_index).load(Ordering::Acquire) != lease.sequence
+        if self.slot_sequence(lease.slot_index)? != lease.sequence
             || self.slot_generation(lease.slot_index)? != generation
         {
             return Ok(None);
         }
         let base = self.slot_base(lease.slot_index);
         let payload_length = self.slot_payload_length(lease.slot_index)?;
-        // SAFETY: payload_length was validated by read_metadata against the slot capacity and
-        // the retained pin excludes producer overwrite for the returned self borrow.
+        // SAFETY: payload_length was validated against slot capacity and the shared OS lock plus
+        // broker-held pin exclude producer overwrite for this copy operation.
         let payload =
             unsafe { std::slice::from_raw_parts(base.add(SLOT_HEADER_BYTES), payload_length) };
-        Ok(Some(FrameView { metadata, payload }))
+        Ok(Some(CopiedFrame {
+            metadata,
+            payload: payload.to_vec(),
+        }))
     }
 
     fn read_metadata(
@@ -470,14 +637,14 @@ impl ReadOnlyMapping {
         }
     }
 
-    fn slot_state(&self, index: usize) -> &AtomicU64 {
-        // SAFETY: see BrokerMapping::slot_state alignment and fixed-layout evidence.
-        unsafe { &*(self.slot_base(index).add(SLOT_STATE).cast::<AtomicU64>()) }
+    fn slot_state(&self, index: usize) -> HalResult<SlotState> {
+        // SAFETY: caller holds the shared OS lock; field is within validated slot header.
+        SlotState::from_raw(unsafe { read_u64(self.slot_base(index).add(SLOT_STATE)) })
     }
 
-    fn slot_sequence(&self, index: usize) -> &AtomicU64 {
-        // SAFETY: see BrokerMapping::slot_sequence alignment and fixed-layout evidence.
-        unsafe { &*(self.slot_base(index).add(SLOT_SEQUENCE).cast::<AtomicU64>()) }
+    fn slot_sequence(&self, index: usize) -> HalResult<u64> {
+        // SAFETY: caller holds the shared OS lock; field is within validated slot header.
+        Ok(unsafe { read_u64(self.slot_base(index).add(SLOT_SEQUENCE)) })
     }
 
     fn slot_generation(&self, index: usize) -> HalResult<u64> {
@@ -504,9 +671,90 @@ impl ReadOnlyMapping {
     }
 }
 
+fn slot_base(mapping: &Mapping, config: &RingConfig, index: usize) -> *mut u8 {
+    // SAFETY: callers ensure index is bounded by the validated slot count; config arithmetic
+    // establishes that the fixed slot range lies within this mapping.
+    unsafe {
+        mapping
+            .as_ptr()
+            .add(HEADER_BYTES + index * config.slot_stride())
+    }
+}
+
+fn read_payload_length(mapping: &Mapping, config: &RingConfig, index: usize) -> HalResult<usize> {
+    // SAFETY: caller holds an OS lock; payload length is a fixed header field in this slot.
+    let length =
+        unsafe { read_u64(slot_base(mapping, config, index).add(SLOT_PAYLOAD_LENGTH)) as usize };
+    if length > config.payload_capacity() {
+        return Err(invalid(
+            "shared_memory.read",
+            "slot payload exceeds the validated capacity",
+        ));
+    }
+    Ok(length)
+}
+
+fn read_metadata(
+    mapping: &Mapping,
+    config: &RingConfig,
+    index: usize,
+    sequence: u64,
+    generation: u64,
+) -> HalResult<FrameMetadata> {
+    let base = slot_base(mapping, config, index);
+    // SAFETY: caller holds an OS lock, so fixed fields cannot race a writer. They lie within
+    // SLOT_HEADER_BYTES and the mapping layout was validated before the caller reached here.
+    let (timestamp, dropped, payload_length, plane_count) = unsafe {
+        (
+            read_u64(base.add(SLOT_TIMESTAMP)),
+            read_u64(base.add(SLOT_DROPPED)),
+            read_u64(base.add(SLOT_PAYLOAD_LENGTH)) as usize,
+            read_u64(base.add(SLOT_PLANE_COUNT)) as usize,
+        )
+    };
+    if payload_length > config.payload_capacity() || plane_count > MAX_PLANES {
+        return Err(invalid(
+            "shared_memory.read",
+            "slot payload or plane count exceeds the validated layout",
+        ));
+    }
+    let mut planes = Vec::with_capacity(plane_count);
+    for index in 0..plane_count {
+        let offset = SLOT_PLANES + index * PLANE_BYTES;
+        // SAFETY: plane_count is bounded by MAX_PLANES, so all plane fields are in the header.
+        let plane = unsafe {
+            crate::PlaneLayout::new(
+                read_u32(base.add(offset)) as usize,
+                read_u32(base.add(offset + 4)) as usize,
+                read_u32(base.add(offset + 8)) as usize,
+            )?
+        };
+        planes.push(plane);
+    }
+    let format = PixelFormat::from(config.format().pixel_format());
+    validate_planes(
+        format,
+        config.format().width(),
+        config.format().height(),
+        &planes,
+        payload_length,
+    )?;
+    FrameMetadata::new(
+        format,
+        config.format().width(),
+        config.format().height(),
+        sequence,
+        generation,
+        timestamp,
+        dropped,
+        planes,
+    )
+}
+
 pub struct FrameView<'a> {
     metadata: FrameMetadata,
     payload: &'a [u8],
+    mapping: &'a Mapping,
 }
 
 impl FrameView<'_> {
@@ -515,6 +763,15 @@ impl FrameView<'_> {
     }
     pub fn payload(&self) -> &[u8] {
         self.payload
+    }
+}
+
+impl Drop for FrameView<'_> {
+    fn drop(&mut self) {
+        // A failing unlock cannot be safely reported from Drop. The public close/release APIs
+        // remain fallible; an unlock failure leaves the OS lock to process teardown rather than
+        // falsely claiming cleanup succeeded.
+        let _ = self.mapping.unlock();
     }
 }
 
@@ -556,7 +813,7 @@ fn validate_header(
             "mapping magic or layout version is incompatible",
         ));
     }
-    if total_length != mapped_length || total_length != descriptor.total_length {
+    if total_length != descriptor.total_length || mapped_length < total_length {
         return Err(invalid(
             "shared_memory.open",
             "mapping total length does not match its descriptor",
@@ -582,13 +839,11 @@ fn validate_header(
     // SAFETY: fixed 32-byte values lie within HEADER_BYTES; comparison never exposes secrets.
     let identity = unsafe { std::slice::from_raw_parts(base.add(HEADER_IDENTITY), 32) };
     // SAFETY: fixed 32-byte values lie within HEADER_BYTES; comparison never exposes secrets.
-    let token_hash = unsafe { std::slice::from_raw_parts(base.add(HEADER_TOKEN_HASH), 32) };
-    if identity != descriptor.identity.bytes().as_slice()
-        || !bool::from(subtle::ConstantTimeEq::ct_eq(
-            token_hash,
-            descriptor.token().hash().as_slice(),
-        ))
-    {
+    let header_token_hash = unsafe { std::slice::from_raw_parts(base.add(HEADER_TOKEN_HASH), 32) };
+    let identity_matches = subtle::ConstantTimeEq::ct_eq(identity, descriptor.identity.bytes());
+    let token_hash = descriptor.token().hash();
+    let token_matches = subtle::ConstantTimeEq::ct_eq(header_token_hash, token_hash.as_slice());
+    if !bool::from(identity_matches & token_matches) {
         return Err(invalid(
             "shared_memory.open",
             "mapping session identity or capability token does not match",

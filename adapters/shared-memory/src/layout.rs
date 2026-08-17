@@ -218,7 +218,7 @@ impl fmt::Debug for MappingToken {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct MappingIdentity([u8; 32]);
 
 impl MappingIdentity {
@@ -233,6 +233,17 @@ impl MappingIdentity {
         &self.0
     }
 }
+
+impl PartialEq for MappingIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        bool::from(subtle::ConstantTimeEq::ct_eq(
+            self.0.as_slice(),
+            other.0.as_slice(),
+        ))
+    }
+}
+
+impl Eq for MappingIdentity {}
 
 pub struct MappingDescriptor {
     pub(crate) name: String,

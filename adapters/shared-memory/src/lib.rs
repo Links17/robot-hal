@@ -8,7 +8,7 @@ pub use layout::{
     FrameMetadata, MAX_MAPPING_BYTES, MappingDescriptor, MappingIdentity, MappingToken,
     PixelFormat, PlaneLayout, RingConfig, SlotState, ValidatedHeader,
 };
-pub use ring::{BrokerMapping, FrameLease, FrameView, ReadOnlyMapping, SlotWriter};
+pub use ring::{BrokerMapping, CopiedFrame, FrameLease, FrameView, ReadOnlyMapping, SlotWriter};
 
 use seeed_hal_core::{ErrorCategory, HalError, HalResult};
 
@@ -74,16 +74,27 @@ mod tests {
     }
 
     #[test]
-    fn creates_and_independently_reopens_read_only_mapping() {
+    fn acquires_a_broker_pinned_zero_copy_frame() {
+        let mut broker = BrokerMapping::create(config()).unwrap();
+        broker.writer().publish(metadata(1, 1), &[1; 8]).unwrap();
+
+        let frame = broker.acquire().unwrap().unwrap();
+        assert_eq!(frame.payload(), &[1; 8]);
+        assert_eq!(frame.metadata().sequence(), 1);
+    }
+
+    #[test]
+    fn independently_reopened_mapping_only_returns_an_owned_copy() {
         let mut broker = BrokerMapping::create(config()).unwrap();
         let descriptor = broker.descriptor().clone();
         broker.writer().publish(metadata(1, 1), &[1; 8]).unwrap();
 
-        let client = ReadOnlyMapping::open(&descriptor).unwrap();
+        let mut client = ReadOnlyMapping::open(&descriptor).unwrap();
         let lease = broker.next_frame_lease().unwrap().unwrap();
-        let frame = client.read(lease).unwrap().unwrap();
+        let frame = client.copy(lease).unwrap().unwrap();
         assert_eq!(frame.payload(), &[1; 8]);
         assert_eq!(frame.metadata().sequence(), 1);
+        broker.release_pin().unwrap();
     }
 
     #[test]
@@ -130,7 +141,7 @@ mod tests {
         let mut client = ReadOnlyMapping::open(broker.descriptor()).unwrap();
         client.force_generation_mismatch_for_test();
         let lease = broker.next_frame_lease().unwrap().unwrap();
-        assert!(client.read(lease).unwrap().is_none());
+        assert!(client.copy(lease).unwrap().is_none());
     }
 
     #[test]
@@ -151,18 +162,13 @@ mod tests {
                 .unwrap();
         }
 
-        let client = ReadOnlyMapping::open(broker.descriptor()).unwrap();
-        let lease = broker.next_frame_lease().unwrap().unwrap();
-        assert_eq!(
-            client.read(lease).unwrap().unwrap().metadata().sequence(),
-            4
-        );
+        let frame = broker.acquire().unwrap().unwrap();
+        assert_eq!(frame.metadata().sequence(), 4);
+        drop(frame);
         broker.writer().publish(metadata(5, 5), &[5; 8]).unwrap();
-        let lease = broker.next_frame_lease().unwrap().unwrap();
-        assert_eq!(
-            client.read(lease).unwrap().unwrap().metadata().sequence(),
-            5
-        );
+        let frame = broker.acquire().unwrap().unwrap();
+        assert_eq!(frame.metadata().sequence(), 5);
+        drop(frame);
 
         broker.pin_all_slots_for_test();
         assert!(broker.writer().publish(metadata(6, 6), &[6; 8]).is_ok());

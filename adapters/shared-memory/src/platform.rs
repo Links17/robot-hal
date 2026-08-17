@@ -9,6 +9,7 @@ pub(crate) struct Mapping {
     address: NonNull<u8>,
     length: usize,
     fd: libc::c_int,
+    semaphore: *mut libc::sem_t,
 }
 
 #[cfg(unix)]
@@ -32,6 +33,45 @@ impl Mapping {
         };
         if fd < 0 {
             return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` owns the newly created POSIX shared-memory object; fchmod changes only
+        // that object's mode. The focused create/reopen test covers this protected creation path.
+        if unsafe { libc::fchmod(fd, (libc::S_IRUSR | libc::S_IWUSR) as libc::mode_t) } != 0
+            && !cfg!(target_vendor = "apple")
+        {
+            let error = io::Error::last_os_error();
+            // SAFETY: both resources are still exclusively owned on this error path.
+            unsafe {
+                libc::close(fd);
+                libc::shm_unlink(name.as_ptr());
+            }
+            return Err(error);
+        }
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `stat` points to writable storage and `fd` is owned by this function.
+        if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+            let error = io::Error::last_os_error();
+            // SAFETY: both resources are still exclusively owned on this error path.
+            unsafe {
+                libc::close(fd);
+                libc::shm_unlink(name.as_ptr());
+            }
+            return Err(error);
+        }
+        // SAFETY: fstat returned success and initialized `stat`.
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_uid != unsafe { libc::geteuid() }
+            || (stat.st_mode & 0o777) != (libc::S_IRUSR | libc::S_IWUSR) as libc::mode_t
+        {
+            // SAFETY: both resources are still exclusively owned on this error path.
+            unsafe {
+                libc::close(fd);
+                libc::shm_unlink(name.as_ptr());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "shared-memory object ownership or mode verification failed",
+            ));
         }
         // SAFETY: `fd` was returned by shm_open and `length` is bounded by
         // layout validation and representable as off_t on supported targets.
@@ -64,11 +104,32 @@ impl Mapping {
             return Err(error);
         }
         // SAFETY: mmap returned a non-null, non-MAP_FAILED valid base address.
-        let address = unsafe { NonNull::new_unchecked(address.cast()) };
+        let address: NonNull<u8> = unsafe { NonNull::new_unchecked(address.cast()) };
+        // SAFETY: name is a valid POSIX semaphore name. O_EXCL prevents aliasing; the semaphore
+        // is a process-shared system synchronization object. Focused reopen tests cover it.
+        let semaphore = unsafe {
+            libc::sem_open(
+                name.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL,
+                (libc::S_IRUSR | libc::S_IWUSR) as libc::c_uint,
+                1,
+            )
+        };
+        if semaphore == libc::SEM_FAILED {
+            let error = io::Error::last_os_error();
+            // SAFETY: mapping, fd, and shm object are all owned on this error path.
+            unsafe {
+                libc::munmap(address.as_ptr().cast(), length);
+                libc::close(fd);
+                libc::shm_unlink(name.as_ptr());
+            }
+            return Err(error);
+        }
         Ok(Self {
             address,
             length,
             fd,
+            semaphore,
         })
     }
 
@@ -84,6 +145,28 @@ impl Mapping {
         let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
+        }
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `stat` points to writable storage and `fd` is the owned reopened object.
+        if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+            let error = io::Error::last_os_error();
+            // SAFETY: `fd` is owned and close does not retain it.
+            unsafe { libc::close(fd) };
+            return Err(error);
+        }
+        // SAFETY: fstat returned success and initialized `stat`.
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_size < 0
+            || usize::try_from(stat.st_size)
+                .ok()
+                .is_none_or(|size| size < length)
+        {
+            // SAFETY: `fd` is owned and close does not retain it.
+            unsafe { libc::close(fd) };
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "shared-memory object length does not match descriptor",
+            ));
         }
         // SAFETY: `fd` owns a readable POSIX shm object and layout validation
         // supplied a bounded length. mmap returns a mapping or MAP_FAILED.
@@ -104,16 +187,49 @@ impl Mapping {
             return Err(error);
         }
         // SAFETY: mmap returned a non-null, non-MAP_FAILED valid base address.
-        let address = unsafe { NonNull::new_unchecked(address.cast()) };
+        let address: NonNull<u8> = unsafe { NonNull::new_unchecked(address.cast()) };
+        // SAFETY: name is valid and sem_open returns a process-shared semaphore handle.
+        let semaphore = unsafe { libc::sem_open(name.as_ptr(), 0) };
+        if semaphore == libc::SEM_FAILED {
+            let error = io::Error::last_os_error();
+            // SAFETY: mapping and fd are owned on this error path.
+            unsafe {
+                libc::munmap(address.as_ptr().cast(), length);
+                libc::close(fd);
+            }
+            return Err(error);
+        }
         Ok(Self {
             address,
             length,
             fd,
+            semaphore,
         })
     }
 
     pub(crate) fn as_ptr(&self) -> *mut u8 {
         self.address.as_ptr()
+    }
+
+    pub(crate) fn try_lock_shared(&self) -> io::Result<()> {
+        self.try_lock_exclusive()
+    }
+
+    pub(crate) fn try_lock_exclusive(&self) -> io::Result<()> {
+        // SAFETY: this Mapping owns an opened process-shared semaphore; sem_trywait is
+        // non-blocking and retains no Rust pointers.
+        if unsafe { libc::sem_trywait(self.semaphore) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn unlock(&self) -> io::Result<()> {
+        // SAFETY: matching lock acquisition on this owned semaphore makes posting valid.
+        if unsafe { libc::sem_post(self.semaphore) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     pub(crate) fn unlink(name: &str) -> io::Result<()> {
@@ -125,6 +241,12 @@ impl Mapping {
         })?;
         // SAFETY: `name` is a NUL-terminated POSIX shm name and remains valid
         // for this synchronous call. POSIX shm_unlink retains no pointer.
+        // SAFETY: name is valid; unlinking the semaphore prevents a stale synchronization
+        // object from becoming associated with a newly created mapping name.
+        if unsafe { libc::sem_unlink(name.as_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: name is valid and shm_unlink retains no pointer.
         if unsafe { libc::shm_unlink(name.as_ptr()) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -140,6 +262,8 @@ impl Drop for Mapping {
         let _ = unsafe { libc::munmap(self.address.as_ptr().cast(), self.length) };
         // SAFETY: this Mapping owns the fd and close does not retain it.
         let _ = unsafe { libc::close(self.fd) };
+        // SAFETY: this Mapping owns the semaphore handle and sem_close retains no pointer.
+        let _ = unsafe { libc::sem_close(self.semaphore) };
     }
 }
 
@@ -153,6 +277,12 @@ pub(crate) struct Mapping {
 #[cfg(windows)]
 impl Mapping {
     pub(crate) fn create(name: &str, length: usize) -> io::Result<Self> {
+        let _ = (name, length);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Windows shared memory is unavailable until DACL and section-size verification is qualified",
+        ))
+        /*
         use std::ffi::OsStr;
         use std::mem;
         use std::os::windows::ffi::OsStrExt;
@@ -220,9 +350,16 @@ impl Mapping {
             length,
             handle,
         })
+        */
     }
 
     pub(crate) fn open_read_only(name: &str, length: usize) -> io::Result<Self> {
+        let _ = (name, length);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Windows shared memory is unavailable until DACL and section-size verification is qualified",
+        ))
+        /*
         use std::ffi::OsStr;
         use std::os::windows::ffi::OsStrExt;
 
@@ -249,10 +386,23 @@ impl Mapping {
             length,
             handle,
         })
+        */
     }
 
     pub(crate) fn as_ptr(&self) -> *mut u8 {
         self.address.as_ptr()
+    }
+
+    pub(crate) fn try_lock_shared(&self) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "unavailable"))
+    }
+
+    pub(crate) fn try_lock_exclusive(&self) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "unavailable"))
+    }
+
+    pub(crate) fn unlock(&self) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "unavailable"))
     }
 
     pub(crate) fn unlink(_name: &str) -> io::Result<()> {
@@ -296,6 +446,15 @@ impl Mapping {
     }
     pub(crate) fn as_ptr(&self) -> *mut u8 {
         std::ptr::null_mut()
+    }
+    pub(crate) fn try_lock_shared(&self) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "unavailable"))
+    }
+    pub(crate) fn try_lock_exclusive(&self) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "unavailable"))
+    }
+    pub(crate) fn unlock(&self) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "unavailable"))
     }
     pub(crate) fn unlink(_name: &str) -> io::Result<()> {
         Ok(())
