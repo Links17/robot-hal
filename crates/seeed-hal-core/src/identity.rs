@@ -148,6 +148,7 @@ pub enum TransportKind {
     Can,
     Usb,
     Gpio,
+    Camera,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]

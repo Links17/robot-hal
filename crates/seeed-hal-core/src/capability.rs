@@ -26,11 +26,7 @@ impl CapabilityId {
             )
         })?;
 
-        if namespace.is_empty()
-            || name.is_empty()
-            || contract.matches('.').count() != 1
-            || !version.starts_with('v')
-        {
+        if namespace.is_empty() || name.is_empty() || !version.starts_with('v') {
             return Err(HalError::invalid_argument_error(
                 "capability.id.invalid",
                 "capability.parse",

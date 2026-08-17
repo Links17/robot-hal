@@ -1179,6 +1179,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "seeed-hal-camera"
+version = "0.4.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "seeed-hal-core",
+]
+
+[[package]]
 name = "seeed-hal-can"
 version = "0.2.0"
 dependencies = [
@@ -1273,6 +1282,7 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "seeed-hal-camera",
  "seeed-hal-can",
  "seeed-hal-core",
  "seeed-hal-gpio",

@@ -833,5 +833,6 @@ fn transport_to_proto(value: TransportKind) -> v1::TransportKind {
         TransportKind::Can => v1::TransportKind::Can,
         TransportKind::Usb => v1::TransportKind::Usb,
         TransportKind::Gpio => v1::TransportKind::Gpio,
+        TransportKind::Camera => v1::TransportKind::Unspecified,
     }
 }
