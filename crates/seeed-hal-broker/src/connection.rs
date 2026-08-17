@@ -852,6 +852,28 @@ async fn dispatch_operation_inner(
     serial_sessions: SerialSessions,
 ) -> HalResult<envelope::Payload> {
     match payload {
+        Some(envelope::Payload::EnumerateUsbRequest(_)) => {
+            let resources = runtime
+                .enumerate_usb()
+                .await?
+                .iter()
+                .map(v1::ResourceDescriptor::from)
+                .collect();
+            Ok(envelope::Payload::EnumerateUsbResponse(
+                v1::EnumerateUsbResponse { resources },
+            ))
+        }
+        Some(envelope::Payload::EnumerateGpioRequest(_)) => {
+            let resources = runtime
+                .enumerate_gpio()
+                .await?
+                .iter()
+                .map(v1::ResourceDescriptor::from)
+                .collect();
+            Ok(envelope::Payload::EnumerateGpioResponse(
+                v1::EnumerateGpioResponse { resources },
+            ))
+        }
         Some(envelope::Payload::EnumerateSerialRequest(_)) => {
             let resources = runtime
                 .enumerate_serial()

@@ -18,7 +18,9 @@ use seeed_hal_core::{
 use seeed_hal_protocol::v1::{self, envelope};
 use seeed_hal_runtime::{HalRuntime, RuntimeEventKind};
 use seeed_hal_serial::{ControlLines, SerialAdapter, SerialConfig, SerialSession};
-use seeed_hal_testkit::{VirtualCanAdapter, VirtualSerialAdapter};
+use seeed_hal_testkit::{
+    VirtualCanAdapter, VirtualGpioAdapter, VirtualSerialAdapter, VirtualUsbAdapter,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{Notify, oneshot};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
@@ -455,6 +457,40 @@ fn runtime() -> HalRuntime {
 
 fn can_runtime(adapter: VirtualCanAdapter) -> HalRuntime {
     HalRuntime::builder().can_adapter(adapter).build()
+}
+
+fn usb_gpio_broker() -> Broker {
+    let runtime = HalRuntime::builder()
+        .usb_adapter(VirtualUsbAdapter::loopback("usb:virtual:broker"))
+        .gpio_adapter(VirtualGpioAdapter::line_bank("gpio:virtual:broker", 2))
+        .build();
+    Broker::with_startup_token(runtime, StartupToken::from_bytes(TOKEN))
+}
+
+#[tokio::test]
+async fn minor_two_handshake_enumerates_usb_and_gpio() {
+    let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+    let server = tokio::spawn(async move { usb_gpio_broker().serve_connection(server_io).await });
+    let mut client = Client::new(client_io);
+    let mut handshake = valid_handshake(TOKEN.to_vec());
+    handshake.protocol_minor = 2;
+    handshake.protocol_minor_minimum = 2;
+    handshake.protocol_minor_maximum = 2;
+    client
+        .request(envelope::Payload::HandshakeRequest(handshake))
+        .await;
+    for payload in [
+        envelope::Payload::EnumerateUsbRequest(v1::EnumerateUsbRequest {}),
+        envelope::Payload::EnumerateGpioRequest(v1::EnumerateGpioRequest {}),
+    ] {
+        let response = client.request(payload).await;
+        assert!(!matches!(
+            response.payload,
+            Some(envelope::Payload::Error(_))
+        ));
+    }
+    drop(client);
+    assert!(server.await.unwrap().cleanup_error().is_none());
 }
 
 fn can_handshake() -> v1::HandshakeRequest {
