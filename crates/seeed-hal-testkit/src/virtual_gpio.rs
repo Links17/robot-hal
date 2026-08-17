@@ -1,11 +1,12 @@
 use async_trait::async_trait;
 use seeed_hal_core::{
-    CapabilitySet, ErrorCategory, HalError, HalResult, IdentityQuality, ResourceDescriptor,
-    ResourceId, ResourceProperties, ResourceSelector, TransportKind, resolve_resource,
+    CapabilitySet, ErrorCategory, ErrorContext, HalError, HalResult, IdentityQuality,
+    ResourceDescriptor, ResourceId, ResourceProperties, ResourceSelector, TransportKind,
+    resolve_resource,
 };
 use seeed_hal_gpio::{
-    GpioAdapter, GpioDirection, GpioEdge, GpioEdgeEvent, GpioEdgeRequest, GpioLineConfig,
-    GpioLineSession, gpio_edges_capability, gpio_lines_capability,
+    DEFAULT_GPIO_EVENT_CAPACITY, GpioAdapter, GpioDirection, GpioEdge, GpioEdgeEvent,
+    GpioEdgeRequest, GpioLineConfig, GpioLineSession, gpio_edges_capability, gpio_lines_capability,
 };
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -21,10 +22,25 @@ struct State {
     values: Vec<bool>,
     claimed: HashSet<u32>,
     events: VecDeque<(u32, GpioEdge, u64)>,
+    event_capacity: usize,
+    dropped_events: u64,
     sequence: u64,
 }
 impl VirtualGpioAdapter {
     pub fn line_bank(resource_id: impl Into<String>, lines: usize) -> Self {
+        Self::line_bank_with_event_capacity(resource_id, lines, DEFAULT_GPIO_EVENT_CAPACITY)
+    }
+
+    /// Creates a deterministic GPIO bank with a bounded, oldest-drop edge queue.
+    pub fn line_bank_with_event_capacity(
+        resource_id: impl Into<String>,
+        lines: usize,
+        event_capacity: usize,
+    ) -> Self {
+        assert!(
+            (1..=seeed_hal_gpio::MAX_GPIO_EVENTS).contains(&event_capacity),
+            "virtual GPIO event capacity must be within public bounds"
+        );
         let id = ResourceId::parse(resource_id.into()).expect("valid virtual GPIO resource id");
         let descriptor = ResourceDescriptor::new(
             id.clone(),
@@ -41,6 +57,8 @@ impl VirtualGpioAdapter {
                 values: vec![false; lines],
                 claimed: HashSet::new(),
                 events: VecDeque::new(),
+                event_capacity,
+                dropped_events: 0,
                 sequence: 0,
             })),
         }
@@ -49,6 +67,10 @@ impl VirtualGpioAdapter {
         let mut s = self.state.lock().expect("virtual GPIO mutex poisoned");
         if line as usize >= s.values.len() {
             return Err(invalid("gpio.inject_edge"));
+        }
+        if s.events.len() == s.event_capacity {
+            s.events.pop_front();
+            s.dropped_events = s.dropped_events.saturating_add(1);
         }
         s.events.push_back((line, edge, monotonic_ns));
         Ok(())
@@ -139,6 +161,10 @@ impl GpioLineSession for VirtualGpioSession {
         _: Duration,
     ) -> HalResult<Option<GpioEdgeEvent>> {
         let mut s = self.state.lock().expect("virtual GPIO mutex poisoned");
+        if s.dropped_events > 0 {
+            let dropped = std::mem::take(&mut s.dropped_events);
+            return Err(lagged(dropped));
+        }
         if let Some(i) = s
             .events
             .iter()
@@ -203,4 +229,19 @@ fn direction(op: &'static str) -> HalError {
         "GPIO line is not configured for output",
     )
     .expect("valid error")
+}
+
+fn lagged(dropped_count: u64) -> HalError {
+    HalError::new(
+        "gpio.edge.lagged",
+        ErrorCategory::Unavailable,
+        "gpio.next_edge",
+        true,
+        "the bounded virtual GPIO edge queue dropped oldest events",
+    )
+    .expect("valid error")
+    .with_context(
+        ErrorContext::new([("dropped_count", dropped_count.to_string())])
+            .expect("static lag context is valid"),
+    )
 }
