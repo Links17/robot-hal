@@ -22,6 +22,7 @@ struct State {
     claims: HashSet<u8>,
     data: HashMap<u8, Bytes>,
     control: Bytes,
+    next_transfer: Option<HalError>,
 }
 
 impl VirtualUsbAdapter {
@@ -51,6 +52,28 @@ impl VirtualUsbAdapter {
             descriptor,
             state: Arc::new(Mutex::new(State::default())),
         }
+    }
+
+    /// Returns the presently claimed interfaces in deterministic order.
+    pub fn claimed_interfaces(&self) -> Vec<u8> {
+        let mut claims = self
+            .state
+            .lock()
+            .expect("virtual USB mutex poisoned")
+            .claims
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        claims.sort_unstable();
+        claims
+    }
+
+    /// Makes exactly one subsequent transfer fail with the supplied error.
+    pub fn fail_next_transfer(&self, error: HalError) {
+        self.state
+            .lock()
+            .expect("virtual USB mutex poisoned")
+            .next_transfer = Some(error);
     }
 }
 
@@ -107,6 +130,9 @@ impl UsbInterfaceSession for VirtualUsbSession {
         }
         transfer.validate()?;
         let mut state = self.state.lock().expect("virtual USB mutex poisoned");
+        if let Some(error) = state.next_transfer.take() {
+            return Err(error.with_resource_id(self.descriptor.id().clone()));
+        }
         match transfer {
             UsbTransfer::ControlOut { data, .. } => {
                 state.control = data;

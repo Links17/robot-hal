@@ -8,7 +8,7 @@ use seeed_hal_gpio::{
     DEFAULT_GPIO_EVENT_CAPACITY, GpioAdapter, GpioDirection, GpioEdge, GpioEdgeEvent,
     GpioEdgeRequest, GpioLineConfig, GpioLineSession, gpio_edges_capability, gpio_lines_capability,
 };
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,8 +21,15 @@ pub struct VirtualGpioAdapter {
 struct State {
     values: Vec<bool>,
     claimed: HashSet<u32>,
-    events: VecDeque<(u32, GpioEdge, u64)>,
+    sessions: HashMap<u64, SessionState>,
     event_capacity: usize,
+    next_session: u64,
+    next_read: Option<HalError>,
+}
+#[derive(Debug, Default)]
+struct SessionState {
+    lines: Vec<u32>,
+    events: VecDeque<(u32, GpioEdge, u64)>,
     dropped_events: u64,
     sequence: u64,
 }
@@ -56,10 +63,10 @@ impl VirtualGpioAdapter {
             state: Arc::new(Mutex::new(State {
                 values: vec![false; lines],
                 claimed: HashSet::new(),
-                events: VecDeque::new(),
+                sessions: HashMap::new(),
                 event_capacity,
-                dropped_events: 0,
-                sequence: 0,
+                next_session: 0,
+                next_read: None,
             })),
         }
     }
@@ -68,12 +75,41 @@ impl VirtualGpioAdapter {
         if line as usize >= s.values.len() {
             return Err(invalid("gpio.inject_edge"));
         }
-        if s.events.len() == s.event_capacity {
-            s.events.pop_front();
-            s.dropped_events = s.dropped_events.saturating_add(1);
+        let capacity = s.event_capacity;
+        for session in s
+            .sessions
+            .values_mut()
+            .filter(|session| session.lines.contains(&line))
+        {
+            if session.events.len() == capacity {
+                session.events.pop_front();
+                session.dropped_events = session.dropped_events.saturating_add(1);
+            }
+            session.events.push_back((line, edge, monotonic_ns));
         }
-        s.events.push_back((line, edge, monotonic_ns));
         Ok(())
+    }
+
+    /// Returns the presently claimed lines in deterministic order.
+    pub fn claimed_lines(&self) -> Vec<u32> {
+        let mut lines = self
+            .state
+            .lock()
+            .expect("virtual GPIO mutex poisoned")
+            .claimed
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        lines.sort_unstable();
+        lines
+    }
+
+    /// Makes exactly one subsequent GPIO read fail with the supplied error.
+    pub fn fail_next_read(&self, error: HalError) {
+        self.state
+            .lock()
+            .expect("virtual GPIO mutex poisoned")
+            .next_read = Some(error);
     }
 }
 #[async_trait]
@@ -111,11 +147,21 @@ impl GpioAdapter for VirtualGpioAdapter {
                 s.values[*l as usize] = v;
             }
         }
+        let session_id = s.next_session;
+        s.next_session = s.next_session.saturating_add(1);
+        s.sessions.insert(
+            session_id,
+            SessionState {
+                lines: lines.to_vec(),
+                ..Default::default()
+            },
+        );
         Ok(Box::new(VirtualGpioSession {
             descriptor: d,
             lines: lines.to_vec(),
             config,
             state: Arc::clone(&self.state),
+            session_id,
             closed: false,
         }))
     }
@@ -125,6 +171,7 @@ struct VirtualGpioSession {
     lines: Vec<u32>,
     config: GpioLineConfig,
     state: Arc<Mutex<State>>,
+    session_id: u64,
     closed: bool,
 }
 #[async_trait]
@@ -139,7 +186,10 @@ impl GpioLineSession for VirtualGpioSession {
         self.config
     }
     async fn read(&mut self) -> HalResult<Vec<bool>> {
-        let s = self.state.lock().expect("virtual GPIO mutex poisoned");
+        let mut s = self.state.lock().expect("virtual GPIO mutex poisoned");
+        if let Some(error) = s.next_read.take() {
+            return Err(error.with_resource_id(self.descriptor.id().clone()));
+        }
         Ok(self.lines.iter().map(|l| s.values[*l as usize]).collect())
     }
     async fn write(&mut self, values: &[bool]) -> HalResult<()> {
@@ -161,30 +211,32 @@ impl GpioLineSession for VirtualGpioSession {
         _: Duration,
     ) -> HalResult<Option<GpioEdgeEvent>> {
         let mut s = self.state.lock().expect("virtual GPIO mutex poisoned");
-        if s.dropped_events > 0 {
-            let dropped = std::mem::take(&mut s.dropped_events);
+        let session = s
+            .sessions
+            .get_mut(&self.session_id)
+            .expect("open virtual GPIO session must retain queue state");
+        if session.dropped_events > 0 {
+            let dropped = std::mem::take(&mut session.dropped_events);
             return Err(lagged(dropped));
         }
-        if let Some(i) = s
+        if let Some(i) = session
             .events
             .iter()
-            .position(|(l, e, _)| self.lines.contains(l) && request.edges().contains(*e))
+            .position(|(_, e, _)| request.edges().contains(*e))
         {
-            let (_, e, t) = s.events.remove(i).expect("known event");
-            s.sequence += 1;
-            return Ok(Some(GpioEdgeEvent::new(e, t, s.sequence)));
+            let (_, e, t) = session.events.remove(i).expect("known event");
+            session.sequence += 1;
+            return Ok(Some(GpioEdgeEvent::new(e, t, session.sequence)));
         }
         Ok(None)
     }
     async fn close(&mut self) -> HalResult<()> {
         if !self.closed {
-            for l in &self.lines {
-                self.state
-                    .lock()
-                    .expect("virtual GPIO mutex poisoned")
-                    .claimed
-                    .remove(l);
+            let mut state = self.state.lock().expect("virtual GPIO mutex poisoned");
+            for line in &self.lines {
+                state.claimed.remove(line);
             }
+            state.sessions.remove(&self.session_id);
             self.closed = true;
         }
         Ok(())
@@ -197,6 +249,7 @@ impl Drop for VirtualGpioSession {
             for l in &self.lines {
                 s.claimed.remove(l);
             }
+            s.sessions.remove(&self.session_id);
         }
     }
 }

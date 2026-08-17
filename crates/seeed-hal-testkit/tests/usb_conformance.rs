@@ -75,3 +75,43 @@ async fn virtual_usb_claims_exclusively_and_loopbacks_all_transfer_classes() {
     assert_eq!(error.name().as_str(), "runtime.adapter.conflict");
     session.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn virtual_usb_exposes_claim_and_one_shot_transfer_fault_hooks() {
+    let adapter = VirtualUsbAdapter::loopback("usb:virtual:hooks");
+    let descriptor = adapter.enumerate().await.unwrap().remove(0);
+    let mut session = adapter
+        .open(&descriptor.selector(), UsbInterfaceClaim::new(3).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(adapter.claimed_interfaces(), vec![3]);
+
+    adapter.fail_next_transfer(
+        seeed_hal_core::HalError::new(
+            "usb.injected",
+            seeed_hal_core::ErrorCategory::Unavailable,
+            "test.injected",
+            true,
+            "injected",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        session
+            .transfer(UsbTransfer::bulk_in(0x83, 1).unwrap(), Duration::ZERO)
+            .await
+            .unwrap_err()
+            .name()
+            .as_str(),
+        "usb.injected"
+    );
+    assert_eq!(
+        session
+            .transfer(UsbTransfer::bulk_in(0x83, 1).unwrap(), Duration::ZERO)
+            .await
+            .unwrap(),
+        Bytes::new()
+    );
+    session.close().await.unwrap();
+    assert!(adapter.claimed_interfaces().is_empty());
+}
