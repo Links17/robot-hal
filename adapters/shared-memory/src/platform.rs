@@ -9,7 +9,7 @@ pub(crate) struct Mapping {
     address: NonNull<u8>,
     length: usize,
     fd: libc::c_int,
-    semaphore: *mut libc::sem_t,
+    lock_fd: libc::c_int,
 }
 
 #[cfg(unix)]
@@ -21,9 +21,8 @@ impl Mapping {
                 "shared-memory name contains an interior NUL",
             )
         })?;
-        // SAFETY: `name` is a NUL-terminated POSIX shm name; O_EXCL prevents
-        // aliasing an existing object; the upstream shm_open contract returns
-        // an owned fd on success. Focused reopen tests cover the object flow.
+        // SAFETY: `name` is a NUL-terminated POSIX shm name; O_EXCL prevents aliasing an
+        // existing object; the upstream shm_open contract returns an owned fd on success.
         let fd = unsafe {
             libc::shm_open(
                 name.as_ptr(),
@@ -84,7 +83,7 @@ impl Mapping {
             return Err(error);
         }
         // SAFETY: `fd` owns an object resized to `length`; requested range is
-        // non-zero and bounded; POSIX mmap returns a distinct mapping or MAP_FAILED.
+        // non-zero and bounded; mmap returns a distinct mapping or MAP_FAILED.
         let address = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -105,31 +104,12 @@ impl Mapping {
         }
         // SAFETY: mmap returned a non-null, non-MAP_FAILED valid base address.
         let address: NonNull<u8> = unsafe { NonNull::new_unchecked(address.cast()) };
-        // SAFETY: name is a valid POSIX semaphore name. O_EXCL prevents aliasing; the semaphore
-        // is a process-shared system synchronization object. Focused reopen tests cover it.
-        let semaphore = unsafe {
-            libc::sem_open(
-                name.as_ptr(),
-                libc::O_CREAT | libc::O_EXCL,
-                (libc::S_IRUSR | libc::S_IWUSR) as libc::c_uint,
-                1,
-            )
-        };
-        if semaphore == libc::SEM_FAILED {
-            let error = io::Error::last_os_error();
-            // SAFETY: mapping, fd, and shm object are all owned on this error path.
-            unsafe {
-                libc::munmap(address.as_ptr().cast(), length);
-                libc::close(fd);
-                libc::shm_unlink(name.as_ptr());
-            }
-            return Err(error);
-        }
+        let lock_fd = create_lock_file(name.as_c_str())?;
         Ok(Self {
             address,
             length,
             fd,
-            semaphore,
+            lock_fd,
         })
     }
 
@@ -140,8 +120,8 @@ impl Mapping {
                 "shared-memory name contains an interior NUL",
             )
         })?;
-        // SAFETY: `name` is a validated NUL-terminated POSIX shm name. POSIX
-        // returns an owned fd on success; the reader reopen test covers this.
+        // SAFETY: `name` is a validated NUL-terminated POSIX shm name. POSIX returns an owned
+        // fd on success; the reader reopen test covers this.
         let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -188,22 +168,12 @@ impl Mapping {
         }
         // SAFETY: mmap returned a non-null, non-MAP_FAILED valid base address.
         let address: NonNull<u8> = unsafe { NonNull::new_unchecked(address.cast()) };
-        // SAFETY: name is valid and sem_open returns a process-shared semaphore handle.
-        let semaphore = unsafe { libc::sem_open(name.as_ptr(), 0) };
-        if semaphore == libc::SEM_FAILED {
-            let error = io::Error::last_os_error();
-            // SAFETY: mapping and fd are owned on this error path.
-            unsafe {
-                libc::munmap(address.as_ptr().cast(), length);
-                libc::close(fd);
-            }
-            return Err(error);
-        }
+        let lock_fd = open_lock_file(name.as_c_str())?;
         Ok(Self {
             address,
             length,
             fd,
-            semaphore,
+            lock_fd,
         })
     }
 
@@ -212,21 +182,26 @@ impl Mapping {
     }
 
     pub(crate) fn try_lock_shared(&self) -> io::Result<()> {
-        self.try_lock_exclusive()
+        self.try_lock(libc::LOCK_SH | libc::LOCK_NB)
     }
 
     pub(crate) fn try_lock_exclusive(&self) -> io::Result<()> {
-        // SAFETY: this Mapping owns an opened process-shared semaphore; sem_trywait is
-        // non-blocking and retains no Rust pointers.
-        if unsafe { libc::sem_trywait(self.semaphore) } != 0 {
+        self.try_lock(libc::LOCK_EX | libc::LOCK_NB)
+    }
+
+    pub(crate) fn unlock(&self) -> io::Result<()> {
+        // SAFETY: `lock_fd` is owned by this Mapping and flock(2) releases its advisory lock
+        // for this open file description without retaining Rust pointers.
+        if unsafe { libc::flock(self.lock_fd, libc::LOCK_UN) } != 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
     }
 
-    pub(crate) fn unlock(&self) -> io::Result<()> {
-        // SAFETY: matching lock acquisition on this owned semaphore makes posting valid.
-        if unsafe { libc::sem_post(self.semaphore) } != 0 {
+    fn try_lock(&self, operation: libc::c_int) -> io::Result<()> {
+        // SAFETY: `lock_fd` is owned by this Mapping. BSD flock(2) specifies advisory,
+        // non-blocking locks with LOCK_NB, released on process exit or final close.
+        if unsafe { libc::flock(self.lock_fd, operation) } != 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
@@ -239,11 +214,9 @@ impl Mapping {
                 "shared-memory name contains an interior NUL",
             )
         })?;
-        // SAFETY: `name` is a NUL-terminated POSIX shm name and remains valid
-        // for this synchronous call. POSIX shm_unlink retains no pointer.
-        // SAFETY: name is valid; unlinking the semaphore prevents a stale synchronization
-        // object from becoming associated with a newly created mapping name.
-        if unsafe { libc::sem_unlink(name.as_ptr()) } != 0 {
+        let lock_path = lock_path(name.as_c_str())?;
+        // SAFETY: lock_path is valid and unlink retains no pointer.
+        if unsafe { libc::unlink(lock_path.as_ptr()) } != 0 {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: name is valid and shm_unlink retains no pointer.
@@ -255,6 +228,47 @@ impl Mapping {
 }
 
 #[cfg(unix)]
+fn lock_path(name: &std::ffi::CStr) -> io::Result<CString> {
+    let name = name
+        .to_str()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 mapping name"))?;
+    CString::new(format!("/tmp/{name}.lock")).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "shared-memory name contains an interior NUL",
+        )
+    })
+}
+
+#[cfg(unix)]
+fn create_lock_file(name: &std::ffi::CStr) -> io::Result<libc::c_int> {
+    let path = lock_path(name)?;
+    // SAFETY: path is NUL-terminated and O_EXCL creates a private 0600 advisory-lock inode.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+            (libc::S_IRUSR | libc::S_IWUSR) as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+#[cfg(unix)]
+fn open_lock_file(name: &std::ffi::CStr) -> io::Result<libc::c_int> {
+    let path = lock_path(name)?;
+    // SAFETY: path is NUL-terminated and opens the broker-created private lock inode.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+#[cfg(unix)]
 impl Drop for Mapping {
     fn drop(&mut self) {
         // SAFETY: this Mapping owns exactly the mmap range created/opened in
@@ -262,8 +276,52 @@ impl Drop for Mapping {
         let _ = unsafe { libc::munmap(self.address.as_ptr().cast(), self.length) };
         // SAFETY: this Mapping owns the fd and close does not retain it.
         let _ = unsafe { libc::close(self.fd) };
-        // SAFETY: this Mapping owns the semaphore handle and sem_close retains no pointer.
-        let _ = unsafe { libc::sem_close(self.semaphore) };
+        // SAFETY: this Mapping owns the advisory-lock descriptor and close releases its flock.
+        let _ = unsafe { libc::close(self.lock_fd) };
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::ffi::CString;
+    use std::process::Command;
+
+    use super::Mapping;
+
+    const CHILD_MAPPING_NAME: &str = "SEEED_HAL_FLOCK_TEST_MAPPING_NAME";
+
+    #[test]
+    fn exclusive_lock_is_released_when_child_exits() {
+        if let Ok(name) = std::env::var(CHILD_MAPPING_NAME) {
+            let _mapping = Mapping::open_read_only(&name, 4096).unwrap();
+            // SAFETY: name is a valid private mapping name and O_RDWR returns a writable
+            // descriptor so this test can acquire the exclusive lock after mapping read-only.
+            let name = CString::new(name).unwrap();
+            let path = super::lock_path(name.as_c_str()).unwrap();
+            let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR) };
+            assert!(fd >= 0);
+            // SAFETY: fd is an owned writable descriptor; flock is non-blocking and the process
+            // exits immediately after acquisition, intentionally bypassing cleanup.
+            assert_eq!(unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) }, 0);
+            // SAFETY: this subprocess intentionally simulates an abnormal process exit after
+            // acquiring the inter-process lock; `_exit` avoids Rust destructor cleanup.
+            unsafe { libc::_exit(0) };
+        }
+
+        let name = format!("/seeed-hal-flock-{}", std::process::id());
+        let mapping = Mapping::create(&name, 4096).unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("platform::tests::exclusive_lock_is_released_when_child_exits")
+            .arg("--nocapture")
+            .env(CHILD_MAPPING_NAME, &name)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        assert!(mapping.try_lock_exclusive().is_ok());
+        mapping.unlock().unwrap();
+        Mapping::unlink(&name).unwrap();
     }
 }
 
