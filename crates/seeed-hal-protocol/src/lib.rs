@@ -15,6 +15,8 @@ pub use can_conversion::{
     open_can_response_from_proto, received_can_frames_from_proto,
     replace_can_filters_request_from_proto, send_can_frames_from_proto,
 };
+pub use conversion::gpio_config_from_proto;
+pub use conversion::usb_transfer_from_proto;
 pub use conversion::{
     enumerate_serial_response_from_proto, error_from_proto, invalid_message,
     open_serial_request_from_proto, open_serial_response_from_proto, parse_serial_session_lease,

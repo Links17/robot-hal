@@ -6,8 +6,10 @@ use seeed_hal_core::{
     IdentityQuality, LeaseId, LeaseMode, LeaseToken, ResourceDescriptor, ResourceId,
     ResourceProperties, ResourceSelector, SessionId, TransportKind,
 };
+use seeed_hal_gpio::{GpioBias, GpioDrive, GpioLineConfig};
 use seeed_hal_runtime::{RuntimeEvent, RuntimeEventKind};
 use seeed_hal_serial::{DataBits, FlowControl, Parity, SerialConfig, StopBits};
+use seeed_hal_usb::UsbTransfer;
 
 use crate::v1;
 
@@ -20,6 +22,81 @@ pub fn invalid_message(debug_message: impl Into<String>) -> HalError {
         debug_message,
     )
     .expect("static protocol error metadata is valid")
+}
+
+pub fn usb_transfer_from_proto(value: v1::UsbTransferRequest) -> HalResult<UsbTransfer> {
+    let kind = required_enum::<v1::UsbTransferKind>(value.kind, "usb_transfer.kind")?;
+    let byte = |value: u32, field: &'static str| {
+        u8::try_from(value).map_err(|_| invalid_message(format!("{field} exceeds u8")))
+    };
+    let u16_value = |value: u32, field: &'static str| {
+        u16::try_from(value).map_err(|_| invalid_message(format!("{field} exceeds u16")))
+    };
+    let max = usize::try_from(value.max_bytes)
+        .map_err(|_| invalid_message("usb_transfer.max_bytes is invalid"))?;
+    let data = value.data.into();
+    let transfer = match kind {
+        v1::UsbTransferKind::ControlOut => UsbTransfer::control_out(
+            byte(value.request_type, "usb_transfer.request_type")?,
+            byte(value.request, "usb_transfer.request")?,
+            u16_value(value.value, "usb_transfer.value")?,
+            u16_value(value.index, "usb_transfer.index")?,
+            data,
+        ),
+        v1::UsbTransferKind::ControlIn => UsbTransfer::control_in(
+            byte(value.request_type, "usb_transfer.request_type")?,
+            byte(value.request, "usb_transfer.request")?,
+            u16_value(value.value, "usb_transfer.value")?,
+            u16_value(value.index, "usb_transfer.index")?,
+            max,
+        ),
+        v1::UsbTransferKind::BulkOut => {
+            UsbTransfer::bulk_out(byte(value.endpoint, "usb_transfer.endpoint")?, data)
+        }
+        v1::UsbTransferKind::BulkIn => {
+            UsbTransfer::bulk_in(byte(value.endpoint, "usb_transfer.endpoint")?, max)
+        }
+        v1::UsbTransferKind::InterruptOut => {
+            UsbTransfer::interrupt_out(byte(value.endpoint, "usb_transfer.endpoint")?, data)
+        }
+        v1::UsbTransferKind::InterruptIn => {
+            UsbTransfer::interrupt_in(byte(value.endpoint, "usb_transfer.endpoint")?, max)
+        }
+        v1::UsbTransferKind::Unspecified => Err(invalid_message("usb_transfer.kind is required")),
+    };
+    transfer.map_err(|_| invalid_message("usb_transfer violates the public USB transfer bounds"))
+}
+
+pub fn gpio_config_from_proto(value: v1::GpioLineConfig) -> HalResult<GpioLineConfig> {
+    let direction = required_enum::<v1::GpioDirection>(value.direction, "gpio_config.direction")?;
+    let bias = match required_enum::<v1::GpioBias>(value.bias, "gpio_config.bias")? {
+        v1::GpioBias::Disabled => GpioBias::Disabled,
+        v1::GpioBias::PullUp => GpioBias::PullUp,
+        v1::GpioBias::PullDown => GpioBias::PullDown,
+        v1::GpioBias::Unspecified => return Err(invalid_message("gpio_config.bias is required")),
+    };
+    match direction {
+        v1::GpioDirection::Input => GpioLineConfig::input(value.active_low, bias),
+        v1::GpioDirection::Output => {
+            let drive = match required_enum::<v1::GpioDrive>(value.drive, "gpio_config.drive")? {
+                v1::GpioDrive::PushPull => GpioDrive::PushPull,
+                v1::GpioDrive::OpenDrain => GpioDrive::OpenDrain,
+                v1::GpioDrive::OpenSource => GpioDrive::OpenSource,
+                v1::GpioDrive::Unspecified => {
+                    return Err(invalid_message("gpio_config.drive is required"));
+                }
+            };
+            GpioLineConfig::output(
+                value.active_low,
+                value.initial_value.ok_or_else(|| {
+                    invalid_message("gpio_config.initial_value is required for output")
+                })?,
+                drive,
+            )
+        }
+        v1::GpioDirection::Unspecified => Err(invalid_message("gpio_config.direction is required")),
+    }
+    .map_err(|_| invalid_message("gpio_config violates the public GPIO configuration bounds"))
 }
 
 pub(crate) fn required_enum<T: TryFrom<i32>>(value: i32, field: &'static str) -> HalResult<T> {

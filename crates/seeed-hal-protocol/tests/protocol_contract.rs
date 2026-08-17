@@ -39,6 +39,25 @@ fn usb_and_gpio_open_requests_lock_session_and_lease_field_tags() {
     assert_tags(&v1::OpenGpioRequest::default(), &[]);
 }
 
+#[test]
+fn usb_transfer_decoder_rejects_payload_over_public_bound() {
+    let error = seeed_hal_protocol::usb_transfer_from_proto(v1::UsbTransferRequest {
+        kind: v1::UsbTransferKind::BulkOut as i32,
+        endpoint: 1,
+        data: vec![0; 16 * 1024 + 1],
+        ..Default::default()
+    })
+    .unwrap_err();
+    assert_eq!(error.name().as_str(), "runtime.protocol.invalid_message");
+}
+
+#[test]
+fn gpio_config_decoder_rejects_unspecified_direction() {
+    let error =
+        seeed_hal_protocol::gpio_config_from_proto(v1::GpioLineConfig::default()).unwrap_err();
+    assert_eq!(error.name().as_str(), "runtime.protocol.invalid_message");
+}
+
 fn envelope_with(payload: envelope::Payload) -> v1::Envelope {
     v1::Envelope {
         request_id: 7,

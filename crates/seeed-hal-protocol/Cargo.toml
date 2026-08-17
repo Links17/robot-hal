@@ -12,6 +12,8 @@ seeed-hal-can = { path = "../seeed-hal-can" }
 seeed-hal-core = { path = "../seeed-hal-core" }
 seeed-hal-runtime = { path = "../seeed-hal-runtime" }
 seeed-hal-serial = { path = "../seeed-hal-serial" }
+seeed-hal-usb = { path = "../seeed-hal-usb" }
+seeed-hal-gpio = { path = "../seeed-hal-gpio" }
 
 [build-dependencies]
 prost-build = { workspace = true }

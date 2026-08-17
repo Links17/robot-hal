@@ -1043,8 +1043,10 @@ dependencies = [
  "protoc-bin-vendored",
  "seeed-hal-can",
  "seeed-hal-core",
+ "seeed-hal-gpio",
  "seeed-hal-runtime",
  "seeed-hal-serial",
+ "seeed-hal-usb",
 ]
 
 [[package]]
