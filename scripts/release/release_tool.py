@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -62,6 +63,27 @@ EXPECTED_TARGETS = (
         ),
     },
 )
+BROKER_MANIFEST_FIELDS = {
+    "broker_version",
+    "wire",
+    "target",
+    "enabled",
+    "msrv",
+    "artifact_checksum",
+    "required_vendor_runtime_libraries",
+}
+BROKER_VERSION = "0.5.0-rc.1"
+BROKER_WIRE = {
+    "major": 1,
+    "minimum_minor": 0,
+    "maximum_minor": 3,
+}
+TARGET_PLATFORMS = {
+    "macos": {"os": "macos", "arch": "aarch64"},
+    "linux": {"os": "linux", "arch": "x86_64"},
+    "windows": {"os": "windows", "arch": "x86_64"},
+}
+BROKER_MSRV = "1.85"
 
 
 class ReleaseFailure(Exception):
@@ -307,6 +329,114 @@ def check_version(repo_root: Path, tag: str, cargo: str = "cargo") -> None:
         )
 
 
+def _read_json(path: Path, error_name: str) -> object:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ReleaseFailure(error_name, str(error)) from error
+
+
+def _manifest_invalid(diagnostic: str) -> NoReturn:
+    raise ReleaseFailure("release.manifest.invalid", diagnostic)
+
+
+def _require_object(value: object, field: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        _manifest_invalid(f"{field} must be an object")
+    return value
+
+
+def _require_exact_fields(
+    value: dict[str, object],
+    expected: set[str],
+    field: str,
+) -> None:
+    if set(value) != expected:
+        _manifest_invalid(f"{field} fields do not match the manifest contract")
+
+
+def _require_string_list(value: object, field: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        _manifest_invalid(f"{field} must be a string list")
+    return tuple(value)
+
+
+def _artifact_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as artifact:
+            while chunk := artifact.read(64 * 1024):
+                digest.update(chunk)
+    except OSError as error:
+        raise ReleaseFailure("release.manifest.invalid", str(error)) from error
+    return digest.hexdigest()
+
+
+def verify_broker_manifest(
+    manifest: object,
+    target: ReleaseTarget,
+    artifact: Path,
+) -> None:
+    document = _require_object(manifest, "manifest")
+    missing_fields = BROKER_MANIFEST_FIELDS - set(document)
+    if missing_fields:
+        _manifest_invalid("manifest is missing required fields")
+
+    if document["broker_version"] != BROKER_VERSION:
+        _manifest_invalid("broker version does not match")
+
+    wire = _require_object(document["wire"], "wire")
+    _require_exact_fields(wire, set(BROKER_WIRE), "wire")
+    if any(type(wire[field]) is not int for field in BROKER_WIRE):
+        _manifest_invalid("wire values must be integers")
+    if wire != BROKER_WIRE:
+        _manifest_invalid("wire range does not match")
+
+    expected_platform = TARGET_PLATFORMS.get(target.name)
+    if expected_platform is None:
+        _manifest_invalid("target platform is unsupported")
+    manifest_target = _require_object(document["target"], "target")
+    _require_exact_fields(manifest_target, {"triple", "os", "arch"}, "target")
+    expected_target = {"triple": target.triple, **expected_platform}
+    if manifest_target != expected_target:
+        _manifest_invalid("target identity does not match")
+
+    enabled = _require_object(document["enabled"], "enabled")
+    _require_exact_fields(enabled, {"adapters", "features"}, "enabled")
+    adapters = _require_string_list(enabled["adapters"], "enabled.adapters")
+    features = _require_string_list(enabled["features"], "enabled.features")
+    if adapters != target.required_adapters:
+        _manifest_invalid("enabled adapters do not match")
+    if features != tuple(sorted(target.features)):
+        _manifest_invalid("enabled features do not match")
+
+    if document["msrv"] != BROKER_MSRV:
+        _manifest_invalid("MSRV does not match")
+    vendor_runtime = _require_string_list(
+        document["required_vendor_runtime_libraries"],
+        "required_vendor_runtime_libraries",
+    )
+    if vendor_runtime:
+        _manifest_invalid("vendor runtime libraries do not match")
+
+    checksum = _require_object(document["artifact_checksum"], "artifact_checksum")
+    _require_exact_fields(checksum, {"algorithm", "value"}, "artifact_checksum")
+    if checksum["algorithm"] != "sha256" or not isinstance(checksum["value"], str):
+        _manifest_invalid("artifact checksum is invalid")
+    if checksum["value"] != _artifact_sha256(artifact):
+        _manifest_invalid("artifact checksum does not match")
+
+
+def _target_by_name(
+    targets: tuple[ReleaseTarget, ...],
+    name: str,
+) -> ReleaseTarget:
+    for target in targets:
+        if target.name == name:
+            return target
+    raise ReleaseFailure("release.target.invalid", f"unknown target {name}")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -314,6 +444,11 @@ def _parser() -> argparse.ArgumentParser:
     check.add_argument("--tag", required=True)
     check.add_argument("--repo-root", required=True, type=Path)
     check.add_argument("--cargo", default="cargo")
+    verify = subcommands.add_parser("verify-broker-manifest")
+    verify.add_argument("--manifest", required=True, type=Path)
+    verify.add_argument("--target", required=True)
+    verify.add_argument("--targets", required=True, type=Path)
+    verify.add_argument("--artifact", required=True, type=Path)
     return parser
 
 
@@ -330,6 +465,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.repo_root.resolve(),
                 arguments.tag,
                 arguments.cargo,
+            )
+        elif arguments.command == "verify-broker-manifest":
+            targets = load_targets(arguments.targets)
+            verify_broker_manifest(
+                _read_json(arguments.manifest, "release.manifest.invalid"),
+                _target_by_name(targets, arguments.target),
+                arguments.artifact,
             )
     except ReleaseFailure as error:
         _fail(error)

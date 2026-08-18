@@ -129,6 +129,8 @@ fn enabled_adapters() -> Vec<&'static str> {
 fn enabled_features() -> Vec<&'static str> {
     #[allow(unused_mut)]
     let mut features = Vec::new();
+    #[cfg(feature = "serialport")]
+    features.push("serialport");
     #[cfg(all(
         feature = "avfoundation",
         target_os = "macos",
@@ -163,6 +165,7 @@ fn enabled_features() -> Vec<&'static str> {
     features.push("v4l2");
     #[cfg(feature = "virtual-adapters")]
     features.push("virtual-adapters");
+    features.sort_unstable();
     features
 }
 

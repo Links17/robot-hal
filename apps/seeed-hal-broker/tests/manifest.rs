@@ -1,6 +1,7 @@
 use std::process::Command;
 
 use sha2::{Digest, Sha256};
+use wait_timeout::ChildExt;
 
 #[test]
 fn manifest_is_deterministic_business_independent_and_hardware_free() {
@@ -17,8 +18,11 @@ fn manifest_is_deterministic_business_independent_and_hardware_free() {
             "--auth-token-file",
             token_path.to_str().unwrap(),
         ])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .unwrap();
+    let output = wait_with_output(output, std::time::Duration::from_secs(10));
     assert!(
         output.status.success(),
         "{}",
@@ -42,6 +46,8 @@ fn manifest_is_deterministic_business_independent_and_hardware_free() {
     let mut expected_adapters = vec!["serialport"];
     #[allow(unused_mut)]
     let mut expected_features: Vec<&str> = Vec::new();
+    #[cfg(feature = "serialport")]
+    expected_features.push("serialport");
     #[cfg(feature = "pcan")]
     {
         expected_adapters.push("pcan");
@@ -109,6 +115,7 @@ fn manifest_is_deterministic_business_independent_and_hardware_free() {
         ]);
         expected_features.push("virtual-adapters");
     }
+    expected_features.sort_unstable();
     expected_adapters.sort_unstable();
     assert_eq!(
         manifest["enabled"]["adapters"],
@@ -158,4 +165,19 @@ fn manifest_is_deterministic_business_independent_and_hardware_free() {
     }
 
     std::fs::remove_file(token_path).unwrap();
+}
+
+fn wait_with_output(
+    mut child: std::process::Child,
+    timeout: std::time::Duration,
+) -> std::process::Output {
+    if child.wait_timeout(timeout).unwrap().is_some() {
+        return child.wait_with_output().unwrap();
+    }
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+    panic!(
+        "broker manifest command timed out: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
