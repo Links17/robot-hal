@@ -85,4 +85,48 @@ creation remain unexercised locally and were intentionally not triggered.
 
 ## Commit
 
-Pending local commit after final review and verification.
+Initial Task 9 implementation: `ddd7764 ci(release): build and attest v0.5 prereleases`.
+
+## Review remediation
+
+### RED / GREEN
+
+- Archive-transfer permission regression first failed in two cases: an
+  artifact-style mode-0644 tar archive left the extracted broker mode at
+  `0755`, and an archive declaring a mode-0644 broker was accepted. The
+  extractor now requires a validated regular tar member with owner execute,
+  then applies mode `0700` only to the freshly extracted broker file. The
+  source archive remains mode `0644`; no downloaded release tree is broadly
+  chmodded. GREEN: 2 passed.
+- Final-job tag immutability and dynamic target-matrix workflow contracts
+  first failed because neither behavior existed. The final job now queries the
+  remote plain tag and optional peeled annotated-tag ref before attestation,
+  before release creation, and after creation; it requires one unambiguous
+  result resolving to the validated commit. Target matrix output is now
+  produced from `release/targets.toml` using `print-target --format json`.
+- Per-platform evidence aggregation tests first failed because no aggregate
+  interface existed. `aggregate-platform-reports` now requires exactly three
+  reports, matching tag/commit/qualification, one Passed job per distinct
+  release platform, and Passed virtual evidence for minors 0–3 on that same
+  platform. Wrong tag, wrong commit, duplicate jobs, and missing minor records
+  fail closed under `release.conformance.invalid` or
+  `release.conformance.incomplete`.
+
+### Review validation
+
+```text
+workflow contracts plus focused archive/evidence regressions
+# 26 passed
+
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+# 203 passed
+
+python3 scripts/release/release_tool.py check-version \
+  --tag v0.5.0-rc.1 --repo-root .
+python3 -m compileall -q scripts/release/release_tool.py tests/release
+git diff --check
+# passed
+```
+
+Hosted Actions execution, remote tag observations, final attestation, and
+prerelease publication remain intentionally unperformed locally.

@@ -1076,6 +1076,122 @@ def aggregate_release(
     return release_dir
 
 
+def aggregate_platform_reports(
+    *,
+    tag: str,
+    commit: str,
+    report_dir: Path,
+) -> dict[str, object]:
+    """Combine exactly one complete passed evidence record per release platform."""
+    try:
+        ReleaseVersion.parse(tag)
+        if RELEASE_COMMIT.fullmatch(commit) is None:
+            raise ReleaseFailure("release.conformance.invalid", "release commit is invalid")
+        directory = _input_directory(report_dir)
+        paths = tuple(sorted(report_dir.glob("*.json")))
+        if len(paths) != len(EXPECTED_TARGETS) or len(paths) != len(directory[2]):
+            raise ReleaseFailure(
+                "release.conformance.incomplete",
+                "expected exactly three platform conformance reports",
+            )
+        reports = [
+            validate_conformance_report(
+                _read_json(path, "release.conformance.invalid")
+            )
+            for path in paths
+        ]
+    except ReleaseFailure as error:
+        if error.name in {"release.manifest.invalid", "release.conformance.incomplete"}:
+            raise ReleaseFailure("release.conformance.invalid", "platform report is invalid") from error
+        raise
+    except OSError as error:
+        raise ReleaseFailure(
+            "release.conformance.invalid",
+            "platform conformance reports are unreadable",
+        ) from error
+
+    expected_platforms = {target["name"] for target in EXPECTED_TARGETS}
+    jobs: list[dict[str, str]] = []
+    virtual: list[dict[str, str | int]] = []
+    seen_platforms: set[str] = set()
+    qualification: dict[str, object] | None = None
+    hardware: dict[str, object] | None = None
+    for report in reports:
+        if report["tag"] != tag or report["commit"] != commit:
+            raise ReleaseFailure(
+                "release.conformance.invalid",
+                "platform conformance identity does not match the release",
+            )
+        software = report["software"]
+        if not isinstance(software, dict):
+            raise ReleaseFailure("release.conformance.invalid", "software evidence is invalid")
+        raw_jobs = software["jobs"]
+        raw_virtual = software["virtual"]
+        if (
+            not isinstance(raw_jobs, list)
+            or len(raw_jobs) != 1
+            or not isinstance(raw_virtual, list)
+            or len(raw_virtual) != BROKER_WIRE["maximum_minor"] + 1
+        ):
+            raise ReleaseFailure(
+                "release.conformance.incomplete",
+                "platform conformance evidence is incomplete",
+            )
+        job = raw_jobs[0]
+        if not isinstance(job, dict):
+            raise ReleaseFailure("release.conformance.invalid", "platform job is invalid")
+        platform = job.get("platform")
+        if (
+            platform not in expected_platforms
+            or platform in seen_platforms
+            or job.get("result") != "Passed"
+            or any(
+                not isinstance(item, dict)
+                or item.get("platform") != platform
+                or item.get("result") != "Passed"
+                for item in raw_virtual
+            )
+            or {item.get("protocol_minor") for item in raw_virtual if isinstance(item, dict)}
+            != set(range(BROKER_WIRE["minimum_minor"], BROKER_WIRE["maximum_minor"] + 1))
+        ):
+            raise ReleaseFailure(
+                "release.conformance.incomplete",
+                "platform conformance evidence is incomplete",
+            )
+        seen_platforms.add(platform)
+        jobs.append(job)
+        virtual.extend(raw_virtual)
+        if qualification is None:
+            qualification = report["qualification"]
+            hardware = report["hardware"]
+        elif qualification != report["qualification"] or hardware != report["hardware"]:
+            raise ReleaseFailure(
+                "release.conformance.invalid",
+                "platform conformance qualifications do not match",
+            )
+    if seen_platforms != expected_platforms or qualification is None or hardware is None:
+        raise ReleaseFailure(
+            "release.conformance.incomplete",
+            "platform conformance evidence is incomplete",
+        )
+    result = {
+        "schema": 1,
+        "tag": tag,
+        "commit": commit,
+        "qualification": qualification,
+        "software": {
+            "status": "Passed",
+            "jobs": sorted(jobs, key=lambda job: str(job["platform"])),
+            "virtual": sorted(
+                virtual,
+                key=lambda item: (str(item["platform"]), int(item["protocol_minor"])),
+            ),
+        },
+        "hardware": hardware,
+    }
+    return validate_conformance_report(result)
+
+
 def _extract_broker_archive(
     archive: Path,
     target: ReleaseTarget,
@@ -1093,7 +1209,12 @@ def _extract_broker_archive(
         destination.mkdir(mode=0o700)
         if archive.name.endswith(".tar.gz"):
             with tarfile.open(archive, "r:gz") as contents:
+                member = contents.getmember(f"{root}/{binary_name}")
+                if not member.isreg() or not member.mode & stat.S_IXUSR:
+                    _archive_invalid("broker archive executable lacks owner execute metadata")
                 contents.extractall(destination, filter="data")
+            binary = destination / root / binary_name
+            binary.chmod(0o700)
         else:
             with zipfile.ZipFile(archive) as contents:
                 contents.extractall(destination)
@@ -1820,8 +1941,10 @@ def _target_by_name(
     raise ReleaseFailure("release.target.invalid", "unknown target")
 
 
-def print_target_matrix(targets_path: Path) -> str:
+def print_target_matrix(targets_path: Path, output_format: str = "github-matrix") -> str:
     """Encode the release targets as a GitHub Actions matrix."""
+    if output_format not in {"github-matrix", "json"}:
+        raise ReleaseFailure("release.tool.invalid", "target output format is invalid")
     return json.dumps(
         {
             "include": [
@@ -2770,7 +2893,7 @@ def _parser() -> argparse.ArgumentParser:
     virtual.add_argument("--ref", required=True)
     target = subcommands.add_parser("print-target")
     target.add_argument("--targets", required=True, type=Path)
-    target.add_argument("--format", required=True, choices=("github-matrix",))
+    target.add_argument("--format", required=True, choices=("github-matrix", "json"))
     static = subcommands.add_parser("verify-static")
     static.add_argument("--release-dir", required=True, type=Path)
     artifacts = subcommands.add_parser("verify-artifacts")
@@ -2786,6 +2909,11 @@ def _parser() -> argparse.ArgumentParser:
     aggregate.add_argument("--python-artifacts", required=True, type=Path)
     aggregate.add_argument("--report-inputs", required=True, type=Path)
     aggregate.add_argument("--release-dir", required=True, type=Path)
+    reports = subcommands.add_parser("aggregate-platform-reports")
+    reports.add_argument("--tag", required=True)
+    reports.add_argument("--commit", required=True)
+    reports.add_argument("--report-dir", required=True, type=Path)
+    reports.add_argument("--output", required=True, type=Path)
     return parser
 
 
@@ -2882,7 +3010,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
         elif arguments.subcommand == "print-target":
-            print(print_target_matrix(arguments.targets))
+            print(print_target_matrix(arguments.targets, arguments.format))
         elif arguments.subcommand == "verify-static":
             verify_static(arguments.release_dir)
         elif arguments.subcommand == "verify-artifacts":
@@ -2901,6 +3029,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 python_candidate=arguments.python_artifacts,
                 report_inputs=arguments.report_inputs,
                 release_dir=arguments.release_dir,
+            )
+        elif arguments.subcommand == "aggregate-platform-reports":
+            arguments.output.write_bytes(
+                encode_conformance_report(
+                    aggregate_platform_reports(
+                        tag=arguments.tag,
+                        commit=arguments.commit,
+                        report_dir=arguments.report_dir,
+                    )
+                )
             )
     except ReleaseFailure as error:
         _fail(error)

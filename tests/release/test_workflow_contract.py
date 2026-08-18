@@ -317,6 +317,19 @@ def test_rc_release_validate_job_fails_closed_on_identity_and_existing_release()
     assert "git fetch --force" not in commands
 
 
+def test_rc_release_rechecks_one_remote_peeled_tag_before_and_after_publish() -> None:
+    _, jobs, _ = _release_workflow()
+    final_commands = _job_commands(jobs["attest-and-release"])
+
+    assert "require_remote_peeled_tag()" in final_commands
+    assert final_commands.count("require_remote_peeled_tag()") == 2
+    assert final_commands.count("require_remote_peeled_tag\n") == 3
+    assert "git ls-remote --tags origin" in final_commands
+    assert "refs/tags/$TAG^{}" in final_commands
+    assert 'test "$remote_commit" = "${{ needs.validate.outputs.commit }}"' in final_commands
+    assert "awk" not in final_commands
+
+
 def test_rc_release_builds_unique_verified_platform_and_client_artifacts() -> None:
     _, jobs, text = _release_workflow()
     platform_commands = _job_commands(jobs["platform-build"])
@@ -335,6 +348,22 @@ def test_rc_release_builds_unique_verified_platform_and_client_artifacts() -> No
     ):
         assert required in platform_commands + client_commands
     assert "release/" in text
+
+
+def test_rc_release_derives_platform_matrices_from_release_targets() -> None:
+    _, jobs, _ = _release_workflow()
+
+    validate_commands = _job_commands(jobs["validate"])
+    assert "print-target --targets release/targets.toml --format json" in validate_commands
+    for name in ("platform-build", "platform-verify"):
+        job = jobs[name]
+        needs = job["needs"]
+        assert "validate" in (needs if isinstance(needs, list) else [needs])
+        assert job["strategy"]["matrix"]["include"] == (
+            "${{ fromJSON(needs.validate.outputs.targets).include }}"
+        )
+    assert "macos-14" not in json.dumps(jobs["platform-build"])
+    assert "windows-2025" not in json.dumps(jobs["platform-build"])
 
 
 def test_rc_release_downloads_only_immutable_same_run_inputs_and_verifies_them() -> None:
@@ -358,10 +387,7 @@ def test_rc_release_downloads_only_immutable_same_run_inputs_and_verifies_them()
         "verify-static",
         "verify-artifacts",
         "release_ready",
-        "Passed",
-        "macos",
-        "linux",
-        "windows",
+        "aggregate-platform-reports",
     ):
         assert required in aggregate_commands
 

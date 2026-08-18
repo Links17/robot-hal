@@ -17,7 +17,12 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.release.release_tool import (
     ReleaseFailure,
+    ReleaseVersion,
+    _extract_broker_archive,
+    _target_by_name,
+    aggregate_platform_reports,
     aggregate_release,
+    load_targets,
     main,
     verify_artifacts,
     verify_static,
@@ -76,7 +81,12 @@ def _broker_binary() -> bytes:
     return b"#!/bin/sh\nif [ \"$1\" = \"--manifest\" ]; then cat broker-manifest.json; exit 0; fi\nexit 1\n"
 
 
-def _write_broker_candidate(directory: Path, target: str) -> Path:
+def _write_broker_candidate(
+    directory: Path,
+    target: str,
+    *,
+    broker_mode: int = 0o755,
+) -> Path:
     triple = {
         "macos": "aarch64-apple-darwin",
         "linux": "x86_64-unknown-linux-gnu",
@@ -107,7 +117,7 @@ def _write_broker_candidate(directory: Path, target: str) -> Path:
             for name, value in entries.items():
                 info = tarfile.TarInfo(name)
                 info.size = len(value)
-                info.mode = 0o755 if name.endswith(binary_name) else 0o644
+                info.mode = broker_mode if name.endswith(binary_name) else 0o644
                 contents.addfile(info, io.BytesIO(value))
     return archive
 
@@ -160,6 +170,54 @@ def _write_report_inputs(directory: Path) -> Path:
         },
     }
     (directory / "conformance-report.json").write_text(json.dumps(report), encoding="utf-8")
+    return directory
+
+
+def _platform_report(platform: str) -> dict[str, object]:
+    return {
+        "schema": 1,
+        "tag": TAG,
+        "commit": COMMIT,
+        "qualification": {
+            "software": {
+                "id": "software-conformance",
+                "uri": "https://example.invalid/software",
+            },
+            "hardware": {
+                "id": "hardware-qualification",
+                "uri": "https://example.invalid/hardware",
+            },
+        },
+        "software": {
+            "status": "Partial",
+            "jobs": [
+                {
+                    "platform": platform,
+                    "result": "Passed",
+                    "command": "release platform artifact verification",
+                    "ref": f"https://example.invalid/jobs/{platform}",
+                }
+            ],
+            "virtual": [
+                {
+                    "platform": platform,
+                    "protocol_minor": minor,
+                    "result": "Passed",
+                    "command": "release platform artifact verification",
+                    "ref": f"https://example.invalid/jobs/{platform}/minor-{minor}",
+                }
+                for minor in range(4)
+            ],
+        },
+        "hardware": {"release-hardware": {"status": "Pending", "evidence": None}},
+    }
+def _write_platform_reports(directory: Path) -> Path:
+    directory.mkdir()
+    for platform in ("macos", "linux", "windows"):
+        (directory / f"{platform}.json").write_text(
+            json.dumps(_platform_report(platform)),
+            encoding="utf-8",
+        )
     return directory
 
 
@@ -249,6 +307,93 @@ def test_aggregate_creates_complete_mode_0700_release_directory(tmp_path: Path) 
 
     assert stat.S_IMODE(release.stat().st_mode) == 0o700
     verify_static(release)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        (
+            lambda report: report.__setitem__("tag", "v0.5.0-rc.2"),
+            "release.conformance.invalid",
+        ),
+        (
+            lambda report: report.__setitem__("commit", "b" * 40),
+            "release.conformance.invalid",
+        ),
+        (
+            lambda report: report["software"].__setitem__(
+                "jobs",
+                report["software"]["jobs"] * 2,
+            ),
+            "release.conformance.invalid",
+        ),
+        (
+            lambda report: report["software"]["virtual"].pop(),
+            "release.conformance.incomplete",
+        ),
+    ],
+)
+def test_platform_report_aggregation_rejects_mismatched_or_incomplete_evidence(
+    tmp_path: Path,
+    mutation,
+    error: str,
+) -> None:
+    reports = _write_platform_reports(tmp_path / "reports")
+    macos = json.loads((reports / "macos.json").read_text(encoding="utf-8"))
+    mutation(macos)
+    (reports / "macos.json").write_text(json.dumps(macos), encoding="utf-8")
+
+    with pytest.raises(ReleaseFailure, match=error):
+        aggregate_platform_reports(tag=TAG, commit=COMMIT, report_dir=reports)
+
+
+def test_platform_report_aggregation_requires_exact_platform_evidence(
+    tmp_path: Path,
+) -> None:
+    reports = _write_platform_reports(tmp_path / "reports")
+
+    report = aggregate_platform_reports(tag=TAG, commit=COMMIT, report_dir=reports)
+
+    assert report["software"]["status"] == "Passed"
+    assert {job["platform"] for job in report["software"]["jobs"]} == {
+        "macos",
+        "linux",
+        "windows",
+    }
+
+
+def test_broker_extraction_restores_execution_only_from_validated_tar_metadata(
+    tmp_path: Path,
+) -> None:
+    archive = _write_broker_candidate(tmp_path, "macos")
+    archive.chmod(0o644)
+    target = _target_by_name(load_targets(TARGETS), "macos")
+
+    extracted = _extract_broker_archive(
+        archive,
+        target,
+        ReleaseVersion.parse(TAG),
+        tmp_path / "extracted",
+    )
+
+    binary = extracted / "seeed-hal-broker"
+    assert stat.S_IMODE(binary.stat().st_mode) == 0o700
+    assert stat.S_IMODE(archive.stat().st_mode) == 0o644
+
+
+def test_broker_extraction_rejects_tar_without_owner_execute_metadata(
+    tmp_path: Path,
+) -> None:
+    archive = _write_broker_candidate(tmp_path, "macos", broker_mode=0o644)
+    target = _target_by_name(load_targets(TARGETS), "macos")
+
+    with pytest.raises(ReleaseFailure, match="release.archive.invalid"):
+        _extract_broker_archive(
+            archive,
+            target,
+            ReleaseVersion.parse(TAG),
+            tmp_path / "extracted",
+        )
 
 
 def test_verify_rejects_partial_platform_set(tmp_path: Path) -> None:

@@ -29,6 +29,7 @@ jobs:
     timeout-minutes: 45
     outputs:
       commit: ${{ steps.identity.outputs.commit }}
+      targets: ${{ steps.targets.outputs.targets }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -73,21 +74,19 @@ jobs:
           cargo +1.85 clippy --workspace --all-targets --all-features -- -D warnings
           cargo +1.85 test --workspace --all-features
           uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+      - name: Derive release target matrix
+        id: targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          targets="$(python3 scripts/release/release_tool.py print-target --targets release/targets.toml --format json)"
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
 
   platform-build:
     needs: validate
     strategy:
       matrix:
-        include:
-          - name: macos
-            runner: macos-14
-            features: serialport,nusb,avfoundation
-          - name: linux
-            runner: ubuntu-24.04
-            features: serialport,nusb,socketcan,linux-gpio,v4l2
-          - name: windows
-            runner: windows-2025
-            features: serialport,nusb,windows-gpio,mediafoundation
+        include: ${{ fromJSON(needs.validate.outputs.targets).include }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
@@ -169,13 +168,7 @@ jobs:
     needs: [validate, platform-build]
     strategy:
       matrix:
-        include:
-          - name: macos
-            runner: macos-14
-          - name: linux
-            runner: ubuntu-24.04
-          - name: windows
-            runner: windows-2025
+        include: ${{ fromJSON(needs.validate.outputs.targets).include }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
@@ -290,26 +283,12 @@ jobs:
             directory="$(dirname "$sums")"
             (cd "$directory" && shasum -a 256 --check SHA256SUMS)
           done
-          python3 - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-          reports = []
-          for path in sorted(Path("downloaded/evidence").glob("*/conformance-report.json")):
-              reports.append(json.loads(path.read_text(encoding="utf-8")))
-          if len(reports) != 3:
-              raise SystemExit("expected exactly three platform reports")
-          jobs = [report["software"]["jobs"][0] for report in reports]
-          virtual = [item for report in reports for item in report["software"]["virtual"]]
-          if {job["platform"] for job in jobs} != {"macos", "linux", "windows"}:
-              raise SystemExit("platform report selection is incomplete")
-          if any(job["result"] != "Passed" for job in jobs) or any(item["result"] != "Passed" for item in virtual):
-              raise SystemExit("conformance evidence is not passed")
-          output = reports[0]
-          output["software"] = {"status": "Passed", "jobs": jobs, "virtual": virtual}
-          Path("report-input").mkdir()
-          Path("report-input/conformance-report.json").write_text(json.dumps(output, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
-          PY
+          mkdir report-input
+          python3 scripts/release/release_tool.py aggregate-platform-reports \
+            --tag "$TAG" \
+            --commit "${{ needs.validate.outputs.commit }}" \
+            --report-dir downloaded/evidence \
+            --output report-input/conformance-report.json
       - name: Aggregate exact release directory and run full verification
         shell: bash
         run: |
@@ -361,6 +340,25 @@ jobs:
           set -euo pipefail
           python3 scripts/release/release_tool.py verify-static --release-dir release
           python3 scripts/release/release_tool.py verify-artifacts --tag "$TAG" --artifacts-dir release --targets release/targets.toml --repo-root .
+      - name: Recheck immutable remote tag before attestation
+        shell: bash
+        run: |
+          set -euo pipefail
+          require_remote_peeled_tag() {
+            local plain peeled remote_commit
+            plain="$(git ls-remote --tags origin "refs/tags/$TAG")"
+            peeled="$(git ls-remote --tags origin "refs/tags/$TAG^{}")"
+            test -n "$plain"
+            test "$(printf '%s\n' "$plain" | wc -l | tr -d ' ')" = 1
+            if [[ -n "$peeled" ]]; then
+              test "$(printf '%s\n' "$peeled" | wc -l | tr -d ' ')" = 1
+            fi
+            test "$(printf '%s\n' "$peeled" | wc -l | tr -d ' ')" -le 1
+            remote_commit="${peeled%%$'\t'*}"
+            if [[ -z "$peeled" ]]; then remote_commit="${plain%%$'\t'*}"; fi
+            test "$remote_commit" = "${{ needs.validate.outputs.commit }}"
+          }
+          require_remote_peeled_tag
       - name: Attest exact final release assets
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
@@ -371,6 +369,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          require_remote_peeled_tag() {
+            local plain peeled remote_commit
+            plain="$(git ls-remote --tags origin "refs/tags/$TAG")"
+            peeled="$(git ls-remote --tags origin "refs/tags/$TAG^{}")"
+            test -n "$plain"
+            test "$(printf '%s\n' "$plain" | wc -l | tr -d ' ')" = 1
+            if [[ -n "$peeled" ]]; then
+              test "$(printf '%s\n' "$peeled" | wc -l | tr -d ' ')" = 1
+            fi
+            test "$(printf '%s\n' "$peeled" | wc -l | tr -d ' ')" -le 1
+            remote_commit="${peeled%%$'\t'*}"
+            if [[ -z "$peeled" ]]; then remote_commit="${plain%%$'\t'*}"; fi
+            test "$remote_commit" = "${{ needs.validate.outputs.commit }}"
+          }
+          require_remote_peeled_tag
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "release already exists for $TAG" >&2
             exit 1
@@ -388,3 +401,4 @@ jobs:
             "release/SHA256SUMS" \
             "release/conformance-report.json" \
             --prerelease --latest=false --title "$TAG"
+          require_remote_peeled_tag
