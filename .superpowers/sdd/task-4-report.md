@@ -351,3 +351,54 @@ and diff check passed.
 
 - Limits apply to the gzip tar raw-header prescan, preventing declared-size
   headers from forcing unbounded inflation before `tarfile` receives the stream.
+
+---
+
+## Final P1 Truncated Gzip Decode Handling
+
+### Status
+
+DONE
+
+### RED Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_archive_safety.py
+```
+
+Result: `1 failed, 29 passed`. A truncated gzip deflate stream raised uncaught
+`EOFError` from the raw tar pre-scan rather than a structured release failure.
+
+### Changes
+
+- Added a small truncated gzip tar fixture that enters the raw pre-scan and
+  asserts a stable `release.archive.invalid` failure with a bounded generic
+  diagnostic and no input-path echo.
+- Mapped `EOFError` alongside existing I/O failures at the raw gzip scan
+  boundary to `release.archive.invalid: unable to inspect archive`.
+- Deliberately did not catch broad exceptions, preserving propagation for
+  process-control and resource-exhaustion exceptions while retaining raw-header,
+  size-budget, trailing-slash, and 64 KiB payload checks.
+
+### GREEN Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_manifest.py tests/release/test_archive_safety.py
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+python3 -m compileall -q scripts/release tests/release
+git diff --check
+```
+
+Result: focused suite `63 passed`; full release suite `109 passed`; compileall
+and diff check passed.
+
+### Commit
+
+`327f0a8` — `fix(release): normalize truncated gzip errors`
+
+### Concerns
+
+- The raw pre-scan only maps expected gzip EOF/I/O decode failures. Other
+  unexpected exceptions remain visible instead of being swallowed.
