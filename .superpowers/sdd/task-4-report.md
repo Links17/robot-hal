@@ -243,7 +243,7 @@ and diff check passed.
 
 ### Commit
 
-Pending.
+`c6cf772` — `fix(release): reject malformed tar directory names`
 
 ### Concerns
 
