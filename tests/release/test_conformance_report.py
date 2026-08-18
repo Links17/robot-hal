@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -16,6 +17,8 @@ from scripts.release.release_tool import (
     validate_conformance_report,
     write_conformance_report,
 )
+
+RELEASE_TOOL = REPO_ROOT / "scripts" / "release" / "release_tool.py"
 
 
 def _report() -> dict[str, object]:
@@ -163,3 +166,64 @@ def test_release_ready_rejects_factual_partial_report() -> None:
 
     with pytest.raises(ReleaseFailure, match="release.conformance.incomplete"):
         release_ready(report)
+
+
+def test_virtual_conformance_cli_dispatches_and_hides_broker_path(tmp_path: Path) -> None:
+    broker = tmp_path / "secret-broker"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(RELEASE_TOOL),
+            "run-virtual-conformance",
+            "--platform",
+            "macos",
+            "--broker",
+            str(broker),
+            "--repo-root",
+            str(REPO_ROOT),
+            "--command-identity",
+            "hosted virtual conformance",
+            "--ref",
+            "https://example.invalid/jobs/macos",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 1
+    assert result.stderr.startswith("release.conformance.invalid:")
+    assert str(broker) not in result.stderr
+
+
+def test_virtual_conformance_cli_preserves_command_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    broker = tmp_path / "broker"
+    broker.write_bytes(b"fixture")
+    observed: dict[str, str] = {}
+
+    def record(*, platform, broker, repo_root, command, ref):
+        observed["command"] = command
+        return []
+
+    monkeypatch.setattr("scripts.release.release_tool.collect_virtual_conformance", record)
+
+    assert __import__("scripts.release.release_tool", fromlist=["main"]).main(
+        [
+            "run-virtual-conformance",
+            "--platform",
+            "macos",
+            "--broker",
+            str(broker),
+            "--repo-root",
+            str(REPO_ROOT),
+            "--command-identity",
+            "hosted virtual conformance",
+            "--ref",
+            "https://example.invalid/jobs/macos",
+        ]
+    ) == 0
+    assert observed["command"] == "hosted virtual conformance"

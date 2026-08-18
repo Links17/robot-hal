@@ -838,6 +838,18 @@ def release_ready(report: dict[str, object]) -> None:
         )
 
 
+def initial_conformance_report(manifest: ReleaseManifest) -> dict[str, object]:
+    """Create the factual, non-ready report emitted with a fresh manifest."""
+    return {
+        "schema": 1,
+        "tag": manifest.tag,
+        "commit": manifest.commit,
+        "qualification": manifest.qualification.to_dict(),
+        "software": {"status": "Pending", "jobs": [], "virtual": []},
+        "hardware": {"release-hardware": {"status": "Pending", "evidence": None}},
+    }
+
+
 def write_conformance_report(inputs: Path, output: Path) -> None:
     """Copy one frozen report input through controlled validation."""
     try:
@@ -2644,7 +2656,7 @@ class _ReleaseArgumentParser(argparse.ArgumentParser):
 
 def _parser() -> argparse.ArgumentParser:
     parser = _ReleaseArgumentParser(add_help=False)
-    subcommands = parser.add_subparsers(dest="command", required=True)
+    subcommands = parser.add_subparsers(dest="subcommand", required=True)
     check = subcommands.add_parser("check-version")
     check.add_argument("--tag", required=True)
     check.add_argument("--repo-root", required=True, type=Path)
@@ -2687,7 +2699,7 @@ def _parser() -> argparse.ArgumentParser:
     virtual.add_argument("--platform", required=True)
     virtual.add_argument("--broker", required=True, type=Path)
     virtual.add_argument("--repo-root", required=True, type=Path)
-    virtual.add_argument("--command", required=True)
+    virtual.add_argument("--command-identity", required=True)
     virtual.add_argument("--ref", required=True)
     static = subcommands.add_parser("verify-static")
     static.add_argument("--release-dir", required=True, type=Path)
@@ -2707,13 +2719,13 @@ def _fail(error: ReleaseFailure) -> NoReturn:
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         arguments = _parser().parse_args(argv)
-        if arguments.command == "check-version":
+        if arguments.subcommand == "check-version":
             check_version(
                 arguments.repo_root.resolve(),
                 arguments.tag,
                 arguments.cargo,
             )
-        elif arguments.command == "verify-broker-manifest":
+        elif arguments.subcommand == "verify-broker-manifest":
             targets = load_targets(arguments.targets)
             verify_broker_manifest(
                 _read_json(arguments.manifest, "release.manifest.invalid"),
@@ -2721,7 +2733,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.artifact,
                 ReleaseVersion.parse(arguments.tag),
             )
-        elif arguments.command == "package-broker":
+        elif arguments.subcommand == "package-broker":
             package_broker(
                 tag=arguments.tag,
                 target_name=arguments.target,
@@ -2731,19 +2743,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 manifest_path=arguments.manifest,
                 repo_root=Path(__file__).resolve().parents[2],
             )
-        elif arguments.command == "package-rust":
+        elif arguments.subcommand == "package-rust":
             package_rust(
                 tag=arguments.tag,
                 repo_root=arguments.repo_root,
                 output_dir=arguments.output_dir,
             )
-        elif arguments.command == "package-python":
+        elif arguments.subcommand == "package-python":
             package_python(
                 tag=arguments.tag,
                 project=arguments.project,
                 output_dir=arguments.candidate_dir,
             )
-        elif arguments.command == "generate-manifest":
+        elif arguments.subcommand == "generate-manifest":
             manifest = generate_manifest(
                 {
                     "tag": arguments.tag,
@@ -2770,10 +2782,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 (arguments.output_dir / CONFORMANCE_REPORT_NAME).write_bytes(
                     (
                         json.dumps(
-                            manifest.qualification.sidecar_dict(
-                                manifest.tag,
-                                manifest.commit,
-                            ),
+                            initial_conformance_report(manifest),
                             sort_keys=True,
                             separators=(",", ":"),
                             ensure_ascii=False,
@@ -2786,25 +2795,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "release.manifest.invalid",
                     "unable to write release manifest output",
                 ) from error
-        elif arguments.command == "write-conformance-report":
+        elif arguments.subcommand == "write-conformance-report":
             write_conformance_report(arguments.inputs, arguments.output)
-        elif arguments.command == "run-virtual-conformance":
+        elif arguments.subcommand == "run-virtual-conformance":
             print(
                 json.dumps(
                     collect_virtual_conformance(
                         platform=arguments.platform,
                         broker=arguments.broker,
                         repo_root=arguments.repo_root,
-                        command=arguments.command,
+                        command=arguments.command_identity,
                         ref=arguments.ref,
                     ),
                     sort_keys=True,
                     separators=(",", ":"),
                 )
             )
-        elif arguments.command == "verify-static":
+        elif arguments.subcommand == "verify-static":
             verify_static(arguments.release_dir)
-        elif arguments.command == "verify-artifacts":
+        elif arguments.subcommand == "verify-artifacts":
             verify_artifacts(
                 arguments.artifacts_dir,
                 arguments.tag,

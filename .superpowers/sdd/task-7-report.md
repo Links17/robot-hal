@@ -115,3 +115,32 @@ Review GREEN:
 ```text
 focused report/artifact/manifest tests: 52 passed
 ```
+
+## Review follow-up — 1a30962..d8fa8be
+
+Addressed the two Important findings without adding Task 8 workflow or Task 9
+release behavior:
+
+- The parser now stores the selected subcommand in `subcommand`, and
+  `run-virtual-conformance` takes the non-conflicting required
+  `--command-identity`. A missing virtual broker reaches the virtual handler,
+  fails with `release.conformance.invalid`, and does not disclose its path.
+  The valid dispatch regression confirms the supplied identity reaches the
+  collector unchanged.
+- `generate-manifest` now creates its sidecar using
+  `initial_conformance_report`: schema 1, matching tag/commit/qualification,
+  software `Pending` with empty `jobs` and `virtual`, and factual Pending
+  hardware. It remains static-valid but is not release-ready.
+
+Review RED:
+
+```text
+tests/release/test_conformance_report.py tests/release/test_manifest.py
+# 3 failures: virtual CLI silently exited 0/failed dispatch; generated legacy report failed verify-static
+```
+
+Review GREEN:
+
+```text
+focused report and manifest tests: 45 passed
+```

@@ -303,6 +303,43 @@ def test_cli_generates_manifest_and_checksums_without_self_reference(tmp_path: P
     )
 
 
+def test_generate_manifest_writes_current_pending_conformance_report(
+    tmp_path: Path,
+) -> None:
+    inputs = _inputs(tmp_path)
+    output = tmp_path / "output"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(RELEASE_TOOL),
+            "generate-manifest",
+            "--tag",
+            "v0.5.0-rc.1",
+            "--commit",
+            "a" * 40,
+            "--artifacts-dir",
+            str(inputs["artifacts_dir"]),
+            "--output-dir",
+            str(output),
+            "--software-qualification",
+            "https://example.invalid/software-conformance",
+            "--hardware-qualification",
+            "https://example.invalid/hardware-qualification",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    for artifact in inputs["artifacts_dir"].iterdir():
+        (output / artifact.name).write_bytes(artifact.read_bytes())
+    verify_static(output)
+    report = json.loads((output / "conformance-report.json").read_text())
+    assert report["software"] == {"status": "Pending", "jobs": [], "virtual": []}
+
+
 @pytest.mark.parametrize(
     "missing",
     [
