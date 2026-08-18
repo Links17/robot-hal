@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import sys
 import stat
 import subprocess
@@ -13,10 +14,12 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.release import release_tool
 from scripts.release.release_tool import (
+    _locked_protobuf_wheel,
     ReleaseFailure,
     ReleaseVersion,
     _verify_wheel_install,
     _wheel_metadata,
+    _prepare_locked_protobuf_wheel,
     python_artifact_names,
 )
 
@@ -111,9 +114,10 @@ def test_python_candidate_rejects_external_write_during_validation(
         wheel: Path,
         version: ReleaseVersion,
         staging_dir: Path,
-        dependency_project: Path,
+        protobuf_wheel: Path,
+        protobuf_hash: str,
     ) -> None:
-        original_verify(wheel, version, staging_dir, dependency_project)
+        original_verify(wheel, version, staging_dir, protobuf_wheel, protobuf_hash)
         (output / "external-write").write_bytes(b"unexpected")
 
     monkeypatch.setattr(release_tool, "_verify_wheel_install", write_external_file)
@@ -143,9 +147,10 @@ def test_python_candidate_rejects_external_directory_replacement(
         wheel: Path,
         version: ReleaseVersion,
         staging_dir: Path,
-        dependency_project: Path,
+        protobuf_wheel: Path,
+        protobuf_hash: str,
     ) -> None:
-        original_verify(wheel, version, staging_dir, dependency_project)
+        original_verify(wheel, version, staging_dir, protobuf_wheel, protobuf_hash)
         output.rename(replacement)
         output.symlink_to(replacement, target_is_directory=True)
 
@@ -193,9 +198,10 @@ def test_python_candidate_rejects_artifact_replacement_after_validation(
         wheel: Path,
         version: ReleaseVersion,
         staging_dir: Path,
-        dependency_project: Path,
+        protobuf_wheel: Path,
+        protobuf_hash: str,
     ) -> None:
-        original_verify(wheel, version, staging_dir, dependency_project)
+        original_verify(wheel, version, staging_dir, protobuf_wheel, protobuf_hash)
         artifact = output / artifact_name
         artifact.unlink()
         if replacement_kind == "symlink":
@@ -256,6 +262,7 @@ def _wheel(
     *,
     dist_info: str = "seeed_hal-0.5.0rc1.dist-info",
     wheel_metadata: str = "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+    extra_members: dict[str, bytes] | None = None,
 ) -> Path:
     wheel = tmp_path / "seeed_hal-0.5.0rc1-py3-none-any.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
@@ -267,6 +274,8 @@ def _wheel(
             "Metadata-Version: 2.4\nName: seeed-hal\nVersion: 0.5.0rc1\n",
         )
         archive.writestr(f"{dist_info}/WHEEL", wheel_metadata)
+        for name, contents in (extra_members or {}).items():
+            archive.writestr(name, contents)
     return wheel
 
 
@@ -299,6 +308,70 @@ def test_wheel_metadata_rejects_noncanonical_internal_identity(
         )
 
 
+def test_wheel_metadata_rejects_candidate_protobuf_shadowing(tmp_path: Path) -> None:
+    with pytest.raises(ReleaseFailure) as failure:
+        _wheel_metadata(
+            _wheel(
+                tmp_path,
+                extra_members={"google/protobuf/__init__.py": b"__version__ = '6.32.1'"},
+            ),
+            ReleaseVersion.parse("v0.5.0-rc.1"),
+        )
+
+    assert failure.value.name == "release.package.invalid"
+
+
+def test_locked_protobuf_requires_direct_pure_python_wheel(tmp_path: Path) -> None:
+    lock = tmp_path / "uv.lock"
+    lock.write_text(
+        """
+version = 1
+[[package]]
+name = "protobuf"
+version = "6.32.1"
+wheels = [
+    { url = "https://example.invalid/protobuf-cp39-abi3.whl", hash = "sha256:abc" },
+]
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ReleaseFailure) as failure:
+        _locked_protobuf_wheel(tmp_path)
+
+    assert failure.value.name == "release.package.invalid"
+
+
+def test_locked_protobuf_rejects_download_with_wrong_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock = tmp_path / "uv.lock"
+    lock.write_text(
+        """
+version = 1
+[[package]]
+name = "protobuf"
+version = "6.32.1"
+wheels = [
+    { url = "https://example.invalid/protobuf-6.32.1-py3-none-any.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
+]
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        release_tool.urllib.request,
+        "urlopen",
+        lambda request, timeout: io.BytesIO(b"tampered wheel"),
+    )
+
+    with pytest.raises(ReleaseFailure) as failure:
+        _prepare_locked_protobuf_wheel(tmp_path, tmp_path / "staging")
+
+    assert failure.value.name == "release.package.invalid"
+    assert not (tmp_path / "staging" / "protobuf-6.32.1-py3-none-any.whl").exists()
+
+
 def test_isolated_wheel_venv_is_offline_and_uses_current_interpreter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -317,7 +390,8 @@ def test_isolated_wheel_venv_is_offline_and_uses_current_interpreter(
         tmp_path / "package.whl",
         ReleaseVersion.parse("v0.5.0-rc.1"),
         tmp_path,
-        REPO_ROOT / "bindings" / "python",
+        tmp_path / "protobuf-6.32.1-py3-none-any.whl",
+        "2601b779fc7d32a866c6b4404f9d42a3f67c5b9f3f15b4db3cccabe06b95c346",
     )
 
     assert commands[0][:4] == ["uv", "venv", "--offline", "--no-project"]
@@ -331,19 +405,19 @@ def test_isolated_wheel_venv_is_offline_and_uses_current_interpreter(
         "--offline",
         "--no-deps",
         str(tmp_path / "package.whl"),
+        str(tmp_path / "protobuf-6.32.1-py3-none-any.whl"),
     ]
     assert commands[2][:3] == [
         str(tmp_path / "venv" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")),
         "-I",
         "-c",
     ]
-    assert "sys.path.extend(json.loads(sys.argv[1]))" in commands[2][3]
     assert "import seeed_hal;" in commands[2][3]
     assert "from seeed_hal.proto import hal_pb2;" in commands[2][3]
     assert "hal_pb2.Empty().SerializeToString() == b''" in commands[2][3]
     assert "google.protobuf.__version__ == '6.32.1'" in commands[2][3]
-    assert commands[2][4] == release_tool.json.dumps(
-        release_tool._project_site_paths(REPO_ROOT / "bindings" / "python")
-    )
+    assert "google.protobuf.__file__" in commands[2][3]
+    assert "RECORD" in commands[2][3]
+    assert "2601b779fc7d32a866c6b4404f9d42a3f67c5b9f3f15b4db3cccabe06b95c346" in commands[2][3]
     assert all("HTTP_PROXY" not in environment for environment in environments)
     assert all("HTTPS_PROXY" not in environment for environment in environments)
