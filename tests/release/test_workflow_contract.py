@@ -107,16 +107,37 @@ def test_source_gate_declares_the_required_frozen_checks() -> None:
     assert "--all-features" not in commands
 
 
-def test_source_gate_limits_rust_checks_to_platform_neutral_packages() -> None:
+def test_source_gate_limits_rust_checks_to_linux_prerequisite_free_runtime_closure() -> None:
     workflow = load_workflow("ci.yml")
     jobs = workflow["jobs"]
     assert isinstance(jobs, dict)
     source_gate = jobs["source-gate"]
+    steps = source_gate["steps"]
     commands = "\n".join(
-        step["run"] for step in source_gate["steps"] if "run" in step
+        step["run"] for step in steps if "run" in step
     )
 
-    neutral_packages = (
+    assert (
+        "only the runtime closure that needs no Linux external native prerequisites"
+        in next(
+            step["name"]
+            for step in steps
+            if step.get("name", "").startswith("Run Linux-prerequisite-free Rust clippy")
+        )
+    )
+    assert (
+        "only the runtime closure that needs no Linux external native prerequisites"
+        in next(
+            step["name"]
+            for step in steps
+            if step.get("name", "").startswith("Run Linux-prerequisite-free Rust tests")
+        )
+    )
+    assert "platform-neutral" not in "\n".join(
+        step.get("name", "") for step in steps
+    ).lower()
+
+    source_packages = (
         "seeed-hal-client",
         "seeed-hal-broker",
         "seeed-hal-can",
@@ -135,10 +156,10 @@ def test_source_gate_limits_rust_checks_to_platform_neutral_packages() -> None:
             line for line in commands.splitlines() if line.startswith(command)
         )
         assert "--workspace" not in command_line
-        for package in neutral_packages:
+        for package in source_packages:
             assert f"-p {package}" in command_line
 
-    for native_package in (
+    hardware_adapter_packages = (
         "seeed-hal-adapter-avfoundation",
         "seeed-hal-adapter-linux-gpio",
         "seeed-hal-adapter-mediafoundation",
@@ -149,8 +170,33 @@ def test_source_gate_limits_rust_checks_to_platform_neutral_packages() -> None:
         "seeed-hal-adapter-v4l2",
         "seeed-hal-adapter-windows-gpio",
         "seeed-hal-broker-app",
-    ):
+    )
+    for native_package in hardware_adapter_packages:
         assert native_package not in commands
+
+
+def test_source_gate_runtime_closure_allows_os_backends_without_linux_prerequisites() -> None:
+    runtime = (REPO_ROOT / "crates" / "seeed-hal-runtime" / "Cargo.toml").read_text(
+        encoding="utf-8"
+    )
+    broker = (REPO_ROOT / "crates" / "seeed-hal-broker" / "Cargo.toml").read_text(
+        encoding="utf-8"
+    )
+    shared_memory = (
+        REPO_ROOT / "adapters" / "shared-memory" / "Cargo.toml"
+    ).read_text(encoding="utf-8")
+    windows_security = (
+        REPO_ROOT / "adapters" / "windows-security" / "Cargo.toml"
+    ).read_text(encoding="utf-8")
+
+    assert 'seeed-hal-adapter-shared-memory = { path = "../../adapters/shared-memory"' in runtime
+    assert 'seeed-hal-windows-security = { path = "../../adapters/windows-security"' in broker
+
+    for manifest in (shared_memory, windows_security):
+        assert "pkg-config" not in manifest
+        assert "libgpiod" not in manifest
+        assert "libudev" not in manifest
+        assert 'cfg(target_os = "linux")' not in manifest
 
 
 def test_linux_platform_jobs_install_shared_prerequisites_before_linux_gpio_builds() -> None:

@@ -27,9 +27,12 @@ jobs:
         run: ./scripts/check-generated-protocol.sh
       - name: Check Rust formatting
         run: cargo +1.85 fmt --all --check
-      - name: Run platform-neutral Rust clippy
+      # This runtime closure intentionally includes shared-memory and Windows
+      # security backends. Each host builds its own OS implementation; neither
+      # needs Linux pkg-config packages or a hardware device adapter build.
+      - name: Run Linux-prerequisite-free Rust clippy (only the runtime closure that needs no Linux external native prerequisites)
         run: cargo +1.85 clippy --all-targets -p seeed-hal-client -p seeed-hal-broker -p seeed-hal-can -p seeed-hal-camera -p seeed-hal-core -p seeed-hal-gpio -p seeed-hal-protocol -p seeed-hal-runtime -p seeed-hal-serial -p seeed-hal-testkit -p seeed-hal-usb -- -D warnings
-      - name: Run platform-neutral Rust tests
+      - name: Run Linux-prerequisite-free Rust tests (only the runtime closure that needs no Linux external native prerequisites)
         run: cargo +1.85 test -p seeed-hal-client -p seeed-hal-broker -p seeed-hal-can -p seeed-hal-camera -p seeed-hal-core -p seeed-hal-gpio -p seeed-hal-protocol -p seeed-hal-runtime -p seeed-hal-serial -p seeed-hal-testkit -p seeed-hal-usb
       - name: Run frozen Python and release tests
         run: |

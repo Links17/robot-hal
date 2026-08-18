@@ -363,3 +363,52 @@ targets from `release/targets.toml`.
 - `cargo +1.85 fmt --all --check` passed.
 - `./scripts/check-generated-protocol.sh` passed.
 - No hosted workflow was pushed, dispatched, or triggered.
+
+## Review follow-up: precise source-gate dependency boundary
+
+The source gate is not defined by the absence of every OS API. Its purpose is
+to isolate build requirements that depend on external Linux native packages or
+compile hardware device adapters, while retaining the production runtime
+closure. This matches the architecture: the runtime owns the bounded
+shared-memory camera data plane, and the broker uses Windows local-IPC security
+when compiled for Windows.
+
+`seeed-hal-adapter-shared-memory` is therefore allowed through
+`seeed-hal-runtime`; its Windows implementation uses Windows memory/security
+APIs, but its manifest has no Linux-target dependency and no `pkg-config`,
+`libgpiod`, or `libudev` prerequisite. `seeed-hal-windows-security` is likewise
+allowed through the broker's `cfg(windows)` dependency, because it provides
+Windows named-pipe/file security rather than a hardware adapter and has no
+Linux native prerequisite.
+
+The excluded closure remains the hardware adapter and production application
+set: AVFoundation, Linux GPIO/libgpiod, Media Foundation, nusb, PCAN,
+serialport, SocketCAN, V4L2, Windows GPIO, and `seeed-hal-broker-app`. Those
+build only in `platform-conformance`; Linux package provisioning stays there
+with the libgpiod/libudev `pkg-config` preflight.
+
+### TDD evidence
+
+RED:
+
+```text
+1 failed, 23 passed
+StopIteration: no step named
+"Run Linux-prerequisite-free Rust clippy ..."
+```
+
+The new workflow contract required source-gate names to describe the actual
+boundary and rejected the inaccurate `platform-neutral` label. It also checked
+that the permitted shared-memory and Windows-security manifests do not declare
+external Linux native prerequisites.
+
+GREEN:
+
+```text
+24 passed in 0.18s
+```
+
+The renamed workflow steps now state that they run only the runtime closure
+requiring no external Linux native prerequisites, and a nearby comment records
+why host-specific shared-memory and Windows-security implementations remain in
+that closure. No hosted workflow was pushed, dispatched, or triggered.
