@@ -452,6 +452,19 @@ def _subprocess_diagnostic(stderr: str) -> str:
     return last
 
 
+def _bounded_subprocess_summary(stderr: str, fallback: str) -> str:
+    """Return one stable, non-sensitive subprocess diagnostic."""
+    diagnostic = _subprocess_diagnostic(stderr)[:256]
+    if (
+        not diagnostic
+        or SENSITIVE_VALUE.search(diagnostic)
+        or re.search(r"(?:^|[\s(])/(?:[^\s:)]+)", diagnostic)
+        or re.search(r"[A-Za-z]:[\\/]", diagnostic)
+    ):
+        return fallback
+    return diagnostic
+
+
 def check_version(repo_root: Path, tag: str, cargo: str = "cargo") -> None:
     expected = ReleaseVersion.parse(tag)
     for package in _cargo_packages(repo_root, cargo):
@@ -1492,49 +1505,138 @@ def _publish_staged_artifact(staged: Path, destination: Path) -> Path:
     return destination
 
 
+def _reserve_package_artifact(output_dir: Path, name: str) -> Path:
+    reservation = output_dir / f".reserve-package-{name}"
+    try:
+        descriptor = os.open(reservation, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as error:
+        raise ReleaseFailure(
+            "release.artifact.unexpected",
+            "final package artifact is already reserved",
+        ) from error
+    except OSError as error:
+        raise ReleaseFailure(
+            "release.package.invalid",
+            "unable to reserve final package artifact",
+        ) from error
+    os.close(descriptor)
+    return reservation
+
+
+def _unlink_published_artifact(path: Path, identity: tuple[int, int]) -> None:
+    try:
+        stat = path.stat()
+        if (stat.st_dev, stat.st_ino) == identity:
+            path.unlink()
+    except OSError:
+        return
+
+
+PYTHON_GENERATED_FILES = frozenset(
+    {
+        "seeed_hal/proto/__init__.py",
+        "seeed_hal/proto/hal_pb2.py",
+    }
+)
+
+
 def _cargo_packageable_members(
     repo_root: Path,
     cargo: str = "cargo",
 ) -> tuple[dict[str, object], ...]:
-    packages = _cargo_packages(repo_root, cargo)
-    workspace_manifest = _read_toml(repo_root / "Cargo.toml", "release.package.invalid")
-    workspace = workspace_manifest.get("workspace")
-    members = workspace.get("members") if isinstance(workspace, dict) else None
-    if not isinstance(members, list) or not all(isinstance(member, str) for member in members):
-        _package_invalid("workspace members are invalid")
-    workspace_paths = {str((repo_root / member).resolve()) for member in members}
-    packageable = tuple(
-        package
-        for package in packages
-        if str(package.get("manifest_path", "")).startswith(str(repo_root.resolve()))
-        and str(Path(str(package.get("manifest_path"))).parent.resolve()) in workspace_paths
-        and package.get("publish") != []
-    )
-    if not packageable:
-        _package_invalid("workspace has no packageable crates")
-    if any(
-        not isinstance(package.get("name"), str)
-        or not isinstance(package.get("version"), str)
-        for package in packageable
-    ):
-        _package_invalid("cargo metadata package is invalid")
-    return tuple(sorted(packageable, key=lambda package: str(package["name"])))
-
-
-def _require_clean_repository(repo_root: Path) -> None:
     try:
-        repository = subprocess.run(
-            ["git", "rev-parse", "--is-inside-work-tree"],
+        result = subprocess.run(
+            [cargo, "metadata", "--no-deps", "--format-version", "1"],
             cwd=repo_root,
             check=False,
             capture_output=True,
             text=True,
             timeout=30,
         )
-        if repository.returncode != 0:
-            return
+        metadata = json.loads(result.stdout) if result.returncode == 0 else None
+        graph = subprocess.run(
+            [cargo, "metadata", "--format-version", "1"],
+            cwd=repo_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if graph.returncode != 0:
+            metadata = None
+        elif isinstance(metadata, dict):
+            metadata["resolve"] = json.loads(graph.stdout).get("resolve")
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
+        raise ReleaseFailure("release.cargo.failed", "cargo metadata failed") from error
+    if not isinstance(metadata, dict):
+        raise ReleaseFailure("release.cargo.failed", "cargo metadata failed")
+    return _packageable_workspace_members(metadata)
+
+
+def _packageable_workspace_members(metadata: dict[str, object]) -> tuple[dict[str, object], ...]:
+    raw_packages = metadata.get("packages")
+    raw_members = metadata.get("workspace_members")
+    resolve = metadata.get("resolve")
+    if not isinstance(raw_packages, list) or not isinstance(raw_members, list):
+        _package_invalid("cargo metadata workspace members are invalid")
+    packages_by_id = {
+        package.get("id"): package
+        for package in raw_packages
+        if isinstance(package, dict) and isinstance(package.get("id"), str)
+    }
+    if not all(isinstance(member, str) and member in packages_by_id for member in raw_members):
+        _package_invalid("cargo metadata workspace members are invalid")
+    packageable = tuple(
+        packages_by_id[member]
+        for member in raw_members
+        if packages_by_id[member].get("publish") != []
+    )
+    if not packageable:
+        _package_invalid("workspace has no packageable crates")
+    if any(
+        not isinstance(package.get("name"), str) or not isinstance(package.get("id"), str)
+        or not isinstance(package.get("version"), str)
+        for package in packageable
+    ):
+        _package_invalid("cargo metadata package is invalid")
+    if not isinstance(resolve, dict) or not isinstance(resolve.get("nodes"), list):
+        _package_invalid("cargo metadata resolve graph is invalid")
+    selected_ids = {str(package["id"]) for package in packageable}
+    dependencies: dict[str, set[str]] = {identifier: set() for identifier in selected_ids}
+    for node in resolve["nodes"]:
+        if not isinstance(node, dict) or not isinstance(node.get("id"), str):
+            _package_invalid("cargo metadata resolve graph is invalid")
+        identifier = node["id"]
+        if identifier not in selected_ids:
+            continue
+        raw_dependencies = node.get("dependencies")
+        if not isinstance(raw_dependencies, list) or not all(
+            isinstance(dependency, str) for dependency in raw_dependencies
+        ):
+            _package_invalid("cargo metadata resolve graph is invalid")
+        dependencies[identifier] = {
+            dependency for dependency in raw_dependencies if dependency in selected_ids
+        }
+    ordered: list[str] = []
+    while dependencies:
+        ready = sorted(
+            (identifier for identifier, needs in dependencies.items() if not needs),
+            key=lambda identifier: str(packages_by_id[identifier]["name"]),
+        )
+        if not ready:
+            _package_invalid("cargo metadata resolve graph contains a cycle")
+        for identifier in ready:
+            ordered.append(identifier)
+            dependencies.pop(identifier)
+        for needs in dependencies.values():
+            needs.difference_update(ready)
+    return tuple(packages_by_id[identifier] for identifier in ordered)
+
+
+def _require_clean_repository(repo_root: Path) -> None:
+    try:
         result = subprocess.run(
-            ["git", "diff", "--quiet"],
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
             cwd=repo_root,
             check=False,
             capture_output=True,
@@ -1543,9 +1645,9 @@ def _require_clean_repository(repo_root: Path) -> None:
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ReleaseFailure("release.package.invalid", "unable to verify repository state") from error
-    if result.returncode == 0:
+    if result.returncode == 0 and not result.stdout:
         return
-    if result.returncode == 1:
+    if result.returncode == 0:
         _package_invalid("repository has uncommitted changes")
     _package_invalid("unable to verify repository state")
 
@@ -1606,7 +1708,10 @@ def _build_local_crate(
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ReleaseFailure("release.cargo.failed", "cargo package failed") from error
     if result.returncode != 0:
-        raise ReleaseFailure("release.cargo.failed", "cargo package failed")
+        raise ReleaseFailure(
+            "release.cargo.failed",
+            _bounded_subprocess_summary(result.stderr, "cargo package failed"),
+        )
     crate = target_dir / "package" / f"{name}-{version}.crate"
     if not crate.is_file() or crate.is_symlink():
         _package_invalid("cargo package did not produce the expected crate")
@@ -1633,7 +1738,10 @@ def _check_packaged_crate(crate: Path, staging_dir: Path) -> None:
     except (OSError, tarfile.TarError, subprocess.TimeoutExpired) as error:
         raise ReleaseFailure("release.cargo.failed", "packaged crate validation failed") from error
     if result.returncode != 0:
-        raise ReleaseFailure("release.cargo.failed", "packaged crate validation failed")
+        raise ReleaseFailure(
+            "release.cargo.failed",
+            _bounded_subprocess_summary(result.stderr, "packaged crate validation failed"),
+        )
 
 
 def package_rust(*, tag: str, repo_root: Path, output_dir: Path) -> Path:
@@ -1659,7 +1767,8 @@ def package_rust(*, tag: str, repo_root: Path, output_dir: Path) -> Path:
             _check_packaged_crate(crate, staging_dir)
         root = f"seeed-hal-crates-v{version.cargo}"
         members = tuple(
-            (f"{root}/{crate.name}", crate, 0o644) for crate in staged_crates
+            (f"{root}/{crate.name}", crate, 0o644)
+            for crate in sorted(staged_crates, key=lambda item: item.name)
         )
         staged_archive = staging_dir / archive_name
         _write_deterministic_tar(staged_archive, root, members)
@@ -1706,6 +1815,7 @@ def _wheel_metadata(wheel: Path, version: ReleaseVersion) -> None:
         or f"Version: {version.python}\n" not in metadata
         or "Tag: py3-none-any\n" not in wheel_data
         or "seeed_hal/__init__.py" not in names
+        or not PYTHON_GENERATED_FILES.issubset(names)
     ):
         _package_invalid("Python wheel content is invalid")
 
@@ -1747,6 +1857,7 @@ def _sdist_metadata(sdist: Path, version: ReleaseVersion) -> None:
         root != f"seeed_hal-{version.python}"
         or "pyproject.toml" not in files
         or "seeed_hal/__init__.py" not in files
+        or not PYTHON_GENERATED_FILES.issubset(files)
         or "Name: seeed-hal\n" not in metadata
         or f"Version: {version.python}\n" not in metadata
     ):
@@ -1777,7 +1888,10 @@ def _verify_wheel_install(wheel: Path, version: ReleaseVersion, staging_dir: Pat
                     "import seeed_hal;"
                     f"expected={version.python!r};"
                     "assert importlib.metadata.version('seeed-hal') == expected;"
-                    "assert seeed_hal.__version__ == expected"
+                    "assert seeed_hal.__version__ == expected;"
+                    "from seeed_hal.proto import hal_pb2;"
+                    "assert hal_pb2.DESCRIPTOR.name == 'hal.proto';"
+                    "assert hal_pb2.Empty().SerializeToString() == b''"
                 ),
             ],
         ):
@@ -1798,18 +1912,25 @@ def _verify_wheel_install(wheel: Path, version: ReleaseVersion, staging_dir: Pat
 
 
 def package_python(*, tag: str, project: Path, output_dir: Path) -> tuple[Path, Path]:
-    version = ReleaseVersion.parse(tag)
-    pyproject = _read_toml(project / "pyproject.toml", "release.package.invalid")
-    metadata = pyproject.get("project")
-    if not isinstance(metadata, dict) or metadata.get("version") != version.python:
-        _package_invalid("Python project version does not match release tag")
-    _package_output_directory(output_dir)
-    wheel_name, sdist_name = python_artifact_names(version)
-    wheel_destination = _published_artifact_path(output_dir, wheel_name)
-    sdist_destination = _published_artifact_path(output_dir, sdist_name)
-    with tempfile.TemporaryDirectory(prefix=".package-python-", dir=output_dir) as directory:
-        staging_dir = Path(directory)
-        try:
+    reservations: list[Path] = []
+    published: list[tuple[Path, tuple[int, int]]] = []
+    completed = False
+    try:
+        version = ReleaseVersion.parse(tag)
+        pyproject = _read_toml(project / "pyproject.toml", "release.package.invalid")
+        metadata = pyproject.get("project")
+        if not isinstance(metadata, dict) or metadata.get("version") != version.python:
+            _package_invalid("Python project version does not match release tag")
+        _package_output_directory(output_dir)
+        wheel_name, sdist_name = python_artifact_names(version)
+        wheel_destination = _published_artifact_path(output_dir, wheel_name)
+        sdist_destination = _published_artifact_path(output_dir, sdist_name)
+        reservations = [
+            _reserve_package_artifact(output_dir, wheel_name),
+            _reserve_package_artifact(output_dir, sdist_name),
+        ]
+        with tempfile.TemporaryDirectory(prefix=".package-python-", dir=output_dir) as directory:
+            staging_dir = Path(directory)
             result = subprocess.run(
                 [
                     "uv",
@@ -1830,21 +1951,32 @@ def package_python(*, tag: str, project: Path, output_dir: Path) -> tuple[Path, 
                 text=True,
                 timeout=120,
             )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise ReleaseFailure("release.package.invalid", "Python build failed") from error
-        if result.returncode != 0:
-            _package_invalid("Python build failed")
-        wheel = staging_dir / wheel_name
-        sdist = staging_dir / sdist_name
-        if not wheel.is_file() or not sdist.is_file():
-            _package_invalid("Python build did not produce expected artifacts")
-        _wheel_metadata(wheel, version)
-        _sdist_metadata(sdist, version)
-        _verify_wheel_install(wheel, version, staging_dir)
-        return (
-            _publish_staged_artifact(wheel, wheel_destination),
-            _publish_staged_artifact(sdist, sdist_destination),
-        )
+            if result.returncode != 0:
+                _package_invalid(
+                    _bounded_subprocess_summary(result.stderr, "Python build failed")
+                )
+            wheel = staging_dir / wheel_name
+            sdist = staging_dir / sdist_name
+            if not wheel.is_file() or not sdist.is_file():
+                _package_invalid("Python build did not produce expected artifacts")
+            _wheel_metadata(wheel, version)
+            _sdist_metadata(sdist, version)
+            _verify_wheel_install(wheel, version, staging_dir)
+            for staged, destination in ((wheel, wheel_destination), (sdist, sdist_destination)):
+                final = _publish_staged_artifact(staged, destination)
+                stat = final.stat()
+                published.append((final, (stat.st_dev, stat.st_ino)))
+            completed = True
+            return (wheel_destination, sdist_destination)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ReleaseFailure("release.package.invalid", "Python build failed") from error
+    finally:
+        if not completed:
+            for path, identity in reversed(published):
+                _unlink_published_artifact(path, identity)
+        for reservation in reservations:
+            with contextlib.suppress(OSError):
+                reservation.unlink()
 
 
 class _ReleaseArgumentParser(argparse.ArgumentParser):

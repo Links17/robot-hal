@@ -106,3 +106,47 @@ Task 7's clean Python 3.11–3.13 matrix was not run or claimed.
   dependency closure; that is a Cargo behavior, not a registry credential
   dependency in this tool.  The current unpublished dependency closure blocks
   the real workspace Rust bundle exactly as documented above.
+
+## Review follow-up
+
+Addressed the four Important findings from the Task 6 review:
+
+- Packageable Rust members now come exclusively from Cargo metadata
+  `workspace_members`; the no-deps metadata result supplies member/package
+  identity and a second Cargo resolve graph supplies deterministic,
+  dependency-first package/check order.  Final bundle entries remain basename
+  sorted.
+- The Rust gate now requires an empty
+  `git status --porcelain=v1 --untracked-files=all`; staged, unstaged,
+  untracked, failed-status, and non-repository states all fail closed before
+  Cargo receives `--allow-dirty`.
+- Python wheel/sdist publication reserves both final names before building.  A
+  failed reservation, build, validation, or second link removes only artifacts
+  hard-linked by this invocation and leaves external final files untouched.
+- The exact generated files
+  `seeed_hal/proto/__init__.py` and `seeed_hal/proto/hal_pb2.py` are required
+  in both distributions.  The isolated install imports the generated module,
+  asserts its descriptor name, and serializes `Empty`.
+
+Review RED:
+
+```text
+pytest initially failed importing the absent metadata-selection helper.
+```
+
+Review GREEN:
+
+```text
+uv run --project bindings/python --python 3.11 --frozen pytest -q \
+  tests/release/test_package_rust.py tests/release/test_package_python.py
+# 11 passed
+
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+# 138 passed
+
+uv run --project bindings/python --python 3.11 --frozen pytest -q bindings/python/tests
+# 187 passed
+```
+
+The in-progress pre-commit Rust package attempt correctly failed closed on the
+strict dirty-tree gate.  A post-commit clean-tree attempt is recorded below.

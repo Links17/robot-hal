@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import subprocess
 import sys
 import tarfile
-import subprocess
 import tempfile
 from pathlib import Path
 
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.release.release_tool import package_rust
+from scripts.release.release_tool import (
+    ReleaseFailure,
+    _packageable_workspace_members,
+    _require_clean_repository,
+    package_rust,
+)
 
 
 def _write_workspace(root: Path) -> None:
@@ -49,6 +55,7 @@ edition = "2024"{publish}
         text=True,
         timeout=30,
     )
+    _clean_git_repository(root)
 
 
 def _bundle_members(bundle: Path) -> tuple[str, ...]:
@@ -120,3 +127,77 @@ def test_rust_bundle_refuses_existing_artifact(tmp_path: Path) -> None:
         raise AssertionError("existing artifact must be rejected")
 
     assert existing.read_bytes() == b"do not overwrite"
+
+
+def test_metadata_workspace_members_and_dependencies_define_package_order() -> None:
+    metadata = {
+        "workspace_members": ["gamma 0.5.0 (path+file:///gamma)", "alpha 0.5.0 (path+file:///alpha)", "beta 0.5.0 (path+file:///beta)", "private 0.5.0 (path+file:///private)"],
+        "packages": [
+            {"id": "alpha 0.5.0 (path+file:///alpha)", "name": "alpha", "version": "0.5.0", "publish": None},
+            {"id": "beta 0.5.0 (path+file:///beta)", "name": "beta", "version": "0.5.0", "publish": None},
+            {"id": "gamma 0.5.0 (path+file:///gamma)", "name": "gamma", "version": "0.5.0", "publish": None},
+            {"id": "private 0.5.0 (path+file:///private)", "name": "private", "version": "0.5.0", "publish": []},
+            {"id": "outside 0.5.0 (registry+https://example.invalid)", "name": "outside", "version": "0.5.0", "publish": None},
+        ],
+        "resolve": {
+            "nodes": [
+                {"id": "gamma 0.5.0 (path+file:///gamma)", "dependencies": ["beta 0.5.0 (path+file:///beta)"]},
+                {"id": "alpha 0.5.0 (path+file:///alpha)", "dependencies": []},
+                {"id": "beta 0.5.0 (path+file:///beta)", "dependencies": ["alpha 0.5.0 (path+file:///alpha)"]},
+                {"id": "private 0.5.0 (path+file:///private)", "dependencies": []},
+            ]
+        },
+    }
+
+    assert [package["name"] for package in _packageable_workspace_members(metadata)] == [
+        "alpha",
+        "beta",
+        "gamma",
+    ]
+
+
+def _git(root: Path, *arguments: str) -> None:
+    subprocess.run(
+        ["git", *arguments],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def _clean_git_repository(root: Path) -> None:
+    _git(root, "init")
+    _git(root, "config", "user.email", "release@example.invalid")
+    _git(root, "config", "user.name", "Release Test")
+    (root / "tracked").write_text("clean\n", encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-m", "initial")
+
+
+@pytest.mark.parametrize("state", ["staged", "unstaged", "untracked"])
+def test_dirty_repository_is_rejected_for_every_status_kind(
+    tmp_path: Path,
+    state: str,
+) -> None:
+    _clean_git_repository(tmp_path)
+    if state == "staged":
+        (tmp_path / "tracked").write_text("staged\n", encoding="utf-8")
+        _git(tmp_path, "add", "tracked")
+    elif state == "unstaged":
+        (tmp_path / "tracked").write_text("unstaged\n", encoding="utf-8")
+    else:
+        (tmp_path / "untracked").write_text("untracked\n", encoding="utf-8")
+
+    with pytest.raises(ReleaseFailure, match="repository has uncommitted changes") as failure:
+        _require_clean_repository(tmp_path)
+
+    assert failure.value.name == "release.package.invalid"
+
+
+def test_non_repository_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ReleaseFailure, match="unable to verify repository state") as failure:
+        _require_clean_repository(tmp_path)
+
+    assert failure.value.name == "release.package.invalid"
