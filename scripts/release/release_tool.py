@@ -2176,11 +2176,12 @@ def _write_deterministic_tar(
                 directory.gname = ""
                 directory.mtime = 0
                 archive.addfile(directory)
-                directories = {
-                    PurePosixPath(name).parent.as_posix()
-                    for name, _, _ in members
-                    if PurePosixPath(name).parent.as_posix() != root
-                }
+                directories: set[str] = set()
+                for name, _, _ in members:
+                    parent = PurePosixPath(name).parent
+                    while parent.as_posix() not in {".", root}:
+                        directories.add(parent.as_posix())
+                        parent = parent.parent
                 for name in sorted(directories, key=lambda item: (item.count("/"), item)):
                     directory = tarfile.TarInfo(name)
                     directory.type = tarfile.DIRTYPE

@@ -53,8 +53,5 @@ all three workspace members, and the path-and-version dependency chain.
 
 ## Concerns
 
-- Real-repository candidate construction is intentionally deferred until the
-  commit has made the checkout clean: `package-rust` correctly rejects dirty
-  sources before it can create an artifact.
 - No registry publish command or registry policy was added. Public-crate
   registry policy remains deferred to the separately planned v1.0 work.
