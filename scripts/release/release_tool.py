@@ -1454,6 +1454,375 @@ def package_broker(
     return published_archive
 
 
+def _package_output_directory(output_dir: Path) -> None:
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise ReleaseFailure(
+            "release.package.invalid",
+            "unable to create package output directory",
+        ) from error
+    if output_dir.is_symlink() or not output_dir.is_dir():
+        _package_invalid("package output directory is invalid")
+
+
+def _published_artifact_path(output_dir: Path, name: str) -> Path:
+    path = output_dir / name
+    if path.exists() or path.is_symlink():
+        raise ReleaseFailure(
+            "release.artifact.unexpected",
+            "final package artifact already exists",
+        )
+    return path
+
+
+def _publish_staged_artifact(staged: Path, destination: Path) -> Path:
+    try:
+        os.link(staged, destination)
+    except FileExistsError as error:
+        raise ReleaseFailure(
+            "release.artifact.unexpected",
+            "final package artifact already exists",
+        ) from error
+    except OSError as error:
+        raise ReleaseFailure(
+            "release.package.invalid",
+            "unable to publish final package artifact",
+        ) from error
+    return destination
+
+
+def _cargo_packageable_members(
+    repo_root: Path,
+    cargo: str = "cargo",
+) -> tuple[dict[str, object], ...]:
+    packages = _cargo_packages(repo_root, cargo)
+    workspace_manifest = _read_toml(repo_root / "Cargo.toml", "release.package.invalid")
+    workspace = workspace_manifest.get("workspace")
+    members = workspace.get("members") if isinstance(workspace, dict) else None
+    if not isinstance(members, list) or not all(isinstance(member, str) for member in members):
+        _package_invalid("workspace members are invalid")
+    workspace_paths = {str((repo_root / member).resolve()) for member in members}
+    packageable = tuple(
+        package
+        for package in packages
+        if str(package.get("manifest_path", "")).startswith(str(repo_root.resolve()))
+        and str(Path(str(package.get("manifest_path"))).parent.resolve()) in workspace_paths
+        and package.get("publish") != []
+    )
+    if not packageable:
+        _package_invalid("workspace has no packageable crates")
+    if any(
+        not isinstance(package.get("name"), str)
+        or not isinstance(package.get("version"), str)
+        for package in packageable
+    ):
+        _package_invalid("cargo metadata package is invalid")
+    return tuple(sorted(packageable, key=lambda package: str(package["name"])))
+
+
+def _require_clean_repository(repo_root: Path) -> None:
+    try:
+        repository = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=repo_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if repository.returncode != 0:
+            return
+        result = subprocess.run(
+            ["git", "diff", "--quiet"],
+            cwd=repo_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ReleaseFailure("release.package.invalid", "unable to verify repository state") from error
+    if result.returncode == 0:
+        return
+    if result.returncode == 1:
+        _package_invalid("repository has uncommitted changes")
+    _package_invalid("unable to verify repository state")
+
+
+def _crate_root_and_files(crate: Path) -> tuple[str, set[str]]:
+    try:
+        with tarfile.open(crate, "r:gz") as archive:
+            members = archive.getmembers()
+    except (OSError, tarfile.TarError) as error:
+        raise ReleaseFailure("release.archive.invalid", "unable to inspect crate archive") from error
+    if not members:
+        _archive_invalid("crate archive is empty")
+    paths = tuple(
+        _archive_member_path(member.name, member.isdir()) for member in members
+    )
+    roots = {path.parts[0] for path in paths}
+    if len(roots) != 1:
+        _archive_invalid("crate archive root is invalid")
+    root = roots.pop()
+    files: set[str] = set()
+    for member, path in zip(members, paths, strict=True):
+        if path.parts[0] != root or member.issym() or member.islnk():
+            _archive_invalid("crate archive member is invalid")
+        if member.isfile():
+            files.add(PurePosixPath(*path.parts[1:]).as_posix())
+    if "Cargo.toml" not in files or not any(path.startswith("src/") for path in files):
+        _archive_invalid("crate archive does not contain Rust package sources")
+    return root, files
+
+
+def _build_local_crate(
+    package: dict[str, object],
+    repo_root: Path,
+    staging_dir: Path,
+) -> Path:
+    name = str(package["name"])
+    version = str(package["version"])
+    target_dir = staging_dir / "target"
+    environment = {**os.environ, "CARGO_TARGET_DIR": str(target_dir)}
+    try:
+        result = subprocess.run(
+            [
+                "cargo",
+                "package",
+                "--package",
+                name,
+                "--locked",
+                "--allow-dirty",
+                "--no-verify",
+            ],
+            cwd=repo_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ReleaseFailure("release.cargo.failed", "cargo package failed") from error
+    if result.returncode != 0:
+        raise ReleaseFailure("release.cargo.failed", "cargo package failed")
+    crate = target_dir / "package" / f"{name}-{version}.crate"
+    if not crate.is_file() or crate.is_symlink():
+        _package_invalid("cargo package did not produce the expected crate")
+    _crate_root_and_files(crate)
+    return crate
+
+
+def package_rust(*, tag: str, repo_root: Path, output_dir: Path) -> Path:
+    """Create a deterministic local source bundle without registry publication."""
+    staging_dir: Path | None = None
+    try:
+        version = ReleaseVersion.parse(tag)
+        resolved_root = repo_root.resolve()
+        if repo_root.is_symlink() or not resolved_root.is_dir():
+            _package_invalid("repository root is invalid")
+        _require_clean_repository(resolved_root)
+        packages = _cargo_packageable_members(resolved_root)
+        if any(package["version"] != version.cargo for package in packages):
+            _package_invalid("cargo package version does not match release tag")
+        _package_output_directory(output_dir)
+        archive_name = f"seeed-hal-crates-v{version.cargo}.tar.gz"
+        destination = _published_artifact_path(output_dir, archive_name)
+        staging_dir = Path(tempfile.mkdtemp(prefix=".package-rust-", dir=output_dir))
+        staged_crates = tuple(
+            _build_local_crate(package, resolved_root, staging_dir) for package in packages
+        )
+        root = f"seeed-hal-crates-v{version.cargo}"
+        members = tuple(
+            (f"{root}/{crate.name}", crate, 0o644) for crate in staged_crates
+        )
+        staged_archive = staging_dir / archive_name
+        _write_deterministic_tar(staged_archive, root, members)
+        validate_archive(
+            staged_archive,
+            expected_root=root,
+            expected_files={crate.name for crate in staged_crates},
+        )
+        return _publish_staged_artifact(staged_archive, destination)
+    except ReleaseFailure:
+        raise
+    except OSError as error:
+        raise ReleaseFailure("release.package.invalid", "unable to package Rust crates") from error
+    finally:
+        if staging_dir is not None:
+            with contextlib.suppress(OSError):
+                for path in sorted(staging_dir.rglob("*"), reverse=True):
+                    if path.is_dir():
+                        path.rmdir()
+                    else:
+                        path.unlink()
+                staging_dir.rmdir()
+
+
+def python_artifact_names(version: ReleaseVersion) -> tuple[str, str]:
+    return (
+        f"seeed_hal-{version.python}-py3-none-any.whl",
+        f"seeed_hal-{version.python}.tar.gz",
+    )
+
+
+def _wheel_metadata(wheel: Path, version: ReleaseVersion) -> None:
+    try:
+        with zipfile.ZipFile(wheel) as archive:
+            names = set(archive.namelist())
+            metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
+            wheel_name = next(name for name in names if name.endswith(".dist-info/WHEEL"))
+            metadata = archive.read(metadata_name).decode("utf-8")
+            wheel_data = archive.read(wheel_name).decode("utf-8")
+    except (OSError, StopIteration, UnicodeError, zipfile.BadZipFile) as error:
+        raise ReleaseFailure("release.package.invalid", "Python wheel metadata is invalid") from error
+    if (
+        "Name: seeed-hal\n" not in metadata
+        or f"Version: {version.python}\n" not in metadata
+        or "Tag: py3-none-any\n" not in wheel_data
+        or "seeed_hal/__init__.py" not in names
+    ):
+        _package_invalid("Python wheel content is invalid")
+
+
+def _sdist_metadata(sdist: Path, version: ReleaseVersion) -> None:
+    try:
+        with tarfile.open(sdist, "r:gz") as archive:
+            members = archive.getmembers()
+    except (OSError, tarfile.TarError) as error:
+        raise ReleaseFailure(
+            "release.package.invalid",
+            "Python source distribution is invalid",
+        ) from error
+    if not members:
+        _package_invalid("Python source distribution content is invalid")
+    paths = tuple(
+        _archive_member_path(member.name, member.isdir()) for member in members
+    )
+    roots = {path.parts[0] for path in paths}
+    if len(roots) != 1:
+        _package_invalid("Python source distribution content is invalid")
+    root = roots.pop()
+    files = set()
+    for member, path in zip(members, paths, strict=True):
+        if member.issym() or member.islnk() or path.parts[0] != root:
+            _package_invalid("Python source distribution content is invalid")
+        if member.isfile():
+            files.add(PurePosixPath(*path.parts[1:]).as_posix())
+    try:
+        with tarfile.open(sdist, "r:gz") as archive:
+            package_info = archive.extractfile(f"{root}/PKG-INFO")
+            metadata = package_info.read().decode("utf-8") if package_info else ""
+    except (OSError, tarfile.TarError, UnicodeError) as error:
+        raise ReleaseFailure(
+            "release.package.invalid",
+            "Python source distribution metadata is invalid",
+        ) from error
+    if (
+        root != f"seeed_hal-{version.python}"
+        or "pyproject.toml" not in files
+        or "seeed_hal/__init__.py" not in files
+        or "Name: seeed-hal\n" not in metadata
+        or f"Version: {version.python}\n" not in metadata
+    ):
+        _package_invalid("Python source distribution content is invalid")
+
+
+def _verify_wheel_install(wheel: Path, version: ReleaseVersion, staging_dir: Path) -> None:
+    virtualenv = staging_dir / "venv"
+    python = virtualenv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    try:
+        for command in (
+            ["uv", "venv", "--no-project", str(virtualenv)],
+            [
+                "uv",
+                "pip",
+                "install",
+                "--python",
+                str(python),
+                "--offline",
+                str(wheel),
+            ],
+            [
+                str(python),
+                "-I",
+                "-c",
+                (
+                    "import importlib.metadata;"
+                    "import seeed_hal;"
+                    f"expected={version.python!r};"
+                    "assert importlib.metadata.version('seeed-hal') == expected;"
+                    "assert seeed_hal.__version__ == expected"
+                ),
+            ],
+        ):
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode != 0:
+                _package_invalid("Python wheel installation validation failed")
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ReleaseFailure(
+            "release.package.invalid",
+            "Python wheel installation validation failed",
+        ) from error
+
+
+def package_python(*, tag: str, project: Path, output_dir: Path) -> tuple[Path, Path]:
+    version = ReleaseVersion.parse(tag)
+    pyproject = _read_toml(project / "pyproject.toml", "release.package.invalid")
+    metadata = pyproject.get("project")
+    if not isinstance(metadata, dict) or metadata.get("version") != version.python:
+        _package_invalid("Python project version does not match release tag")
+    _package_output_directory(output_dir)
+    wheel_name, sdist_name = python_artifact_names(version)
+    wheel_destination = _published_artifact_path(output_dir, wheel_name)
+    sdist_destination = _published_artifact_path(output_dir, sdist_name)
+    with tempfile.TemporaryDirectory(prefix=".package-python-", dir=output_dir) as directory:
+        staging_dir = Path(directory)
+        try:
+            result = subprocess.run(
+                [
+                    "uv",
+                    "run",
+                    "--project",
+                    str(project),
+                    "--frozen",
+                    "python",
+                    "-m",
+                    "build",
+                    "--outdir",
+                    str(staging_dir),
+                    str(project),
+                ],
+                cwd=project.parent.parent,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ReleaseFailure("release.package.invalid", "Python build failed") from error
+        if result.returncode != 0:
+            _package_invalid("Python build failed")
+        wheel = staging_dir / wheel_name
+        sdist = staging_dir / sdist_name
+        if not wheel.is_file() or not sdist.is_file():
+            _package_invalid("Python build did not produce expected artifacts")
+        _wheel_metadata(wheel, version)
+        _sdist_metadata(sdist, version)
+        _verify_wheel_install(wheel, version, staging_dir)
+        return (
+            _publish_staged_artifact(wheel, wheel_destination),
+            _publish_staged_artifact(sdist, sdist_destination),
+        )
+
+
 class _ReleaseArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> NoReturn:
         raise ReleaseFailure("release.tool.invalid", "invalid command arguments")
@@ -1479,6 +1848,14 @@ def _parser() -> argparse.ArgumentParser:
     package.add_argument("--binary", required=True, type=Path)
     package.add_argument("--output-dir", required=True, type=Path)
     package.add_argument("--manifest", required=True, type=Path)
+    rust = subcommands.add_parser("package-rust")
+    rust.add_argument("--tag", required=True)
+    rust.add_argument("--repo-root", required=True, type=Path)
+    rust.add_argument("--output-dir", required=True, type=Path)
+    python = subcommands.add_parser("package-python")
+    python.add_argument("--tag", required=True)
+    python.add_argument("--project", required=True, type=Path)
+    python.add_argument("--output-dir", required=True, type=Path)
     generate = subcommands.add_parser("generate-manifest")
     generate.add_argument("--tag", required=True)
     generate.add_argument("--commit", required=True)
@@ -1522,6 +1899,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output_dir=arguments.output_dir,
                 manifest_path=arguments.manifest,
                 repo_root=Path(__file__).resolve().parents[2],
+            )
+        elif arguments.command == "package-rust":
+            package_rust(
+                tag=arguments.tag,
+                repo_root=arguments.repo_root,
+                output_dir=arguments.output_dir,
+            )
+        elif arguments.command == "package-python":
+            package_python(
+                tag=arguments.tag,
+                project=arguments.project,
+                output_dir=arguments.output_dir,
             )
         elif arguments.command == "generate-manifest":
             manifest = generate_manifest(
