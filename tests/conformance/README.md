@@ -49,6 +49,10 @@ qualification.
 The deterministic virtual CAN loopback can exercise Classic, FD, configure, error-frame filtering
 and frames, and receive timestamps. These are virtual-fixture qualification boundaries, not
 physical bus error injection, hardware timestamp accuracy, or adapter timing qualification.
+The virtual broker exposes separate stable Classic-active and FD-active CAN resource identities.
+Classic, error-frame, and timestamp checks explicitly attach with Classic expectations; FD checks
+explicitly attach with FD expectations. Configure qualification uses the Classic resource with a
+Maintenance Configure request and restores its previous state on close.
 
 One monotonic deadline bounds each complete request even when runtime events are interleaved. Process
 startup/readiness, transport connection, disconnect cleanup, cooperative shutdown, kill fallback,

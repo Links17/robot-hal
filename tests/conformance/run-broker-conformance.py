@@ -504,7 +504,9 @@ def _can_open_request(descriptor, mode: str):
             )
         )
     else:
-        config = hal_pb2.CanOpenConfig(attach=hal_pb2.CanLinkExpectation())
+        config = hal_pb2.CanOpenConfig(
+            attach=hal_pb2.CanLinkExpectation(mode=hal_pb2.CAN_MODE_CLASSIC)
+        )
     filters = hal_pb2.CanFilterSet()
     if mode == "error-frames":
         filters.filters.add(
@@ -565,8 +567,20 @@ async def _exercise_can_mode(
 ):
     enumerated = await client.request("enumerate_can_request", hal_pb2.EnumerateCanRequest())
     resources = _expect_payload(enumerated, "enumerate_can_response").resources
-    _require(len(resources) == 1, f"expected one virtual CAN resource, got {len(resources)}")
-    descriptor = resources[0]
+    _require(len(resources) == 2, f"expected two virtual CAN resources, got {len(resources)}")
+    resource_suffix = ":fd" if mode == "fd" else ":classic"
+    descriptor = next(
+        (
+            resource
+            for resource in resources
+            if resource.resource_id.endswith(resource_suffix)
+        ),
+        None,
+    )
+    _require(
+        descriptor is not None,
+        f"virtual CAN resource for {mode} was not enumerated",
+    )
     _require(descriptor.properties.get("adapter") == "virtual", "CAN adapter was not virtual")
     opened = _expect_payload(
         await client.request(

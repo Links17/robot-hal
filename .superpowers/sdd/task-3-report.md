@@ -223,3 +223,41 @@ GREEN:
 ### Follow-up commit
 
 Conventional Commit: `fix(protocol): qualify CAN FD via attach`.
+
+## Dual-mode virtual CAN follow-up
+
+The virtual broker now exposes separate Classic-active and FD-active CAN resource identities, so
+each mode is qualified with an explicit matching Attach expectation.
+
+### TDD evidence
+
+RED:
+
+```text
+3 failed
+```
+
+The failures proved that Classic, Error Frames, and RX Timestamp checks used an empty Attach
+expectation and therefore did not prove a Classic-active link.
+
+GREEN:
+
+```text
+59 passed
+```
+
+### Verification
+
+- Classic, Error Frames, and RX Timestamp explicitly use `Attach(mode=CLASSIC)` on the stable
+  Classic virtual resource.
+- FD-only explicitly uses `Attach(mode=FD)` on the stable FD virtual resource and has no
+  Classic/Configure closure.
+- Configure uses Maintenance Configure(Classic) on the Classic resource and restores its prior
+  state when closed.
+- Disconnect cleanup reopens and closes the same selected resource identity.
+- Default minor 0, 1, 2, and 3 profiles passed.
+- Explicit Classic-only, FD-only, Error Frames, and RX Timestamp profiles passed.
+
+### Follow-up commit
+
+Conventional Commit: `fix(protocol): qualify both virtual CAN modes`.
