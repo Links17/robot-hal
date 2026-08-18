@@ -81,6 +81,11 @@ enum CameraCommand {
     },
 }
 
+enum EnqueueError {
+    Full(HalError),
+    Closed,
+}
+
 impl CameraCommand {
     fn reject_closed(self) {
         match self {
@@ -122,18 +127,22 @@ struct CameraWorker {
 }
 
 impl CameraWorker {
-    fn try_enqueue(&self, command: CameraCommand, operation: &'static str) -> HalResult<()> {
+    fn try_enqueue(
+        &self,
+        command: CameraCommand,
+        operation: &'static str,
+    ) -> Result<(), EnqueueError> {
         self.commands
             .try_send(command)
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => runtime_error(
+                mpsc::error::TrySendError::Full(_) => EnqueueError::Full(runtime_error(
                     "runtime.queue.full",
                     ErrorCategory::Unavailable,
                     operation,
                     true,
                     "the bounded camera command queue has reached its 64-command capacity",
-                ),
-                mpsc::error::TrySendError::Closed(_) => actor_unavailable(operation),
+                )),
+                mpsc::error::TrySendError::Closed(_) => EnqueueError::Closed,
             })
     }
 
@@ -626,9 +635,18 @@ impl CameraManager {
     ) -> HalResult<T> {
         let (worker, resource) = self.worker(&id, lease, op).await?;
         let (reply, response) = oneshot::channel();
-        worker
-            .try_enqueue(command(reply), op)
-            .map_err(|error| error.with_resource_id(resource.clone()))?;
+        match worker.try_enqueue(command(reply), op) {
+            Ok(()) => {}
+            Err(EnqueueError::Full(error)) => {
+                return Err(error.with_resource_id(resource));
+            }
+            Err(EnqueueError::Closed) => {
+                return Err(worker
+                    .terminal_error()
+                    .unwrap_or_else(|| actor_unavailable(op))
+                    .with_resource_id(resource));
+            }
+        }
         let mut closing = worker.shutdown.subscribe();
         tokio::select! {
             result = response => result.unwrap_or_else(|_| Err(actor_unavailable(op))),
@@ -783,6 +801,71 @@ async fn finish_session(state: &Mutex<State>, id: &SessionId) {
                 lease: entry.lease,
                 terminal_error: entry.worker.terminal_error(),
             },
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn request_replays_published_terminal_error_when_active_worker_channel_is_closed() {
+        let manager = CameraManager::new(None, Duration::from_secs(1));
+        let resource = ResourceId::parse("camera:runtime:terminal-race").unwrap();
+        let owner = OwnerId::parse("owner:camera-terminal-race").unwrap();
+        let id = SessionId::parse("11111111-1111-1111-1111-111111111111").unwrap();
+        let (commands, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let (shutdown, _) = watch::channel(false);
+        let (_, completion) = watch::channel(None);
+        let (_, terminal_error) = watch::channel(Some(
+            HalError::new(
+                "camera.session.unplugged",
+                ErrorCategory::Unavailable,
+                "camera.capture",
+                false,
+                "camera was unplugged",
+            )
+            .unwrap(),
+        ));
+        let worker = CameraWorker {
+            commands,
+            shutdown,
+            admission: Arc::new(Mutex::new(())),
+            completion,
+            terminal_error,
+        };
+        let lease = {
+            let mut state = manager.state.lock().await;
+            let lease = state
+                .leases
+                .reserve_control(resource.clone(), id.clone(), owner.clone())
+                .unwrap();
+            assert!(state.leases.commit(&resource, &id, &lease));
+            state.sessions.insert(
+                id.clone(),
+                Entry {
+                    resource: resource.clone(),
+                    owner,
+                    lease: lease.clone(),
+                    worker,
+                },
+            );
+            lease
+        };
+
+        let error = manager
+            .capture(id, &lease, Duration::ZERO)
+            .await
+            .expect_err("a closed worker channel must replay its published terminal error");
+
+        assert_eq!(error.name().as_str(), "camera.session.unplugged");
+        assert_eq!(error.resource_id(), Some(&resource));
+        assert_eq!(
+            manager.state.lock().await.sessions.len(),
+            1,
+            "the request must exercise the active-session pre-reap window"
         );
     }
 }
