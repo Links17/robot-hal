@@ -187,3 +187,72 @@ manifest generation, `package-broker.sh`, and `verify-broker-manifest`.
   isolated artifact directories.
 - Linux and Windows native binary build/runtime validation remains unperformed
   on this macOS arm64 host.
+
+---
+
+## Important Review Follow-up: No-clobber Publish Reservation
+
+### Status
+
+DONE
+
+### RED Evidence
+
+The new deterministic two-publisher race test synchronized both callers at the
+old pre-`os.replace` window:
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_package_broker.py
+```
+
+Result: `1 failed, 11 passed`. Both calls reported success, proving that the
+existing `exists()` check followed by `os.replace()` could overwrite a
+concurrently published archive.
+
+### Changes
+
+- Publication now creates a stable hidden same-directory reservation:
+  `.reserve-broker-<archive-basename>`, using portable `os.open` with
+  `O_CREAT | O_EXCL`.
+- A final archive or any pre-existing reservation fails closed as
+  `release.artifact.unexpected`. Existing reservations are not deleted or
+  reused, so crash leftovers require isolated-job cleanup or manual review.
+- Only the reservation owner stages inputs, creates and validates the archive,
+  then atomically places the staged archive at the final path.
+- Success and ordinary failure remove only the caller's staging directory and
+  reservation. The reservation is hidden, does not match a release artifact
+  basename, and is removed on successful completion so later exact release-dir
+  validation remains clean.
+
+### GREEN Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_package_broker.py
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+python3 -m compileall -q scripts/release tests/release
+git diff --check
+```
+
+Result: Task 5 focused suite `13 passed`; complete release suite `122 passed`;
+Python compilation and whitespace validation exited 0. The concurrency case
+asserts exactly one success, one `release.artifact.unexpected` failure, a
+validator-accepted final archive, and no staging/reservation leftovers. A
+separate regression confirms that a pre-existing reservation fails closed and
+is not removed.
+
+The macOS arm64 release build, runtime manifest generation,
+`package-broker.sh`, and manifest verification were re-run successfully.
+
+### Commit
+
+`fix(release): reserve broker artifact publication`
+
+### Concerns
+
+- A crash may leave a reservation by design; subsequent publishers fail closed
+  instead of deleting a possibly active or unknown reservation. Isolated release
+  artifact directories or explicit operator cleanup are therefore required.
+- Linux and Windows native binary build/runtime verification remains outside
+  this macOS arm64 execution.

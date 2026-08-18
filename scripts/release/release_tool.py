@@ -1161,6 +1161,27 @@ def _package_archive_name(version: ReleaseVersion, target: ReleaseTarget) -> str
     return f"{_package_root(version, target)}.{suffix}"
 
 
+def _package_reservation_path(output_dir: Path, archive_name: str) -> Path:
+    return output_dir / f".reserve-broker-{archive_name}"
+
+
+def _reserve_package_archive(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as error:
+        raise ReleaseFailure(
+            "release.artifact.unexpected",
+            "final broker archive is already reserved",
+        ) from error
+    except OSError as error:
+        raise ReleaseFailure(
+            "release.package.invalid",
+            "unable to reserve final broker archive",
+        ) from error
+    else:
+        os.close(descriptor)
+
+
 def _package_members(
     root: str,
     binary_name: str,
@@ -1288,6 +1309,8 @@ def package_broker(
     repo_root: Path,
 ) -> Path:
     staging_dir: Path | None = None
+    reservation_path: Path | None = None
+    owns_reservation = False
     try:
         version = ReleaseVersion.parse(tag)
         targets = load_targets(targets_path)
@@ -1309,6 +1332,14 @@ def package_broker(
         if output_dir.is_symlink() or not output_dir.is_dir():
             _package_invalid("package output directory is invalid")
         archive_path = output_dir / _package_archive_name(version, target)
+        if archive_path.exists():
+            raise ReleaseFailure(
+                "release.artifact.unexpected",
+                "final broker archive already exists",
+            )
+        reservation_path = _package_reservation_path(output_dir, archive_path.name)
+        _reserve_package_archive(reservation_path)
+        owns_reservation = True
         if archive_path.exists():
             raise ReleaseFailure(
                 "release.artifact.unexpected",
@@ -1350,11 +1381,6 @@ def package_broker(
             expected_root=root,
             expected_files={name.rsplit("/", 1)[1] for name, _, _ in members},
         )
-        if archive_path.exists():
-            raise ReleaseFailure(
-                "release.artifact.unexpected",
-                "final broker archive already exists",
-            )
         os.replace(staged_archive, archive_path)
         return archive_path
     except ReleaseFailure as error:
@@ -1370,6 +1396,9 @@ def package_broker(
                     else:
                         path.unlink()
                 staging_dir.rmdir()
+        if owns_reservation and reservation_path is not None:
+            with contextlib.suppress(OSError):
+                reservation_path.unlink()
 
 
 class _ReleaseArgumentParser(argparse.ArgumentParser):

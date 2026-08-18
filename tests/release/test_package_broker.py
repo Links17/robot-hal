@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 import tarfile
+import threading
 import zipfile
 from pathlib import Path
 
@@ -15,7 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.release import release_tool
-from scripts.release.release_tool import ReleaseFailure, package_broker
+from scripts.release.release_tool import ReleaseFailure, package_broker, validate_archive
 
 
 RELEASE_TOOL = REPO_ROOT / "scripts" / "release" / "release_tool.py"
@@ -288,6 +289,93 @@ def test_packaging_uses_frozen_staged_input_copies(
             "seeed-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin/broker-manifest.json"
         ).read() == original_manifest
     assert not any(path.name.startswith(".package-broker-") for path in archive.parent.iterdir())
+
+
+def test_concurrent_publish_reserves_final_archive_without_overwrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, targets = _fixture_repo(tmp_path)
+    output = tmp_path / "output"
+    barrier = threading.Barrier(2)
+    original_reserve = release_tool._reserve_package_archive
+    results: list[Path | ReleaseFailure] = []
+
+    def synchronized_reserve(path: Path) -> None:
+        barrier.wait(timeout=5)
+        original_reserve(path)
+
+    monkeypatch.setattr(release_tool, "_reserve_package_archive", synchronized_reserve)
+
+    def publish(label: str) -> None:
+        source = tmp_path / label
+        source.mkdir()
+        binary = source / "seeed-hal-broker"
+        binary.write_bytes(f"broker fixture {label}\n".encode())
+        manifest = source / "broker-manifest.json"
+        _write_fixture_manifest("macos", binary, manifest)
+        try:
+            results.append(
+                package_broker(
+                    tag="v0.5.0-rc.1",
+                    target_name="macos",
+                    targets_path=targets,
+                    binary_path=binary,
+                    output_dir=output,
+                    manifest_path=manifest,
+                    repo_root=repo,
+                )
+            )
+        except ReleaseFailure as error:
+            results.append(error)
+
+    threads = [threading.Thread(target=publish, args=(label,)) for label in ("one", "two")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    successes = [result for result in results if isinstance(result, Path)]
+    failures = [result for result in results if isinstance(result, ReleaseFailure)]
+    assert len(successes) == 1
+    assert [failure.name for failure in failures] == ["release.artifact.unexpected"]
+    archive = successes[0]
+    validate_archive(
+        archive,
+        expected_root="seeed-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin",
+        expected_files={"LICENSE", "README.md", "broker-manifest.json", "seeed-hal-broker"},
+    )
+    assert not any(path.name.startswith(".package-broker-") for path in output.iterdir())
+    assert not any(path.name.startswith(".reserve-broker-") for path in output.iterdir())
+
+
+def test_existing_reservation_fails_closed_without_removal(tmp_path: Path) -> None:
+    repo, targets = _fixture_repo(tmp_path)
+    binary = tmp_path / "seeed-hal-broker"
+    binary.write_bytes(b"broker fixture\n")
+    manifest = tmp_path / "broker-manifest.json"
+    _write_fixture_manifest("macos", binary, manifest)
+    output = tmp_path / "output"
+    output.mkdir()
+    reservation = output / (
+        ".reserve-broker-seeed-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin.tar.gz"
+    )
+    reservation.write_bytes(b"unknown publisher reservation")
+
+    with pytest.raises(ReleaseFailure) as failure:
+        package_broker(
+            tag="v0.5.0-rc.1",
+            target_name="macos",
+            targets_path=targets,
+            binary_path=binary,
+            output_dir=output,
+            manifest_path=manifest,
+            repo_root=repo,
+        )
+
+    assert failure.value.name == "release.artifact.unexpected"
+    assert reservation.read_bytes() == b"unknown publisher reservation"
 
 
 def test_cli_rejects_missing_tag_with_stable_failure(tmp_path: Path) -> None:
