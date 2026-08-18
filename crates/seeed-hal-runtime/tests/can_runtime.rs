@@ -599,6 +599,7 @@ async fn actor_panic_disconnect_is_reported_without_hanging() {
         )
         .await
         .unwrap();
+    gate.wait_started().await;
     gate.release();
     wait_for_can_session_closed(&observer).await;
 }
@@ -727,6 +728,7 @@ async fn failed_actor_is_reconciled_before_resource_reuse() {
         )
         .await
         .unwrap();
+    gate.wait_started().await;
     gate.release();
     wait_for_can_session_closed(&first).await;
     let second = runtime
