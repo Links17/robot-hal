@@ -298,3 +298,56 @@ and diff check passed.
 
 - The bounded loop reads declared payload bytes only until EOF; because each read
   is capped, a forged huge size cannot allocate a proportional buffer.
+
+---
+
+## Final P1 Raw Tar Decompression Budget
+
+### Status
+
+DONE
+
+### RED Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_manifest.py tests/release/test_archive_safety.py
+```
+
+Result: `1 failed, 61 passed`. The new raw-tar limit test failed because no
+explicit per-member or cumulative decompressed-payload safety budget existed.
+
+### Changes
+
+- Defined and documented `MAX_ARCHIVE_MEMBER_BYTES` (768 MiB) and
+  `MAX_ARCHIVE_UNCOMPRESSED_BYTES` (1 GiB), retaining capacity for expected
+  v0.5 broker binaries and the Rust crates bundle while bounding hostile input.
+- The raw tar scanner checks each declared size before any payload read, then
+  accumulates only declared member payload bytes (never alignment padding).
+- The scanner continues to consume allowable payload with 64 KiB reads; malformed
+  sizes, truncated data, and limit violations map to `release.archive.invalid`.
+- Added tests proving an oversized header is rejected after its header read and
+  before payload consumption, and multiple individually legal members that exceed
+  the aggregate payload budget are rejected stably.
+
+### GREEN Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_manifest.py tests/release/test_archive_safety.py
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+python3 -m compileall -q scripts/release tests/release
+git diff --check
+```
+
+Result: focused suite `62 passed`; full release suite `108 passed`; compileall
+and diff check passed.
+
+### Commit
+
+`df8da40` — `fix(release): cap tar decompression budgets`
+
+### Concerns
+
+- Limits apply to the gzip tar raw-header prescan, preventing declared-size
+  headers from forcing unbounded inflation before `tarfile` receives the stream.
