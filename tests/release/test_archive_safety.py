@@ -73,7 +73,15 @@ def test_valid_tar_and_zip_are_inspected_without_extraction(tmp_path: Path) -> N
 
 @pytest.mark.parametrize(
     "name",
-    ["../escape", "/absolute", "./dot", "root\\windows", "C:/drive", "root//empty"],
+    [
+        "../escape",
+        "/absolute",
+        "./dot",
+        "root\\windows",
+        "C:/drive",
+        "root//empty",
+        "root//",
+    ],
 )
 def test_tar_rejects_unsafe_member_names_before_extraction(
     tmp_path: Path,
@@ -90,7 +98,15 @@ def test_tar_rejects_unsafe_member_names_before_extraction(
 
 @pytest.mark.parametrize(
     "name",
-    ["../escape", "/absolute", "./dot", "root\\windows", "C:/drive", "root//empty"],
+    [
+        "../escape",
+        "/absolute",
+        "./dot",
+        "root\\windows",
+        "C:/drive",
+        "root//empty",
+        "root//",
+    ],
 )
 def test_zip_rejects_unsafe_member_names_before_extraction(
     tmp_path: Path,

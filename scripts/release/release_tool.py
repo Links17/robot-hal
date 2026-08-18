@@ -741,9 +741,16 @@ def verify_static(artifacts_dir: Path, manifest_path: Path, checksums_path: Path
 
 
 def _safe_archive_path(name: str) -> PurePosixPath:
-    if not name or "\\" in name or name.startswith("/") or re.match(r"^[A-Za-z]:", name):
+    normalized_input = name[:-1] if name.endswith("/") else name
+    if (
+        not normalized_input
+        or "\\" in name
+        or name.startswith("/")
+        or re.match(r"^[A-Za-z]:", name)
+        or "" in normalized_input.split("/")
+    ):
         _archive_invalid("archive member path is not a safe POSIX relative path")
-    path = PurePosixPath(name)
+    path = PurePosixPath(normalized_input)
     if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
         _archive_invalid("archive member path is not normalized")
     return path

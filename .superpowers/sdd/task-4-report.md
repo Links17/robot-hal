@@ -43,7 +43,7 @@ uv run --project bindings/python --python 3.11 --frozen \
   pytest -q tests/release/test_manifest.py tests/release/test_archive_safety.py
 ```
 
-Result: `29 passed`.
+Result: `31 passed`.
 
 ```bash
 uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
@@ -51,12 +51,12 @@ python3 -m compileall -q scripts/release tests/release
 git diff --check
 ```
 
-Result: release suite `75 passed`; Python compilation and diff check exited 0.
+Result: release suite `77 passed`; Python compilation and diff check exited 0.
 IDE diagnostics reported no errors for changed files.
 
 ## Commit
 
-Pending at report creation.
+`d4e2f03` — `feat(release): generate and validate artifact manifests`
 
 ## Self-review
 
