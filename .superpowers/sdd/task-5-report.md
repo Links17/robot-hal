@@ -403,3 +403,66 @@ Linux and Windows binaries were not built or run on this host.
   which is ensured by staging inside the output directory. Filesystems that
   reject hard links fail closed.
 - Crash-left reservations remain fail-closed by design.
+
+---
+
+## Final Review Follow-up: Published Archive Cleanup
+
+### Status
+
+DONE
+
+### RED Evidence
+
+The focused suite ran after adding a regression that makes `Path.unlink` fail
+only for the staged archive after `os.link` has created the final name:
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_package_broker.py
+```
+
+Result: `1 failed, 17 passed`. The prior implementation surfaced
+`release.package.invalid` even though the published archive already existed.
+
+### Changes
+
+- `package_broker` explicitly records the final archive only after the atomic
+  hard-link publication succeeds.
+- Removal of the staged archive is now best-effort after publication.
+- Per-entry staging cleanup is also best-effort, so a residual staged file
+  cannot turn a successful publication into a failed result.
+- Validation, link publication, reservation ownership, and all pre-publication
+  failures remain fail-closed. Final archives still use the no-clobber link
+  create and are returned only after it succeeds.
+
+### GREEN Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_package_broker.py
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+python3 -m compileall -q scripts/release tests/release
+git diff --check
+```
+
+Result: focused Task 5 suite `18 passed`; complete release suite `127 passed`;
+Python compilation and whitespace validation exited 0. The regression validates
+the returned final archive after the staged unlink failure.
+
+### Commit
+
+`fix(release): preserve published broker result`
+
+### Self-review
+
+- A post-link cleanup failure no longer changes the successful public result.
+- Link failures and all pre-link validation failures still return stable,
+  fail-closed release errors.
+- Reservation cleanup and no-clobber behavior are unchanged.
+
+### Concerns
+
+- A failed post-publication staging cleanup can leave a private staging
+  directory for operator cleanup; the final archive remains valid and its
+  publication result remains authoritative.

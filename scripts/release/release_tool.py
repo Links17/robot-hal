@@ -1348,6 +1348,7 @@ def package_broker(
 ) -> Path:
     staging_dir: Path | None = None
     reservation_path: Path | None = None
+    published_archive: Path | None = None
     owns_reservation = False
     try:
         version = ReleaseVersion.parse(tag)
@@ -1428,24 +1429,29 @@ def package_broker(
                 "release.package.invalid",
                 "unable to publish final broker archive",
             ) from error
-        staged_archive.unlink()
-        return archive_path
+        published_archive = archive_path
+        with contextlib.suppress(OSError):
+            staged_archive.unlink()
     except ReleaseFailure as error:
         raise ReleaseFailure(error.name, _package_diagnostic(error.name)) from error
     except OSError as error:
         raise ReleaseFailure("release.package.invalid", "unable to package broker") from error
     finally:
         if staging_dir is not None:
-            with contextlib.suppress(OSError):
-                for path in sorted(staging_dir.rglob("*"), reverse=True):
+            for path in sorted(staging_dir.rglob("*"), reverse=True):
+                with contextlib.suppress(OSError):
                     if path.is_dir():
                         path.rmdir()
                     else:
                         path.unlink()
+            with contextlib.suppress(OSError):
                 staging_dir.rmdir()
         if owns_reservation and reservation_path is not None:
             with contextlib.suppress(OSError):
                 reservation_path.unlink()
+    if published_archive is None:
+        _package_invalid("broker archive publication did not complete")
+    return published_archive
 
 
 class _ReleaseArgumentParser(argparse.ArgumentParser):

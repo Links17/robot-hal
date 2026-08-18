@@ -475,6 +475,49 @@ def test_link_publish_fails_closed_when_unsupported(
     assert not output.exists() or not any(output.iterdir())
 
 
+def test_published_archive_succeeds_when_staged_unlink_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, targets = _fixture_repo(tmp_path)
+    binary = tmp_path / "seeed-hal-broker"
+    binary.write_bytes(b"broker fixture\n")
+    manifest = tmp_path / "broker-manifest.json"
+    _write_fixture_manifest("macos", binary, manifest)
+    output = tmp_path / "output"
+    staged_archives: set[Path] = set()
+    original_link = release_tool.os.link
+    original_unlink = Path.unlink
+
+    def record_staged_archive(source: Path, destination: Path) -> None:
+        staged_archives.add(source)
+        original_link(source, destination)
+
+    def reject_staged_archive_unlink(path: Path, *args, **kwargs) -> None:
+        if path in staged_archives:
+            raise OSError("fixture staged archive unlink failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(release_tool.os, "link", record_staged_archive)
+    monkeypatch.setattr(Path, "unlink", reject_staged_archive_unlink)
+
+    archive = package_broker(
+        tag="v0.5.0-rc.1",
+        target_name="macos",
+        targets_path=targets,
+        binary_path=binary,
+        output_dir=output,
+        manifest_path=manifest,
+        repo_root=repo,
+    )
+
+    validate_archive(
+        archive,
+        expected_root="seeed-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin",
+        expected_files={"LICENSE", "README.md", "broker-manifest.json", "seeed-hal-broker"},
+    )
+
+
 def test_cli_rejects_missing_tag_with_stable_failure(tmp_path: Path) -> None:
     result = subprocess.run(
         [sys.executable, str(RELEASE_TOOL), "package-broker"],
