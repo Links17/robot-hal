@@ -38,9 +38,8 @@ uv run --project bindings/python --python 3.11 --frozen pytest -q \
 - `verify-artifacts --tag --artifacts-dir --targets --repo-root` accepts only a
   complete directory, runs Task 4 `verify-static`, archive/static broker checks
   for all three targets, executes `--manifest` only for a native host broker,
-  and never claims that a foreign target executable was run. A packaged
-  `virtual-conformance` entrypoint, when supplied by a future broker archive,
-  is run with bounded subprocesses for wire minors 0–3.
+  and never claims that a foreign target executable was run. Native brokers run
+  the existing bounded virtual conformance runner for wire minors 0–3.
 - POSIX and PowerShell wrappers and the qualification template were added.
 
 ## Commands
@@ -66,9 +65,8 @@ broker archives only; no release-ready verdict is produced.
 - Linux and Windows binaries were not executed on macOS. Their archive and
   static manifest checks remain local; hosted platform evidence is required
   before their executable conformance can be claimed.
-- The checked archive format does not currently package a
-  `virtual-conformance` executable. The verifier supports it if supplied but
-  does not fabricate an execution claim.
+- The current fixture run stubs the existing Python virtual runner; real
+  macOS broker execution would run it for wire minors 0–3.
 - Real Rust bundle aggregation remains blocked by the existing unpublished
   crates.io dependency closure documented by Task 6. No missing bundle was
   faked and no release-ready result was claimed.

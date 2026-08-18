@@ -999,22 +999,37 @@ def _host_target(target: ReleaseTarget) -> bool:
     )
 
 
-def _run_virtual_conformance(
-    extracted: Path,
-) -> None:
-    """Run the broker's hardware-free virtual conformance entrypoint, if packaged."""
-    entrypoint = extracted / "virtual-conformance"
-    if not entrypoint.is_file() or entrypoint.is_symlink():
-        return
+def _run_virtual_conformance(binary: Path, repo_root: Path) -> None:
+    """Run every hardware-free virtual wire profile with bounded subprocesses."""
+    runner = repo_root / "tests" / "conformance" / "run-broker-conformance.py"
+    if not runner.is_file() or runner.is_symlink():
+        raise ReleaseFailure(
+            "release.package.invalid",
+            "virtual conformance runner is unavailable",
+        )
     try:
         for minor in range(BROKER_WIRE["minimum_minor"], BROKER_WIRE["maximum_minor"] + 1):
             result = subprocess.run(
-                [str(entrypoint), f"--wire-minor={minor}"],
-                cwd=extracted,
+                [
+                    "uv",
+                    "run",
+                    "--project",
+                    str(repo_root / "bindings" / "python"),
+                    "--python",
+                    "3.11",
+                    "--frozen",
+                    "python",
+                    str(runner),
+                    "--broker",
+                    str(binary),
+                    "--protocol-minor",
+                    str(minor),
+                ],
+                cwd=repo_root,
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=120,
             )
             if result.returncode != 0:
                 raise ReleaseFailure(
@@ -1095,7 +1110,7 @@ def verify_artifacts(
                 binary,
                 ReleaseVersion.parse(tag),
             )
-            _run_virtual_conformance(extracted)
+            _run_virtual_conformance(binary, repo_root)
 
 
 def _qualification(value: object, field: str) -> QualificationStatus:

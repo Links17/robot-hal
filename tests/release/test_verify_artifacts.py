@@ -257,7 +257,12 @@ def test_aggregate_rejects_external_candidate_mutation_before_publish(
 
 def test_verify_static_release_directory_is_the_only_success_boundary(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     release = _complete_release(tmp_path)
+    monkeypatch.setattr(
+        "scripts.release.release_tool._run_virtual_conformance",
+        lambda binary, repo_root: None,
+    )
 
     verify_artifacts(release, TAG, TARGETS, REPO_ROOT)
