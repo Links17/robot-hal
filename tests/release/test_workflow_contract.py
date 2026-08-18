@@ -129,7 +129,7 @@ def test_linux_jobs_install_libgpiod_before_linux_gpio_builds() -> None:
         assert step["if"] == "${{ runner.os == 'Linux' }}"
         assert step["run"].strip() == (
             "sudo apt-get update\n"
-            "sudo apt-get install --yes libgpiod-dev pkg-config"
+            "sudo apt-get install --yes libgpiod-dev libudev-dev pkg-config"
         )
 
     source_prepare_index = source_steps.index(source_prepare)

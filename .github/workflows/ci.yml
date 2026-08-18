@@ -28,7 +28,7 @@ jobs:
         if: ${{ runner.os == 'Linux' }}
         run: |
           sudo apt-get update
-          sudo apt-get install --yes libgpiod-dev pkg-config
+          sudo apt-get install --yes libgpiod-dev libudev-dev pkg-config
       - name: Check generated protocol
         run: ./scripts/check-generated-protocol.sh
       - name: Check Rust formatting
