@@ -23,10 +23,15 @@ The implementation is library-first. Rust applications link the library directly
 - [v0.1.0 acceptance evidence](docs/releases/v0.1.0-acceptance.md)
 - [v0.2.0 acceptance evidence](docs/releases/v0.2.0-acceptance.md)
 - [v0.3 USB/GPIO acceptance evidence](docs/releases/v0.3.0-acceptance.md)
+- [v0.4 Camera acceptance evidence](docs/releases/v0.4.0-acceptance.md)
+- [v0.4 Camera external qualification](docs/releases/v0.4.0-camera-qualification.md)
 - [Physical Serial loopback runbook](docs/runbooks/serial-loopback.md)
 - [Native USB qualification runbook](docs/runbooks/nusb-native.md)
 - [Native Linux GPIO qualification runbook](docs/runbooks/linux-gpio-native.md)
 - [Native Windows GPIO qualification runbook](docs/runbooks/windows-gpio-native.md)
+- [Native macOS Camera qualification runbook](docs/runbooks/camera-avfoundation-native.md)
+- [Native Linux Camera qualification runbook](docs/runbooks/camera-v4l2-native.md)
+- [Native Windows Camera qualification runbook](docs/runbooks/camera-mediafoundation-native.md)
 
 ## Status
 
@@ -43,7 +48,11 @@ hardware qualification remains an external gate. v0.3 adds USB Control/Bulk/Inte
 line/edge APIs, bounded runtime workers, wire-minor-2 broker operations, Rust and Python sessions,
 virtual conformance adapters, and opt-in nusb, Linux GPIO, and Windows GPIO adapters. Native USB
 and GPIO qualification remain external gates; macOS GPIO fails closed because no native GPIO adapter
-is registered. Camera, Node bindings, and the camera frame data plane remain planned.
+is registered. v0.4 adds Camera contracts, a bounded named shared-memory frame ring, virtual
+conformance, wire-minor-3 broker operations, Rust/Python clients, and AVFoundation, V4L2, and Media
+Foundation adapters. Camera frame bytes do not use protobuf IPC. Native camera qualification remains
+an external per-platform gate recorded separately from the hardware-free acceptance evidence. Node
+bindings and device protocols remain planned.
 
 ## Verification
 
@@ -63,3 +72,12 @@ cd bindings/python && uv run --frozen pytest -q
 
 The hardware-free executable conformance command is documented in
 [`tests/conformance/README.md`](tests/conformance/README.md).
+
+Run the Camera v0.4 hardware-free release gate with:
+
+```bash
+./scripts/check-camera-v0.4.sh
+```
+
+It deliberately leaves physical adapter tests ignored. Follow the platform Camera runbooks to
+produce external qualification evidence on real devices.

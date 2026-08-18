@@ -85,3 +85,12 @@ dispatch; the pre-existing Serial and CAN meanings remain unchanged. The manifes
 independently compiled `nusb`, `linux-gpio`, or `windows-gpio` adapters, but that does not claim
 their vendor runtime, controller, or physical hardware was available. `virtual-adapters` is
 test-only and is not a production-device claim.
+
+The Camera vertical slice supports wire major 1, inclusive minors `0..=3`. Minor 3 adds optional
+Camera discovery, exclusive sessions, capture, mapping descriptors, frame leases, drop counts, and
+standardized controls. Frame bytes never appear in the protobuf control plane: the broker conveys
+only a validated shared-memory descriptor and access credential. A peer negotiated below minor 3
+rejects every Camera entry point locally or at broker dispatch; it must not downgrade capture to a
+payload-bearing protobuf response. The manifest may list an AVFoundation, V4L2, or Media Foundation
+adapter without claiming the target runtime, privacy authorization, driver, or a physical camera was
+available. `virtual-adapters` remains test-only evidence.
