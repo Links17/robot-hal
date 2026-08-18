@@ -16,26 +16,18 @@ release directory, a GitHub workflow result, a GitHub attestation, a GitHub
 Release, crates.io publication, PyPI publication, or physical-hardware
 qualification.
 
-## Actual local source evidence
+## Preserved local source evidence
 
-The following source gate ran from the Task 10 worktree and exited `0`:
+The currently preserved Task 10 terminal evidence is bounded:
 
-```sh
-./scripts/check-generated-protocol.sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-uv run --project bindings/python --python 3.11 --frozen pytest -q
-```
-
-The available terminal output records `449 passed in 81.18s` for the final
-Python command. It does not preserve a separate full transcript or aggregate
-test count for the Rust commands; their exit status is `0` in the same command
-record. Terminal evidence: Cursor terminal `46004`, command
-`运行发布与工作区验证套件`; the terminal record itself is not a repository
-artifact.
-
-The final release regression record executed:
+- Cursor terminal `46004` records an exit-0 command comprising the Rust
+  format, warnings-denied clippy, and workspace test gates, plus the release
+  test suite and Python binding suite. Its output reports **130 release tests**
+  and **187 Python binding tests**; it supports those counts and the Rust-gate
+  exit status, but it does not support protocol-generation execution or a
+  449-test full-Python result.
+- Cursor terminal `379862` records the following exit-0 release regression
+  command and reports **203 passed in 68.20s**:
 
 ```sh
 uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
@@ -45,11 +37,15 @@ python3 -m compileall -q scripts/release/release_tool.py tests/release
 git diff --check
 ```
 
-It exited `0`; the preserved output reports `203 passed in 68.20s`. Terminal
-evidence: Cursor terminal `379862`, completed at `2026-08-18T15:21:08Z`. The
-post-documentation record reran the release test suite and reported `203
-passed in 67.49s`; it also exited `0` after `check-version` and `git diff
---check`. That terminal output is not a repository artifact.
+No preserved terminal output or repository evidence currently supports a Task
+10 audited pass for either `./scripts/check-generated-protocol.sh` or a full
+`uv run --project bindings/python --python 3.11 --frozen pytest -q` run with
+449 tests. This report therefore makes neither assertion. Terminal records are
+not repository artifacts.
+
+Terminal `379862` completed at `2026-08-18T15:21:08Z`. A later terminal
+record also reported 203 release tests, but is not used to expand the audited
+claims above because it is not a repository artifact.
 
 ## Actual local release candidates
 
@@ -168,3 +164,12 @@ This report is the GREEN documentation resolution for the first finding; the
 qualification table now includes pending SocketCAN vcan and PCAN loopback rows
 for the second. Link checks and `git diff --check` are recorded with this
 remediation commit. The Task 9 release workflow semantics were not modified.
+
+## Final factual correction
+
+The final factual review found that the earlier audit report incorrectly
+attributed protocol-generation execution and a 449-test full-Python result to
+terminal `46004`. Those assertions were removed. The qualification remains
+partial and not release-qualified based only on the bounded evidence above,
+local candidate artifacts, the blocked Rust source bundle, and pending hosted
+and physical-hardware gates.
