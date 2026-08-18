@@ -109,7 +109,7 @@ class ReleaseTarget:
 def load_targets(path: Path) -> tuple[ReleaseTarget, ...]:
     try:
         document = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError) as error:
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
         raise ReleaseFailure("release.targets.invalid", str(error)) from error
     if set(document) != {"schema", "target"} or document.get("schema") != 1:
         raise ReleaseFailure("release.targets.invalid", "expected schema 1")
@@ -178,7 +178,7 @@ def _string_tuple(value: object, field: str) -> tuple[str, ...]:
 def _read_toml(path: Path, error_name: str) -> dict[str, object]:
     try:
         return tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError) as error:
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
         raise ReleaseFailure(error_name, str(error)) from error
 
 

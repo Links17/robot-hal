@@ -110,3 +110,11 @@ def test_target_matrix_rejects_invalid_types_or_unknown_fields(
     contents: str,
 ) -> None:
     _load_text(tmp_path, contents)
+
+
+def test_target_matrix_rejects_non_utf8_input(tmp_path: Path) -> None:
+    path = tmp_path / "targets.toml"
+    path.write_bytes(b"schema = 1\n\xff")
+
+    with pytest.raises(ReleaseFailure, match="release.targets.invalid"):
+        load_targets(path)
