@@ -101,6 +101,7 @@ CONFORMANCE_REPORT_NAME = "conformance-report.json"
 RELEASE_SIDECARS = frozenset(
     {"release-manifest.json", "SHA256SUMS", CONFORMANCE_REPORT_NAME}
 )
+ARCHIVE_READ_CHUNK_SIZE = 64 * 1024
 SENSITIVE_FIELD = re.compile(
     r"(?:token|secret|password|serial|payload|mapping|endpoint|address)",
     re.IGNORECASE,
@@ -924,8 +925,11 @@ def _validate_raw_tar_directory_names(archive_path: Path) -> None:
                         "tar archive member size is invalid",
                     ) from error
                 remaining = (size + 511) // 512 * 512
-                if remaining and len(archive.read(remaining)) != remaining:
-                    _archive_invalid("tar archive has truncated member data")
+                while remaining:
+                    chunk_size = min(remaining, ARCHIVE_READ_CHUNK_SIZE)
+                    if len(archive.read(chunk_size)) != chunk_size:
+                        _archive_invalid("tar archive has truncated member data")
+                    remaining -= chunk_size
     except OSError as error:
         raise ReleaseFailure("release.archive.invalid", "unable to inspect archive") from error
 

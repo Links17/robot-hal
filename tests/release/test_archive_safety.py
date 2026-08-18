@@ -15,6 +15,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
+from scripts.release import release_tool
 from scripts.release.release_tool import ReleaseFailure, validate_archive
 
 
@@ -68,6 +69,62 @@ def _raw_tar_members(path: Path, members: list[tuple[str, bytes, bool]]) -> None
     payload.extend(b"\0" * 1024)
     with gzip.GzipFile(path, "wb", mtime=0) as archive:
         archive.write(payload)
+
+
+def _raw_tar_with_claimed_size(path: Path, size: int) -> None:
+    payload = bytearray(512)
+    payload[: len(b"root/short.txt")] = b"root/short.txt"
+    payload[100:108] = b"0000644\x00"
+    payload[108:116] = b"0000000\x00"
+    payload[116:124] = b"0000000\x00"
+    payload[124:136] = f"{size:011o}\0".encode("ascii")
+    payload[136:148] = b"00000000000\x00"
+    payload[148:156] = b"        "
+    payload[156:157] = b"0"
+    payload[257:263] = b"ustar\x00"
+    payload[263:265] = b"00"
+    payload[148:156] = f"{sum(payload):06o}\0 ".encode("ascii")
+    payload.extend(b"short")
+    payload.extend(b"\0" * 1024)
+    with gzip.GzipFile(path, "wb", mtime=0) as archive:
+        archive.write(payload)
+
+
+def test_raw_tar_size_is_consumed_in_bounded_chunks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "claimed-size.tar.gz"
+    _raw_tar_with_claimed_size(archive_path, 8 * 1024 * 1024 * 1024)
+    original_open = gzip.open
+
+    class BoundedReadArchive:
+        def __init__(self, archive) -> None:
+            self.archive = archive
+
+        def __enter__(self):
+            self.archive.__enter__()
+            return self
+
+        def __exit__(self, *args) -> None:
+            self.archive.__exit__(*args)
+
+        def read(self, size: int = -1) -> bytes:
+            assert size <= 64 * 1024
+            return self.archive.read(size)
+
+    monkeypatch.setattr(
+        release_tool.gzip,
+        "open",
+        lambda *args, **kwargs: BoundedReadArchive(original_open(*args, **kwargs)),
+    )
+
+    with pytest.raises(ReleaseFailure, match="release.archive.invalid"):
+        validate_archive(
+            archive_path,
+            expected_root="root",
+            expected_files={"short.txt"},
+        )
 
 
 def test_valid_tar_and_zip_are_inspected_without_extraction(tmp_path: Path) -> None:

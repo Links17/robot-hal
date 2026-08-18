@@ -249,3 +249,52 @@ and diff check passed.
 
 - Raw tar header inspection is intentionally limited to archive metadata needed
   to catch parser normalization; no artifact extraction or packaging is added.
+
+---
+
+## Final P1 Tar Size Follow-up
+
+### Status
+
+DONE
+
+### RED Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_manifest.py tests/release/test_archive_safety.py
+```
+
+Result: `1 failed, 60 passed`. A small gzip tar fixture declared an 8 GiB legal
+octal member size with a short payload. A read spy failed before allocation when
+the raw-header validator attempted one `read(8589934592)`.
+
+### Changes
+
+- Raw tar payload consumption now reads at most 64 KiB per operation, with a
+  decreasing remaining-byte counter.
+- A short payload, malformed size, or raw-header read failure remains a stable
+  `release.archive.invalid` failure. Raw header slash checks still run before
+  `tarfile`, and validation remains metadata-only without extraction.
+
+### GREEN Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_manifest.py tests/release/test_archive_safety.py
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+python3 -m compileall -q scripts/release tests/release
+git diff --check
+```
+
+Result: focused suite `61 passed`; full release suite `107 passed`; compileall
+and diff check passed.
+
+### Commit
+
+Pending.
+
+### Concerns
+
+- The bounded loop reads declared payload bytes only until EOF; because each read
+  is capped, a forged huge size cannot allocate a proportional buffer.
