@@ -2,8 +2,9 @@
 
 ## Status
 
-Implemented Task 3 only. Changes are limited to the conformance runner, its tests, and conformance
-README, plus this required report.
+Implemented Task 3 only. Changes cover the conformance runner, its tests and README, plus the
+test-only broker wiring and virtual CAN fixture needed to expose separate Classic-active and
+FD-active resources for truthful mode qualification.
 
 ## Capability matrix source of truth
 
