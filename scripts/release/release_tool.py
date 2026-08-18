@@ -1507,7 +1507,10 @@ def _publish_staged_artifact(staged: Path, destination: Path) -> Path:
     return destination
 
 
-def _reserve_package_artifact(output_dir: Path, name: str) -> Path:
+def _reserve_package_artifact(
+    output_dir: Path,
+    name: str,
+) -> tuple[Path, tuple[int, int]]:
     # Reservations coordinate cooperative publishers. os.link below is the
     # atomic no-clobber boundary against external output-directory races.
     reservation = output_dir / f".reserve-package-{name}"
@@ -1523,8 +1526,25 @@ def _reserve_package_artifact(output_dir: Path, name: str) -> Path:
             "release.package.invalid",
             "unable to reserve final package artifact",
         ) from error
-    os.close(descriptor)
-    return reservation
+    try:
+        identity = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    return reservation, (identity.st_dev, identity.st_ino)
+
+
+def _unlink_owned_reservation(path: Path, identity: tuple[int, int]) -> None:
+    try:
+        stat = path.lstat()
+        if (
+            not path.is_file()
+            or path.is_symlink()
+            or (stat.st_dev, stat.st_ino) != identity
+        ):
+            return
+        path.unlink()
+    except OSError:
+        return
 
 
 def _unlink_published_artifact(path: Path, identity: tuple[int, int]) -> None:
@@ -1935,7 +1955,7 @@ def _verify_wheel_install(wheel: Path, version: ReleaseVersion, staging_dir: Pat
 
 
 def package_python(*, tag: str, project: Path, output_dir: Path) -> tuple[Path, Path]:
-    reservations: list[Path] = []
+    reservations: list[tuple[Path, tuple[int, int]]] = []
     published: list[tuple[Path, tuple[int, int]]] = []
     completed = False
     try:
@@ -1995,9 +2015,8 @@ def package_python(*, tag: str, project: Path, output_dir: Path) -> tuple[Path, 
         if not completed:
             for path, identity in reversed(published):
                 _unlink_published_artifact(path, identity)
-        for reservation in reservations:
-            with contextlib.suppress(OSError):
-                reservation.unlink()
+        for reservation, identity in reservations:
+            _unlink_owned_reservation(reservation, identity)
 
 
 class _ReleaseArgumentParser(argparse.ArgumentParser):

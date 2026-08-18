@@ -204,3 +204,20 @@ Task 6 focused tests: 17 passed
 tests/release: 144 passed
 compileall and git diff --check: passed
 ```
+
+## Reservation ownership TOCTOU follow-up
+
+Reservations now carry the `(st_dev, st_ino)` identity returned by `os.fstat`
+at exclusive creation. Cleanup uses `lstat`, rejects symlinks and non-regular
+files, and only unlinks a reservation when its identity still matches this
+invocation. Stat errors and identity mismatches preserve the unknown file.
+RED simulated an external wheel-reservation replacement before cleanup; the
+old cleanup deleted it. GREEN preserved that replacement while retaining normal
+partial-reservation cleanup and external sdist-reservation preservation:
+
+```text
+tests/release/test_package_python.py: 10 passed
+Task 6 focused tests: 18 passed
+tests/release: 145 passed
+compileall and git diff --check: passed
+```

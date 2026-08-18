@@ -80,6 +80,45 @@ def test_failed_second_reservation_cleans_only_our_wheel_reservation(
     assert sdist_reservation.read_bytes() == b"external reservation"
 
 
+def test_cleanup_preserves_externally_replaced_wheel_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "artifacts"
+    output.mkdir()
+    wheel_reservation = output / ".reserve-package-seeed_hal-0.5.0rc1-py3-none-any.whl"
+    replacement = b"external replacement"
+    original_reserve = release_tool._reserve_package_artifact
+
+    def replace_wheel_after_reserving(
+        output_dir: Path,
+        name: str,
+    ) -> tuple[Path, tuple[int, int]]:
+        reservation, identity = original_reserve(output_dir, name)
+        if name.endswith(".whl"):
+            reservation.unlink()
+            reservation.write_bytes(replacement)
+        return reservation, identity
+
+    monkeypatch.setattr(
+        release_tool,
+        "_reserve_package_artifact",
+        replace_wheel_after_reserving,
+    )
+    (output / ".reserve-package-seeed_hal-0.5.0rc1.tar.gz").write_bytes(
+        b"external sdist reservation"
+    )
+
+    with pytest.raises(ReleaseFailure):
+        release_tool.package_python(
+            tag="v0.5.0-rc.1",
+            project=REPO_ROOT / "bindings" / "python",
+            output_dir=output,
+        )
+
+    assert wheel_reservation.read_bytes() == replacement
+
+
 def test_python_package_rolls_back_wheel_when_sdist_link_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
