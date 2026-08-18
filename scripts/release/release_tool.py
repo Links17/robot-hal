@@ -685,6 +685,8 @@ def validate_release_manifest(value: object) -> ReleaseManifest:
     if not isinstance(raw_artifacts, list):
         _release_manifest_invalid("artifacts must be a list")
     artifacts = tuple(_artifact_record(item) for item in raw_artifacts)
+    if len({artifact.name for artifact in artifacts}) != len(artifacts):
+        _release_manifest_invalid("artifact records must be unique")
     if tuple(item.name for item in artifacts) != tuple(
         sorted(item.name for item in artifacts)
     ):
@@ -815,22 +817,43 @@ def _validate_checksum_file(checksums: bytes, manifest: ReleaseManifest) -> None
         _release_manifest_invalid("SHA256SUMS does not exactly cover manifest artifacts")
 
 
-def verify_static(artifacts_dir: Path, manifest_path: Path, checksums_path: Path) -> None:
+def _release_directory_path(release_dir: Path, name: str) -> Path:
+    path = release_dir / name
+    if path.parent != release_dir or path.name != name or path.is_symlink():
+        _release_manifest_invalid("release directory entry is invalid")
+    return path
+
+
+def verify_static(
+    release_dir: Path,
+    manifest_path: Path | None = None,
+    checksums_path: Path | None = None,
+) -> None:
+    if manifest_path is not None or checksums_path is not None:
+        _release_manifest_invalid("verify-static requires one release directory")
+    if not release_dir.is_dir() or release_dir.is_symlink():
+        _release_manifest_invalid("release directory is invalid")
+    manifest_path = _release_directory_path(release_dir, "release-manifest.json")
+    checksums_path = _release_directory_path(release_dir, "SHA256SUMS")
+    report_path = _release_directory_path(release_dir, CONFORMANCE_REPORT_NAME)
     manifest = validate_release_manifest(
         _read_json(manifest_path, "release.manifest.invalid")
     )
     try:
         _validate_checksum_file(checksums_path.read_bytes(), manifest)
-        actual = tuple(sorted(path.name for path in artifacts_dir.iterdir() if path.is_file()))
-        report_path = manifest_path.parent / CONFORMANCE_REPORT_NAME
+        entries = tuple(release_dir.iterdir())
+        expected_names = frozenset(
+            artifact.name for artifact in manifest.artifacts
+        ) | RELEASE_SIDECARS
+        if {path.name for path in entries} != expected_names:
+            _release_manifest_invalid("release directory contents are invalid")
+        if any(not path.is_file() or path.is_symlink() for path in entries):
+            _release_manifest_invalid("release directory contains an unsafe entry")
         report = _read_json(report_path, "release.manifest.invalid")
     except OSError as error:
         raise ReleaseFailure("release.manifest.invalid", "unable to read static release inputs") from error
-    expected = tuple(artifact.name for artifact in manifest.artifacts)
-    if actual != expected:
-        _release_manifest_invalid("artifacts directory does not exactly match the manifest")
     for artifact in manifest.artifacts:
-        path = artifacts_dir / artifact.name
+        path = _release_directory_path(release_dir, artifact.name)
         try:
             size = path.stat().st_size
         except OSError as error:
@@ -872,7 +895,7 @@ def _validate_members(
     root_seen = False
     for name, is_directory, is_regular in members:
         path = _safe_archive_path(name.rstrip("/") if name.endswith("/") else name)
-        normalized = path.as_posix()
+        normalized = unicodedata.normalize("NFC", path.as_posix())
         collision_key = _archive_collision_key(normalized)
         if collision_key in seen:
             _archive_invalid("archive contains a duplicate member")
@@ -886,7 +909,10 @@ def _validate_members(
             continue
         if not is_regular or len(path.parts) < 2:
             _archive_invalid("archive contains an invalid member type")
-        relative = PurePosixPath(*path.parts[1:]).as_posix()
+        relative = unicodedata.normalize(
+            "NFC",
+            PurePosixPath(*path.parts[1:]).as_posix(),
+        )
         actual_files.add(relative)
     allowed_directories = {expected_root}
     for relative in canonical_expected:
@@ -914,7 +940,7 @@ def _canonical_archive_paths(paths: set[str], field: str) -> set[str]:
         path = _safe_archive_path(item)
         if len(path.parts) < 1:
             _archive_invalid(f"{field} contains an invalid path")
-        normalized = path.as_posix()
+        normalized = unicodedata.normalize("NFC", path.as_posix())
         key = _archive_collision_key(normalized)
         if key in collisions:
             _archive_invalid(f"{field} contains a case or Unicode collision")
@@ -1058,9 +1084,7 @@ def _parser() -> argparse.ArgumentParser:
     generate.add_argument("--software-qualification", required=True)
     generate.add_argument("--hardware-qualification", required=True)
     static = subcommands.add_parser("verify-static")
-    static.add_argument("--artifacts-dir", required=True, type=Path)
-    static.add_argument("--manifest", required=True, type=Path)
-    static.add_argument("--checksums", required=True, type=Path)
+    static.add_argument("--release-dir", required=True, type=Path)
     return parser
 
 
@@ -1130,11 +1154,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "unable to write release manifest output",
                 ) from error
         elif arguments.command == "verify-static":
-            verify_static(
-                arguments.artifacts_dir,
-                arguments.manifest,
-                arguments.checksums,
-            )
+            verify_static(arguments.release_dir)
     except ReleaseFailure as error:
         _fail(error)
     except OSError as error:

@@ -144,3 +144,57 @@ compileall and diff check passed. IDE diagnostics reported no errors.
 - The follow-up supplies only the release model and static verification required
   for later packaging and qualification tasks. It does not perform artifact
   packaging or cross-platform qualification execution.
+
+---
+
+## Important Review Follow-up
+
+### Status
+
+DONE
+
+### RED Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_manifest.py tests/release/test_archive_safety.py
+```
+
+Result: `4 failed, 52 passed`. The failures demonstrated acceptance of identical
+duplicate records through the artifact map, the old split-path static verifier
+API, and inconsistent NFD-member/NFC-expected archive comparison.
+
+### Changes
+
+- Manifest validation rejects duplicate artifact names before comparing the
+  exact artifact map. Diagnostics remain value-free.
+- `verify-static` is now a complete single-directory gate:
+  `verify-static --release-dir <dir>`. The directory must contain exactly the
+  six tag-derived primary artifacts plus `release-manifest.json`, `SHA256SUMS`,
+  and `conformance-report.json`; every entry must be a regular non-symlink
+  file in that same directory.
+- Archive comparisons use NFC canonical path strings while collision keys use
+  NFC plus case-folding. A single NFD member therefore matches one NFC expected
+  name, but multiple colliding spellings are rejected.
+
+### GREEN Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_manifest.py tests/release/test_archive_safety.py
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+python3 -m compileall -q scripts/release tests/release
+git diff --check
+```
+
+Result: focused suite `56 passed`; full release suite `102 passed`; compileall
+and diff check passed.
+
+### Commit
+
+Pending.
+
+### Concerns
+
+- This follow-up establishes static directory layout and archive-validation
+  semantics only. It does not add package production or release workflows.

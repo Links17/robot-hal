@@ -4,6 +4,7 @@ import hashlib
 import json
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.release.release_tool import (
+    ArtifactRecord,
     ReleaseFailure,
     encode_manifest,
     generate_checksums,
@@ -148,41 +150,111 @@ def test_validation_rejects_duplicate_names_and_invalid_sizes(tmp_path: Path) ->
         validate_release_manifest(data)
 
 
-def test_verify_static_rejects_mismatched_files_and_self_reference(tmp_path: Path) -> None:
-    inputs = _inputs(tmp_path)
+def test_manifest_rejects_identical_duplicate_record_without_hash_leak(
+    tmp_path: Path,
+) -> None:
+    data = generate_manifest(_inputs(tmp_path)).to_dict()
+    artifacts = data["artifacts"]
+    assert isinstance(artifacts, list)
+    duplicate = dict(artifacts[0])
+    duplicate["sha256"] = "f" * 64
+    artifacts.insert(1, duplicate)
+
+    with pytest.raises(ReleaseFailure) as failure:
+        validate_release_manifest(data)
+
+    assert failure.value.name == "release.manifest.invalid"
+    assert "f" * 64 not in failure.value.diagnostic
+    manifest = generate_manifest(_inputs(tmp_path))
+    duplicate_manifest = replace(
+        manifest,
+        artifacts=(
+            manifest.artifacts[0],
+            ArtifactRecord(**manifest.artifacts[0].to_dict()),
+            *manifest.artifacts[1:],
+        ),
+    )
+    with pytest.raises(ReleaseFailure) as encoded:
+        encode_manifest(duplicate_manifest)
+    assert encoded.value.name == "release.manifest.invalid"
+
+
+def _write_release_directory(release_dir: Path, inputs: dict[str, object]) -> None:
     manifest = generate_manifest(inputs)
-    manifest_path = tmp_path / "release-manifest.json"
-    checksums_path = tmp_path / "SHA256SUMS"
-    manifest_path.write_bytes(encode_manifest(manifest))
-    checksums_path.write_bytes(generate_checksums(manifest))
-    (tmp_path / "conformance-report.json").write_text(
+    for artifact in manifest.artifacts:
+        source = inputs["artifacts_dir"] / artifact.name
+        (release_dir / artifact.name).write_bytes(source.read_bytes())
+    (release_dir / "release-manifest.json").write_bytes(encode_manifest(manifest))
+    (release_dir / "SHA256SUMS").write_bytes(generate_checksums(manifest))
+    (release_dir / "conformance-report.json").write_text(
         json.dumps(manifest.qualification.sidecar_dict(manifest.tag, manifest.commit)),
         encoding="utf-8",
     )
 
-    verify_static(inputs["artifacts_dir"], manifest_path, checksums_path)
 
-    first = next(iter(inputs["artifacts_dir"].iterdir()))
+def test_static_verifier_requires_exact_single_release_directory(tmp_path: Path) -> None:
+    inputs = _inputs(tmp_path)
+    release_dir = tmp_path / "release"
+    release_dir.mkdir()
+    _write_release_directory(release_dir, inputs)
+
+    verify_static(release_dir)
+
+    (release_dir / "unexpected.txt").write_text("unexpected", encoding="utf-8")
+    with pytest.raises(ReleaseFailure, match="release.manifest.invalid"):
+        verify_static(release_dir)
+
+
+def test_static_verifier_rejects_split_and_symlinked_release_paths(tmp_path: Path) -> None:
+    inputs = _inputs(tmp_path)
+    release_dir = tmp_path / "release"
+    release_dir.mkdir()
+    _write_release_directory(release_dir, inputs)
+    sibling = tmp_path / "sibling"
+    sibling.mkdir()
+    manifest = release_dir / "release-manifest.json"
+    checksums = release_dir / "SHA256SUMS"
+
+    with pytest.raises(ReleaseFailure, match="release.manifest.invalid"):
+        verify_static(release_dir, sibling / "release-manifest.json", checksums)
+
+    (sibling / "release-manifest.json").symlink_to(manifest)
+    with pytest.raises(ReleaseFailure, match="release.manifest.invalid"):
+        verify_static(release_dir, sibling / "release-manifest.json", checksums)
+
+
+def test_verify_static_rejects_mismatched_files_and_self_reference(tmp_path: Path) -> None:
+    inputs = _inputs(tmp_path)
+    release_dir = tmp_path / "release"
+    release_dir.mkdir()
+    _write_release_directory(release_dir, inputs)
+    verify_static(release_dir)
+
+    first = next(
+        path
+        for path in release_dir.iterdir()
+        if path.name.startswith("seeed-")
+    )
     first.write_bytes(b"tampered")
     with pytest.raises(ReleaseFailure, match="release.manifest.invalid"):
-        verify_static(inputs["artifacts_dir"], manifest_path, checksums_path)
+        verify_static(release_dir)
 
     first.write_bytes(b"artifact-0\n")
     data = generate_manifest(inputs).to_dict()
     data["artifacts"][0]["sha256"] = "0" * 64
     changed = validate_release_manifest(data)
-    manifest_path.write_bytes(encode_manifest(changed))
-    checksums_path.write_bytes(generate_checksums(changed))
+    (release_dir / "release-manifest.json").write_bytes(encode_manifest(changed))
+    (release_dir / "SHA256SUMS").write_bytes(generate_checksums(changed))
     with pytest.raises(ReleaseFailure, match="release.manifest.invalid"):
-        verify_static(inputs["artifacts_dir"], manifest_path, checksums_path)
+        verify_static(release_dir)
 
     data = generate_manifest(inputs).to_dict()
     data["artifacts"][0]["size"] += 1
     changed = validate_release_manifest(data)
-    manifest_path.write_bytes(encode_manifest(changed))
-    checksums_path.write_bytes(generate_checksums(changed))
+    (release_dir / "release-manifest.json").write_bytes(encode_manifest(changed))
+    (release_dir / "SHA256SUMS").write_bytes(generate_checksums(changed))
     with pytest.raises(ReleaseFailure, match="release.manifest.invalid"):
-        verify_static(inputs["artifacts_dir"], manifest_path, checksums_path)
+        verify_static(release_dir)
 
 
 def test_cli_generates_manifest_and_checksums_without_self_reference(tmp_path: Path) -> None:
@@ -256,13 +328,11 @@ def test_static_verifier_requires_controlled_conformance_report(tmp_path: Path) 
     manifest = generate_manifest(inputs)
     release_dir = tmp_path / "release"
     release_dir.mkdir()
-    manifest_path = release_dir / "release-manifest.json"
-    checksums_path = release_dir / "SHA256SUMS"
-    manifest_path.write_bytes(encode_manifest(manifest))
-    checksums_path.write_bytes(generate_checksums(manifest))
+    _write_release_directory(release_dir, inputs)
+    (release_dir / "conformance-report.json").unlink()
 
     with pytest.raises(ReleaseFailure, match="release.manifest.invalid"):
-        verify_static(inputs["artifacts_dir"], manifest_path, checksums_path)
+        verify_static(release_dir)
 
 
 @pytest.mark.parametrize(

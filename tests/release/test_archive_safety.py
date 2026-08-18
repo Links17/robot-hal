@@ -235,6 +235,27 @@ def test_archive_rejects_casefold_and_unicode_nfc_collisions(
 
 
 @pytest.mark.parametrize("suffix", [".tar.gz", ".zip"])
+def test_archive_compares_single_member_and_expected_file_as_nfc(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    archive = tmp_path / f"nfc{suffix}"
+    members = [
+        ("root/", b"", "directory"),
+        ("root/cafe\u0301.txt", b"ok", "file"),
+    ]
+    if suffix == ".tar.gz":
+        _tar(archive, members)
+    else:
+        _zip(
+            archive,
+            [(name, contents, False) for name, contents, _ in members],
+        )
+
+    validate_archive(archive, expected_root="root", expected_files={"café.txt"})
+
+
+@pytest.mark.parametrize("suffix", [".tar.gz", ".zip"])
 def test_archive_rejects_unexpected_empty_directories(
     tmp_path: Path,
     suffix: str,
