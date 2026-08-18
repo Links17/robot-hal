@@ -99,52 +99,39 @@ def test_source_gate_declares_the_required_frozen_checks() -> None:
         "rustup toolchain install 1.85 --profile minimal --component rustfmt --component clippy",
         "./scripts/check-generated-protocol.sh",
         "cargo +1.85 fmt --all --check",
-        "cargo +1.85 clippy --workspace --all-targets --all-features -- -D warnings",
-        "cargo +1.85 test --workspace --all-features",
+        "cargo +1.85 clippy --workspace --all-targets --no-default-features -- -D warnings",
+        "cargo +1.85 test --workspace --no-default-features",
         "uv run --project bindings/python --python 3.11 --frozen pytest -q",
         "pytest -q tests/release",
         "test_minor_matrix.py",
     ):
         assert command in commands
+    assert "--all-features" not in commands
 
 
-def test_linux_jobs_install_libgpiod_before_linux_gpio_builds() -> None:
+def test_linux_platform_jobs_install_shared_prerequisites_before_linux_gpio_builds() -> None:
     workflow = load_workflow("ci.yml")
     jobs = workflow["jobs"]
     assert isinstance(jobs, dict)
-    source_gate = jobs["source-gate"]
     platform_job = jobs["platform-conformance"]
-    source_steps = source_gate["steps"]
     platform_steps = platform_job["steps"]
-    source_prepare = next(
-        step for step in source_steps if step.get("name") == "Install Linux build prerequisites"
-    )
     platform_prepare = next(
         step
         for step in platform_steps
         if step.get("name") == "Install Linux build prerequisites"
     )
 
-    for step in (source_prepare, platform_prepare):
-        assert step["if"] == "${{ runner.os == 'Linux' }}"
-        assert step["run"].strip() == (
-            "sudo apt-get update\n"
-            "sudo apt-get install --yes libgpiod-dev libudev-dev pkg-config"
-        )
-
-    source_prepare_index = source_steps.index(source_prepare)
-    source_clippy_index = next(
-        index
-        for index, step in enumerate(source_steps)
-        if "cargo +1.85 clippy" in step.get("run", "")
+    assert platform_prepare["if"] == "${{ runner.os == 'Linux' }}"
+    assert platform_prepare["run"].strip() == (
+        "./scripts/ci/install-linux-native-prerequisites.sh"
     )
+
     platform_prepare_index = platform_steps.index(platform_prepare)
     platform_build_index = next(
         index
         for index, step in enumerate(platform_steps)
         if "cargo +1.85 build" in step.get("run", "")
     )
-    assert source_prepare_index < source_clippy_index
     assert platform_prepare_index < platform_build_index
 
 
