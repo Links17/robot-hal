@@ -44,6 +44,24 @@ def test_linux_build_jobs_use_the_shared_prerequisite_script() -> None:
     assert "--all-features" not in source_gate
 
 
+def test_linux_production_broker_jobs_pin_the_runtime_loader_to_libgpiod_v2() -> None:
+    script = SCRIPT.read_text(encoding="utf-8")
+    ci = CI.read_text(encoding="utf-8")
+    release_rc = RELEASE_RC.read_text(encoding="utf-8")
+
+    assert 'test -f "$PREFIX/lib/libgpiod.so.3"' in script
+    assert 'LD_LIBRARY_PATH="$PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"' in script
+    assert 'printf \'LD_LIBRARY_PATH=%s\\n\' "$LD_LIBRARY_PATH" >> "$GITHUB_ENV"' in script
+
+    for workflow, job in (
+        (ci, "platform-conformance"),
+        (release_rc, "platform-verify"),
+    ):
+        job_text = workflow.split(f"  {job}:", maxsplit=1)[1]
+        assert "./scripts/ci/install-linux-native-prerequisites.sh" in job_text
+        assert 'if: ${{ runner.os == \'Linux\' }}' in job_text
+
+
 def test_workflows_retain_linux_v2_preflight_and_bounded_apt_policy() -> None:
     script = SCRIPT.read_text(encoding="utf-8")
 

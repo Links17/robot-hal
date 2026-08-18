@@ -43,9 +43,13 @@ tar -xzf "$archive" -C "$workdir"
 export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
 pkg-config --exists 'libgpiod >= 2'
 pkg-config --exists libudev
+test -f "$PREFIX/lib/libgpiod.so.3"
+export LD_LIBRARY_PATH="$PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 if [[ -n "${GITHUB_ENV:-}" ]]; then
   printf 'PKG_CONFIG_PATH=%s\n' "$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
+  printf 'LD_LIBRARY_PATH=%s\n' "$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
 fi
 printf 'libgpiod=%s\n' "$(pkg-config --modversion libgpiod)"
 printf 'libudev=%s\n' "$(pkg-config --modversion libudev)"
 printf 'PKG_CONFIG_PATH=%s\n' "$PKG_CONFIG_PATH"
+printf 'LD_LIBRARY_PATH=%s\n' "$LD_LIBRARY_PATH"
