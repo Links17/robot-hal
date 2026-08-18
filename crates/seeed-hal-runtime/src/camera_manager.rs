@@ -124,6 +124,8 @@ struct CameraWorker {
     admission: Arc<Mutex<()>>,
     completion: watch::Receiver<Option<HalResult<()>>>,
     terminal_error: watch::Receiver<Option<HalError>>,
+    #[cfg(test)]
+    admission_attempt: Option<mpsc::UnboundedSender<()>>,
 }
 
 impl CameraWorker {
@@ -376,6 +378,8 @@ fn spawn_worker(
             admission,
             completion,
             terminal_error,
+            #[cfg(test)]
+            admission_attempt: None,
         },
         opened_rx,
     ))
@@ -649,6 +653,21 @@ impl CameraManager {
         // This is the linearization point shared with native command execution:
         // a worker that can publish a terminal result holds this lock until its
         // result has been sent to `terminal_error`.
+        #[cfg(test)]
+        let admission = if let Some(admission_attempt) = &worker.admission_attempt {
+            let mut lock = std::pin::pin!(worker.admission.lock());
+            std::future::poll_fn(|context| match lock.as_mut().poll(context) {
+                std::task::Poll::Ready(admission) => std::task::Poll::Ready(admission),
+                std::task::Poll::Pending => {
+                    let _ = admission_attempt.send(());
+                    std::task::Poll::Pending
+                }
+            })
+            .await
+        } else {
+            worker.admission.lock().await
+        };
+        #[cfg(not(test))]
         let admission = worker.admission.lock().await;
         if worker.is_closing() {
             return Err(session_closed(op).with_resource_id(resource));
@@ -867,6 +886,7 @@ mod tests {
             admission: Arc::new(Mutex::new(())),
             completion,
             terminal_error,
+            admission_attempt: None,
         };
         let lease = {
             let mut state = manager.state.lock().await;
@@ -919,12 +939,14 @@ mod tests {
         let (_, completion) = watch::channel(None);
         let (terminal_error_tx, terminal_error) = watch::channel(None);
         let admission = Arc::new(Mutex::new(()));
+        let (admission_attempt, mut admission_attempts) = mpsc::unbounded_channel();
         let worker = CameraWorker {
             commands,
             shutdown,
             admission: Arc::clone(&admission),
             completion,
             terminal_error,
+            admission_attempt: Some(admission_attempt),
         };
         let lease = {
             let mut state = manager.state.lock().await;
@@ -973,28 +995,20 @@ mod tests {
         worker_holding_admission_rx
             .await
             .expect("worker must hold admission before the request starts");
-        let (request_started, request_started_rx) = oneshot::channel();
-        let mut capture = tokio::spawn({
+        let capture = tokio::spawn({
             let manager = Arc::clone(&manager);
             let id = id.clone();
             let lease = lease.clone();
-            async move {
-                request_started
-                    .send(())
-                    .expect("request task must announce its admission attempt");
-                manager.capture(id, &lease, Duration::ZERO).await
-            }
+            async move { manager.capture(id, &lease, Duration::ZERO).await }
         });
-        request_started_rx
+        tokio::time::timeout(Duration::from_secs(1), admission_attempts.recv())
             .await
-            .expect("request must start while worker holds admission");
-        tokio::select! {
-            biased;
-            result = &mut capture => {
-                panic!("request bypassed worker-held terminal admission: {result:?}");
-            }
-            _ = tokio::task::yield_now() => {}
-        }
+            .expect("request must reach the admission lock while the worker holds it")
+            .expect("request admission hook must remain connected");
+        assert!(
+            !capture.is_finished(),
+            "a request that observed admission contention must remain blocked"
+        );
         publish_terminal_tx
             .send(())
             .expect("worker publisher must still be waiting at the terminal point");
