@@ -292,7 +292,7 @@ and diff check passed.
 
 ### Commit
 
-Pending.
+`7b55c7d` — `fix(release): bound raw tar payload reads`
 
 ### Concerns
 
