@@ -2644,6 +2644,38 @@ async fn can_classic_batch_receive_filter_and_status_use_correlated_responses_on
         other => panic!("expected CAN send response, got {other:?}"),
     }
 
+    for value in [1, 2] {
+        let receive = client
+            .request(envelope::Payload::CanReceiveRequest(
+                v1::CanReceiveRequest {
+                    session_id: session.session_id.clone(),
+                    lease: session.lease.clone(),
+                    max_frames: 1,
+                    timeout_ms: 100,
+                },
+            ))
+            .await;
+        match receive.payload.unwrap() {
+            envelope::Payload::CanReceiveResponse(response) => {
+                assert_eq!(response.frames.len(), 1);
+                assert_eq!(response.frames[0].frame.as_ref().unwrap().data, [value]);
+                assert_eq!(
+                    response.frames[0].timestamp.as_ref().map(|timestamp| (
+                        timestamp.timestamp_ns,
+                        timestamp.source,
+                        timestamp.clock_domain.as_str(),
+                    )),
+                    Some((
+                        0,
+                        v1::CanTimestampSource::HostMonotonic as i32,
+                        "virtual-can",
+                    ))
+                );
+            }
+            other => panic!("expected CAN loopback receive response, got {other:?}"),
+        }
+    }
+
     let replace = client
         .request(envelope::Payload::ReplaceCanFiltersRequest(
             v1::ReplaceCanFiltersRequest {
