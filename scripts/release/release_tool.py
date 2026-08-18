@@ -703,7 +703,7 @@ def validate_conformance_report(value: object) -> dict[str, object]:
         "hardware": _qualification(qualification["hardware"], "hardware").to_dict(),
     }
     software = value["software"]
-    if not isinstance(software, dict) or set(software) != {"status", "jobs"}:
+    if not isinstance(software, dict) or set(software) != {"status", "jobs", "virtual"}:
         _conformance_report_invalid("software conformance fields are invalid")
     if software["status"] not in {"Passed", "Partial", "Pending", "Blocked", "Failed"}:
         _conformance_report_invalid("software conformance status is invalid")
@@ -735,6 +735,65 @@ def validate_conformance_report(value: object) -> dict[str, object]:
                 "ref": _safe_public_https_uri(job["ref"], "software"),
             }
         )
+    virtual = software["virtual"]
+    if not isinstance(virtual, list) or len(virtual) > len(EXPECTED_TARGETS) * 4:
+        _conformance_report_invalid("virtual conformance evidence is invalid")
+    normalized_virtual: list[dict[str, str | int]] = []
+    seen_virtual: set[tuple[str, int]] = set()
+    for evidence in virtual:
+        if not isinstance(evidence, dict) or set(evidence) != {
+            "platform",
+            "protocol_minor",
+            "result",
+            "command",
+            "ref",
+        }:
+            _conformance_report_invalid("virtual conformance evidence fields are invalid")
+        platform = evidence["platform"]
+        minor = evidence["protocol_minor"]
+        result = evidence["result"]
+        if (
+            platform not in {"macos", "linux", "windows"}
+            or type(minor) is not int
+            or minor not in range(BROKER_WIRE["minimum_minor"], BROKER_WIRE["maximum_minor"] + 1)
+            or (platform, minor) in seen_virtual
+        ):
+            _conformance_report_invalid("virtual conformance evidence identity is invalid")
+        if result not in {"Passed", "Partial", "Pending", "Blocked", "Failed"}:
+            _conformance_report_invalid("virtual conformance evidence result is invalid")
+        seen_virtual.add((platform, minor))
+        normalized_virtual.append(
+            {
+                "platform": platform,
+                "protocol_minor": minor,
+                "result": result,
+                "command": _bounded_command_identity(evidence["command"]),
+                "ref": _safe_public_https_uri(evidence["ref"], "software"),
+            }
+        )
+    if software["status"] == "Passed":
+        required_platforms = {"macos", "linux", "windows"}
+        if (
+            {job["platform"] for job in normalized_jobs} != required_platforms
+            or any(job["result"] != "Passed" for job in normalized_jobs)
+            or {
+                (str(item["platform"]), int(item["protocol_minor"]))
+                for item in normalized_virtual
+            }
+            != {
+                (platform, minor)
+                for platform in required_platforms
+                for minor in range(
+                    BROKER_WIRE["minimum_minor"],
+                    BROKER_WIRE["maximum_minor"] + 1,
+                )
+            }
+            or any(item["result"] != "Passed" for item in normalized_virtual)
+        ):
+            raise ReleaseFailure(
+                "release.conformance.incomplete",
+                "passed software conformance lacks complete hosted evidence",
+            )
     hardware = value["hardware"]
     if not isinstance(hardware, dict) or not hardware:
         _conformance_report_invalid("hardware conformance is invalid")
@@ -761,9 +820,22 @@ def validate_conformance_report(value: object) -> dict[str, object]:
         "tag": tag,
         "commit": commit,
         "qualification": normalized_qualification,
-        "software": {"status": software["status"], "jobs": normalized_jobs},
+        "software": {
+            "status": software["status"],
+            "jobs": normalized_jobs,
+            "virtual": normalized_virtual,
+        },
         "hardware": normalized_hardware,
     }
+
+
+def release_ready(report: dict[str, object]) -> None:
+    """Require complete successful hosted software evidence before final readiness."""
+    if report["software"]["status"] != "Passed":
+        raise ReleaseFailure(
+            "release.conformance.incomplete",
+            "software conformance is not passed",
+        )
 
 
 def write_conformance_report(inputs: Path, output: Path) -> None:
@@ -837,6 +909,21 @@ def _require_input_directory(
             "release.artifact.unexpected",
             "artifact input directory changed during aggregation",
         )
+
+
+def _require_frozen_inputs(
+    directories: tuple[tuple[Path, tuple[int, int, frozenset[str]]], ...],
+    artifacts: dict[str, Path],
+    identities: dict[str, tuple[int, int, int, str]],
+) -> None:
+    for directory, identity in directories:
+        _require_input_directory(directory, identity)
+    for name, artifact in artifacts.items():
+        if _file_identity(artifact) != identities[name]:
+            raise ReleaseFailure(
+                "release.artifact.unexpected",
+                "artifact input changed during aggregation",
+            )
 
 
 def _copy_frozen_artifact(
@@ -916,7 +1003,6 @@ def aggregate_release(
     broker_identity = _input_directory(broker_dir, broker_names)
     python_identity = _input_directory(python_candidate, python_names)
     report_identity = _input_directory(report_inputs, frozenset({CONFORMANCE_REPORT_NAME}))
-    rust_identity = _file_identity(rust_bundle / rust_name)
     artifacts = {
         name: broker_dir / name for name in broker_names
     } | {
@@ -924,21 +1010,20 @@ def aggregate_release(
     } | {rust_name: rust_bundle / rust_name}
     rust_directory_identity = _input_directory(rust_bundle, frozenset({rust_name}))
     identities = {name: _file_identity(path) for name, path in artifacts.items()}
+    frozen_inputs = (
+        (broker_dir, broker_identity),
+        (python_candidate, python_identity),
+        (rust_bundle, rust_directory_identity),
+        (report_inputs, report_identity),
+    )
     _create_release_directory(release_dir)
     try:
         for name in sorted(artifacts):
             _copy_frozen_artifact(artifacts[name], release_dir / name, identities[name])
-        _require_input_directory(broker_dir, broker_identity)
-        _require_input_directory(python_candidate, python_identity)
-        _require_input_directory(rust_bundle, rust_directory_identity)
-        _require_input_directory(report_inputs, report_identity)
-        if _file_identity(rust_bundle / rust_name) != rust_identity:
-            raise ReleaseFailure(
-                "release.artifact.unexpected",
-                "artifact input changed during aggregation",
-            )
+        _require_frozen_inputs(frozen_inputs, artifacts, identities)
         report_path = release_dir / CONFORMANCE_REPORT_NAME
         write_conformance_report(report_inputs, report_path)
+        _require_frozen_inputs(frozen_inputs, artifacts, identities)
         report = validate_conformance_report(
             _read_json(report_path, "release.manifest.invalid")
         )
@@ -954,6 +1039,7 @@ def aggregate_release(
         (release_dir / "release-manifest.json").write_bytes(encode_manifest(manifest))
         (release_dir / "SHA256SUMS").write_bytes(generate_checksums(manifest))
         verify_static(release_dir)
+        _require_frozen_inputs(frozen_inputs, artifacts, identities)
     except ReleaseFailure:
         raise
     except OSError as error:
@@ -1043,6 +1129,42 @@ def _run_virtual_conformance(binary: Path, repo_root: Path) -> None:
         ) from error
 
 
+def collect_virtual_conformance(
+    *,
+    platform: str,
+    broker: Path,
+    repo_root: Path,
+    command: str,
+    ref: str,
+) -> list[dict[str, str | int]]:
+    """Run a separately supplied virtual-adapters broker for one hosted platform."""
+    if platform not in {"macos", "linux", "windows"} or not _host_target(
+        _target_by_name(load_targets(repo_root / "release" / "targets.toml"), platform)
+    ):
+        raise ReleaseFailure(
+            "release.conformance.host",
+            "virtual conformance broker must run on its matching host",
+        )
+    _bounded_command_identity(command)
+    _safe_public_https_uri(ref, "software")
+    if not broker.is_file() or broker.is_symlink():
+        raise ReleaseFailure(
+            "release.conformance.invalid",
+            "virtual conformance broker is invalid",
+        )
+    _run_virtual_conformance(broker, repo_root)
+    return [
+        {
+            "platform": platform,
+            "protocol_minor": minor,
+            "result": "Passed",
+            "command": command,
+            "ref": ref,
+        }
+        for minor in range(BROKER_WIRE["minimum_minor"], BROKER_WIRE["maximum_minor"] + 1)
+    ]
+
+
 def verify_artifacts(
     release_dir: Path,
     tag: str,
@@ -1064,6 +1186,10 @@ def verify_artifacts(
     )
     if manifest.tag != tag:
         raise ReleaseFailure("release.artifact.unexpected", "release tag does not match")
+    report = validate_conformance_report(
+        _read_json(release_dir / CONFORMANCE_REPORT_NAME, "release.manifest.invalid")
+    )
+    release_ready(report)
     targets = load_targets(targets_path)
     with tempfile.TemporaryDirectory(prefix=".verify-artifacts-") as temporary:
         root = Path(temporary)
@@ -1110,7 +1236,6 @@ def verify_artifacts(
                 binary,
                 ReleaseVersion.parse(tag),
             )
-            _run_virtual_conformance(binary, repo_root)
 
 
 def _qualification(value: object, field: str) -> QualificationStatus:
@@ -2558,6 +2683,12 @@ def _parser() -> argparse.ArgumentParser:
     report = subcommands.add_parser("write-conformance-report")
     report.add_argument("--inputs", required=True, type=Path)
     report.add_argument("--output", required=True, type=Path)
+    virtual = subcommands.add_parser("run-virtual-conformance")
+    virtual.add_argument("--platform", required=True)
+    virtual.add_argument("--broker", required=True, type=Path)
+    virtual.add_argument("--repo-root", required=True, type=Path)
+    virtual.add_argument("--command", required=True)
+    virtual.add_argument("--ref", required=True)
     static = subcommands.add_parser("verify-static")
     static.add_argument("--release-dir", required=True, type=Path)
     artifacts = subcommands.add_parser("verify-artifacts")
@@ -2657,6 +2788,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ) from error
         elif arguments.command == "write-conformance-report":
             write_conformance_report(arguments.inputs, arguments.output)
+        elif arguments.command == "run-virtual-conformance":
+            print(
+                json.dumps(
+                    collect_virtual_conformance(
+                        platform=arguments.platform,
+                        broker=arguments.broker,
+                        repo_root=arguments.repo_root,
+                        command=arguments.command,
+                        ref=arguments.ref,
+                    ),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
         elif arguments.command == "verify-static":
             verify_static(arguments.release_dir)
         elif arguments.command == "verify-artifacts":

@@ -151,6 +151,7 @@ def _write_report_inputs(directory: Path) -> Path:
                     "ref": "https://example.invalid/jobs/macos",
                 }
             ],
+            "virtual": [],
         },
         "hardware": {
             "camera-avfoundation": {"status": "Pending", "evidence": None},
@@ -255,14 +256,107 @@ def test_aggregate_rejects_external_candidate_mutation_before_publish(
         )
 
 
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        "seeed_hal-0.5.0rc1-py3-none-any.whl",
+        "seeed_hal-0.5.0rc1.tar.gz",
+        "seeed-hal-crates-v0.5.0-rc.1.tar.gz",
+        "seeed-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin.tar.gz",
+    ],
+)
+def test_aggregate_rechecks_every_candidate_before_return(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    candidate: str,
+) -> None:
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    brokers = inputs / "brokers"
+    brokers.mkdir()
+    for target in ("macos", "linux", "windows"):
+        _write_broker_candidate(brokers, target)
+    rust = _write_source_candidate(inputs / "rust")
+    python = _write_python_candidate(inputs / "python")
+    report = _write_report_inputs(inputs / "report")
+    source = (
+        python / candidate
+        if candidate.startswith("seeed_hal")
+        else rust / candidate
+        if candidate.startswith("seeed-hal-crates")
+        else brokers / candidate
+    )
+    original_verify = __import__(
+        "scripts.release.release_tool", fromlist=["verify_static"]
+    ).verify_static
+
+    def mutate_before_return(release_dir: Path) -> None:
+        original_verify(release_dir)
+        source.write_bytes(b"replaced after sidecar generation")
+
+    monkeypatch.setattr(
+        "scripts.release.release_tool.verify_static",
+        mutate_before_return,
+    )
+
+    with pytest.raises(ReleaseFailure, match="release.artifact.unexpected"):
+        aggregate_release(
+            tag=TAG,
+            commit=COMMIT,
+            broker_dir=brokers,
+            rust_bundle=rust,
+            python_candidate=python,
+            report_inputs=report,
+            release_dir=tmp_path / "release",
+        )
+
+
 def test_verify_static_release_directory_is_the_only_success_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     release = _complete_release(tmp_path)
+    with pytest.raises(ReleaseFailure, match="release.conformance.incomplete"):
+        verify_artifacts(release, TAG, TARGETS, REPO_ROOT)
+
+
+def test_verify_artifacts_does_not_run_virtual_conformance_from_release_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = _complete_release(tmp_path)
+    report_path = release / "conformance-report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    software = report["software"]
+    software["status"] = "Passed"
+    software["jobs"] = [
+        {
+            "platform": platform,
+            "result": "Passed",
+            "command": "verify-artifacts --tag v0.5.0-rc.1",
+            "ref": f"https://example.invalid/jobs/{platform}",
+        }
+        for platform in ("macos", "linux", "windows")
+    ]
+    software["virtual"] = [
+        {
+            "platform": platform,
+            "protocol_minor": minor,
+            "result": "Passed",
+            "command": "run-broker-conformance",
+            "ref": f"https://example.invalid/jobs/{platform}/minor-{minor}",
+        }
+        for platform in ("macos", "linux", "windows")
+        for minor in range(4)
+    ]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    def should_not_run(*args, **kwargs) -> None:
+        raise AssertionError("production archive must not run virtual conformance")
+
     monkeypatch.setattr(
         "scripts.release.release_tool._run_virtual_conformance",
-        lambda binary, repo_root: None,
+        should_not_run,
     )
 
     verify_artifacts(release, TAG, TARGETS, REPO_ROOT)

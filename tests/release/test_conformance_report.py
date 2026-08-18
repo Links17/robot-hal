@@ -12,6 +12,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.release.release_tool import (
     ReleaseFailure,
+    release_ready,
     validate_conformance_report,
     write_conformance_report,
 )
@@ -33,7 +34,7 @@ def _report() -> dict[str, object]:
             },
         },
         "software": {
-            "status": "Passed",
+            "status": "Partial",
             "jobs": [
                 {
                     "platform": "macos",
@@ -42,6 +43,7 @@ def _report() -> dict[str, object]:
                     "ref": "https://example.invalid/jobs/macos",
                 }
             ],
+            "virtual": [],
         },
         "hardware": {
             "camera-avfoundation": {
@@ -114,3 +116,50 @@ def test_write_report_reads_exact_input_and_never_promotes_hardware(
     assert (inputs / "conformance-report.json").read_text(encoding="utf-8") == json.dumps(
         _report()
     )
+
+
+def _passed_report() -> dict[str, object]:
+    report = _report()
+    software = report["software"]
+    assert isinstance(software, dict)
+    software["status"] = "Passed"
+    software["jobs"] = [
+        {
+            "platform": platform,
+            "result": "Passed",
+            "command": "verify-artifacts --tag v0.5.0-rc.1",
+            "ref": f"https://example.invalid/jobs/{platform}",
+        }
+        for platform in ("macos", "linux", "windows")
+    ]
+    software["virtual"] = [
+        {
+            "platform": platform,
+            "protocol_minor": minor,
+            "result": "Passed",
+            "command": "run-broker-conformance",
+            "ref": f"https://example.invalid/jobs/{platform}/minor-{minor}",
+        }
+        for platform in ("macos", "linux", "windows")
+        for minor in range(4)
+    ]
+    return report
+
+
+def test_passed_software_requires_each_platform_and_virtual_minor() -> None:
+    report = _passed_report()
+    software = report["software"]
+    assert isinstance(software, dict)
+    virtual = software["virtual"]
+    assert isinstance(virtual, list)
+    virtual.pop()
+
+    with pytest.raises(ReleaseFailure, match="release.conformance.incomplete"):
+        validate_conformance_report(report)
+
+
+def test_release_ready_rejects_factual_partial_report() -> None:
+    report = validate_conformance_report(_report())
+
+    with pytest.raises(ReleaseFailure, match="release.conformance.incomplete"):
+        release_ready(report)

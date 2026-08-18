@@ -80,3 +80,38 @@ broker archives only; no release-ready verdict is produced.
 - The report is an evidence record, not a hardware qualification authority.
 - The `--repo-root` CLI argument is retained for the prescribed interface but
   is intentionally not used to infer hosted or hardware evidence.
+
+## Review follow-up — 1a30962..1b75633
+
+Addressed the three Critical/Important review findings without adding Task 8
+workflow or Task 9 release behavior:
+
+- Production broker archives are now limited to archive/static checks and,
+  only on their matching host, `--manifest`. `verify-artifacts` no longer
+  runs virtual conformance from a production archive. The new
+  `run-virtual-conformance --platform --broker --repo-root --command --ref`
+  entrypoint accepts a separately supplied host-local virtual-adapters broker,
+  runs minors 0–3 with bounded subprocesses, and emits controlled evidence
+  records. It rejects cross-host invocation.
+- Software `Passed` is valid only with exactly one `Passed` job for macOS,
+  Linux, and Windows plus `Passed` virtual evidence for every platform/minor
+  pair. `release_ready` and `verify-artifacts` fail a factual
+  `Partial`/`Pending`/`Blocked`/`Failed` report as
+  `release.conformance.incomplete`; static validation continues to preserve
+  those factual non-passed reports.
+- Aggregation now records all candidate lstat identities and hashes before any
+  copy, rechecks them after copying and report writing, and rechecks them
+  again after sidecar/static verification immediately before return.
+
+Review RED:
+
+```text
+tests/release/test_conformance_report.py tests/release/test_verify_artifacts.py
+# expected collection error: release_ready absent
+```
+
+Review GREEN:
+
+```text
+focused report/artifact/manifest tests: 52 passed
+```

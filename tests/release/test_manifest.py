@@ -193,7 +193,7 @@ def _write_release_directory(release_dir: Path, inputs: dict[str, object]) -> No
                 "tag": manifest.tag,
                 "commit": manifest.commit,
                 "qualification": manifest.qualification.to_dict(),
-                "software": {"status": "Pending", "jobs": []},
+                "software": {"status": "Pending", "jobs": [], "virtual": []},
                 "hardware": {
                     "camera-avfoundation": {"status": "Pending", "evidence": None}
                 },
