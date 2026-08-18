@@ -1,6 +1,6 @@
 # Seeed HAL Architecture
 
-**Status:** v0.4 Camera software implementation landed; native hardware qualification remains open
+**Status:** v0.4 Camera software implementation landed; v0.5 release-conformance infrastructure has local evidence, while hosted and native hardware qualification remain open
 **Date:** 2026-08-18
 **Scope:** Team-reusable Rust HAL; `lerobot-easy` is the first consumer, not the domain model.
 
@@ -334,6 +334,18 @@ The library emits structured tracing spans and metrics but never installs a subs
 5. **v1.0:** stabilized interfaces, compatibility guarantees, and cross-platform conformance qualification.
 
 Each version is a working vertical slice. Later modules may refine core only through backward-compatible additions or an explicit contract revision.
+
+### 11.1 v0.5 release conformance
+
+v0.5 adds release and conformance infrastructure rather than a new HAL
+hardware-class feature. The RC workflow derives its macOS, Linux, and Windows
+target matrix from one artifact contract; builds immutable production-broker,
+Rust-source, and Python candidates; verifies per-host broker execution and
+separate hardware-free virtual conformance; then aggregates exact artifacts
+only after all hosted evidence is present. Attestation and prerelease creation
+are a separately permissioned final workflow job. Local candidates, hosted
+evidence, and physical-hardware evidence are recorded separately in the
+[v0.5 RC qualification record](../releases/v0.5.0-rc-qualification.md).
 
 Implementation status is intentionally separate from cross-platform release qualification:
 

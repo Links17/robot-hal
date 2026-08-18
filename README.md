@@ -25,6 +25,8 @@ The implementation is library-first. Rust applications link the library directly
 - [v0.3 USB/GPIO acceptance evidence](docs/releases/v0.3.0-acceptance.md)
 - [v0.4 Camera acceptance evidence](docs/releases/v0.4.0-acceptance.md)
 - [v0.4 Camera external qualification](docs/releases/v0.4.0-camera-qualification.md)
+- [v0.5 RC release qualification](docs/releases/v0.5.0-rc-qualification.md)
+- [v0.5 release artifact contract](docs/contracts/release-artifacts.md)
 - [Physical Serial loopback runbook](docs/runbooks/serial-loopback.md)
 - [Native USB qualification runbook](docs/runbooks/nusb-native.md)
 - [Native Linux GPIO qualification runbook](docs/runbooks/linux-gpio-native.md)
@@ -53,6 +55,13 @@ conformance, wire-minor-3 broker operations, Rust/Python clients, and AVFoundati
 Foundation adapters. Camera frame bytes do not use protobuf IPC. Native camera qualification remains
 an external per-platform gate recorded separately from the hardware-free acceptance evidence. Node
 bindings and device protocols remain planned.
+
+v0.5 adds release/conformance infrastructure: an exact three-platform artifact
+contract, immutable candidate aggregation, per-host broker verification,
+hardware-free virtual conformance, and a separately permissioned final
+attestation/prerelease path. It does not add a HAL hardware-class interface.
+The v0.5 qualification record distinguishes local candidates from pending
+hosted and physical-hardware evidence.
 
 ## Verification
 

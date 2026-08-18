@@ -94,3 +94,13 @@ rejects every Camera entry point locally or at broker dispatch; it must not down
 payload-bearing protobuf response. The manifest may list an AVFoundation, V4L2, or Media Foundation
 adapter without claiming the target runtime, privacy authorization, driver, or a physical camera was
 available. `virtual-adapters` remains test-only evidence.
+
+## Release artifact contract
+
+The v0.5 RC release artifact names, target matrix, manifest schema, checksums,
+conformance-report binding, immutable aggregation, and qualification rules are
+defined by the [release artifact contract](release-artifacts.md). A release
+manifest records the broker and Python release versions derived from its RC tag,
+the wire range, and artifact checksums; it does not itself prove hosted
+execution, attestation, or physical-hardware qualification. Those evidence
+classes remain distinct in the [v0.5 RC qualification record](../releases/v0.5.0-rc-qualification.md).
