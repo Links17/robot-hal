@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from email.parser import BytesParser
+from email.policy import compat32
 import gzip
 import hashlib
 import ipaddress
@@ -1506,6 +1508,8 @@ def _publish_staged_artifact(staged: Path, destination: Path) -> Path:
 
 
 def _reserve_package_artifact(output_dir: Path, name: str) -> Path:
+    # Reservations coordinate cooperative publishers. os.link below is the
+    # atomic no-clobber boundary against external output-directory races.
     reservation = output_dir / f".reserve-package-{name}"
     try:
         descriptor = os.open(reservation, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -1555,7 +1559,7 @@ def _cargo_packageable_members(
         )
         metadata = json.loads(result.stdout) if result.returncode == 0 else None
         graph = subprocess.run(
-            [cargo, "metadata", "--format-version", "1"],
+            [cargo, "metadata", "--locked", "--format-version", "1"],
             cwd=repo_root,
             check=False,
             capture_output=True,
@@ -1804,16 +1808,21 @@ def _wheel_metadata(wheel: Path, version: ReleaseVersion) -> None:
     try:
         with zipfile.ZipFile(wheel) as archive:
             names = set(archive.namelist())
-            metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
-            wheel_name = next(name for name in names if name.endswith(".dist-info/WHEEL"))
+            dist_info = f"seeed_hal-{version.python}.dist-info"
+            metadata_name = f"{dist_info}/METADATA"
+            wheel_name = f"{dist_info}/WHEEL"
+            if metadata_name not in names or wheel_name not in names:
+                _package_invalid("Python wheel metadata is invalid")
             metadata = archive.read(metadata_name).decode("utf-8")
-            wheel_data = archive.read(wheel_name).decode("utf-8")
-    except (OSError, StopIteration, UnicodeError, zipfile.BadZipFile) as error:
+            wheel_data = archive.read(wheel_name)
+            wheel_headers = BytesParser(policy=compat32).parsebytes(wheel_data)
+    except (OSError, UnicodeError, zipfile.BadZipFile) as error:
         raise ReleaseFailure("release.package.invalid", "Python wheel metadata is invalid") from error
     if (
         "Name: seeed-hal\n" not in metadata
         or f"Version: {version.python}\n" not in metadata
-        or "Tag: py3-none-any\n" not in wheel_data
+        or wheel_headers.get_all("Root-Is-Purelib") != ["true"]
+        or wheel_headers.get_all("Tag") != ["py3-none-any"]
         or "seeed_hal/__init__.py" not in names
         or not PYTHON_GENERATED_FILES.issubset(names)
     ):
@@ -1867,9 +1876,22 @@ def _sdist_metadata(sdist: Path, version: ReleaseVersion) -> None:
 def _verify_wheel_install(wheel: Path, version: ReleaseVersion, staging_dir: Path) -> None:
     virtualenv = staging_dir / "venv"
     python = virtualenv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() not in {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"}
+    }
     try:
         for command in (
-            ["uv", "venv", "--no-project", str(virtualenv)],
+            [
+                "uv",
+                "venv",
+                "--offline",
+                "--no-project",
+                "--python",
+                sys.executable,
+                str(virtualenv),
+            ],
             [
                 "uv",
                 "pip",
@@ -1901,6 +1923,7 @@ def _verify_wheel_install(wheel: Path, version: ReleaseVersion, staging_dir: Pat
                 capture_output=True,
                 text=True,
                 timeout=120,
+                env=environment,
             )
             if result.returncode != 0:
                 _package_invalid("Python wheel installation validation failed")

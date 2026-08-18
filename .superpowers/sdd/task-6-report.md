@@ -155,3 +155,37 @@ passed that gate and again reached the existing Cargo package boundary:
 `release.cargo.failed: cargo package failed`.  This is the already documented
 unpublished crates.io dependency closure; no dependency source was changed and
 no publication was attempted.
+
+## Second review follow-up
+
+Addressed the next two Important and two Minor findings:
+
+- Wheel validation now parses its internal `WHEEL` metadata and requires the
+  exact `seeed_hal-<PEP 440 version>.dist-info` directory,
+  `Root-Is-Purelib: true`, and exactly one `Tag: py3-none-any`.
+- Temporary wheel validation invokes `uv venv --offline --no-project --python
+  sys.executable`, removes proxy variables from all validator subprocesses, and
+  therefore neither downloads an interpreter nor permits proxy-based network
+  access.
+- The second Cargo metadata invocation that obtains the resolve graph now has
+  `--locked`.
+- A source comment distinguishes cooperative reservation files from
+  `os.link`, which remains the atomic no-clobber defense against external
+  output-directory races.
+
+Second-review RED was 5 expected focused failures for missing strict wheel
+identity checks, missing offline venv command/environment controls, and the
+missing resolve `--locked`.  GREEN:
+
+```text
+focused Task 6 tests: 16 passed
+tests/release: 143 passed
+bindings/python/tests: 187 passed
+```
+
+Actual Python package build/inspection/isolated install passed and emitted the
+expected wheel and sdist. `cargo fmt` and `cargo clippy` passed. The full Rust
+workspace test gate had one transient `camera_hot_unplug_closes_then_releases_for_reopen`
+failure (`runtime.actor.unavailable` versus `camera.session.unplugged`); its
+immediate exact rerun passed. This Task 6 Python/release-only change did not
+modify runtime code.

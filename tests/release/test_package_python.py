@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sys
 import errno
+import subprocess
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -10,7 +12,13 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.release import release_tool
-from scripts.release.release_tool import ReleaseFailure, ReleaseVersion, python_artifact_names
+from scripts.release.release_tool import (
+    ReleaseFailure,
+    ReleaseVersion,
+    _verify_wheel_install,
+    _wheel_metadata,
+    python_artifact_names,
+)
 
 
 def test_python_artifact_names_use_pep440() -> None:
@@ -91,3 +99,77 @@ def test_python_package_publishes_the_complete_pair(tmp_path: Path) -> None:
     assert wheel.is_file()
     assert sdist.is_file()
     assert {path.name for path in wheel.parent.iterdir()} == {wheel.name, sdist.name}
+
+
+def _wheel(
+    tmp_path: Path,
+    *,
+    dist_info: str = "seeed_hal-0.5.0rc1.dist-info",
+    wheel_metadata: str = "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+) -> Path:
+    wheel = tmp_path / "seeed_hal-0.5.0rc1-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("seeed_hal/__init__.py", "")
+        archive.writestr("seeed_hal/proto/__init__.py", "")
+        archive.writestr("seeed_hal/proto/hal_pb2.py", "")
+        archive.writestr(
+            f"{dist_info}/METADATA",
+            "Metadata-Version: 2.4\nName: seeed-hal\nVersion: 0.5.0rc1\n",
+        )
+        archive.writestr(f"{dist_info}/WHEEL", wheel_metadata)
+    return wheel
+
+
+@pytest.mark.parametrize(
+    ("dist_info", "wheel_metadata"),
+    [
+        (
+            "wrong-0.5.0rc1.dist-info",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        ),
+        (
+            "seeed_hal-0.5.0rc1.dist-info",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: py3-none-any\n",
+        ),
+        (
+            "seeed_hal-0.5.0rc1.dist-info",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\nTag: cp311-none-any\n",
+        ),
+    ],
+)
+def test_wheel_metadata_rejects_noncanonical_internal_identity(
+    tmp_path: Path,
+    dist_info: str,
+    wheel_metadata: str,
+) -> None:
+    with pytest.raises(ReleaseFailure):
+        _wheel_metadata(
+            _wheel(tmp_path, dist_info=dist_info, wheel_metadata=wheel_metadata),
+            ReleaseVersion.parse("v0.5.0-rc.1"),
+        )
+
+
+def test_isolated_wheel_venv_is_offline_and_uses_current_interpreter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+    environments: list[dict[str, str]] = []
+
+    def record(command, **kwargs):
+        commands.append(command)
+        environments.append(kwargs["env"])
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(release_tool.subprocess, "run", record)
+
+    _verify_wheel_install(
+        tmp_path / "package.whl",
+        ReleaseVersion.parse("v0.5.0-rc.1"),
+        tmp_path,
+    )
+
+    assert commands[0][:4] == ["uv", "venv", "--offline", "--no-project"]
+    assert commands[0][4:6] == ["--python", sys.executable]
+    assert all("HTTP_PROXY" not in environment for environment in environments)
+    assert all("HTTPS_PROXY" not in environment for environment in environments)

@@ -13,6 +13,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.release.release_tool import (
     ReleaseFailure,
+    _cargo_packageable_members,
     _packageable_workspace_members,
     _require_clean_repository,
     package_rust,
@@ -201,3 +202,25 @@ def test_non_repository_is_rejected(tmp_path: Path) -> None:
         _require_clean_repository(tmp_path)
 
     assert failure.value.name == "release.package.invalid"
+
+
+def test_resolve_metadata_uses_locked_graph(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = {
+        "workspace_members": ["alpha"],
+        "packages": [{"id": "alpha", "name": "alpha", "version": "0.5.0-rc.1"}],
+        "resolve": {"nodes": [{"id": "alpha", "dependencies": []}]},
+    }
+    commands: list[list[str]] = []
+
+    def record(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, __import__("json").dumps(metadata), "")
+
+    monkeypatch.setattr("scripts.release.release_tool.subprocess.run", record)
+
+    _cargo_packageable_members(tmp_path)
+
+    assert commands[1] == ["cargo", "metadata", "--locked", "--format-version", "1"]
