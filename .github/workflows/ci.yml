@@ -20,9 +20,15 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.11"
-      - uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - name: Install Rust 1.85
         run: rustup toolchain install 1.85 --profile minimal --component rustfmt --component clippy
+      - &linux-build-prerequisites
+        name: Install Linux build prerequisites
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libgpiod-dev pkg-config
       - name: Check generated protocol
         run: ./scripts/check-generated-protocol.sh
       - name: Check Rust formatting
@@ -58,10 +64,11 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.11"
-      - uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - name: Install Rust 1.85
         shell: bash
         run: rustup toolchain install 1.85 --profile minimal --component rustfmt --component clippy
+      - *linux-build-prerequisites
       - name: Build production broker
         shell: bash
         run: |
