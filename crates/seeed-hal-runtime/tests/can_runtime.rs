@@ -158,10 +158,13 @@ async fn receive_returns_available_frames_below_requested_maximum() {
     let observer = open(&runtime, &adapter, "receive-maximum", LeaseMode::Observe).await;
     adapter.inject_received(frame(1), None).unwrap();
 
-    let received = observer
-        .receive(2, Duration::from_millis(100))
-        .await
-        .unwrap();
+    let received = tokio::time::timeout(
+        Duration::from_millis(100),
+        observer.receive(2, Duration::from_secs(1)),
+    )
+    .await
+    .expect("a ready CAN frame must complete before the receive timeout")
+    .unwrap();
 
     assert_eq!(received.len(), 1);
     assert_eq!(received[0].frame(), &frame(1));
