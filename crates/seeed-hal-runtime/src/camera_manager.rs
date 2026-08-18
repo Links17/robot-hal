@@ -634,6 +634,9 @@ impl CameraManager {
         command: impl FnOnce(oneshot::Sender<HalResult<T>>) -> CameraCommand,
     ) -> HalResult<T> {
         let (worker, resource) = self.worker(&id, lease, op).await?;
+        if let Some(error) = worker.terminal_error() {
+            return Err(error.with_resource_id(resource));
+        }
         let (reply, response) = oneshot::channel();
         match worker.try_enqueue(command(reply), op) {
             Ok(()) => {}
@@ -815,8 +818,17 @@ mod tests {
         let resource = ResourceId::parse("camera:runtime:terminal-race").unwrap();
         let owner = OwnerId::parse("owner:camera-terminal-race").unwrap();
         let id = SessionId::parse("11111111-1111-1111-1111-111111111111").unwrap();
-        let (commands, receiver) = mpsc::channel(1);
-        drop(receiver);
+        let (commands, mut receiver) = mpsc::channel::<CameraCommand>(1);
+        let (stop_worker, stop_worker_rx) = oneshot::channel();
+        let worker_task = tokio::spawn(async move {
+            tokio::select! {
+                command = receiver.recv() => {
+                    command.expect("the old behavior enqueues a command").reject_closed();
+                    true
+                }
+                _ = stop_worker_rx => false,
+            }
+        });
         let (shutdown, _) = watch::channel(false);
         let (_, completion) = watch::channel(None);
         let (_, terminal_error) = watch::channel(Some(
@@ -862,6 +874,13 @@ mod tests {
 
         assert_eq!(error.name().as_str(), "camera.session.unplugged");
         assert_eq!(error.resource_id(), Some(&resource));
+        stop_worker
+            .send(())
+            .expect("terminal replay must leave the live worker receiver idle");
+        assert!(
+            !worker_task.await.expect("test worker task must not panic"),
+            "terminal replay must not enqueue a command for cleanup to reject as closed"
+        );
         assert_eq!(
             manager.state.lock().await.sessions.len(),
             1,
