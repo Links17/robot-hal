@@ -34,13 +34,14 @@ fn manifest_is_deterministic_business_independent_and_hardware_free() {
     assert_eq!(manifest["broker_version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(manifest["wire"]["major"], 1);
     assert_eq!(manifest["wire"]["minimum_minor"], 0);
-    assert_eq!(manifest["broker_version"], "0.2.0");
+    assert_eq!(manifest["broker_version"], "0.5.0-rc.1");
     assert_eq!(manifest["wire"]["maximum_minor"], 3);
     assert_eq!(manifest["target"]["triple"], env!("SEEED_HAL_TARGET"));
     assert_eq!(manifest["target"]["os"], std::env::consts::OS);
     assert_eq!(manifest["target"]["arch"], std::env::consts::ARCH);
     let mut expected_adapters = vec!["serialport"];
-    let mut expected_features = Vec::new();
+    #[allow(unused_mut)]
+    let mut expected_features: Vec<&str> = Vec::new();
     #[cfg(feature = "pcan")]
     {
         expected_adapters.push("pcan");

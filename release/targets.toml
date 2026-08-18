@@ -1,0 +1,25 @@
+schema = 1
+
+[[target]]
+name = "macos"
+runner = "macos-14"
+triple = "aarch64-apple-darwin"
+archive = "tar.gz"
+features = ["serialport", "nusb", "avfoundation"]
+required_adapters = ["avfoundation", "nusb", "serialport"]
+
+[[target]]
+name = "linux"
+runner = "ubuntu-24.04"
+triple = "x86_64-unknown-linux-gnu"
+archive = "tar.gz"
+features = ["serialport", "nusb", "socketcan", "linux-gpio", "v4l2"]
+required_adapters = ["linux-gpio", "nusb", "serialport", "socketcan", "v4l2"]
+
+[[target]]
+name = "windows"
+runner = "windows-2025"
+triple = "x86_64-pc-windows-msvc"
+archive = "zip"
+features = ["serialport", "nusb", "windows-gpio", "mediafoundation"]
+required_adapters = ["mediafoundation", "nusb", "serialport", "windows-gpio"]

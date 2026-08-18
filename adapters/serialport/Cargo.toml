@@ -1,6 +1,6 @@
 [package]
 name = "seeed-hal-adapter-serialport"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -13,8 +13,8 @@ hardware-tests = ["hardware-loopback"]
 async-trait = { workspace = true }
 bytes = { workspace = true }
 percent-encoding = { workspace = true }
-seeed-hal-core = { path = "../../crates/seeed-hal-core" }
-seeed-hal-serial = { path = "../../crates/seeed-hal-serial" }
+seeed-hal-core = { path = "../../crates/seeed-hal-core", version = "=0.5.0-rc.1"}
+seeed-hal-serial = { path = "../../crates/seeed-hal-serial", version = "=0.5.0-rc.1"}
 serial2 = { workspace = true, features = ["unix"] }
 serialport = { workspace = true }
 tokio = { workspace = true }
@@ -29,4 +29,4 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
-seeed-hal-testkit = { path = "../../crates/seeed-hal-testkit" }
+seeed-hal-testkit = { path = "../../crates/seeed-hal-testkit", version = "=0.5.0-rc.1"}

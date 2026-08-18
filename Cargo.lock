@@ -1305,7 +1305,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "seeed-hal-adapter-avfoundation"
-version = "0.1.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1323,7 +1323,7 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-adapter-linux-gpio"
-version = "0.3.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "async-trait",
  "libgpiod",
@@ -1335,7 +1335,7 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-adapter-mediafoundation"
-version = "0.1.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1348,7 +1348,7 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-adapter-nusb"
-version = "0.3.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1361,7 +1361,7 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-adapter-pcan"
-version = "0.2.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "async-trait",
  "can-hal-pcan",
@@ -1376,7 +1376,7 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-adapter-serialport"
-version = "0.1.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1393,7 +1393,7 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-adapter-shared-memory"
-version = "0.4.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "getrandom 0.3.4",
  "libc",
@@ -1409,7 +1409,7 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-adapter-socketcan"
-version = "0.2.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "async-trait",
  "can-hal-rs",
@@ -1426,7 +1426,7 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-adapter-v4l2"
-version = "0.1.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1438,7 +1438,7 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-adapter-windows-gpio"
-version = "0.3.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "async-trait",
  "percent-encoding",
@@ -1450,7 +1450,7 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-broker"
-version = "0.2.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1477,7 +1477,7 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-broker-app"
-version = "0.2.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "clap",
  "rustix 1.1.4",
@@ -1513,7 +1513,7 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-camera"
-version = "0.4.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1522,7 +1522,7 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-can"
-version = "0.2.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1532,7 +1532,7 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-client"
-version = "0.2.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1556,7 +1556,7 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-core"
-version = "0.1.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1565,7 +1565,7 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-gpio"
-version = "0.3.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "async-trait",
  "seeed-hal-core",
@@ -1573,7 +1573,7 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-protocol"
-version = "0.2.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "bytes",
  "prost",
@@ -1591,7 +1591,7 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-runtime"
-version = "0.2.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1609,7 +1609,7 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-serial"
-version = "0.1.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1618,7 +1618,7 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-testkit"
-version = "0.2.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1633,7 +1633,7 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-usb"
-version = "0.3.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1642,14 +1642,14 @@ dependencies = [
 
 [[package]]
 name = "seeed-hal-windows-file"
-version = "0.1.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "seeed-hal-windows-security"
-version = "0.1.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "tokio",
  "uuid",
@@ -2115,9 +2115,9 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"
-version = "1.24.0"
+version = "1.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf3923a6f5c4c6382e0b653c4117f48d631ea17f38ed86e2a828e6f7412f5239"
+checksum = "2cefc03fd367c0c6d4305de1b312cf00248c4114f4a0418ce6a6af769e3b0bd9"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",

@@ -1,6 +1,6 @@
 [project]
 name = "seeed-hal"
-version = "0.1.0"
+version = "0.5.0rc1"
 description = "Async Python client for the local Seeed HAL broker"
 requires-python = ">=3.11"
 dependencies = [

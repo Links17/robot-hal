@@ -1,6 +1,6 @@
 [package]
 name = "seeed-hal-adapter-socketcan"
-version = "0.2.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -8,8 +8,8 @@ license.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 percent-encoding = { workspace = true }
-seeed-hal-can = { path = "../../crates/seeed-hal-can" }
-seeed-hal-core = { path = "../../crates/seeed-hal-core" }
+seeed-hal-can = { path = "../../crates/seeed-hal-can", version = "=0.5.0-rc.1"}
+seeed-hal-core = { path = "../../crates/seeed-hal-core", version = "=0.5.0-rc.1"}
 tokio = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -20,4 +20,4 @@ neli = "=0.6.5"
 socketcan = { version = "=3.5.0", default-features = false, features = ["netlink", "enumerate"] }
 
 [dev-dependencies]
-seeed-hal-testkit = { path = "../../crates/seeed-hal-testkit" }
+seeed-hal-testkit = { path = "../../crates/seeed-hal-testkit", version = "=0.5.0-rc.1"}

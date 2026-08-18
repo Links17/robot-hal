@@ -1,5 +1,12 @@
 """Public, protobuf-independent Seeed HAL Python API."""
 
+from importlib.metadata import PackageNotFoundError, version as _distribution_version
+
+try:
+    __version__ = _distribution_version("seeed-hal")
+except PackageNotFoundError:
+    __version__ = "0.5.0rc1"
+
 from .client import (
     EventSubscription,
     HalClient,
@@ -74,6 +81,7 @@ from .camera import (
 )
 
 __all__ = [
+    "__version__",
     "ControlLines",
     "CanBatchSendError",
     "CanBitTiming",
