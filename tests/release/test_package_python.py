@@ -17,8 +17,10 @@ sys.path.insert(0, str(REPO_ROOT))
 from scripts.release import release_tool
 from scripts.release.release_tool import (
     _locked_protobuf_wheel,
+    _locked_protobuf_record_mapping,
     ReleaseFailure,
     ReleaseVersion,
+    _verify_installed_protobuf_record,
     _verify_wheel_install,
     _wheel_metadata,
     _prepare_locked_protobuf_wheel,
@@ -282,12 +284,22 @@ def _wheel(
 
 
 def _protobuf_wheel(path: Path) -> Path:
+    package_path = "google/protobuf/__init__.py"
+    package_contents = b"__version__ = '6.32.1'\n"
+    metadata_path = "protobuf-6.32.1.dist-info/METADATA"
+    metadata_contents = b"Metadata-Version: 2.4\nName: protobuf\nVersion: 6.32.1\n"
+    record_path = "protobuf-6.32.1.dist-info/RECORD"
+    record_contents = (
+        _record_entry(package_path, package_contents)
+        + "\n"
+        + _record_entry(metadata_path, metadata_contents)
+        + "\n"
+        + f"{record_path},,\n"
+    )
     with zipfile.ZipFile(path, "w") as archive:
-        archive.writestr("google/protobuf/__init__.py", "__version__ = '6.32.1'\n")
-        archive.writestr(
-            "protobuf-6.32.1.dist-info/RECORD",
-            "google/protobuf/__init__.py,,\nprotobuf-6.32.1.dist-info/RECORD,,\n",
-        )
+        archive.writestr(package_path, package_contents)
+        archive.writestr(metadata_path, metadata_contents)
+        archive.writestr(record_path, record_contents)
     return path
 
 
@@ -326,6 +338,8 @@ def test_wheel_metadata_rejects_noncanonical_internal_identity(
         "google/__init__.py",
         "google/anything.py",
         "google/protobuf/__init__.py",
+        "seeed_hal-0.5.0rc1.data/purelib/google/__init__.py",
+        "seeed_hal-0.5.0rc1.data/platlib/google/protobuf/__init__.py",
     ],
 )
 def test_wheel_metadata_rejects_candidate_google_namespace_members(
@@ -340,6 +354,70 @@ def test_wheel_metadata_rejects_candidate_google_namespace_members(
             ),
             ReleaseVersion.parse("v0.5.0-rc.1"),
         )
+
+    assert failure.value.name == "release.package.invalid"
+
+
+def _record_entry(path: str, contents: bytes) -> str:
+    digest = hashlib.sha256(contents).digest()
+    encoded = __import__("base64").urlsafe_b64encode(digest).rstrip(b"=").decode()
+    return f"{path},sha256={encoded},{len(contents)}"
+
+
+def _strict_protobuf_wheel(path: Path) -> Path:
+    return _protobuf_wheel(path)
+
+
+def test_locked_protobuf_record_mapping_rejects_hashless_non_record_member(
+    tmp_path: Path,
+) -> None:
+    wheel = tmp_path / "protobuf-6.32.1-py3-none-any.whl"
+    package_contents = b"__version__ = '6.32.1'\n"
+    metadata_contents = b"Metadata-Version: 2.4\nName: protobuf\nVersion: 6.32.1\n"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("google/protobuf/__init__.py", package_contents)
+        archive.writestr("protobuf-6.32.1.dist-info/METADATA", metadata_contents)
+        archive.writestr(
+            "protobuf-6.32.1.dist-info/RECORD",
+            "google/protobuf/__init__.py,,\n"
+            + _record_entry(
+                "protobuf-6.32.1.dist-info/METADATA", metadata_contents
+            )
+            + "\nprotobuf-6.32.1.dist-info/RECORD,,\n",
+        )
+
+    with pytest.raises(ReleaseFailure) as failure:
+        _locked_protobuf_record_mapping(wheel)
+
+    assert failure.value.name == "release.package.invalid"
+
+
+def test_installed_protobuf_record_rejects_extra_injected_file_and_record(
+    tmp_path: Path,
+) -> None:
+    wheel = _strict_protobuf_wheel(tmp_path / "protobuf-6.32.1-py3-none-any.whl")
+    expected = _locked_protobuf_record_mapping(wheel)
+    root = tmp_path / "site-packages"
+    package = root / "google" / "protobuf"
+    dist_info = root / "protobuf-6.32.1.dist-info"
+    package.mkdir(parents=True)
+    dist_info.mkdir()
+    package_contents = b"__version__ = '6.32.1'\n"
+    injected_contents = b"unexpected injected file\n"
+    (package / "__init__.py").write_bytes(package_contents)
+    (root / "injected.py").write_bytes(injected_contents)
+    record = dist_info / "RECORD"
+    record.write_text(
+        _record_entry("google/protobuf/__init__.py", package_contents)
+        + "\n"
+        + _record_entry("injected.py", injected_contents)
+        + "\n"
+        + "protobuf-6.32.1.dist-info/RECORD,,\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ReleaseFailure) as failure:
+        _verify_installed_protobuf_record(root, record, expected)
 
     assert failure.value.name == "release.package.invalid"
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import csv
 from email.parser import BytesParser
@@ -2701,21 +2702,39 @@ def python_artifact_names(version: ReleaseVersion) -> tuple[str, str]:
 def _wheel_metadata(wheel: Path, version: ReleaseVersion) -> None:
     try:
         with zipfile.ZipFile(wheel) as archive:
-            names = set(archive.namelist())
+            members = tuple(archive.namelist())
+            names = set(members)
             dist_info = f"seeed_hal-{version.python}.dist-info"
             metadata_name = f"{dist_info}/METADATA"
             wheel_name = f"{dist_info}/WHEEL"
             if metadata_name not in names or wheel_name not in names:
                 _package_invalid("Python wheel metadata is invalid")
+            for member in members:
+                try:
+                    path = _safe_archive_path(member)
+                except ReleaseFailure as error:
+                    raise ReleaseFailure(
+                        "release.package.invalid",
+                        "Python wheel member path is invalid",
+                    ) from error
+                normalized = path.as_posix()
+                data_prefix = f"{dist_info.removesuffix('.dist-info')}.data"
+                install_path = (
+                    PurePosixPath(*path.parts[2:]).as_posix()
+                    if len(path.parts) >= 3
+                    and path.parts[:2] in {
+                        (data_prefix, "purelib"),
+                        (data_prefix, "platlib"),
+                    }
+                    else normalized
+                )
+                if install_path == "google" or install_path.startswith("google/"):
+                    _package_invalid("Python wheel must not provide protobuf")
             metadata = archive.read(metadata_name).decode("utf-8")
             wheel_data = archive.read(wheel_name)
             wheel_headers = BytesParser(policy=compat32).parsebytes(wheel_data)
     except (OSError, UnicodeError, zipfile.BadZipFile) as error:
         raise ReleaseFailure("release.package.invalid", "Python wheel metadata is invalid") from error
-    if any("\\" in name for name in names):
-        _package_invalid("Python wheel member path is invalid")
-    if any(name == "google" or name.startswith("google/") for name in names):
-        _package_invalid("Python wheel must not provide protobuf")
     if (
         "Name: seeed-hal\n" not in metadata
         or f"Version: {version.python}\n" not in metadata
@@ -2825,33 +2844,219 @@ class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
 @dataclass
 class _LockedProtobufWheel:
     path: Path
-    protected_dir: Path
 
     def close(self) -> None:
-        self.protected_dir.chmod(0o700)
+        pass
 
 
-def _locked_protobuf_record_entries(wheel: Path) -> tuple[tuple[str, str, str], ...]:
+def _protobuf_record_mapping(
+    record: str,
+    *,
+    record_path: str,
+) -> dict[str, tuple[str | None, int | None]]:
+    mapping: dict[str, tuple[str | None, int | None]] = {}
+    try:
+        rows = tuple(csv.reader(record.splitlines()))
+    except csv.Error as error:
+        raise ReleaseFailure(
+            "release.package.invalid", "protobuf RECORD is invalid"
+        ) from error
+    for row in rows:
+        if len(row) != 3 or not row[0] or row[0] in mapping:
+            _package_invalid("protobuf RECORD is invalid")
+        try:
+            path = _safe_archive_path(row[0]).as_posix()
+        except ReleaseFailure as error:
+            raise ReleaseFailure(
+                "release.package.invalid", "protobuf RECORD is invalid"
+            ) from error
+        encoded, raw_size = row[1], row[2]
+        if path == record_path:
+            if encoded or raw_size:
+                _package_invalid("protobuf RECORD is invalid")
+            mapping[path] = (None, None)
+            continue
+        if (
+            not encoded.startswith("sha256=")
+            or not re.fullmatch(r"[A-Za-z0-9_-]{43}", encoded.removeprefix("sha256="))
+            or not re.fullmatch(r"(?:0|[1-9][0-9]*)", raw_size)
+        ):
+            _package_invalid("protobuf RECORD is invalid")
+        try:
+            digest = base64.urlsafe_b64decode(
+                encoded.removeprefix("sha256=") + "="
+            )
+        except ValueError as error:
+            raise ReleaseFailure(
+                "release.package.invalid", "protobuf RECORD is invalid"
+            ) from error
+        if len(digest) != 32:
+            _package_invalid("protobuf RECORD is invalid")
+        mapping[path] = (encoded, int(raw_size))
+    if record_path not in mapping:
+        _package_invalid("protobuf RECORD is invalid")
+    return mapping
+
+
+def _locked_protobuf_record_mapping(wheel: Path) -> dict[str, tuple[str | None, int | None]]:
     try:
         with zipfile.ZipFile(wheel) as archive:
-            records = [
-                name
-                for name in archive.namelist()
-                if name.startswith("protobuf-") and name.endswith(".dist-info/RECORD")
+            members = tuple(archive.namelist())
+            record_paths = [
+                name for name in members if name.endswith(".dist-info/RECORD")
             ]
-            if len(records) != 1:
+            metadata_paths = [
+                name for name in members if name.endswith(".dist-info/METADATA")
+            ]
+            if len(record_paths) != 1 or len(metadata_paths) != 1:
                 _package_invalid("locked protobuf wheel is invalid")
-            return tuple(
-                (path, encoded, size)
-                for path, encoded, size in csv.reader(
-                    archive.read(records[0]).decode("utf-8").splitlines()
-                )
-                if encoded
+            record_path = _safe_archive_path(record_paths[0]).as_posix()
+            metadata_path = _safe_archive_path(metadata_paths[0]).as_posix()
+            dist_info = record_path.removesuffix("/RECORD")
+            if metadata_path != f"{dist_info}/METADATA":
+                _package_invalid("locked protobuf wheel is invalid")
+            metadata = archive.read(metadata_path).decode("utf-8")
+            if (
+                "Name: protobuf\n" not in metadata
+                or "Version: 6.32.1\n" not in metadata
+            ):
+                _package_invalid("locked protobuf wheel is invalid")
+            mapping = _protobuf_record_mapping(
+                archive.read(record_path).decode("utf-8"),
+                record_path=record_path,
             )
-    except (OSError, zipfile.BadZipFile) as error:
+            inventory = {
+                _safe_archive_path(member).as_posix()
+                for member in members
+                if not member.endswith("/")
+            }
+            if set(mapping) != inventory:
+                _package_invalid("locked protobuf wheel is invalid")
+            data_prefix = f"{dist_info.removesuffix('.dist-info')}.data/"
+            for path in mapping:
+                installed = (
+                    path.removeprefix(data_prefix + "purelib/")
+                    if path.startswith(data_prefix + "purelib/")
+                    else path.removeprefix(data_prefix + "platlib/")
+                    if path.startswith(data_prefix + "platlib/")
+                    else path
+                )
+                if not (
+                    installed.startswith("google/protobuf/")
+                    or installed.startswith(f"{dist_info}/")
+                ):
+                    _package_invalid("locked protobuf wheel is invalid")
+            return {
+                (
+                    path.removeprefix(data_prefix + "purelib/")
+                    if path.startswith(data_prefix + "purelib/")
+                    else path.removeprefix(data_prefix + "platlib/")
+                    if path.startswith(data_prefix + "platlib/")
+                    else path
+                ): entry
+                for path, entry in mapping.items()
+            }
+    except (OSError, UnicodeError, zipfile.BadZipFile, ReleaseFailure) as error:
+        if isinstance(error, ReleaseFailure):
+            raise
         raise ReleaseFailure(
             "release.package.invalid", "locked protobuf wheel is invalid"
         ) from error
+
+
+def _verify_installed_protobuf_record(
+    root: Path,
+    record: Path,
+    expected: dict[str, tuple[str | None, int | None]],
+) -> None:
+    try:
+        actual = _protobuf_record_mapping(
+            record.read_text(encoding="utf-8"),
+            record_path=record.relative_to(root).as_posix(),
+        )
+        expected_non_record = {
+            path: entry
+            for path, entry in expected.items()
+            if not path.endswith(".dist-info/RECORD")
+        }
+        actual_non_record = {
+            path: entry
+            for path, entry in actual.items()
+            if not path.endswith(".dist-info/RECORD")
+        }
+        permitted_metadata = {
+            record.parent.relative_to(root).as_posix() + "/" + name
+            for name in {"INSTALLER", "REQUESTED", "direct_url.json", "uv_cache.json"}
+        }
+        if (
+            set(actual_non_record) - permitted_metadata != set(expected_non_record)
+            or actual.get(record.relative_to(root).as_posix()) != (None, None)
+        ):
+            _package_invalid("installed protobuf RECORD does not match locked wheel")
+        for path, (encoded, size) in expected.items():
+            installed = root / path
+            if not installed.is_file() or installed.is_symlink():
+                _package_invalid("installed protobuf RECORD does not match locked wheel")
+            if encoded is None:
+                continue
+            contents = installed.read_bytes()
+            actual_hash = (
+                "sha256="
+                + base64.urlsafe_b64encode(hashlib.sha256(contents).digest())
+                .rstrip(b"=")
+                .decode("ascii")
+            )
+            if actual_hash != encoded or len(contents) != size:
+                _package_invalid("installed protobuf RECORD does not match locked wheel")
+        scopes = {
+            root / "google" / "protobuf",
+            root / record.relative_to(root).parent,
+        }
+        actual_files = {
+            path.relative_to(root).as_posix()
+            for scope in scopes
+            for path in scope.rglob("*")
+            if path.is_file() and not path.is_symlink() and path.suffix != ".pyc"
+        }
+        if actual_files != set(expected) | permitted_metadata:
+            _package_invalid("installed protobuf RECORD does not match locked wheel")
+    except (OSError, ValueError) as error:
+        raise ReleaseFailure(
+            "release.package.invalid",
+            "installed protobuf RECORD does not match locked wheel",
+        ) from error
+
+
+def _installed_protobuf_record_validation_script(
+    expected: dict[str, tuple[str | None, int | None]],
+) -> str:
+    return (
+        "import base64, csv, hashlib, importlib.metadata, pathlib\n"
+        "import google.protobuf;"
+        "dist=importlib.metadata.distribution('protobuf');"
+        "record=dist.locate_file(next(path for path in dist.files if path.name == 'RECORD'));"
+        "site=record.parent.parent;"
+        "assert record.is_file() and pathlib.Path(google.protobuf.__file__).is_relative_to(site);"
+        f"expected_entries={expected!r};"
+        "installed_entries={};"
+        "exec(\"for row in csv.reader(record.read_text(encoding='utf-8').splitlines()):\\n"
+        " assert len(row) == 3 and row[0] and row[0] not in installed_entries\\n"
+        " path, encoded, size = row\\n"
+        " if path == record.relative_to(site).as_posix():\\n"
+        "  assert not encoded and not size; installed_entries[path] = (None, None); continue\\n"
+        " assert encoded.startswith('sha256=') and len(encoded.removeprefix('sha256=')) == 43 and size.isdecimal()\\n"
+        " data=(site / path).read_bytes()\\n"
+        " assert base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b'=').decode() == encoded.removeprefix('sha256=')\\n"
+        " assert len(data) == int(size)\\n"
+        " installed_entries[path] = (encoded, int(size))\")\n"
+        "permitted_metadata={'INSTALLER','REQUESTED','direct_url.json','uv_cache.json'};"
+        "expected_non_record={path for path in expected_entries if not path.endswith('.dist-info/RECORD')};"
+        "actual_non_record={path for path in installed_entries if not path.endswith('.dist-info/RECORD')};"
+        "assert actual_non_record - {record.parent.relative_to(site).as_posix() + '/' + name for name in permitted_metadata} == expected_non_record, (actual_non_record - {record.parent.relative_to(site).as_posix() + '/' + name for name in permitted_metadata}) ^ expected_non_record;"
+        "assert installed_entries[record.relative_to(site).as_posix()] == (None, None);"
+        "actual_files={path.relative_to(site).as_posix() for scope in (site / 'google' / 'protobuf', record.parent) for path in scope.rglob('*') if path.is_file() and not path.is_symlink() and path.suffix != '.pyc'};"
+        "assert actual_files == set(expected_entries) | {record.parent.relative_to(site).as_posix() + '/' + name for name in permitted_metadata}, actual_files ^ (set(expected_entries) | {record.parent.relative_to(site).as_posix() + '/' + name for name in permitted_metadata});"
+    )
 
 
 def _locked_protobuf_file_identity(path: Path) -> tuple[int, int, int, int]:
@@ -2892,8 +3097,6 @@ def _require_locked_protobuf_wheel(
 def _prepare_locked_protobuf_wheel(
     project: Path, staging_dir: Path
 ) -> tuple[_LockedProtobufWheel, str]:
-    if os.name != "posix":
-        _package_invalid("locked protobuf wheel verification is unsupported on this platform")
     url, expected_hash = _locked_protobuf_wheel(project)
     candidate_dir = staging_dir / "candidate"
     immutable_dir = staging_dir / "immutable"
@@ -2917,7 +3120,6 @@ def _prepare_locked_protobuf_wheel(
                 destination.write(chunk)
         wheel.chmod(0o400)
         actual_hash = _locked_protobuf_hash(wheel)
-        staging_dir.chmod(0o500)
     except (OSError, urllib.error.URLError) as error:
         raise ReleaseFailure(
             "release.package.invalid",
@@ -2925,7 +3127,7 @@ def _prepare_locked_protobuf_wheel(
         ) from error
     if actual_hash != expected_hash:
         _package_invalid("locked protobuf wheel hash is invalid")
-    return (_LockedProtobufWheel(wheel, staging_dir), expected_hash)
+    return (_LockedProtobufWheel(wheel), expected_hash)
 
 
 def _verify_wheel_install(
@@ -2935,20 +3137,16 @@ def _verify_wheel_install(
     protobuf_wheel: Path | _LockedProtobufWheel,
     protobuf_hash: str,
 ) -> None:
-    if os.name != "posix":
-        _package_invalid("locked protobuf wheel verification is unsupported on this platform")
     virtualenv = staging_dir / "venv"
     python = virtualenv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     owns_descriptor = isinstance(protobuf_wheel, Path)
     if owns_descriptor:
-        protobuf_wheel = _LockedProtobufWheel(
-            protobuf_wheel, protobuf_wheel.parent
-        )
+        protobuf_wheel = _LockedProtobufWheel(protobuf_wheel)
     protobuf_identity = _locked_protobuf_file_identity(protobuf_wheel.path)
     _require_locked_protobuf_wheel(
         protobuf_wheel.path, protobuf_hash, protobuf_identity
     )
-    protobuf_record_entries = _locked_protobuf_record_entries(protobuf_wheel.path)
+    protobuf_record_mapping = _locked_protobuf_record_mapping(protobuf_wheel.path)
     environment = {
         key: value
         for key, value in os.environ.items()
@@ -2981,31 +3179,18 @@ def _verify_wheel_install(
                 "-I",
                 "-c",
                 (
-                    "import base64, csv, hashlib, importlib.metadata, pathlib\n"
-                    "import seeed_hal;"
-                    f"expected={version.python!r};"
-                    "assert importlib.metadata.version('seeed-hal') == expected;"
-                    "assert seeed_hal.__version__ == expected;"
-                    "from seeed_hal.proto import hal_pb2;"
-                    "import google.protobuf;"
-                    "assert google.protobuf.__version__ == '6.32.1';"
-                    "site=pathlib.Path(google.protobuf.__file__).resolve().parents[2];"
-                    "dist=importlib.metadata.distribution('protobuf');"
-                    "record=dist.locate_file(next(path for path in dist.files if path.name == 'RECORD'));"
-                    "assert record.is_file() and record.resolve().is_relative_to(site);"
-                    f"expected_entries={protobuf_record_entries!r};"
-                    "installed_entries={path: (encoded, size) for path, encoded, size in csv.reader(record.read_text(encoding='utf-8').splitlines())};"
-                    "assert all(installed_entries.get(path) == (encoded, size) for path, encoded, size in expected_entries);"
-                    "exec(\"for path, encoded, size in csv.reader(record.read_text(encoding='utf-8').splitlines()):\\n"
-                    " if encoded:\\n"
-                    "  algorithm, value=encoded.split('=', 1)\\n"
-                    "  assert algorithm == 'sha256'\\n"
-                    "  data=dist.locate_file(path).read_bytes()\\n"
-                    "  assert base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b'=')"
-                    ".decode() == value\\n"
-                    "  assert str(len(data)) == size\")\n"
-                    "assert hal_pb2.DESCRIPTOR.name == 'hal.proto';"
-                    "assert hal_pb2.Empty().SerializeToString() == b''"
+                    "import importlib.metadata;import seeed_hal;"
+                    + f"expected={version.python!r};"
+                    + "assert importlib.metadata.version('seeed-hal') == expected;"
+                    + "assert seeed_hal.__version__ == expected;"
+                    + "from seeed_hal.proto import hal_pb2;"
+                    + "import google.protobuf;"
+                    + "assert google.protobuf.__version__ == '6.32.1';"
+                    + _installed_protobuf_record_validation_script(
+                        protobuf_record_mapping
+                    )
+                    + "assert hal_pb2.DESCRIPTOR.name == 'hal.proto';"
+                    + "assert hal_pb2.Empty().SerializeToString() == b''"
                 ),
             ],
         ):
@@ -3042,6 +3227,8 @@ def package_python(*, tag: str, project: Path, output_dir: Path) -> tuple[Path, 
     release directory.  Task 7 aggregates validated candidates separately.
     """
     try:
+        if os.name == "nt":
+            _package_invalid("Python candidate packaging is unsupported on Windows")
         version = ReleaseVersion.parse(tag)
         pyproject = _read_toml(project / "pyproject.toml", "release.package.invalid")
         metadata = pyproject.get("project")

@@ -41,6 +41,22 @@ static verifier rejects a changed report even if it is semantically valid.
 Candidate directories, platform virtual brokers, and virtual-conformance
 outputs are intermediate evidence only. They are never Release assets.
 
+Python candidate validation installs the candidate and the exact locked
+pure-Python `protobuf` wheel into a fresh offline environment. The candidate
+wheel is rejected when a safe, normalized wheel member—or the installed target
+of its `.data/purelib/` or `.data/platlib/` member—would occupy top-level
+`google`. The installed `protobuf` distribution must have the exact normalized
+`RECORD` mapping from that wheel: non-`RECORD` rows require SHA-256 and size,
+and additional, missing, duplicate, or hashless entries fail validation.
+
+Private staging and candidate identity checks detect replacement before a
+candidate is accepted, but do not claim a no-replace boundary against a
+malicious process with the same operating-system UID. Python cannot provide
+that boundary to pathname-consuming installers without an OS-level sandbox or
+file-descriptor-aware installer interface. The current RC package-python
+candidate build is supported on Unix hosts; Windows candidate qualification
+requires hosted evidence before it may be claimed.
+
 ## Rust workspace source bundle
 
 `seeed-hal-crates-v0.5.0-rc.N.tar.gz` is a deterministic, complete Rust
