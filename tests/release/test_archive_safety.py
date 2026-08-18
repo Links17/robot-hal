@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import sys
 import tarfile
+import unicodedata
 import warnings
 import zipfile
 from pathlib import Path
@@ -92,7 +93,6 @@ def test_tar_rejects_unsafe_member_names_before_extraction(
 
     with pytest.raises(ReleaseFailure) as failure:
         validate_archive(archive, expected_root="root", expected_files={"README.txt"})
-
     assert failure.value.name == "release.archive.invalid"
 
 
@@ -148,7 +148,6 @@ def test_archive_rejects_symlink_duplicate_and_unexpected_content(
 
     with pytest.raises(ReleaseFailure, match="release.archive.invalid"):
         validate_archive(archive, expected_root="root", expected_files={"README.txt"})
-
     if suffix == ".tar.gz":
         _tar(
             archive,
@@ -171,7 +170,6 @@ def test_archive_rejects_symlink_duplicate_and_unexpected_content(
             )
     with pytest.raises(ReleaseFailure, match="release.archive.invalid"):
         validate_archive(archive, expected_root="root", expected_files={"README.txt"})
-
     if suffix == ".tar.gz":
         _tar(
             archive,
@@ -192,3 +190,71 @@ def test_archive_rejects_symlink_duplicate_and_unexpected_content(
         )
     with pytest.raises(ReleaseFailure, match="release.archive.invalid"):
         validate_archive(archive, expected_root="root", expected_files={"README.txt"})
+@pytest.mark.parametrize("suffix", [".tar.gz", ".zip"])
+def test_archive_rejects_casefold_and_unicode_nfc_collisions(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    archive = tmp_path / f"collision{suffix}"
+    members = [
+        ("root/", b"", "directory"),
+        ("root/README.txt", b"one", "file"),
+        ("root/readme.TXT", b"two", "file"),
+    ]
+    if suffix == ".tar.gz":
+        _tar(archive, members)
+    else:
+        _zip(
+            archive,
+            [(name, contents, False) for name, contents, _ in members],
+        )
+    with pytest.raises(ReleaseFailure, match="release.archive.invalid"):
+        validate_archive(archive, expected_root="root", expected_files={"README.txt"})
+
+    decomposed = "root/cafe\u0301.txt"
+    composed_name = unicodedata.normalize("NFC", "cafe\u0301")
+    composed = f"root/{composed_name}.txt"
+    members = [
+        ("root/", b"", "directory"),
+        (decomposed, b"one", "file"),
+        (composed, b"two", "file"),
+    ]
+    if suffix == ".tar.gz":
+        _tar(archive, members)
+    else:
+        _zip(
+            archive,
+            [(name, contents, False) for name, contents, _ in members],
+        )
+    with pytest.raises(ReleaseFailure, match="release.archive.invalid"):
+        validate_archive(
+            archive,
+            expected_root="root",
+            expected_files={"café.txt", "cafe\u0301.txt"},
+        )
+
+
+@pytest.mark.parametrize("suffix", [".tar.gz", ".zip"])
+def test_archive_rejects_unexpected_empty_directories(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    archive = tmp_path / f"directory{suffix}"
+    members = [
+        ("root/", b"", "directory"),
+        ("root/empty/", b"", "directory"),
+        ("root/README.txt", b"ok", "file"),
+    ]
+    if suffix == ".tar.gz":
+        _tar(archive, members)
+    else:
+        _zip(
+            archive,
+            [(name, contents, False) for name, contents, _ in members],
+        )
+
+    with pytest.raises(ReleaseFailure, match="release.archive.invalid"):
+        validate_archive(archive, expected_root="root", expected_files={"README.txt"})
+
+
+# End of archive safety cases.

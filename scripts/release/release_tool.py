@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -13,6 +14,8 @@ import sys
 import tempfile
 import tarfile
 import tomllib
+import unicodedata
+import urllib.parse
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -93,6 +96,10 @@ RELEASE_WIRE = {"major": 1, "minimum_minor": 0, "maximum_minor": 3}
 RELEASE_PYTHON_MIN = "3.11"
 RELEASE_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+CONFORMANCE_REPORT_NAME = "conformance-report.json"
+RELEASE_SIDECARS = frozenset(
+    {"release-manifest.json", "SHA256SUMS", CONFORMANCE_REPORT_NAME}
+)
 SENSITIVE_FIELD = re.compile(
     r"(?:token|secret|password|serial|payload|mapping|endpoint|address)",
     re.IGNORECASE,
@@ -103,6 +110,10 @@ SENSITIVE_VALUE = re.compile(
     re.IGNORECASE,
 )
 ARTIFACT_PATTERNS = (
+    (
+        "rust-crates",
+        re.compile(r"^seeed-hal-crates-v0\.5\.0-rc\.[1-9][0-9]*\.tar\.gz$"),
+    ),
     (
         "broker",
         re.compile(
@@ -189,6 +200,14 @@ class ConformanceReport:
             "hardware": self.hardware.to_dict(),
         }
 
+    def sidecar_dict(self, tag: str, commit: str) -> dict[str, object]:
+        return {
+            "schema": 1,
+            "tag": tag,
+            "commit": commit,
+            "qualification": self.to_dict(),
+        }
+
 
 @dataclass(frozen=True)
 class ReleaseManifest:
@@ -215,6 +234,10 @@ class ReleaseManifest:
             "artifacts": [artifact.to_dict() for artifact in self.artifacts],
             "broker_composition": self.broker_composition,
             "qualification": self.qualification.to_dict(),
+            "conformance_report": {
+                "name": CONFORMANCE_REPORT_NAME,
+                "schema": 1,
+            },
         }
 
 
@@ -510,13 +533,38 @@ def _artifact_metadata(name: str) -> tuple[str, str | None]:
         if pattern.fullmatch(name):
             if kind != "broker":
                 return kind, None
-            target = name.rsplit("-", 1)[1]
-            if target.endswith(".tar.gz"):
-                target = target.removesuffix(".tar.gz")
-            else:
-                target = target.removesuffix(".zip")
-            return kind, target
+            for target in (
+                "aarch64-apple-darwin",
+                "x86_64-unknown-linux-gnu",
+                "x86_64-pc-windows-msvc",
+            ):
+                if name.endswith(f"-{target}.tar.gz") or name.endswith(
+                    f"-{target}.zip"
+                ):
+                    return kind, target
+            _release_manifest_invalid("broker artifact target is invalid")
     _release_manifest_invalid("artifact name is not permitted by the v0.5 contract")
+
+
+def _expected_artifacts(version: ReleaseVersion) -> dict[str, tuple[str, str | None]]:
+    names = {
+        f"seeed-hal-broker-v{version.cargo}-aarch64-apple-darwin.tar.gz": (
+            "broker",
+            "aarch64-apple-darwin",
+        ),
+        f"seeed-hal-broker-v{version.cargo}-x86_64-unknown-linux-gnu.tar.gz": (
+            "broker",
+            "x86_64-unknown-linux-gnu",
+        ),
+        f"seeed-hal-broker-v{version.cargo}-x86_64-pc-windows-msvc.zip": (
+            "broker",
+            "x86_64-pc-windows-msvc",
+        ),
+        f"seeed-hal-crates-v{version.cargo}.tar.gz": ("rust-crates", None),
+        f"seeed_hal-{version.python}-py3-none-any.whl": ("python-wheel", None),
+        f"seeed_hal-{version.python}.tar.gz": ("python-source", None),
+    }
+    return names
 
 
 def _reject_sensitive(value: object) -> None:
@@ -532,14 +580,46 @@ def _reject_sensitive(value: object) -> None:
         _release_manifest_invalid("manifest contains a prohibited sensitive value")
 
 
+def _safe_public_https_uri(value: object, field: str) -> str:
+    if not isinstance(value, str):
+        _release_manifest_invalid(f"{field} qualification URI is invalid")
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except ValueError as error:
+        raise ReleaseFailure("release.manifest.invalid", f"{field} qualification URI is invalid") from error
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path in {"", "/"}
+    ):
+        _release_manifest_invalid(f"{field} qualification URI is invalid")
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        _release_manifest_invalid(f"{field} qualification URI is invalid")
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return value
+    if address.is_private or address.is_loopback or address.is_link_local or address.is_unspecified:
+        _release_manifest_invalid(f"{field} qualification URI is invalid")
+    return value
+
+
 def _qualification(value: object, field: str) -> QualificationStatus:
     if not isinstance(value, dict) or set(value) != {"id", "uri"}:
         _release_manifest_invalid(f"{field} qualification must have id and uri")
     identifier = value["id"]
-    uri = value["uri"]
-    if not isinstance(identifier, str) or not identifier or not isinstance(uri, str):
+    expected_id = {
+        "software": "software-conformance",
+        "hardware": "hardware-qualification",
+    }[field]
+    if identifier != expected_id:
         _release_manifest_invalid(f"{field} qualification values are invalid")
-    return QualificationStatus(identifier, uri)
+    return QualificationStatus(identifier, _safe_public_https_uri(value["uri"], field))
 
 
 def _artifact_record(value: object) -> ArtifactRecord:
@@ -581,6 +661,7 @@ def validate_release_manifest(value: object) -> ReleaseManifest:
         "artifacts",
         "broker_composition",
         "qualification",
+        "conformance_report",
     }:
         _release_manifest_invalid("manifest fields do not match the manifest contract")
     if value["schema"] != RELEASE_MANIFEST_SCHEMA:
@@ -590,7 +671,10 @@ def validate_release_manifest(value: object) -> ReleaseManifest:
     commit = value["commit"]
     if not isinstance(tag, str) or not isinstance(version, str) or not isinstance(commit, str):
         _release_manifest_invalid("release identity is invalid")
-    parsed = ReleaseVersion.parse(tag)
+    try:
+        parsed = ReleaseVersion.parse(tag)
+    except ReleaseFailure as error:
+        raise ReleaseFailure("release.manifest.invalid", "release tag is invalid") from error
     if version != parsed.cargo or RELEASE_COMMIT.fullmatch(commit) is None:
         _release_manifest_invalid("release identity does not match the v0.5 contract")
     if value["wire"] != RELEASE_WIRE or value["msrv"] != BROKER_MSRV:
@@ -601,18 +685,30 @@ def validate_release_manifest(value: object) -> ReleaseManifest:
     if not isinstance(raw_artifacts, list):
         _release_manifest_invalid("artifacts must be a list")
     artifacts = tuple(_artifact_record(item) for item in raw_artifacts)
-    if not artifacts or tuple(item.name for item in artifacts) != tuple(
+    if tuple(item.name for item in artifacts) != tuple(
         sorted(item.name for item in artifacts)
     ):
-        _release_manifest_invalid("artifacts must be non-empty and basename sorted")
-    if len({item.name for item in artifacts}) != len(artifacts):
-        _release_manifest_invalid("artifact names must be unique")
+        _release_manifest_invalid("artifacts must be basename sorted")
+    expected_artifacts = _expected_artifacts(parsed)
+    actual_artifacts = {
+        item.name: (item.kind, item.target)
+        for item in artifacts
+    }
+    if actual_artifacts != expected_artifacts:
+        _release_manifest_invalid("artifacts do not exactly match the release tag")
     composition = value["broker_composition"]
     if composition != EXPECTED_BROKER_COMPOSITION:
         _release_manifest_invalid("broker composition does not match the release contract")
     qualification = value["qualification"]
     if not isinstance(qualification, dict) or set(qualification) != {"software", "hardware"}:
         _release_manifest_invalid("qualification fields are invalid")
+    conformance_report = value["conformance_report"]
+    if conformance_report != {"name": CONFORMANCE_REPORT_NAME, "schema": 1}:
+        _release_manifest_invalid("conformance report reference is invalid")
+    report = ConformanceReport(
+        _qualification(qualification["software"], "software"),
+        _qualification(qualification["hardware"], "hardware"),
+    )
     return ReleaseManifest(
         schema=RELEASE_MANIFEST_SCHEMA,
         tag=tag,
@@ -623,10 +719,7 @@ def validate_release_manifest(value: object) -> ReleaseManifest:
         python_min=RELEASE_PYTHON_MIN,
         artifacts=artifacts,
         broker_composition=EXPECTED_BROKER_COMPOSITION,
-        qualification=ConformanceReport(
-            _qualification(qualification["software"], "software"),
-            _qualification(qualification["hardware"], "hardware"),
-        ),
+        qualification=report,
     )
 
 
@@ -688,6 +781,10 @@ def generate_manifest(inputs: dict[str, object]) -> ReleaseManifest:
                 "software": inputs["software_qualification"],
                 "hardware": inputs["hardware_qualification"],
             },
+            "conformance_report": {
+                "name": CONFORMANCE_REPORT_NAME,
+                "schema": 1,
+            },
         }
     )
 
@@ -725,6 +822,8 @@ def verify_static(artifacts_dir: Path, manifest_path: Path, checksums_path: Path
     try:
         _validate_checksum_file(checksums_path.read_bytes(), manifest)
         actual = tuple(sorted(path.name for path in artifacts_dir.iterdir() if path.is_file()))
+        report_path = manifest_path.parent / CONFORMANCE_REPORT_NAME
+        report = _read_json(report_path, "release.manifest.invalid")
     except OSError as error:
         raise ReleaseFailure("release.manifest.invalid", "unable to read static release inputs") from error
     expected = tuple(artifact.name for artifact in manifest.artifacts)
@@ -738,6 +837,8 @@ def verify_static(artifacts_dir: Path, manifest_path: Path, checksums_path: Path
             raise ReleaseFailure("release.manifest.invalid", "unable to read artifact metadata") from error
         if size != artifact.size or _artifact_sha256(path) != artifact.sha256:
             _release_manifest_invalid("artifact size or SHA-256 does not match the manifest")
+    if report != manifest.qualification.sidecar_dict(manifest.tag, manifest.commit):
+        _release_manifest_invalid("conformance report does not match the manifest")
 
 
 def _safe_archive_path(name: str) -> PurePosixPath:
@@ -764,18 +865,22 @@ def _validate_members(
     root_path = _safe_archive_path(expected_root)
     if len(root_path.parts) != 1:
         _archive_invalid("expected archive root must be one safe component")
+    canonical_expected = _canonical_archive_paths(expected_files, "expected files")
     seen: set[str] = set()
     actual_files: set[str] = set()
+    directories: set[str] = set()
     root_seen = False
     for name, is_directory, is_regular in members:
         path = _safe_archive_path(name.rstrip("/") if name.endswith("/") else name)
         normalized = path.as_posix()
-        if normalized in seen:
+        collision_key = _archive_collision_key(normalized)
+        if collision_key in seen:
             _archive_invalid("archive contains a duplicate member")
-        seen.add(normalized)
+        seen.add(collision_key)
         if path.parts[0] != expected_root:
             _archive_invalid("archive member is outside the expected root")
         if is_directory:
+            directories.add(normalized)
             if len(path.parts) == 1:
                 root_seen = True
             continue
@@ -783,8 +888,39 @@ def _validate_members(
             _archive_invalid("archive contains an invalid member type")
         relative = PurePosixPath(*path.parts[1:]).as_posix()
         actual_files.add(relative)
-    if not root_seen or actual_files != expected_files:
+    allowed_directories = {expected_root}
+    for relative in canonical_expected:
+        parts = PurePosixPath(relative).parts
+        for index in range(1, len(parts)):
+            allowed_directories.add(
+                PurePosixPath(expected_root, *parts[:index]).as_posix()
+            )
+    if (
+        not root_seen
+        or actual_files != canonical_expected
+        or directories != allowed_directories
+    ):
         _archive_invalid("archive content does not exactly match the expected files")
+
+
+def _archive_collision_key(path: str) -> str:
+    return unicodedata.normalize("NFC", path).casefold()
+
+
+def _canonical_archive_paths(paths: set[str], field: str) -> set[str]:
+    canonical: set[str] = set()
+    collisions: set[str] = set()
+    for item in paths:
+        path = _safe_archive_path(item)
+        if len(path.parts) < 1:
+            _archive_invalid(f"{field} contains an invalid path")
+        normalized = path.as_posix()
+        key = _archive_collision_key(normalized)
+        if key in collisions:
+            _archive_invalid(f"{field} contains a case or Unicode collision")
+        collisions.add(key)
+        canonical.add(normalized)
+    return canonical
 
 
 def validate_archive(
@@ -896,8 +1032,13 @@ def _target_by_name(
     raise ReleaseFailure("release.target.invalid", f"unknown target {name}")
 
 
+class _ReleaseArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> NoReturn:
+        raise ReleaseFailure("release.tool.invalid", "invalid command arguments")
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser()
+    parser = _ReleaseArgumentParser(add_help=False)
     subcommands = parser.add_subparsers(dest="command", required=True)
     check = subcommands.add_parser("check-version")
     check.add_argument("--tag", required=True)
@@ -952,7 +1093,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "commit": arguments.commit,
                     "artifacts_dir": arguments.artifacts_dir,
                     "software_qualification": {
-                        "id": "software-qualification",
+                        "id": "software-conformance",
                         "uri": arguments.software_qualification,
                     },
                     "hardware_qualification": {
@@ -969,6 +1110,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 (arguments.output_dir / "SHA256SUMS").write_bytes(
                     generate_checksums(manifest)
                 )
+                (arguments.output_dir / CONFORMANCE_REPORT_NAME).write_bytes(
+                    (
+                        json.dumps(
+                            manifest.qualification.sidecar_dict(
+                                manifest.tag,
+                                manifest.commit,
+                            ),
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                        ).encode("utf-8")
+                        + b"\n"
+                    )
+                )
             except OSError as error:
                 raise ReleaseFailure(
                     "release.manifest.invalid",
@@ -984,6 +1139,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         _fail(error)
     except OSError as error:
         _fail(ReleaseFailure("release.tool.failed", str(error)))
+    except (TypeError, ValueError):
+        _fail(ReleaseFailure("release.tool.invalid", "invalid command arguments"))
     return 0
 
 

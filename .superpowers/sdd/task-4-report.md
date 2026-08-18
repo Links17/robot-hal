@@ -80,3 +80,67 @@ IDE diagnostics reported no errors for changed files.
   `validate_archive(..., expected_root=..., expected_files=...)` interface. This
   task intentionally establishes strict validation without guessing a future
   package file inventory.
+
+---
+
+## P0/P1 Review Follow-up
+
+### Status
+
+DONE
+
+### RED Evidence
+
+After adding tests for the reviewed gaps, the required focused command failed as
+expected:
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_manifest.py tests/release/test_archive_safety.py
+```
+
+Result: `16 failed, 35 passed`. Failures demonstrated that the release model
+accepted a partial artifact set, omitted the crates bundle, lacked a controlled
+conformance report sidecar, allowed unsafe qualification URIs, emitted argparse
+usage for malformed CLI input, and did not reject archive case/Unicode
+collisions or empty directories.
+
+### Changes
+
+- The manifest now derives and requires the exact v0.5 RC artifact set from its
+  tag: three broker archives, one Rust crates bundle, wheel, and sdist.
+- `conformance-report.json` is a controlled manifest sidecar with an explicit
+  schema and identity/qualification linkage. It is required by static
+  verification but excluded from artifact checksum coverage, along with
+  `release-manifest.json` and `SHA256SUMS`, to avoid self-reference.
+- Qualification IDs and HTTPS report URIs are schema-validated. Userinfo,
+  query/fragment, local hosts, and private/loopback/link-local IP endpoints are
+  rejected without echoing values.
+- Archive validation now detects case-fold and NFC collisions, canonicalizes
+  expected paths, and permits only the root plus parent directories implied by
+  expected files.
+- CLI parsing maps argument errors to `release.tool.invalid` without argparse
+  usage text or supplied values.
+
+### GREEN Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_manifest.py tests/release/test_archive_safety.py
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+python3 -m compileall -q scripts/release tests/release
+git diff --check
+```
+
+Result: focused suite `51 passed`; complete release suite `97 passed`;
+compileall and diff check passed. IDE diagnostics reported no errors.
+
+### Commit
+
+Pending.
+
+### Concerns
+
+- The follow-up supplies only the release model and static verification required
+  for later packaging and qualification tasks. It does not perform artifact
+  packaging or cross-platform qualification execution.

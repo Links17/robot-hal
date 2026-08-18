@@ -35,6 +35,7 @@ def _write_artifacts(directory: Path) -> tuple[Path, ...]:
         _broker_name("x86_64-pc-windows-msvc"),
         _broker_name("aarch64-apple-darwin"),
         _broker_name("x86_64-unknown-linux-gnu"),
+        "seeed-hal-crates-v0.5.0-rc.1.tar.gz",
         "seeed_hal-0.5.0rc1-py3-none-any.whl",
         "seeed_hal-0.5.0rc1.tar.gz",
     )
@@ -154,6 +155,10 @@ def test_verify_static_rejects_mismatched_files_and_self_reference(tmp_path: Pat
     checksums_path = tmp_path / "SHA256SUMS"
     manifest_path.write_bytes(encode_manifest(manifest))
     checksums_path.write_bytes(generate_checksums(manifest))
+    (tmp_path / "conformance-report.json").write_text(
+        json.dumps(manifest.qualification.sidecar_dict(manifest.tag, manifest.commit)),
+        encoding="utf-8",
+    )
 
     verify_static(inputs["artifacts_dir"], manifest_path, checksums_path)
 
@@ -213,3 +218,90 @@ def test_cli_generates_manifest_and_checksums_without_self_reference(tmp_path: P
     assert (output / "SHA256SUMS").read_bytes() == generate_checksums(
         validate_release_manifest(manifest)
     )
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        _broker_name("x86_64-pc-windows-msvc"),
+        _broker_name("aarch64-apple-darwin"),
+        _broker_name("x86_64-unknown-linux-gnu"),
+        "seeed-hal-crates-v0.5.0-rc.1.tar.gz",
+        "seeed_hal-0.5.0rc1-py3-none-any.whl",
+        "seeed_hal-0.5.0rc1.tar.gz",
+    ],
+)
+def test_manifest_requires_complete_exact_rc_artifact_set(
+    tmp_path: Path,
+    missing: str,
+) -> None:
+    inputs = _inputs(tmp_path)
+    (inputs["artifacts_dir"] / missing).unlink()
+
+    with pytest.raises(ReleaseFailure, match="release.manifest.invalid"):
+        generate_manifest(inputs)
+
+
+def test_manifest_rejects_artifact_version_that_does_not_match_tag(tmp_path: Path) -> None:
+    inputs = _inputs(tmp_path)
+    artifact = inputs["artifacts_dir"] / "seeed_hal-0.5.0rc1.tar.gz"
+    artifact.rename(inputs["artifacts_dir"] / "seeed_hal-0.5.0rc2.tar.gz")
+
+    with pytest.raises(ReleaseFailure, match="release.manifest.invalid"):
+        generate_manifest(inputs)
+
+
+def test_static_verifier_requires_controlled_conformance_report(tmp_path: Path) -> None:
+    inputs = _inputs(tmp_path)
+    manifest = generate_manifest(inputs)
+    release_dir = tmp_path / "release"
+    release_dir.mkdir()
+    manifest_path = release_dir / "release-manifest.json"
+    checksums_path = release_dir / "SHA256SUMS"
+    manifest_path.write_bytes(encode_manifest(manifest))
+    checksums_path.write_bytes(generate_checksums(manifest))
+
+    with pytest.raises(ReleaseFailure, match="release.manifest.invalid"):
+        verify_static(inputs["artifacts_dir"], manifest_path, checksums_path)
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "https://user:credential@example.invalid/report",
+        "https://example.invalid/report?token=secret",
+        "https://example.invalid/report#secret",
+        "http://127.0.0.1/report",
+        "https://[::1]/report",
+        "https://localhost/report",
+        "file:///private/report",
+    ],
+)
+def test_manifest_rejects_unsafe_qualification_uri(tmp_path: Path, uri: str) -> None:
+    inputs = _inputs(tmp_path)
+    inputs["software_qualification"] = {
+        "id": "software-conformance",
+        "uri": uri,
+    }
+
+    with pytest.raises(ReleaseFailure) as failure:
+        generate_manifest(inputs)
+
+    assert failure.value.name == "release.manifest.invalid"
+    assert "credential" not in failure.value.diagnostic
+    assert "secret" not in failure.value.diagnostic
+
+
+def test_cli_parse_errors_are_structured_and_do_not_echo_values() -> None:
+    result = subprocess.run(
+        [sys.executable, str(RELEASE_TOOL), "generate-manifest", "--commit", "secret-value"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 1
+    assert result.stderr.startswith("release.tool.invalid:")
+    assert "usage:" not in result.stderr
+    assert "secret-value" not in result.stderr
