@@ -130,3 +130,25 @@ git diff --check
 
 Hosted Actions execution, remote tag observations, final attestation, and
 prerelease publication remain intentionally unperformed locally.
+
+## Final review remediation
+
+The final-review workflow contract was added before the fix and failed because
+`gh release create` did not use `--verify-tag`. The release command now passes
+`--verify-tag`, preventing the GitHub CLI from creating the requested tag at a
+default-branch commit if that tag disappears after the remote identity checks.
+The existing before/after remote tag checks remain intact.
+
+```text
+tests/release/test_workflow_contract.py
+# 19 passed
+
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+# 203 passed
+
+python3 scripts/release/release_tool.py check-version \
+  --tag v0.5.0-rc.1 --repo-root .
+python3 -m compileall -q scripts/release/release_tool.py tests/release
+git diff --check
+# passed
+```

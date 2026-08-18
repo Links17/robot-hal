@@ -400,5 +400,5 @@ jobs:
             "release/release-manifest.json" \
             "release/SHA256SUMS" \
             "release/conformance-report.json" \
-            --prerelease --latest=false --title "$TAG"
+            --prerelease --latest=false --verify-tag --title "$TAG"
           require_remote_peeled_tag

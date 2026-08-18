@@ -411,6 +411,7 @@ def test_rc_release_gates_attestation_and_prerelease_after_aggregate() -> None:
     assert "SHA256SUMS" in final_commands
     assert "conformance-report.json" in final_commands
     assert "--prerelease --latest=false" in final_commands
+    assert "--verify-tag" in final_commands
 
 
 def test_rc_release_attests_and_publishes_only_exact_final_assets() -> None:
