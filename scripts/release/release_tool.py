@@ -232,6 +232,7 @@ class ReleaseManifest:
     artifacts: tuple[ArtifactRecord, ...]
     broker_composition: dict[str, dict[str, object]]
     qualification: ConformanceReport
+    conformance_report: dict[str, object]
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -245,10 +246,7 @@ class ReleaseManifest:
             "artifacts": [artifact.to_dict() for artifact in self.artifacts],
             "broker_composition": self.broker_composition,
             "qualification": self.qualification.to_dict(),
-            "conformance_report": {
-                "name": CONFORMANCE_REPORT_NAME,
-                "schema": 1,
-            },
+            "conformance_report": self.conformance_report,
         }
 
 
@@ -850,6 +848,29 @@ def initial_conformance_report(manifest: ReleaseManifest) -> dict[str, object]:
     }
 
 
+def encode_conformance_report(report: object) -> bytes:
+    validated = validate_conformance_report(report)
+    return (
+        json.dumps(
+            validated,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
+def conformance_report_binding(report: object) -> dict[str, object]:
+    encoded = encode_conformance_report(report)
+    return {
+        "schema": 1,
+        "name": CONFORMANCE_REPORT_NAME,
+        "byte_size": len(encoded),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
 def write_conformance_report(inputs: Path, output: Path) -> None:
     """Copy one frozen report input through controlled validation."""
     try:
@@ -870,15 +891,7 @@ def write_conformance_report(inputs: Path, output: Path) -> None:
         if _file_identity(report_path) != before:
             _conformance_report_invalid("conformance report input changed")
         with output.open("xb") as destination:
-            destination.write(
-                json.dumps(
-                    report,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                ).encode("utf-8")
-                + b"\n"
-            )
+            destination.write(encode_conformance_report(report))
     except OSError as error:
         raise ReleaseFailure(
             "release.manifest.invalid",
@@ -1046,6 +1059,7 @@ def aggregate_release(
                 "artifacts_dir": release_dir,
                 "software_qualification": report["qualification"]["software"],
                 "hardware_qualification": report["qualification"]["hardware"],
+                "conformance_report": report,
             }
         )
         (release_dir / "release-manifest.json").write_bytes(encode_manifest(manifest))
@@ -1346,7 +1360,16 @@ def validate_release_manifest(value: object) -> ReleaseManifest:
     if not isinstance(qualification, dict) or set(qualification) != {"software", "hardware"}:
         _release_manifest_invalid("qualification fields are invalid")
     conformance_report = value["conformance_report"]
-    if conformance_report != {"name": CONFORMANCE_REPORT_NAME, "schema": 1}:
+    if (
+        not isinstance(conformance_report, dict)
+        or set(conformance_report) != {"schema", "name", "byte_size", "sha256"}
+        or conformance_report["schema"] != 1
+        or conformance_report["name"] != CONFORMANCE_REPORT_NAME
+        or type(conformance_report["byte_size"]) is not int
+        or conformance_report["byte_size"] < 1
+        or not isinstance(conformance_report["sha256"], str)
+        or SHA256.fullmatch(conformance_report["sha256"]) is None
+    ):
         _release_manifest_invalid("conformance report reference is invalid")
     report = ConformanceReport(
         _qualification(qualification["software"], "software"),
@@ -1363,18 +1386,19 @@ def validate_release_manifest(value: object) -> ReleaseManifest:
         artifacts=artifacts,
         broker_composition=EXPECTED_BROKER_COMPOSITION,
         qualification=report,
+        conformance_report=dict(conformance_report),
     )
 
 
 def generate_manifest(inputs: dict[str, object]) -> ReleaseManifest:
-    expected = {
+    required = {
         "tag",
         "commit",
         "artifacts_dir",
         "software_qualification",
         "hardware_qualification",
     }
-    if set(inputs) != expected:
+    if not required.issubset(inputs) or set(inputs) - (required | {"conformance_report"}):
         _release_manifest_invalid("generation inputs do not match the manifest contract")
     tag = inputs["tag"]
     commit = inputs["commit"]
@@ -1411,6 +1435,19 @@ def generate_manifest(inputs: dict[str, object]) -> ReleaseManifest:
                 "sha256": _artifact_sha256(path),
             }
         )
+    qualification = {
+        "software": inputs["software_qualification"],
+        "hardware": inputs["hardware_qualification"],
+    }
+    default_report = {
+        "schema": 1,
+        "tag": tag,
+        "commit": commit,
+        "qualification": qualification,
+        "software": {"status": "Pending", "jobs": [], "virtual": []},
+        "hardware": {"release-hardware": {"status": "Pending", "evidence": None}},
+    }
+    report = inputs.get("conformance_report", default_report)
     return validate_release_manifest(
         {
             "schema": RELEASE_MANIFEST_SCHEMA,
@@ -1422,14 +1459,8 @@ def generate_manifest(inputs: dict[str, object]) -> ReleaseManifest:
             "python_min": RELEASE_PYTHON_MIN,
             "artifacts": artifacts,
             "broker_composition": EXPECTED_BROKER_COMPOSITION,
-            "qualification": {
-                "software": inputs["software_qualification"],
-                "hardware": inputs["hardware_qualification"],
-            },
-            "conformance_report": {
-                "name": CONFORMANCE_REPORT_NAME,
-                "schema": 1,
-            },
+            "qualification": qualification,
+            "conformance_report": conformance_report_binding(report),
         }
     )
 
@@ -1503,6 +1534,24 @@ def verify_static(
             raise ReleaseFailure("release.manifest.invalid", "unable to read artifact metadata") from error
         if size != artifact.size or _artifact_sha256(path) != artifact.sha256:
             _release_manifest_invalid("artifact size or SHA-256 does not match the manifest")
+    try:
+        report_bytes = report_path.read_bytes()
+        expected_report = encode_conformance_report(_read_json(
+            report_path,
+            "release.manifest.invalid",
+        ))
+    except OSError as error:
+        raise ReleaseFailure(
+            "release.manifest.invalid",
+            "unable to read conformance report",
+        ) from error
+    binding = manifest.conformance_report
+    if (
+        report_bytes != expected_report
+        or len(report_bytes) != binding["byte_size"]
+        or hashlib.sha256(report_bytes).hexdigest() != binding["sha256"]
+    ):
+        _release_manifest_invalid("conformance report binding does not match")
     try:
         validated_report = validate_conformance_report(report)
     except ReleaseFailure as error:
@@ -2780,15 +2829,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     generate_checksums(manifest)
                 )
                 (arguments.output_dir / CONFORMANCE_REPORT_NAME).write_bytes(
-                    (
-                        json.dumps(
-                            initial_conformance_report(manifest),
-                            sort_keys=True,
-                            separators=(",", ":"),
-                            ensure_ascii=False,
-                        ).encode("utf-8")
-                        + b"\n"
-                    )
+                    encode_conformance_report(initial_conformance_report(manifest))
                 )
             except OSError as error:
                 raise ReleaseFailure(

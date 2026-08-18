@@ -17,8 +17,10 @@ from scripts.release.release_tool import (
     ArtifactRecord,
     ReleaseFailure,
     encode_manifest,
+    encode_conformance_report,
     generate_checksums,
     generate_manifest,
+    initial_conformance_report,
     validate_release_manifest,
     verify_static,
 )
@@ -186,20 +188,8 @@ def _write_release_directory(release_dir: Path, inputs: dict[str, object]) -> No
         (release_dir / artifact.name).write_bytes(source.read_bytes())
     (release_dir / "release-manifest.json").write_bytes(encode_manifest(manifest))
     (release_dir / "SHA256SUMS").write_bytes(generate_checksums(manifest))
-    (release_dir / "conformance-report.json").write_text(
-        json.dumps(
-            {
-                "schema": 1,
-                "tag": manifest.tag,
-                "commit": manifest.commit,
-                "qualification": manifest.qualification.to_dict(),
-                "software": {"status": "Pending", "jobs": [], "virtual": []},
-                "hardware": {
-                    "camera-avfoundation": {"status": "Pending", "evidence": None}
-                },
-            }
-        ),
-        encoding="utf-8",
+    (release_dir / "conformance-report.json").write_bytes(
+        encode_conformance_report(initial_conformance_report(manifest))
     )
 
 
@@ -298,6 +288,14 @@ def test_cli_generates_manifest_and_checksums_without_self_reference(tmp_path: P
     assert result.returncode == 0, result.stderr
     manifest = json.loads((output / "release-manifest.json").read_text())
     assert "release-manifest.json" not in {item["name"] for item in manifest["artifacts"]}
+    assert manifest["conformance_report"] == {
+        "schema": 1,
+        "name": "conformance-report.json",
+        "byte_size": len((output / "conformance-report.json").read_bytes()),
+        "sha256": hashlib.sha256(
+            (output / "conformance-report.json").read_bytes()
+        ).hexdigest(),
+    }
     assert (output / "SHA256SUMS").read_bytes() == generate_checksums(
         validate_release_manifest(manifest)
     )
@@ -338,6 +336,7 @@ def test_generate_manifest_writes_current_pending_conformance_report(
     verify_static(output)
     report = json.loads((output / "conformance-report.json").read_text())
     assert report["software"] == {"status": "Pending", "jobs": [], "virtual": []}
+    assert (output / "SHA256SUMS").read_bytes().count(b"\n") == 6
 
 
 @pytest.mark.parametrize(

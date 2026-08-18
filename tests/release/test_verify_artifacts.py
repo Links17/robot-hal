@@ -359,4 +359,54 @@ def test_verify_artifacts_does_not_run_virtual_conformance_from_release_archive(
         should_not_run,
     )
 
-    verify_artifacts(release, TAG, TARGETS, REPO_ROOT)
+    with pytest.raises(ReleaseFailure, match="release.artifact.unexpected"):
+        verify_artifacts(release, TAG, TARGETS, REPO_ROOT)
+
+
+def test_static_verifier_rejects_replaced_passed_conformance_report(
+    tmp_path: Path,
+) -> None:
+    release = _complete_release(tmp_path)
+    report_path = release / "conformance-report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    software = report["software"]
+    software["status"] = "Passed"
+    software["jobs"] = [
+        {
+            "platform": platform,
+            "result": "Passed",
+            "command": "verify-artifacts --tag v0.5.0-rc.1",
+            "ref": f"https://example.invalid/jobs/{platform}",
+        }
+        for platform in ("macos", "linux", "windows")
+    ]
+    software["virtual"] = [
+        {
+            "platform": platform,
+            "protocol_minor": minor,
+            "result": "Passed",
+            "command": "run-broker-conformance",
+            "ref": f"https://example.invalid/jobs/{platform}/minor-{minor}",
+        }
+        for platform in ("macos", "linux", "windows")
+        for minor in range(4)
+    ]
+    report_path.write_text(
+        json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ReleaseFailure, match="release.manifest.invalid"):
+        verify_static(release)
+
+
+def test_static_verifier_rejects_noncanonical_bound_report(tmp_path: Path) -> None:
+    release = _complete_release(tmp_path)
+    report_path = release / "conformance-report.json"
+    report_path.write_text(
+        json.dumps(json.loads(report_path.read_text(encoding="utf-8")), indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ReleaseFailure, match="release.manifest.invalid"):
+        verify_static(release)

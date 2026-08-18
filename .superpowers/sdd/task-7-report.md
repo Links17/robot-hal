@@ -144,3 +144,36 @@ Review GREEN:
 ```text
 focused report and manifest tests: 45 passed
 ```
+
+## Final review follow-up — 1a30962..0906e1d
+
+Addressed the final Important report-substitution finding without adding Task
+8 workflow or Task 9 release behavior:
+
+- `release-manifest.json` now binds the canonical
+  `conformance-report.json` independently of `SHA256SUMS` through an exact
+  schema/name/byte-size/SHA-256 record. The checksum list remains restricted
+  to the six primary artifacts, so the report binding introduces no
+  self-reference.
+- `verify-static` requires canonical report bytes, the bound size and digest,
+  then validates report schema semantics and release identity. Replacing a
+  Pending report with a fully formed three-platform `Passed` report, or merely
+  reformatting the same report, now fails as `release.manifest.invalid`.
+- Aggregation passes its validated report into manifest generation so the
+  binding covers its actual sidecar. The standalone generate-manifest path
+  binds the factual initial Pending report it writes.
+
+Review RED:
+
+```text
+tests/release/test_verify_artifacts.py tests/release/test_manifest.py
+# 2 failures: replacement passed verify-static; manifest lacked report size/hash
+```
+
+Review GREEN:
+
+```text
+focused report/artifact/manifest tests: 57 passed
+tests/release: 175 passed
+compileall and git diff --check: passed
+```
