@@ -130,7 +130,7 @@ def test_linux_platform_jobs_install_shared_prerequisites_before_linux_gpio_buil
     platform_build_index = next(
         index
         for index, step in enumerate(platform_steps)
-        if "cargo +1.85 build" in step.get("run", "")
+        if '"cargo",' in step.get("run", "")
     )
     assert platform_prepare_index < platform_build_index
 
@@ -173,13 +173,82 @@ def test_platform_job_separates_production_manifest_and_virtual_conformance() ->
         step["run"] for step in platform_job["steps"] if "run" in step
     )
 
-    assert "cargo +1.85 build -p seeed-hal-broker-app --no-default-features --features" in commands
+    assert '"cargo",' in commands
+    assert '"seeed-hal-broker-app",' in commands
+    assert '"--no-default-features",' in commands
+    assert '"--features",' in commands
     assert "verify-broker-manifest" in commands
-    assert "cargo +1.85 build -p seeed-hal-broker-app --no-default-features --features virtual-adapters" in commands
+    assert '"virtual-adapters",' in commands
     assert "run-virtual-conformance" in commands
     assert "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02" in json.dumps(
         platform_job
     )
+
+
+def test_source_gate_contains_no_native_or_platform_adapter_prerequisites() -> None:
+    workflow = load_workflow("ci.yml")
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+    source_gate = jobs["source-gate"]
+    commands = "\n".join(
+        step["run"] for step in source_gate["steps"] if "run" in step
+    )
+
+    for forbidden in (
+        "install-linux-native-prerequisites.sh",
+        "matrix.features",
+        "linux-gpio",
+        "windows-gpio",
+        "avfoundation",
+        "v4l2",
+        "mediafoundation",
+    ):
+        assert forbidden not in commands
+    assert "check-generated-protocol.sh" in commands
+    assert "pytest -q tests/release" in commands
+
+
+def test_platform_matrix_executes_manifest_and_virtual_minors_on_every_target() -> None:
+    workflow = load_workflow("ci.yml")
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+    platform_job = jobs["platform-conformance"]
+    steps = platform_job["steps"]
+    commands = "\n".join(step["run"] for step in steps if "run" in step)
+
+    assert platform_job["needs"] == "source-gate"
+    assert (
+        platform_job["strategy"]["matrix"]["include"]
+        == "${{ fromJSON(needs.source-gate.outputs.targets).include }}"
+    )
+    assert "verify-broker-manifest" in commands
+    assert "run-virtual-conformance" in commands
+    assert "BROKER_WIRE" not in commands
+    assert "minimum_minor" not in commands
+    assert "maximum_minor" not in commands
+    assert "scripts/release/release_tool.py" in commands
+    assert "ci-evidence/production/broker-manifest.json" in commands
+    assert "ci-evidence/virtual-conformance.json" in commands
+
+
+def test_platform_jobs_use_python_release_tooling_without_git_bash_dependency() -> None:
+    workflow = load_workflow("ci.yml")
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+    platform_job = jobs["platform-conformance"]
+
+    platform_steps = [
+        step
+        for step in platform_job["steps"]
+        if step.get("name") in {"Build production broker", "Build and qualify virtual broker"}
+    ]
+    assert len(platform_steps) == 2
+    assert all(step.get("shell") == "python" for step in platform_steps)
+    commands = "\n".join(step["run"] for step in platform_steps)
+    for forbidden in ("shasum", "chmod", "archive", "[[", "RUNNER_OS", "python3"):
+        assert forbidden not in commands
+    assert "sys.executable" in commands
+    assert "subprocess.run" in commands
 
 
 def _release_workflow() -> tuple[dict[str, object], dict[str, object], str]:

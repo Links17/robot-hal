@@ -60,39 +60,102 @@ jobs:
           python-version: "3.11"
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - name: Install Rust 1.85
-        shell: bash
         run: rustup toolchain install 1.85 --profile minimal --component rustfmt --component clippy
       - name: Install Linux build prerequisites
         if: ${{ runner.os == 'Linux' }}
         shell: bash
         run: ./scripts/ci/install-linux-native-prerequisites.sh
       - name: Build production broker
-        shell: bash
+        shell: python
         run: |
-          cargo +1.85 build -p seeed-hal-broker-app --no-default-features --features "${{ matrix.features }}"
-          mkdir -p ci-evidence/production
-          broker="target/debug/seeed-hal-broker"
-          if [[ "$RUNNER_OS" == "Windows" ]]; then broker="${broker}.exe"; fi
-          "$broker" --manifest > ci-evidence/production/broker-manifest.json
-          python3 scripts/release/release_tool.py verify-broker-manifest \
-            --tag v0.5.0-rc.1 \
-            --manifest ci-evidence/production/broker-manifest.json \
-            --target "${{ matrix.name }}" \
-            --targets release/targets.toml \
-            --artifact "$broker"
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          broker = Path("target/debug/seeed-hal-broker")
+          if sys.platform == "win32":
+              broker = broker.with_suffix(".exe")
+          manifest = Path("ci-evidence/production/broker-manifest.json")
+          manifest.parent.mkdir(parents=True, exist_ok=True)
+          subprocess.run(
+              [
+                  "cargo",
+                  "+1.85",
+                  "build",
+                  "-p",
+                  "seeed-hal-broker-app",
+                  "--no-default-features",
+                  "--features",
+                  "${{ matrix.features }}",
+              ],
+              check=True,
+          )
+          with manifest.open("wb") as output:
+              subprocess.run([str(broker), "--manifest"], check=True, stdout=output)
+          subprocess.run(
+              [
+                  sys.executable,
+                  "scripts/release/release_tool.py",
+                  "verify-broker-manifest",
+                  "--tag",
+                  "v0.5.0-rc.1",
+                  "--manifest",
+                  str(manifest),
+                  "--target",
+                  "${{ matrix.name }}",
+                  "--targets",
+                  "release/targets.toml",
+                  "--artifact",
+                  str(broker),
+              ],
+              check=True,
+          )
       - name: Build and qualify virtual broker
-        shell: bash
+        shell: python
         run: |
-          cargo +1.85 build -p seeed-hal-broker-app --no-default-features --features virtual-adapters
-          broker="target/debug/seeed-hal-broker"
-          if [[ "$RUNNER_OS" == "Windows" ]]; then broker="${broker}.exe"; fi
-          python3 scripts/release/release_tool.py run-virtual-conformance \
-            --platform "${{ matrix.name }}" \
-            --broker "$broker" \
-            --repo-root "$GITHUB_WORKSPACE" \
-            --command-identity "ci platform virtual conformance" \
-            --ref "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            > ci-evidence/virtual-conformance.json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          broker = Path("target/debug/seeed-hal-broker")
+          if sys.platform == "win32":
+              broker = broker.with_suffix(".exe")
+          report = Path("ci-evidence/virtual-conformance.json")
+          report.parent.mkdir(parents=True, exist_ok=True)
+          subprocess.run(
+              [
+                  "cargo",
+                  "+1.85",
+                  "build",
+                  "-p",
+                  "seeed-hal-broker-app",
+                  "--no-default-features",
+                  "--features",
+                  "virtual-adapters",
+              ],
+              check=True,
+          )
+          with report.open("wb") as output:
+              subprocess.run(
+                  [
+                      sys.executable,
+                      "scripts/release/release_tool.py",
+                      "run-virtual-conformance",
+                      "--platform",
+                      "${{ matrix.name }}",
+                      "--broker",
+                      str(broker),
+                      "--repo-root",
+                      os.environ["GITHUB_WORKSPACE"],
+                      "--command-identity",
+                      "ci platform virtual conformance",
+                      "--ref",
+                      "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                  ],
+                  check=True,
+                  stdout=output,
+              )
       - name: Upload conformance evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

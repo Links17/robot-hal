@@ -262,3 +262,61 @@ GREEN:
 ### Follow-up commit
 
 Conventional Commit: `fix(protocol): qualify both virtual CAN modes`.
+
+---
+
+# Task 3 addendum: split three-platform CI conformance
+
+## Outcome
+
+`source-gate` retains only platform-independent generated-protocol, Rust,
+Python, protocol-minor, and release checks. It does not install Linux native
+prerequisites or compile platform adapter feature sets.
+
+`platform-conformance` derives its macOS, Linux, and Windows matrix from
+`release/targets.toml`. Every matrix entry builds and verifies its production
+broker manifest, then separately builds a virtual-adapters broker and records
+virtual protocol conformance for minors 0–3. The production and virtual
+commands run under Python so Windows does not depend on Git Bash `shasum`,
+`chmod`, or archive tooling.
+
+## RED
+
+```sh
+uv run --project bindings/python --python 3.11 --frozen pytest -q \
+  tests/release/test_workflow_contract.py
+```
+
+Result: **1 failed, 21 passed**. The failing contract proved that the two
+platform build steps used Bash rather than Windows-compatible Python release
+tooling.
+
+## GREEN and local verification
+
+```sh
+uv run --project bindings/python --python 3.11 --frozen pytest -q \
+  tests/release/test_workflow_contract.py
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+cargo +1.85 fmt --all --check
+cargo +1.85 clippy --workspace --all-targets --no-default-features -- -D warnings
+cargo +1.85 test --workspace --no-default-features
+./scripts/check-generated-protocol.sh
+```
+
+- Workflow contract tests: **22 passed**.
+- Release tests: **212 passed**.
+- Rust formatting and no-default-features clippy: passed.
+- The final complete no-default-features Rust test run passed. An earlier run
+  transiently failed `gpio_cancelled_queued_read_does_not_start_native_io`
+  with `runtime.session.close_timeout`; its isolated rerun and final full run
+  passed. Task 3 does not modify GPIO runtime code.
+- Generated protocol check: passed.
+
+## Hosted evidence prerequisite
+
+No workflow was pushed, dispatched, or remotely triggered for Task 3. Hosted
+macOS, Linux, and Windows evidence remains pending. After implementation review
+and push, the controller must obtain one real GitHub Actions run showing all
+three platform matrix entries green, each with production manifest verification
+and virtual protocol-minor coverage 0–3. Only then may the qualification record
+include a run URL, commit, and Passed hosted evidence.
