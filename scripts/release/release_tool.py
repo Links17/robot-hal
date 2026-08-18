@@ -2711,9 +2711,10 @@ def _wheel_metadata(wheel: Path, version: ReleaseVersion) -> None:
             wheel_headers = BytesParser(policy=compat32).parsebytes(wheel_data)
     except (OSError, UnicodeError, zipfile.BadZipFile) as error:
         raise ReleaseFailure("release.package.invalid", "Python wheel metadata is invalid") from error
+    if any("\\" in name for name in names):
+        _package_invalid("Python wheel member path is invalid")
     if any(
-        name == "google/protobuf" or name.startswith("google/protobuf/")
-        for name in names
+        name == "google/protobuf" or name.startswith("google/protobuf/") for name in names
     ):
         _package_invalid("Python wheel must not provide protobuf")
     if (
@@ -2796,6 +2797,7 @@ def _locked_protobuf_wheel(project: Path) -> tuple[str, str]:
             if (
                 isinstance(url, str)
                 and url.endswith("protobuf-6.32.1-py3-none-any.whl")
+                and _is_credential_free_https_url(url)
                 and isinstance(digest, str)
                 and SHA256.fullmatch(digest.removeprefix("sha256:")) is not None
             ):
@@ -2804,24 +2806,88 @@ def _locked_protobuf_wheel(project: Path) -> tuple[str, str]:
     _package_invalid("locked protobuf wheel is unavailable")
 
 
+def _is_credential_free_https_url(url: str) -> bool:
+    parsed = urllib.parse.urlsplit(url)
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname is not None
+        and parsed.username is None
+        and parsed.password is None
+    )
+
+
+class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, message, headers, newurl):
+        if not _is_credential_free_https_url(newurl):
+            _package_invalid("locked protobuf wheel redirect is invalid")
+        return super().redirect_request(request, fp, code, message, headers, newurl)
+
+
+def _locked_protobuf_file_identity(path: Path) -> tuple[int, int, int, int]:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise ReleaseFailure(
+            "release.package.invalid",
+            "locked protobuf wheel is invalid",
+        ) from error
+    if not stat.S_ISREG(metadata.st_mode):
+        _package_invalid("locked protobuf wheel is invalid")
+    return (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
+
+
+def _locked_protobuf_hash(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as error:
+        raise ReleaseFailure(
+            "release.package.invalid",
+            "locked protobuf wheel is invalid",
+        ) from error
+
+
+def _require_locked_protobuf_wheel(
+    path: Path,
+    expected_hash: str,
+    expected_identity: tuple[int, int, int, int],
+) -> None:
+    if (
+        _locked_protobuf_file_identity(path) != expected_identity
+        or _locked_protobuf_hash(path) != expected_hash
+    ):
+        _package_invalid("locked protobuf wheel changed before installation")
+
+
 def _prepare_locked_protobuf_wheel(project: Path, staging_dir: Path) -> tuple[Path, str]:
     url, expected_hash = _locked_protobuf_wheel(project)
-    wheel = staging_dir / "protobuf-6.32.1-py3-none-any.whl"
-    staging_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    candidate_dir = staging_dir / "candidate"
+    immutable_dir = staging_dir / "immutable"
+    candidate_wheel = candidate_dir / "protobuf-6.32.1-py3-none-any.whl"
+    wheel = immutable_dir / candidate_wheel.name
+    candidate_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+    immutable_dir.mkdir(mode=0o700, exist_ok=False)
     try:
-        with urllib.request.urlopen(url, timeout=120) as response:
-            with wheel.open("xb") as destination:
+        opener = urllib.request.build_opener(_HttpsOnlyRedirectHandler())
+        with opener.open(url, timeout=120) as response:
+            if not _is_credential_free_https_url(response.geturl()):
+                _package_invalid("locked protobuf wheel redirect is invalid")
+            with candidate_wheel.open("xb") as destination:
                 while chunk := response.read(64 * 1024):
                     destination.write(chunk)
-        actual_hash = hashlib.sha256(wheel.read_bytes()).hexdigest()
+        actual_hash = _locked_protobuf_hash(candidate_wheel)
+        if actual_hash != expected_hash:
+            _package_invalid("locked protobuf wheel hash is invalid")
+        with candidate_wheel.open("rb") as source, wheel.open("xb") as destination:
+            while chunk := source.read(64 * 1024):
+                destination.write(chunk)
+        wheel.chmod(0o400)
+        actual_hash = _locked_protobuf_hash(wheel)
     except (OSError, urllib.error.URLError) as error:
         raise ReleaseFailure(
             "release.package.invalid",
             "unable to prepare locked protobuf wheel",
         ) from error
     if actual_hash != expected_hash:
-        with contextlib.suppress(OSError):
-            wheel.unlink()
         _package_invalid("locked protobuf wheel hash is invalid")
     return (wheel, expected_hash)
 
@@ -2835,6 +2901,8 @@ def _verify_wheel_install(
 ) -> None:
     virtualenv = staging_dir / "venv"
     python = virtualenv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    protobuf_identity = _locked_protobuf_file_identity(protobuf_wheel)
+    _require_locked_protobuf_wheel(protobuf_wheel, protobuf_hash, protobuf_identity)
     environment = {
         key: value
         for key, value in os.environ.items()
@@ -2893,6 +2961,10 @@ def _verify_wheel_install(
                 ),
             ],
         ):
+            if command[:3] == ["uv", "pip", "install"]:
+                _require_locked_protobuf_wheel(
+                    protobuf_wheel, protobuf_hash, protobuf_identity
+                )
             result = subprocess.run(
                 command,
                 check=False,

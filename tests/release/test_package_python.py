@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import sys
 import stat
 import subprocess
@@ -321,6 +322,21 @@ def test_wheel_metadata_rejects_candidate_protobuf_shadowing(tmp_path: Path) -> 
     assert failure.value.name == "release.package.invalid"
 
 
+def test_wheel_metadata_rejects_backslash_protobuf_shadowing(tmp_path: Path) -> None:
+    with pytest.raises(ReleaseFailure) as failure:
+        _wheel_metadata(
+            _wheel(
+                tmp_path,
+                extra_members={
+                    r"google\protobuf\__init__.py": b"__version__ = '6.32.1'"
+                },
+            ),
+            ReleaseVersion.parse("v0.5.0-rc.1"),
+        )
+
+    assert failure.value.name == "release.package.invalid"
+
+
 def test_locked_protobuf_requires_direct_pure_python_wheel(tmp_path: Path) -> None:
     lock = tmp_path / "uv.lock"
     lock.write_text(
@@ -331,6 +347,36 @@ name = "protobuf"
 version = "6.32.1"
 wheels = [
     { url = "https://example.invalid/protobuf-cp39-abi3.whl", hash = "sha256:abc" },
+]
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ReleaseFailure) as failure:
+        _locked_protobuf_wheel(tmp_path)
+
+    assert failure.value.name == "release.package.invalid"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://example.invalid/protobuf-6.32.1-py3-none-any.whl",
+        "https://user:password@example.invalid/protobuf-6.32.1-py3-none-any.whl",
+    ],
+)
+def test_locked_protobuf_rejects_insecure_or_credentialed_url(
+    tmp_path: Path,
+    url: str,
+) -> None:
+    (tmp_path / "uv.lock").write_text(
+        f"""
+version = 1
+[[package]]
+name = "protobuf"
+version = "6.32.1"
+wheels = [
+    {{ url = "{url}", hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000" }},
 ]
 """.strip(),
         encoding="utf-8",
@@ -359,10 +405,24 @@ wheels = [
 """.strip(),
         encoding="utf-8",
     )
+    class Response(io.BytesIO):
+        def geturl(self) -> str:
+            return "https://example.invalid/protobuf-6.32.1-py3-none-any.whl"
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self.close()
+
+    class Opener:
+        def open(self, url: str, timeout: int) -> Response:
+            return Response(b"tampered wheel")
+
     monkeypatch.setattr(
         release_tool.urllib.request,
-        "urlopen",
-        lambda request, timeout: io.BytesIO(b"tampered wheel"),
+        "build_opener",
+        lambda *handlers: Opener(),
     )
 
     with pytest.raises(ReleaseFailure) as failure:
@@ -372,12 +432,90 @@ wheels = [
     assert not (tmp_path / "staging" / "protobuf-6.32.1-py3-none-any.whl").exists()
 
 
+def test_locked_protobuf_rejects_redirect_to_non_https_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wheel_bytes = b"locked protobuf wheel"
+    digest = hashlib.sha256(wheel_bytes).hexdigest()
+    (tmp_path / "uv.lock").write_text(
+        f"""
+version = 1
+[[package]]
+name = "protobuf"
+version = "6.32.1"
+wheels = [
+    {{ url = "https://example.invalid/protobuf-6.32.1-py3-none-any.whl", hash = "sha256:{digest}" }},
+]
+""".strip(),
+        encoding="utf-8",
+    )
+
+    class RedirectedResponse(io.BytesIO):
+        def geturl(self) -> str:
+            return "http://example.invalid/protobuf-6.32.1-py3-none-any.whl"
+
+        def __enter__(self) -> RedirectedResponse:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self.close()
+
+    class Opener:
+        def open(self, url: str, timeout: int) -> RedirectedResponse:
+            return RedirectedResponse(wheel_bytes)
+
+    monkeypatch.setattr(
+        release_tool.urllib.request,
+        "build_opener",
+        lambda *handlers: Opener(),
+    )
+
+    with pytest.raises(ReleaseFailure) as failure:
+        _prepare_locked_protobuf_wheel(tmp_path, tmp_path / "staging")
+
+    assert failure.value.name == "release.package.invalid"
+
+
+def test_locked_protobuf_rejects_replacement_before_install(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    protobuf_wheel = tmp_path / "protobuf-6.32.1-py3-none-any.whl"
+    protobuf_wheel.write_bytes(b"locked protobuf wheel")
+    protobuf_hash = hashlib.sha256(protobuf_wheel.read_bytes()).hexdigest()
+    commands: list[list[str]] = []
+
+    def replace_after_venv(command, **kwargs):
+        commands.append(command)
+        if command[:2] == ["uv", "venv"]:
+            protobuf_wheel.write_bytes(b"replaced protobuf wheel")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(release_tool.subprocess, "run", replace_after_venv)
+
+    with pytest.raises(ReleaseFailure) as failure:
+        _verify_wheel_install(
+            tmp_path / "package.whl",
+            ReleaseVersion.parse("v0.5.0-rc.1"),
+            tmp_path / "staging",
+            protobuf_wheel,
+            protobuf_hash,
+        )
+
+    assert failure.value.name == "release.package.invalid"
+    assert not any(command[:3] == ["uv", "pip", "install"] for command in commands)
+
+
 def test_isolated_wheel_venv_is_offline_and_uses_current_interpreter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     commands: list[list[str]] = []
     environments: list[dict[str, str]] = []
+    protobuf_wheel = tmp_path / "protobuf-6.32.1-py3-none-any.whl"
+    protobuf_wheel.write_bytes(b"locked protobuf wheel")
+    protobuf_hash = hashlib.sha256(protobuf_wheel.read_bytes()).hexdigest()
 
     def record(command, **kwargs):
         commands.append(command)
@@ -390,8 +528,8 @@ def test_isolated_wheel_venv_is_offline_and_uses_current_interpreter(
         tmp_path / "package.whl",
         ReleaseVersion.parse("v0.5.0-rc.1"),
         tmp_path,
-        tmp_path / "protobuf-6.32.1-py3-none-any.whl",
-        "2601b779fc7d32a866c6b4404f9d42a3f67c5b9f3f15b4db3cccabe06b95c346",
+        protobuf_wheel,
+        protobuf_hash,
     )
 
     assert commands[0][:4] == ["uv", "venv", "--offline", "--no-project"]
@@ -405,7 +543,7 @@ def test_isolated_wheel_venv_is_offline_and_uses_current_interpreter(
         "--offline",
         "--no-deps",
         str(tmp_path / "package.whl"),
-        str(tmp_path / "protobuf-6.32.1-py3-none-any.whl"),
+        str(protobuf_wheel),
     ]
     assert commands[2][:3] == [
         str(tmp_path / "venv" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")),
@@ -418,6 +556,6 @@ def test_isolated_wheel_venv_is_offline_and_uses_current_interpreter(
     assert "google.protobuf.__version__ == '6.32.1'" in commands[2][3]
     assert "google.protobuf.__file__" in commands[2][3]
     assert "RECORD" in commands[2][3]
-    assert "2601b779fc7d32a866c6b4404f9d42a3f67c5b9f3f15b4db3cccabe06b95c346" in commands[2][3]
+    assert protobuf_hash in commands[2][3]
     assert all("HTTP_PROXY" not in environment for environment in environments)
     assert all("HTTPS_PROXY" not in environment for environment in environments)
