@@ -187,7 +187,18 @@ def _write_release_directory(release_dir: Path, inputs: dict[str, object]) -> No
     (release_dir / "release-manifest.json").write_bytes(encode_manifest(manifest))
     (release_dir / "SHA256SUMS").write_bytes(generate_checksums(manifest))
     (release_dir / "conformance-report.json").write_text(
-        json.dumps(manifest.qualification.sidecar_dict(manifest.tag, manifest.commit)),
+        json.dumps(
+            {
+                "schema": 1,
+                "tag": manifest.tag,
+                "commit": manifest.commit,
+                "qualification": manifest.qualification.to_dict(),
+                "software": {"status": "Pending", "jobs": []},
+                "hardware": {
+                    "camera-avfoundation": {"status": "Pending", "evidence": None}
+                },
+            }
+        ),
         encoding="utf-8",
     )
 

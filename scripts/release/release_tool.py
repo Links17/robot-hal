@@ -542,6 +542,19 @@ def _artifact_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _file_identity(path: Path) -> tuple[int, int, int, str]:
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("artifact is not a regular file")
+        return (metadata.st_dev, metadata.st_ino, metadata.st_size, _artifact_sha256(path))
+    except (OSError, ReleaseFailure) as error:
+        raise ReleaseFailure(
+            "release.artifact.unexpected",
+            "artifact input changed during aggregation",
+        ) from error
+
+
 def _release_manifest_invalid(diagnostic: str) -> NoReturn:
     raise ReleaseFailure("release.manifest.invalid", diagnostic)
 
@@ -631,6 +644,458 @@ def _safe_public_https_uri(value: object, field: str) -> str:
     if address.is_private or address.is_loopback or address.is_link_local or address.is_unspecified:
         _release_manifest_invalid(f"{field} qualification URI is invalid")
     return value
+
+
+def _conformance_report_invalid(diagnostic: str) -> NoReturn:
+    raise ReleaseFailure("release.manifest.invalid", diagnostic)
+
+
+def _bounded_command_identity(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 256
+        or "\n" in value
+        or "\r" in value
+        or SENSITIVE_VALUE.search(value)
+        or re.search(r"(?:^|[\s(])/(?:[^\s:)]+)", value)
+        or re.search(r"[A-Za-z]:[\\/]", value)
+    ):
+        _conformance_report_invalid("software job command identity is invalid")
+    return value
+
+
+def validate_conformance_report(value: object) -> dict[str, object]:
+    """Validate the controlled, evidence-only conformance report schema."""
+    _reject_sensitive(value)
+    if not isinstance(value, dict) or set(value) != {
+        "schema",
+        "tag",
+        "commit",
+        "qualification",
+        "software",
+        "hardware",
+    }:
+        _conformance_report_invalid("conformance report fields are invalid")
+    if value["schema"] != 1:
+        _conformance_report_invalid("unsupported conformance report schema")
+    tag = value["tag"]
+    commit = value["commit"]
+    if not isinstance(tag, str) or not isinstance(commit, str):
+        _conformance_report_invalid("conformance report identity is invalid")
+    try:
+        ReleaseVersion.parse(tag)
+    except ReleaseFailure as error:
+        raise ReleaseFailure(
+            "release.manifest.invalid",
+            "conformance report tag is invalid",
+        ) from error
+    if RELEASE_COMMIT.fullmatch(commit) is None:
+        _conformance_report_invalid("conformance report commit is invalid")
+    qualification = value["qualification"]
+    if not isinstance(qualification, dict) or set(qualification) != {
+        "software",
+        "hardware",
+    }:
+        _conformance_report_invalid("conformance report qualification is invalid")
+    normalized_qualification = {
+        "software": _qualification(qualification["software"], "software").to_dict(),
+        "hardware": _qualification(qualification["hardware"], "hardware").to_dict(),
+    }
+    software = value["software"]
+    if not isinstance(software, dict) or set(software) != {"status", "jobs"}:
+        _conformance_report_invalid("software conformance fields are invalid")
+    if software["status"] not in {"Passed", "Partial", "Pending", "Blocked", "Failed"}:
+        _conformance_report_invalid("software conformance status is invalid")
+    jobs = software["jobs"]
+    if not isinstance(jobs, list) or len(jobs) > len(EXPECTED_TARGETS):
+        _conformance_report_invalid("software conformance jobs are invalid")
+    normalized_jobs: list[dict[str, str]] = []
+    seen_platforms: set[str] = set()
+    for job in jobs:
+        if not isinstance(job, dict) or set(job) != {
+            "platform",
+            "result",
+            "command",
+            "ref",
+        }:
+            _conformance_report_invalid("software job fields are invalid")
+        platform = job["platform"]
+        result = job["result"]
+        if platform not in {"macos", "linux", "windows"} or platform in seen_platforms:
+            _conformance_report_invalid("software job platform is invalid")
+        if result not in {"Passed", "Partial", "Pending", "Blocked", "Failed"}:
+            _conformance_report_invalid("software job result is invalid")
+        seen_platforms.add(platform)
+        normalized_jobs.append(
+            {
+                "platform": platform,
+                "result": result,
+                "command": _bounded_command_identity(job["command"]),
+                "ref": _safe_public_https_uri(job["ref"], "software"),
+            }
+        )
+    hardware = value["hardware"]
+    if not isinstance(hardware, dict) or not hardware:
+        _conformance_report_invalid("hardware conformance is invalid")
+    normalized_hardware: dict[str, dict[str, str | None]] = {}
+    for name, entry in hardware.items():
+        if (
+            not isinstance(name, str)
+            or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name)
+            or not isinstance(entry, dict)
+            or set(entry) != {"status", "evidence"}
+        ):
+            _conformance_report_invalid("hardware conformance fields are invalid")
+        status = entry["status"]
+        evidence = entry["evidence"]
+        if status not in {"Passed", "Partial", "Pending", "Blocked", "Failed"}:
+            _conformance_report_invalid("hardware conformance status is invalid")
+        if status in {"Passed", "Partial", "Failed"}:
+            evidence = _safe_public_https_uri(evidence, "hardware")
+        elif evidence is not None:
+            _conformance_report_invalid("pending or blocked hardware evidence must be null")
+        normalized_hardware[name] = {"status": status, "evidence": evidence}
+    return {
+        "schema": 1,
+        "tag": tag,
+        "commit": commit,
+        "qualification": normalized_qualification,
+        "software": {"status": software["status"], "jobs": normalized_jobs},
+        "hardware": normalized_hardware,
+    }
+
+
+def write_conformance_report(inputs: Path, output: Path) -> None:
+    """Copy one frozen report input through controlled validation."""
+    try:
+        directory = inputs.lstat()
+        report_path = inputs / CONFORMANCE_REPORT_NAME
+        if (
+            not stat.S_ISDIR(directory.st_mode)
+            or inputs.is_symlink()
+            or {path.name for path in inputs.iterdir()} != {CONFORMANCE_REPORT_NAME}
+            or report_path.is_symlink()
+            or not report_path.is_file()
+        ):
+            _conformance_report_invalid("conformance report input is invalid")
+        before = _file_identity(report_path)
+        report = validate_conformance_report(
+            _read_json(report_path, "release.manifest.invalid")
+        )
+        if _file_identity(report_path) != before:
+            _conformance_report_invalid("conformance report input changed")
+        with output.open("xb") as destination:
+            destination.write(
+                json.dumps(
+                    report,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                + b"\n"
+            )
+    except OSError as error:
+        raise ReleaseFailure(
+            "release.manifest.invalid",
+            "unable to write conformance report",
+        ) from error
+
+
+def _input_directory(
+    directory: Path,
+    expected_names: frozenset[str] | None = None,
+) -> tuple[int, int, frozenset[str]]:
+    try:
+        metadata = directory.lstat()
+        entries = frozenset(path.name for path in directory.iterdir())
+    except OSError as error:
+        raise ReleaseFailure(
+            "release.artifact.unexpected",
+            "artifact input directory is invalid",
+        ) from error
+    if not stat.S_ISDIR(metadata.st_mode) or directory.is_symlink():
+        raise ReleaseFailure(
+            "release.artifact.unexpected",
+            "artifact input directory is invalid",
+        )
+    if expected_names is not None and entries != expected_names:
+        raise ReleaseFailure(
+            "release.artifact.unexpected",
+            "artifact input directory entries are invalid",
+        )
+    return (metadata.st_dev, metadata.st_ino, entries)
+
+
+def _require_input_directory(
+    directory: Path,
+    expected: tuple[int, int, frozenset[str]],
+) -> None:
+    actual = _input_directory(directory, expected[2])
+    if actual != expected:
+        raise ReleaseFailure(
+            "release.artifact.unexpected",
+            "artifact input directory changed during aggregation",
+        )
+
+
+def _copy_frozen_artifact(
+    source: Path,
+    destination: Path,
+    identity: tuple[int, int, int, str],
+) -> None:
+    if _file_identity(source) != identity:
+        raise ReleaseFailure(
+            "release.artifact.unexpected",
+            "artifact input changed during aggregation",
+        )
+    try:
+        with source.open("rb") as input_file, destination.open("xb") as output_file:
+            while chunk := input_file.read(ARCHIVE_READ_CHUNK_SIZE):
+                output_file.write(chunk)
+    except FileExistsError as error:
+        raise ReleaseFailure(
+            "release.artifact.unexpected",
+            "release output entry already exists",
+        ) from error
+    except OSError as error:
+        raise ReleaseFailure(
+            "release.package.invalid",
+            "unable to copy artifact input",
+        ) from error
+    if _file_identity(source) != identity or _file_identity(destination)[3:] != identity[3:]:
+        raise ReleaseFailure(
+            "release.artifact.unexpected",
+            "artifact input changed during aggregation",
+        )
+
+
+def _create_release_directory(release_dir: Path) -> tuple[int, int]:
+    try:
+        release_dir.mkdir(parents=True, mode=0o700)
+        metadata = release_dir.lstat()
+    except FileExistsError as error:
+        raise ReleaseFailure(
+            "release.artifact.unexpected",
+            "release directory must be new",
+        ) from error
+    except OSError as error:
+        raise ReleaseFailure(
+            "release.package.invalid",
+            "unable to create release directory",
+        ) from error
+    if not stat.S_ISDIR(metadata.st_mode) or release_dir.is_symlink():
+        raise ReleaseFailure(
+            "release.artifact.unexpected",
+            "release directory is invalid",
+        )
+    release_dir.chmod(0o700)
+    return (metadata.st_dev, metadata.st_ino)
+
+
+def aggregate_release(
+    *,
+    tag: str,
+    commit: str,
+    broker_dir: Path,
+    rust_bundle: Path,
+    python_candidate: Path,
+    report_inputs: Path,
+    release_dir: Path,
+) -> Path:
+    """Aggregate frozen Task 6 candidates into one newly-created release directory."""
+    version = ReleaseVersion.parse(tag)
+    expected = _expected_artifacts(version)
+    broker_names = frozenset(
+        name for name, (kind, _) in expected.items() if kind == "broker"
+    )
+    python_names = frozenset(
+        name for name, (kind, _) in expected.items() if kind.startswith("python-")
+    )
+    rust_name = next(name for name, (kind, _) in expected.items() if kind == "rust-crates")
+    broker_identity = _input_directory(broker_dir, broker_names)
+    python_identity = _input_directory(python_candidate, python_names)
+    report_identity = _input_directory(report_inputs, frozenset({CONFORMANCE_REPORT_NAME}))
+    rust_identity = _file_identity(rust_bundle / rust_name)
+    artifacts = {
+        name: broker_dir / name for name in broker_names
+    } | {
+        name: python_candidate / name for name in python_names
+    } | {rust_name: rust_bundle / rust_name}
+    rust_directory_identity = _input_directory(rust_bundle, frozenset({rust_name}))
+    identities = {name: _file_identity(path) for name, path in artifacts.items()}
+    _create_release_directory(release_dir)
+    try:
+        for name in sorted(artifacts):
+            _copy_frozen_artifact(artifacts[name], release_dir / name, identities[name])
+        _require_input_directory(broker_dir, broker_identity)
+        _require_input_directory(python_candidate, python_identity)
+        _require_input_directory(rust_bundle, rust_directory_identity)
+        _require_input_directory(report_inputs, report_identity)
+        if _file_identity(rust_bundle / rust_name) != rust_identity:
+            raise ReleaseFailure(
+                "release.artifact.unexpected",
+                "artifact input changed during aggregation",
+            )
+        report_path = release_dir / CONFORMANCE_REPORT_NAME
+        write_conformance_report(report_inputs, report_path)
+        report = validate_conformance_report(
+            _read_json(report_path, "release.manifest.invalid")
+        )
+        manifest = generate_manifest(
+            {
+                "tag": tag,
+                "commit": commit,
+                "artifacts_dir": release_dir,
+                "software_qualification": report["qualification"]["software"],
+                "hardware_qualification": report["qualification"]["hardware"],
+            }
+        )
+        (release_dir / "release-manifest.json").write_bytes(encode_manifest(manifest))
+        (release_dir / "SHA256SUMS").write_bytes(generate_checksums(manifest))
+        verify_static(release_dir)
+    except ReleaseFailure:
+        raise
+    except OSError as error:
+        raise ReleaseFailure(
+            "release.package.invalid",
+            "unable to aggregate release directory",
+        ) from error
+    return release_dir
+
+
+def _extract_broker_archive(
+    archive: Path,
+    target: ReleaseTarget,
+    version: ReleaseVersion,
+    destination: Path,
+) -> Path:
+    root = _package_root(version, target)
+    binary_name = _package_binary_name(target)
+    validate_archive(
+        archive,
+        expected_root=root,
+        expected_files={"LICENSE", "README.md", "broker-manifest.json", binary_name},
+    )
+    try:
+        destination.mkdir(mode=0o700)
+        if archive.name.endswith(".tar.gz"):
+            with tarfile.open(archive, "r:gz") as contents:
+                contents.extractall(destination, filter="data")
+        else:
+            with zipfile.ZipFile(archive) as contents:
+                contents.extractall(destination)
+    except (OSError, tarfile.TarError, zipfile.BadZipFile) as error:
+        raise ReleaseFailure("release.archive.invalid", "unable to extract broker archive") from error
+    return destination / root
+
+
+def _host_target(target: ReleaseTarget) -> bool:
+    host = sys.platform
+    return (
+        (target.name == "macos" and host == "darwin" and os.uname().machine == "arm64")
+        or (target.name == "linux" and host.startswith("linux") and os.uname().machine == "x86_64")
+        or (target.name == "windows" and host == "win32")
+    )
+
+
+def _run_virtual_conformance(
+    extracted: Path,
+) -> None:
+    """Run the broker's hardware-free virtual conformance entrypoint, if packaged."""
+    entrypoint = extracted / "virtual-conformance"
+    if not entrypoint.is_file() or entrypoint.is_symlink():
+        return
+    try:
+        for minor in range(BROKER_WIRE["minimum_minor"], BROKER_WIRE["maximum_minor"] + 1):
+            result = subprocess.run(
+                [str(entrypoint), f"--wire-minor={minor}"],
+                cwd=extracted,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode != 0:
+                raise ReleaseFailure(
+                    "release.package.invalid",
+                    "local virtual conformance command failed",
+                )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ReleaseFailure(
+            "release.package.invalid",
+            "local virtual conformance command failed",
+        ) from error
+
+
+def verify_artifacts(
+    release_dir: Path,
+    tag: str,
+    targets_path: Path,
+    repo_root: Path,
+) -> None:
+    """Verify one complete release directory; executable checks run only on its host."""
+    try:
+        verify_static(release_dir)
+    except ReleaseFailure as error:
+        if error.name == "release.manifest.invalid":
+            raise ReleaseFailure(
+                "release.artifact.unexpected",
+                "release directory is incomplete or inconsistent",
+            ) from error
+        raise
+    manifest = validate_release_manifest(
+        _read_json(release_dir / "release-manifest.json", "release.manifest.invalid")
+    )
+    if manifest.tag != tag:
+        raise ReleaseFailure("release.artifact.unexpected", "release tag does not match")
+    targets = load_targets(targets_path)
+    with tempfile.TemporaryDirectory(prefix=".verify-artifacts-") as temporary:
+        root = Path(temporary)
+        for target in targets:
+            archive = release_dir / _package_archive_name(ReleaseVersion.parse(tag), target)
+            extracted = _extract_broker_archive(
+                archive,
+                target,
+                ReleaseVersion.parse(tag),
+                root / target.name,
+            )
+            binary = extracted / _package_binary_name(target)
+            broker_manifest = extracted / "broker-manifest.json"
+            verify_broker_manifest(
+                _read_json(broker_manifest, "release.manifest.invalid"),
+                target,
+                binary,
+                ReleaseVersion.parse(tag),
+            )
+            if not _host_target(target):
+                continue
+            try:
+                result = subprocess.run(
+                    [str(binary), "--manifest"],
+                    cwd=extracted,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise ReleaseFailure(
+                    "release.package.invalid",
+                    "local broker executable verification failed",
+                ) from error
+            if result.returncode != 0:
+                raise ReleaseFailure(
+                    "release.manifest.invalid",
+                    "local broker manifest command failed",
+                )
+            verify_broker_manifest(
+                json.loads(result.stdout),
+                target,
+                binary,
+                ReleaseVersion.parse(tag),
+            )
+            _run_virtual_conformance(extracted)
 
 
 def _qualification(value: object, field: str) -> QualificationStatus:
@@ -776,6 +1241,8 @@ def generate_manifest(inputs: dict[str, object]) -> ReleaseManifest:
         raise ReleaseFailure("release.manifest.invalid", "unable to read artifacts directory") from error
     artifacts: list[dict[str, object]] = []
     for path in entries:
+        if path.name in RELEASE_SIDECARS:
+            continue
         if not path.is_file():
             _release_manifest_invalid("artifacts directory contains a non-file entry")
         kind, target = _artifact_metadata(path.name)
@@ -884,7 +1351,18 @@ def verify_static(
             raise ReleaseFailure("release.manifest.invalid", "unable to read artifact metadata") from error
         if size != artifact.size or _artifact_sha256(path) != artifact.sha256:
             _release_manifest_invalid("artifact size or SHA-256 does not match the manifest")
-    if report != manifest.qualification.sidecar_dict(manifest.tag, manifest.commit):
+    try:
+        validated_report = validate_conformance_report(report)
+    except ReleaseFailure as error:
+        raise ReleaseFailure(
+            "release.manifest.invalid",
+            "conformance report is invalid",
+        ) from error
+    if (
+        validated_report["tag"] != manifest.tag
+        or validated_report["commit"] != manifest.commit
+        or validated_report["qualification"] != manifest.qualification.to_dict()
+    ):
         _release_manifest_invalid("conformance report does not match the manifest")
 
 
@@ -2062,8 +2540,16 @@ def _parser() -> argparse.ArgumentParser:
     generate.add_argument("--output-dir", required=True, type=Path)
     generate.add_argument("--software-qualification", required=True)
     generate.add_argument("--hardware-qualification", required=True)
+    report = subcommands.add_parser("write-conformance-report")
+    report.add_argument("--inputs", required=True, type=Path)
+    report.add_argument("--output", required=True, type=Path)
     static = subcommands.add_parser("verify-static")
     static.add_argument("--release-dir", required=True, type=Path)
+    artifacts = subcommands.add_parser("verify-artifacts")
+    artifacts.add_argument("--tag", required=True)
+    artifacts.add_argument("--artifacts-dir", required=True, type=Path)
+    artifacts.add_argument("--targets", required=True, type=Path)
+    artifacts.add_argument("--repo-root", required=True, type=Path)
     return parser
 
 
@@ -2154,8 +2640,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "release.manifest.invalid",
                     "unable to write release manifest output",
                 ) from error
+        elif arguments.command == "write-conformance-report":
+            write_conformance_report(arguments.inputs, arguments.output)
         elif arguments.command == "verify-static":
             verify_static(arguments.release_dir)
+        elif arguments.command == "verify-artifacts":
+            verify_artifacts(
+                arguments.artifacts_dir,
+                arguments.tag,
+                arguments.targets,
+                arguments.repo_root,
+            )
     except ReleaseFailure as error:
         _fail(error)
     except OSError as error:
