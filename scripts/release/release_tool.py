@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import csv
 from email.parser import BytesParser
 from email.policy import compat32
 import gzip
@@ -2713,9 +2714,7 @@ def _wheel_metadata(wheel: Path, version: ReleaseVersion) -> None:
         raise ReleaseFailure("release.package.invalid", "Python wheel metadata is invalid") from error
     if any("\\" in name for name in names):
         _package_invalid("Python wheel member path is invalid")
-    if any(
-        name == "google/protobuf" or name.startswith("google/protobuf/") for name in names
-    ):
+    if any(name == "google" or name.startswith("google/") for name in names):
         _package_invalid("Python wheel must not provide protobuf")
     if (
         "Name: seeed-hal\n" not in metadata
@@ -2823,6 +2822,38 @@ class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(request, fp, code, message, headers, newurl)
 
 
+@dataclass
+class _LockedProtobufWheel:
+    path: Path
+    protected_dir: Path
+
+    def close(self) -> None:
+        self.protected_dir.chmod(0o700)
+
+
+def _locked_protobuf_record_entries(wheel: Path) -> tuple[tuple[str, str, str], ...]:
+    try:
+        with zipfile.ZipFile(wheel) as archive:
+            records = [
+                name
+                for name in archive.namelist()
+                if name.startswith("protobuf-") and name.endswith(".dist-info/RECORD")
+            ]
+            if len(records) != 1:
+                _package_invalid("locked protobuf wheel is invalid")
+            return tuple(
+                (path, encoded, size)
+                for path, encoded, size in csv.reader(
+                    archive.read(records[0]).decode("utf-8").splitlines()
+                )
+                if encoded
+            )
+    except (OSError, zipfile.BadZipFile) as error:
+        raise ReleaseFailure(
+            "release.package.invalid", "locked protobuf wheel is invalid"
+        ) from error
+
+
 def _locked_protobuf_file_identity(path: Path) -> tuple[int, int, int, int]:
     try:
         metadata = path.lstat()
@@ -2858,7 +2889,11 @@ def _require_locked_protobuf_wheel(
         _package_invalid("locked protobuf wheel changed before installation")
 
 
-def _prepare_locked_protobuf_wheel(project: Path, staging_dir: Path) -> tuple[Path, str]:
+def _prepare_locked_protobuf_wheel(
+    project: Path, staging_dir: Path
+) -> tuple[_LockedProtobufWheel, str]:
+    if os.name != "posix":
+        _package_invalid("locked protobuf wheel verification is unsupported on this platform")
     url, expected_hash = _locked_protobuf_wheel(project)
     candidate_dir = staging_dir / "candidate"
     immutable_dir = staging_dir / "immutable"
@@ -2882,6 +2917,7 @@ def _prepare_locked_protobuf_wheel(project: Path, staging_dir: Path) -> tuple[Pa
                 destination.write(chunk)
         wheel.chmod(0o400)
         actual_hash = _locked_protobuf_hash(wheel)
+        staging_dir.chmod(0o500)
     except (OSError, urllib.error.URLError) as error:
         raise ReleaseFailure(
             "release.package.invalid",
@@ -2889,20 +2925,30 @@ def _prepare_locked_protobuf_wheel(project: Path, staging_dir: Path) -> tuple[Pa
         ) from error
     if actual_hash != expected_hash:
         _package_invalid("locked protobuf wheel hash is invalid")
-    return (wheel, expected_hash)
+    return (_LockedProtobufWheel(wheel, staging_dir), expected_hash)
 
 
 def _verify_wheel_install(
     wheel: Path,
     version: ReleaseVersion,
     staging_dir: Path,
-    protobuf_wheel: Path,
+    protobuf_wheel: Path | _LockedProtobufWheel,
     protobuf_hash: str,
 ) -> None:
+    if os.name != "posix":
+        _package_invalid("locked protobuf wheel verification is unsupported on this platform")
     virtualenv = staging_dir / "venv"
     python = virtualenv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    protobuf_identity = _locked_protobuf_file_identity(protobuf_wheel)
-    _require_locked_protobuf_wheel(protobuf_wheel, protobuf_hash, protobuf_identity)
+    owns_descriptor = isinstance(protobuf_wheel, Path)
+    if owns_descriptor:
+        protobuf_wheel = _LockedProtobufWheel(
+            protobuf_wheel, protobuf_wheel.parent
+        )
+    protobuf_identity = _locked_protobuf_file_identity(protobuf_wheel.path)
+    _require_locked_protobuf_wheel(
+        protobuf_wheel.path, protobuf_hash, protobuf_identity
+    )
+    protobuf_record_entries = _locked_protobuf_record_entries(protobuf_wheel.path)
     environment = {
         key: value
         for key, value in os.environ.items()
@@ -2928,7 +2974,7 @@ def _verify_wheel_install(
                 "--offline",
                 "--no-deps",
                 str(wheel),
-                str(protobuf_wheel),
+                str(protobuf_wheel.path),
             ],
             [
                 str(python),
@@ -2947,6 +2993,9 @@ def _verify_wheel_install(
                     "dist=importlib.metadata.distribution('protobuf');"
                     "record=dist.locate_file(next(path for path in dist.files if path.name == 'RECORD'));"
                     "assert record.is_file() and record.resolve().is_relative_to(site);"
+                    f"expected_entries={protobuf_record_entries!r};"
+                    "installed_entries={path: (encoded, size) for path, encoded, size in csv.reader(record.read_text(encoding='utf-8').splitlines())};"
+                    "assert all(installed_entries.get(path) == (encoded, size) for path, encoded, size in expected_entries);"
                     "exec(\"for path, encoded, size in csv.reader(record.read_text(encoding='utf-8').splitlines()):\\n"
                     " if encoded:\\n"
                     "  algorithm, value=encoded.split('=', 1)\\n"
@@ -2955,16 +3004,11 @@ def _verify_wheel_install(
                     "  assert base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b'=')"
                     ".decode() == value\\n"
                     "  assert str(len(data)) == size\")\n"
-                    f"assert hashlib.sha256(pathlib.Path({str(protobuf_wheel)!r}).read_bytes()).hexdigest() == {protobuf_hash!r};"
                     "assert hal_pb2.DESCRIPTOR.name == 'hal.proto';"
                     "assert hal_pb2.Empty().SerializeToString() == b''"
                 ),
             ],
         ):
-            if command[:3] == ["uv", "pip", "install"]:
-                _require_locked_protobuf_wheel(
-                    protobuf_wheel, protobuf_hash, protobuf_identity
-                )
             result = subprocess.run(
                 command,
                 check=False,
@@ -2974,12 +3018,20 @@ def _verify_wheel_install(
                 env=environment,
             )
             if result.returncode != 0:
-                _package_invalid("Python wheel installation validation failed")
+                _package_invalid(
+                    _bounded_subprocess_summary(
+                        f"{result.stdout}\n{result.stderr}",
+                        "Python wheel installation validation failed",
+                    )
+                )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ReleaseFailure(
             "release.package.invalid",
             "Python wheel installation validation failed",
         ) from error
+    finally:
+        if owns_descriptor:
+            protobuf_wheel.close()
 
 
 def package_python(*, tag: str, project: Path, output_dir: Path) -> tuple[Path, Path]:
@@ -3003,50 +3055,53 @@ def package_python(*, tag: str, project: Path, output_dir: Path) -> tuple[Path, 
             protobuf_wheel, protobuf_hash = _prepare_locked_protobuf_wheel(
                 project, Path(directory)
             )
-            result = subprocess.run(
-                [
-                    "uv",
-                    "run",
-                    "--project",
-                    str(project),
-                    "--frozen",
-                    "python",
-                    "-m",
-                    "build",
-                    "--outdir",
-                    str(output_dir),
-                    str(project),
-                ],
-                cwd=project.parent.parent,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            if result.returncode != 0:
-                _package_invalid(
-                    _bounded_subprocess_summary(result.stderr, "Python build failed")
+            try:
+                result = subprocess.run(
+                    [
+                        "uv",
+                        "run",
+                        "--project",
+                        str(project),
+                        "--frozen",
+                        "python",
+                        "-m",
+                        "build",
+                        "--outdir",
+                        str(output_dir),
+                        str(project),
+                    ],
+                    cwd=project.parent.parent,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
                 )
-            wheel = output_dir / wheel_name
-            sdist = output_dir / sdist_name
-            expected = frozenset({wheel_name, sdist_name})
-            _require_python_candidate_entries(output_dir, candidate_identity, expected)
-            wheel_identity = _python_candidate_artifact_identity(wheel)
-            sdist_identity = _python_candidate_artifact_identity(sdist)
-            _wheel_metadata(wheel, version)
-            _sdist_metadata(sdist, version)
-            with tempfile.TemporaryDirectory(prefix=".package-python-validate-") as staging:
-                _verify_wheel_install(
-                    wheel,
-                    version,
-                    Path(staging),
-                    protobuf_wheel,
-                    protobuf_hash,
-                )
-            _require_python_candidate_entries(output_dir, candidate_identity, expected)
-            _require_python_candidate_artifact_identity(wheel, wheel_identity)
-            _require_python_candidate_artifact_identity(sdist, sdist_identity)
-            return (wheel, sdist)
+                if result.returncode != 0:
+                    _package_invalid(
+                        _bounded_subprocess_summary(result.stderr, "Python build failed")
+                    )
+                wheel = output_dir / wheel_name
+                sdist = output_dir / sdist_name
+                expected = frozenset({wheel_name, sdist_name})
+                _require_python_candidate_entries(output_dir, candidate_identity, expected)
+                wheel_identity = _python_candidate_artifact_identity(wheel)
+                sdist_identity = _python_candidate_artifact_identity(sdist)
+                _wheel_metadata(wheel, version)
+                _sdist_metadata(sdist, version)
+                with tempfile.TemporaryDirectory(prefix=".package-python-validate-") as staging:
+                    _verify_wheel_install(
+                        wheel,
+                        version,
+                        Path(staging),
+                        protobuf_wheel,
+                        protobuf_hash,
+                    )
+                _require_python_candidate_entries(output_dir, candidate_identity, expected)
+                _require_python_candidate_artifact_identity(wheel, wheel_identity)
+                _require_python_candidate_artifact_identity(sdist, sdist_identity)
+                return (wheel, sdist)
+            finally:
+                protobuf_wheel.close()
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ReleaseFailure("release.package.invalid", "Python build failed") from error
 

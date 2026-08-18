@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import hashlib
+import os
 import sys
 import stat
 import subprocess
@@ -280,6 +281,16 @@ def _wheel(
     return wheel
 
 
+def _protobuf_wheel(path: Path) -> Path:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("google/protobuf/__init__.py", "__version__ = '6.32.1'\n")
+        archive.writestr(
+            "protobuf-6.32.1.dist-info/RECORD",
+            "google/protobuf/__init__.py,,\nprotobuf-6.32.1.dist-info/RECORD,,\n",
+        )
+    return path
+
+
 @pytest.mark.parametrize(
     ("dist_info", "wheel_metadata"),
     [
@@ -309,12 +320,23 @@ def test_wheel_metadata_rejects_noncanonical_internal_identity(
         )
 
 
-def test_wheel_metadata_rejects_candidate_protobuf_shadowing(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "member",
+    [
+        "google/__init__.py",
+        "google/anything.py",
+        "google/protobuf/__init__.py",
+    ],
+)
+def test_wheel_metadata_rejects_candidate_google_namespace_members(
+    tmp_path: Path,
+    member: str,
+) -> None:
     with pytest.raises(ReleaseFailure) as failure:
         _wheel_metadata(
             _wheel(
                 tmp_path,
-                extra_members={"google/protobuf/__init__.py": b"__version__ = '6.32.1'"},
+                extra_members={member: b"candidate-controlled namespace shadow"},
             ),
             ReleaseVersion.parse("v0.5.0-rc.1"),
         )
@@ -477,24 +499,31 @@ wheels = [
     assert failure.value.name == "release.package.invalid"
 
 
-def test_locked_protobuf_rejects_replacement_before_install(
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX directory permissions")
+def test_locked_protobuf_install_rejects_parent_directory_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    protobuf_wheel = tmp_path / "protobuf-6.32.1-py3-none-any.whl"
-    protobuf_wheel.write_bytes(b"locked protobuf wheel")
+    protected = tmp_path / "protected"
+    protected.mkdir()
+    immutable = protected / "immutable"
+    immutable.mkdir()
+    protobuf_wheel = immutable / "protobuf-6.32.1-py3-none-any.whl"
+    _protobuf_wheel(protobuf_wheel)
     protobuf_hash = hashlib.sha256(protobuf_wheel.read_bytes()).hexdigest()
     commands: list[list[str]] = []
+    replacement = tmp_path / "replaced-immutable"
 
-    def replace_after_venv(command, **kwargs):
+    def replace_before_install(command, **kwargs):
         commands.append(command)
         if command[:2] == ["uv", "venv"]:
-            protobuf_wheel.write_bytes(b"replaced protobuf wheel")
+            with pytest.raises(PermissionError):
+                immutable.rename(replacement)
         return subprocess.CompletedProcess(command, 0, "", "")
 
-    monkeypatch.setattr(release_tool.subprocess, "run", replace_after_venv)
-
-    with pytest.raises(ReleaseFailure) as failure:
+    monkeypatch.setattr(release_tool.subprocess, "run", replace_before_install)
+    protected.chmod(0o500)
+    try:
         _verify_wheel_install(
             tmp_path / "package.whl",
             ReleaseVersion.parse("v0.5.0-rc.1"),
@@ -502,9 +531,13 @@ def test_locked_protobuf_rejects_replacement_before_install(
             protobuf_wheel,
             protobuf_hash,
         )
+    finally:
+        protected.chmod(0o700)
 
-    assert failure.value.name == "release.package.invalid"
-    assert not any(command[:3] == ["uv", "pip", "install"] for command in commands)
+    install = next(command for command in commands if command[:3] == ["uv", "pip", "install"])
+    assert install[-1] == str(protobuf_wheel)
+    assert not replacement.exists()
+    assert protobuf_wheel.is_file()
 
 
 def test_isolated_wheel_venv_is_offline_and_uses_current_interpreter(
@@ -513,8 +546,10 @@ def test_isolated_wheel_venv_is_offline_and_uses_current_interpreter(
 ) -> None:
     commands: list[list[str]] = []
     environments: list[dict[str, str]] = []
-    protobuf_wheel = tmp_path / "protobuf-6.32.1-py3-none-any.whl"
-    protobuf_wheel.write_bytes(b"locked protobuf wheel")
+    immutable = tmp_path / "immutable"
+    immutable.mkdir()
+    protobuf_wheel = immutable / "protobuf-6.32.1-py3-none-any.whl"
+    _protobuf_wheel(protobuf_wheel)
     protobuf_hash = hashlib.sha256(protobuf_wheel.read_bytes()).hexdigest()
 
     def record(command, **kwargs):
@@ -534,7 +569,7 @@ def test_isolated_wheel_venv_is_offline_and_uses_current_interpreter(
 
     assert commands[0][:4] == ["uv", "venv", "--offline", "--no-project"]
     assert commands[0][4:6] == ["--python", sys.executable]
-    assert commands[1] == [
+    assert commands[1][:-1] == [
         "uv",
         "pip",
         "install",
@@ -543,8 +578,8 @@ def test_isolated_wheel_venv_is_offline_and_uses_current_interpreter(
         "--offline",
         "--no-deps",
         str(tmp_path / "package.whl"),
-        str(protobuf_wheel),
     ]
+    assert commands[1][-1] == str(protobuf_wheel)
     assert commands[2][:3] == [
         str(tmp_path / "venv" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")),
         "-I",
@@ -556,6 +591,6 @@ def test_isolated_wheel_venv_is_offline_and_uses_current_interpreter(
     assert "google.protobuf.__version__ == '6.32.1'" in commands[2][3]
     assert "google.protobuf.__file__" in commands[2][3]
     assert "RECORD" in commands[2][3]
-    assert protobuf_hash in commands[2][3]
+    assert "expected_entries" in commands[2][3]
     assert all("HTTP_PROXY" not in environment for environment in environments)
     assert all("HTTPS_PROXY" not in environment for environment in environments)
