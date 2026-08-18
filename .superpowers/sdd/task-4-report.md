@@ -56,7 +56,8 @@ IDE diagnostics reported no errors for changed files.
 
 ## Commit
 
-`d4e2f03` — `feat(release): generate and validate artifact manifests`
+- `d4e2f03` — `feat(release): generate and validate artifact manifests`
+- `cfe5f18` — `fix(release): reject empty archive path components`
 
 ## Self-review
 
