@@ -189,3 +189,18 @@ workspace test gate had one transient `camera_hot_unplug_closes_then_releases_fo
 failure (`runtime.actor.unavailable` versus `camera.session.unplugged`); its
 immediate exact rerun passed. This Task 6 Python/release-only change did not
 modify runtime code.
+
+## Final reservation leak follow-up
+
+The second reservation can fail after the wheel reservation was acquired. The
+reservation list now appends each successful acquisition individually, so the
+`finally` cleanup removes the wheel reservation while preserving the
+pre-existing external sdist reservation. RED reproduced the leaked wheel
+reservation; GREEN passed:
+
+```text
+tests/release/test_package_python.py: 9 passed
+Task 6 focused tests: 17 passed
+tests/release: 144 passed
+compileall and git diff --check: passed
+```

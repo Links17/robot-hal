@@ -58,6 +58,28 @@ def test_python_package_reserves_both_artifacts_before_build(
     assert not (output / "seeed_hal-0.5.0rc1-py3-none-any.whl").exists()
 
 
+def test_failed_second_reservation_cleans_only_our_wheel_reservation(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "artifacts"
+    output.mkdir()
+    sdist_reservation = output / ".reserve-package-seeed_hal-0.5.0rc1.tar.gz"
+    sdist_reservation.write_bytes(b"external reservation")
+
+    with pytest.raises(ReleaseFailure) as failure:
+        release_tool.package_python(
+            tag="v0.5.0-rc.1",
+            project=REPO_ROOT / "bindings" / "python",
+            output_dir=output,
+        )
+
+    assert failure.value.name == "release.artifact.unexpected"
+    assert not (
+        output / ".reserve-package-seeed_hal-0.5.0rc1-py3-none-any.whl"
+    ).exists()
+    assert sdist_reservation.read_bytes() == b"external reservation"
+
+
 def test_python_package_rolls_back_wheel_when_sdist_link_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

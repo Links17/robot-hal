@@ -1948,10 +1948,8 @@ def package_python(*, tag: str, project: Path, output_dir: Path) -> tuple[Path, 
         wheel_name, sdist_name = python_artifact_names(version)
         wheel_destination = _published_artifact_path(output_dir, wheel_name)
         sdist_destination = _published_artifact_path(output_dir, sdist_name)
-        reservations = [
-            _reserve_package_artifact(output_dir, wheel_name),
-            _reserve_package_artifact(output_dir, sdist_name),
-        ]
+        reservations.append(_reserve_package_artifact(output_dir, wheel_name))
+        reservations.append(_reserve_package_artifact(output_dir, sdist_name))
         with tempfile.TemporaryDirectory(prefix=".package-python-", dir=output_dir) as directory:
             staging_dir = Path(directory)
             result = subprocess.run(
