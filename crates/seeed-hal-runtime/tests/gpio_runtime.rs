@@ -307,6 +307,10 @@ async fn gpio_cancelled_queued_read_does_not_start_native_io() {
     };
     tokio::task::yield_now().await;
     cancelled.abort();
+    assert!(
+        cancelled.await.unwrap_err().is_cancelled(),
+        "the queued read task must finish cancellation before native I/O is released"
+    );
     adapter.release_read.add_permits(1);
     first.await.unwrap().unwrap();
     assert!(
