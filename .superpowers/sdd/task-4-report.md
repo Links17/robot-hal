@@ -198,3 +198,54 @@ and diff check passed.
 
 - This follow-up establishes static directory layout and archive-validation
   semantics only. It does not add package production or release workflows.
+
+---
+
+## Final Archive Review Follow-up
+
+### Status
+
+DONE
+
+### RED Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_manifest.py tests/release/test_archive_safety.py
+```
+
+Result: `2 failed, 58 passed` after adding tar/zip `root//` and
+`root/subdir//` directory-member tests. The nested malformed tar directory was
+normalized by `tarfile` and bypassed the prior metadata-only check.
+
+### Changes
+
+- Directory members now reject extra trailing slashes; regular members with a
+  trailing slash remain rejected.
+- ZIP names are checked directly. For tar.gz archives, the validator also reads
+  raw 512-byte headers before `tarfile` normalization so malformed directory
+  names cannot bypass the same fail-closed contract.
+- Existing type, traversal, root, NFC/case collision, expected-directory, and
+  no-extraction checks remain in force.
+
+### GREEN Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_manifest.py tests/release/test_archive_safety.py
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+python3 -m compileall -q scripts/release tests/release
+git diff --check
+```
+
+Result: focused suite `60 passed`; full release suite `106 passed`; compileall
+and diff check passed.
+
+### Commit
+
+Pending.
+
+### Concerns
+
+- Raw tar header inspection is intentionally limited to archive metadata needed
+  to catch parser normalization; no artifact extraction or packaging is added.

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import ipaddress
 import json
@@ -880,6 +881,55 @@ def _safe_archive_path(name: str) -> PurePosixPath:
     return path
 
 
+def _archive_member_path(name: str, is_directory: bool) -> PurePosixPath:
+    if is_directory:
+        # tarfile normalizes standard directory names to omit the trailing slash,
+        # whereas ZIP retains it. Both forms are permitted, but doubled slashes
+        # are never a valid directory representation.
+        if name.endswith("//"):
+            _archive_invalid("archive directory name has extra trailing slashes")
+    elif name.endswith("/"):
+        _archive_invalid("archive file name must not have a trailing slash")
+    return _safe_archive_path(name)
+
+
+def _validate_raw_tar_directory_names(archive_path: Path) -> None:
+    """Reject slash forms tarfile normalizes before exposing TarInfo names."""
+    try:
+        with gzip.open(archive_path, "rb") as archive:
+            while header := archive.read(512):
+                if len(header) != 512:
+                    _archive_invalid("tar archive has a truncated header")
+                if header == b"\0" * 512:
+                    return
+                raw_name = header[:100].split(b"\0", 1)[0]
+                if header[156:157] == b"5":
+                    try:
+                        name = raw_name.decode("utf-8")
+                    except UnicodeDecodeError as error:
+                        raise ReleaseFailure(
+                            "release.archive.invalid",
+                            "tar archive member name is not UTF-8",
+                        ) from error
+                    if name.endswith("//"):
+                        _archive_invalid(
+                            "tar directory name has extra trailing slashes"
+                        )
+                size_field = header[124:136].rstrip(b"\0 ")
+                try:
+                    size = int(size_field or b"0", 8)
+                except ValueError as error:
+                    raise ReleaseFailure(
+                        "release.archive.invalid",
+                        "tar archive member size is invalid",
+                    ) from error
+                remaining = (size + 511) // 512 * 512
+                if remaining and len(archive.read(remaining)) != remaining:
+                    _archive_invalid("tar archive has truncated member data")
+    except OSError as error:
+        raise ReleaseFailure("release.archive.invalid", "unable to inspect archive") from error
+
+
 def _validate_members(
     members: Iterable[tuple[str, bool, bool]],
     expected_root: str,
@@ -894,7 +944,7 @@ def _validate_members(
     directories: set[str] = set()
     root_seen = False
     for name, is_directory, is_regular in members:
-        path = _safe_archive_path(name.rstrip("/") if name.endswith("/") else name)
+        path = _archive_member_path(name, is_directory)
         normalized = unicodedata.normalize("NFC", path.as_posix())
         collision_key = _archive_collision_key(normalized)
         if collision_key in seen:
@@ -957,6 +1007,7 @@ def validate_archive(
 ) -> None:
     try:
         if archive_path.name.endswith(".tar.gz"):
+            _validate_raw_tar_directory_names(archive_path)
             with tarfile.open(archive_path, "r:gz") as archive:
                 members = []
                 for member in archive.getmembers():

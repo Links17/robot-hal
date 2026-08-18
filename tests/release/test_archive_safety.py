@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import gzip
 import sys
 import tarfile
 import unicodedata
@@ -40,6 +41,33 @@ def _zip(path: Path, members: list[tuple[str, bytes, bool]]) -> None:
             if symlink:
                 info.external_attr = 0o120777 << 16
             archive.writestr(info, contents)
+
+
+def _raw_tar_members(path: Path, members: list[tuple[str, bytes, bool]]) -> None:
+    """Write directory headers without tarfile's trailing-slash normalization."""
+    payload = bytearray()
+    for name, contents, is_directory in members:
+        header = bytearray(512)
+        encoded = name.encode("utf-8")
+        header[: len(encoded)] = encoded
+        header[100:108] = b"0000755\x00"
+        header[108:116] = b"0000000\x00"
+        header[116:124] = b"0000000\x00"
+        header[124:136] = f"{len(contents):011o}\0".encode("ascii")
+        header[136:148] = b"00000000000\x00"
+        header[148:156] = b"        "
+        header[156:157] = b"5" if is_directory else b"0"
+        header[257:263] = b"ustar\x00"
+        header[263:265] = b"00"
+        checksum = sum(header)
+        header[148:156] = f"{checksum:06o}\0 ".encode("ascii")
+        payload.extend(header)
+        if not is_directory:
+            payload.extend(contents)
+            payload.extend(b"\0" * (-len(contents) % 512))
+    payload.extend(b"\0" * 1024)
+    with gzip.GzipFile(path, "wb", mtime=0) as archive:
+        archive.write(payload)
 
 
 def test_valid_tar_and_zip_are_inspected_without_extraction(tmp_path: Path) -> None:
@@ -276,6 +304,44 @@ def test_archive_rejects_unexpected_empty_directories(
 
     with pytest.raises(ReleaseFailure, match="release.archive.invalid"):
         validate_archive(archive, expected_root="root", expected_files={"README.txt"})
+
+
+@pytest.mark.parametrize("suffix", [".tar.gz", ".zip"])
+@pytest.mark.parametrize("directory", ["root//", "root/subdir//"])
+def test_archive_rejects_directory_members_with_extra_trailing_slashes(
+    tmp_path: Path,
+    suffix: str,
+    directory: str,
+) -> None:
+    archive = tmp_path / f"trailing-slash{suffix}"
+    members = [
+        ("root/", b"", "directory"),
+        (directory, b"", "directory"),
+        ("root/subdir/README.txt", b"ok", "file"),
+    ]
+    if suffix == ".tar.gz":
+        _raw_tar_members(
+            archive,
+            [
+                ("root/", b"", True),
+                (directory, b"", True),
+                ("root/subdir/README.txt", b"ok", False),
+            ],
+        )
+    else:
+        _zip(
+            archive,
+            [(name, contents, False) for name, contents, _ in members],
+        )
+
+    with pytest.raises(ReleaseFailure) as failure:
+        validate_archive(
+            archive,
+            expected_root="root",
+            expected_files={"subdir/README.txt"},
+        )
+
+    assert failure.value.name == "release.archive.invalid"
 
 
 # End of archive safety cases.
