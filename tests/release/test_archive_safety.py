@@ -90,6 +90,34 @@ def _raw_tar_with_claimed_size(path: Path, size: int) -> None:
         archive.write(payload)
 
 
+def _truncated_gzip_tar(path: Path) -> None:
+    _tar(
+        path,
+        [
+            ("root/", b"", "directory"),
+            ("root/README.txt", b"ok", "file"),
+        ],
+    )
+    compressed = path.read_bytes()
+    path.write_bytes(compressed[: len(compressed) // 2])
+
+
+def test_raw_tar_prescan_maps_truncated_gzip_to_stable_failure(tmp_path: Path) -> None:
+    archive_path = tmp_path / "truncated.tar.gz"
+    _truncated_gzip_tar(archive_path)
+
+    with pytest.raises(ReleaseFailure) as failure:
+        validate_archive(
+            archive_path,
+            expected_root="root",
+            expected_files={"README.txt"},
+        )
+
+    assert failure.value.name == "release.archive.invalid"
+    assert failure.value.diagnostic == "unable to inspect archive"
+    assert str(archive_path) not in failure.value.diagnostic
+
+
 def _raw_tar_headers(path: Path, sizes: list[int], *, include_payload: bool = False) -> None:
     payload = bytearray()
     for index, size in enumerate(sizes):

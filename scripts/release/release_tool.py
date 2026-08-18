@@ -940,7 +940,7 @@ def _validate_raw_tar_directory_names(archive_path: Path) -> None:
                     if len(archive.read(chunk_size)) != chunk_size:
                         _archive_invalid("tar archive has truncated member data")
                     remaining -= chunk_size
-    except OSError as error:
+    except (EOFError, OSError) as error:
         raise ReleaseFailure("release.archive.invalid", "unable to inspect archive") from error
 
 
