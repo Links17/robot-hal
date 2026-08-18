@@ -1,0 +1,314 @@
+# Task 6 Report — Package Rust crates and Python distributions
+
+## Status
+
+Complete within the Task 6 scope. No Task 7+ behavior, release plan, or design
+documents were modified.
+
+Commit sequence:
+
+1. `c79636c feat(release): package Rust and Python clients`
+2. Pending report and packaged-crate closure validation commit.
+
+## Implementation
+
+- Added `package-rust --tag --repo-root --output-dir` and
+  `package-python --tag --project --output-dir` to `release_tool.py`.
+- Added thin POSIX wrappers for Rust and Python plus a PowerShell wrapper for
+  Python; policy, validation, subprocess handling, and output publication
+  remain in the Python tool.
+- Rust package selection is derived from `cargo metadata --no-deps` and limits
+  output to workspace members whose `publish` is not `false`.  The bundle uses
+  exact, name-sorted `.crate` basenames, deterministic outer tar.gz encoding,
+  archive validation, staging, and hard-link publication without overwriting an
+  existing artifact.
+- Each local `.crate` is archive-inspected, extracted with `tarfile`'s data
+  filter, and checked using `cargo check --locked`; all subprocesses have
+  bounded timeouts and exposed diagnostics are stable/sanitized.
+- Added locked `build==1.3.0` to the Python development group and lockfile.
+  Python packaging validates exact PEP 440 artifact names, wheel metadata/tag
+  (`py3-none-any`), sdist metadata/content, and a temporary offline wheel
+  installation asserting both distribution and `seeed_hal.__version__`.
+
+## TDD
+
+RED command:
+
+```text
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release/test_package_rust.py tests/release/test_package_python.py
+```
+
+Observed expected RED: test collection failed because
+`package_rust` and `python_artifact_names` did not yet exist.
+
+GREEN command:
+
+```text
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release/test_package_rust.py tests/release/test_package_python.py
+```
+
+Observed GREEN: `3 passed`.
+
+## Verification
+
+Completed:
+
+```text
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+# 130 passed
+
+uv run --project bindings/python --python 3.11 --frozen pytest -q bindings/python/tests
+# 187 passed
+
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+# completed successfully; hardware tests remained appropriately ignored
+
+scripts/release/package-python.sh v0.5.0-rc.1 target/task6-python-artifacts
+# emitted seeed_hal-0.5.0rc1-py3-none-any.whl and seeed_hal-0.5.0rc1.tar.gz
+# wheel was installed offline in a temporary venv and version assertions passed
+
+python3 -m compileall -q scripts/release/release_tool.py \
+  tests/release/test_package_rust.py tests/release/test_package_python.py
+git diff --check
+```
+
+## Actual Rust package boundary
+
+The public v0.5 crates are not yet published to crates.io.  Running the
+release workspace's real package command reached Cargo's normal upload
+preparation check and failed because `seeed-hal-camera` was not available in
+the crates.io index:
+
+```text
+cargo package --package seeed-hal-adapter-avfoundation --locked --allow-dirty --no-verify
+# failed to prepare local package for uploading:
+# no matching package named `seeed-hal-camera` found; location searched: crates.io index
+```
+
+This is expected for the current release state.  The implementation neither
+publishes nor changes workspace dependencies to registry sources.  It retains
+the safe, repeatable local `cargo package` workflow and validates generated
+crate archive structure plus extracted `cargo check --locked` whenever Cargo
+can produce the local package.  Full actual-workspace Rust bundle generation
+remains blocked until the dependency publication closure exists; it is not
+claimed as verified.
+
+Task 7's clean Python 3.11–3.13 matrix was not run or claimed.
+
+## Self-review and concerns
+
+- Verified no artifact may overwrite an existing final filename.
+- Verified sensitive subprocess diagnostics are not returned as paths/tokens.
+- Kept artifact publication local and credential-independent.
+- Concern: `cargo package` necessarily asks Cargo to assess the crates.io
+  dependency closure; that is a Cargo behavior, not a registry credential
+  dependency in this tool.  The current unpublished dependency closure blocks
+  the real workspace Rust bundle exactly as documented above.
+
+## Review follow-up
+
+Addressed the four Important findings from the Task 6 review:
+
+- Packageable Rust members now come exclusively from Cargo metadata
+  `workspace_members`; the no-deps metadata result supplies member/package
+  identity and a second Cargo resolve graph supplies deterministic,
+  dependency-first package/check order.  Final bundle entries remain basename
+  sorted.
+- The Rust gate now requires an empty
+  `git status --porcelain=v1 --untracked-files=all`; staged, unstaged,
+  untracked, failed-status, and non-repository states all fail closed before
+  Cargo receives `--allow-dirty`.
+- Python wheel/sdist publication reserves both final names before building.  A
+  failed reservation, build, validation, or second link removes only artifacts
+  hard-linked by this invocation and leaves external final files untouched.
+- The exact generated files
+  `seeed_hal/proto/__init__.py` and `seeed_hal/proto/hal_pb2.py` are required
+  in both distributions.  The isolated install imports the generated module,
+  asserts its descriptor name, and serializes `Empty`.
+
+Review RED:
+
+```text
+pytest initially failed importing the absent metadata-selection helper.
+```
+
+Review GREEN:
+
+```text
+uv run --project bindings/python --python 3.11 --frozen pytest -q \
+  tests/release/test_package_rust.py tests/release/test_package_python.py
+# 11 passed
+
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+# 138 passed
+
+uv run --project bindings/python --python 3.11 --frozen pytest -q bindings/python/tests
+# 187 passed
+```
+
+The in-progress pre-commit Rust package attempt correctly failed closed on the
+strict dirty-tree gate.  After commit `fc58a5c`, a clean-tree
+`scripts/release/package-rust.sh v0.5.0-rc.1 target/task6-review-rust-clean`
+passed that gate and again reached the existing Cargo package boundary:
+`release.cargo.failed: cargo package failed`.  This is the already documented
+unpublished crates.io dependency closure; no dependency source was changed and
+no publication was attempted.
+
+## Second review follow-up
+
+Addressed the next two Important and two Minor findings:
+
+- Wheel validation now parses its internal `WHEEL` metadata and requires the
+  exact `seeed_hal-<PEP 440 version>.dist-info` directory,
+  `Root-Is-Purelib: true`, and exactly one `Tag: py3-none-any`.
+- Temporary wheel validation invokes `uv venv --offline --no-project --python
+  sys.executable`, removes proxy variables from all validator subprocesses, and
+  therefore neither downloads an interpreter nor permits proxy-based network
+  access.
+- The second Cargo metadata invocation that obtains the resolve graph now has
+  `--locked`.
+- A source comment distinguishes cooperative reservation files from
+  `os.link`, which remains the atomic no-clobber defense against external
+  output-directory races.
+
+Second-review RED was 5 expected focused failures for missing strict wheel
+identity checks, missing offline venv command/environment controls, and the
+missing resolve `--locked`.  GREEN:
+
+```text
+focused Task 6 tests: 16 passed
+tests/release: 143 passed
+bindings/python/tests: 187 passed
+```
+
+Actual Python package build/inspection/isolated install passed and emitted the
+expected wheel and sdist. `cargo fmt` and `cargo clippy` passed. The full Rust
+workspace test gate had one transient `camera_hot_unplug_closes_then_releases_for_reopen`
+failure (`runtime.actor.unavailable` versus `camera.session.unplugged`); its
+immediate exact rerun passed. This Task 6 Python/release-only change did not
+modify runtime code.
+
+## Final reservation leak follow-up
+
+The second reservation can fail after the wheel reservation was acquired. The
+reservation list now appends each successful acquisition individually, so the
+`finally` cleanup removes the wheel reservation while preserving the
+pre-existing external sdist reservation. RED reproduced the leaked wheel
+reservation; GREEN passed:
+
+```text
+tests/release/test_package_python.py: 9 passed
+Task 6 focused tests: 17 passed
+tests/release: 144 passed
+compileall and git diff --check: passed
+```
+
+## Reservation ownership TOCTOU follow-up
+
+Reservations now carry the `(st_dev, st_ino)` identity returned by `os.fstat`
+at exclusive creation. Cleanup uses `lstat`, rejects symlinks and non-regular
+files, and only unlinks a reservation when its identity still matches this
+invocation. Stat errors and identity mismatches preserve the unknown file.
+RED simulated an external wheel-reservation replacement before cleanup; the
+old cleanup deleted it. GREEN preserved that replacement while retaining normal
+partial-reservation cleanup and external sdist-reservation preservation:
+
+```text
+tests/release/test_package_python.py: 10 passed
+Task 6 focused tests: 18 passed
+tests/release: 145 passed
+compileall and git diff --check: passed
+```
+
+## Approved candidate-output architecture correction
+
+Task 6 no longer treats Python wheel/sdist files as final release artifacts or
+publishes them into a shared release directory. `package-python` now takes a
+`--candidate-dir` path which must not exist when invoked. It creates that
+private directory, builds the exact PEP 440 wheel/sdist pair directly there,
+performs the existing strict wheel/sdist inspection and offline
+venv/import/protobuf validation, then returns the pair only when the directory
+contains exactly those two regular, non-symlink files.
+
+The old `.reserve-package-*` protocol, hard-link publishing, and all
+per-artifact cleanup were removed. This eliminates the reservation-cleanup
+TOCTOU class rather than attempting to distinguish ownership during deletion.
+Any pre-existing candidate directory fails closed without modification. Any
+unexpected or external write before successful return also fails closed. A
+failed candidate may remain for diagnostics, but it has neither sidecars nor
+the required complete release contents, so `verify-static` rejects it.
+
+The POSIX and PowerShell wrappers now describe their second argument as a
+new candidate directory and invoke the CLI with `--candidate-dir`. Task 7
+remains unimplemented and is solely responsible for aggregating verified
+candidates into a new, exclusive complete release directory, generating
+sidecars, and applying the exact `verify-static` gate. Task 9 must consume
+only that completed Task 7 directory.
+
+TDD RED:
+
+```text
+uv run --project bindings/python --python 3.11 --frozen pytest -q \
+  tests/release/test_package_python.py
+# 1 failed, 8 passed: existing candidate directory incorrectly reached build
+```
+
+Initial GREEN:
+
+```text
+uv run --project bindings/python --python 3.11 --frozen pytest -q \
+  tests/release/test_package_python.py
+# 9 passed
+```
+
+Candidate directory identity (`st_dev`, `st_ino`) is captured immediately
+after creation and checked before and after offline validation. This rejects a
+directory replacement or symlink substitution as well as unexpected entries.
+
+Final verification:
+
+```text
+Task 6 focused package tests: 20 passed
+tests/release: 147 passed
+bindings/python/tests: 187 passed
+actual package-python candidate build: passed
+verify-static candidate rejection: expected release.manifest.invalid
+cargo fmt --all --check: passed
+cargo clippy --workspace --all-targets --all-features -- -D warnings: passed
+cargo test --workspace --all-features: passed
+```
+
+The first full Rust test run had one `usb_runtime` close-timeout failure. Its
+exact standalone rerun and a subsequent full workspace gate passed. No runtime
+code was changed for this Task 6 correction.
+
+## Candidate artifact replacement review follow-up
+
+The candidate-directory identity and exact-name checks alone could not prove
+that the wheel or sdist remained the inspected and offline-validated file.
+After candidate build completes and before wheel/sdist inspection, Task 6 now
+captures each artifact's `lstat` device, inode, and size plus SHA-256 using the
+bounded existing hashing helper. Immediately before returning candidate success,
+it rechecks both artifacts after the directory identity and exact-entry gate.
+
+A symlink, FIFO, other non-regular file, stat/hash error, changed identity, or
+changed bytes fails closed as `release.artifact.unexpected` with a stable
+no-value diagnostic. No cleanup attempts to delete the potentially external
+replacement; the candidate directory remains available for diagnostics.
+
+TDD RED replaced each of wheel and sdist after offline validation with both a
+same-name symlink and a same-name regular file containing different bytes:
+
+```text
+tests/release/test_package_python.py
+# 4 failed, 12 passed: package_python incorrectly returned candidate success
+```
+
+GREEN:
+
+```text
+tests/release/test_package_python.py
+# 16 passed
+```

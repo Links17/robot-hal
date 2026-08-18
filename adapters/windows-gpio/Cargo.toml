@@ -1,0 +1,21 @@
+[package]
+name = "seeed-hal-adapter-windows-gpio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Dependency audit (2026-08-17): windows 0.58.0 is MIT OR Apache-2.0, declares
+# Rust 1.70, and projects Windows.Devices.Gpio through safe Rust bindings.
+[features]
+hardware-tests = []
+
+[dependencies]
+async-trait = { workspace = true }
+percent-encoding = { workspace = true }
+seeed-hal-core = { path = "../../crates/seeed-hal-core", version = "=0.5.0-rc.1"}
+seeed-hal-gpio = { path = "../../crates/seeed-hal-gpio", version = "=0.5.0-rc.1"}
+tokio = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.58.0", features = ["Devices_Gpio", "Foundation"] }

@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 
 #[derive(Serialize)]
 pub struct BrokerManifest {
+    schema: ManifestSchema,
     broker_version: &'static str,
     wire: WireRange,
     target: Target,
@@ -12,6 +13,11 @@ pub struct BrokerManifest {
     msrv: &'static str,
     artifact_checksum: ArtifactChecksum,
     required_vendor_runtime_libraries: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+struct ManifestSchema {
+    major: u32,
 }
 
 #[derive(Serialize)]
@@ -54,6 +60,7 @@ impl BrokerManifest {
             hasher.update(&buffer[..read]);
         }
         Ok(Self {
+            schema: ManifestSchema { major: 1 },
             broker_version: env!("CARGO_PKG_VERSION"),
             wire: WireRange {
                 major: seeed_hal_protocol::PROTOCOL_MAJOR,
@@ -81,12 +88,46 @@ impl BrokerManifest {
 
 fn enabled_adapters() -> Vec<&'static str> {
     let mut adapters = vec!["serialport"];
+    #[cfg(all(
+        feature = "avfoundation",
+        target_os = "macos",
+        not(feature = "virtual-adapters")
+    ))]
+    adapters.push("avfoundation");
+    #[cfg(all(
+        feature = "mediafoundation",
+        windows,
+        not(feature = "virtual-adapters")
+    ))]
+    adapters.push("mediafoundation");
     #[cfg(feature = "pcan")]
     adapters.push("pcan");
     #[cfg(feature = "socketcan")]
     adapters.push("socketcan");
+    #[cfg(all(feature = "nusb", not(feature = "virtual-adapters")))]
+    adapters.push("nusb");
+    #[cfg(all(
+        feature = "linux-gpio",
+        target_os = "linux",
+        not(feature = "virtual-adapters")
+    ))]
+    adapters.push("linux-gpio");
+    #[cfg(all(feature = "windows-gpio", windows, not(feature = "virtual-adapters")))]
+    adapters.push("windows-gpio");
+    #[cfg(all(
+        feature = "v4l2",
+        target_os = "linux",
+        not(feature = "virtual-adapters")
+    ))]
+    adapters.push("v4l2");
     #[cfg(feature = "virtual-adapters")]
-    adapters.extend(["virtual-can", "virtual-serial"]);
+    adapters.extend([
+        "virtual-can",
+        "virtual-camera",
+        "virtual-gpio",
+        "virtual-serial",
+        "virtual-usb",
+    ]);
     adapters.sort_unstable();
     adapters
 }
@@ -95,12 +136,43 @@ fn enabled_adapters() -> Vec<&'static str> {
 fn enabled_features() -> Vec<&'static str> {
     #[allow(unused_mut)]
     let mut features = Vec::new();
+    #[cfg(feature = "serialport")]
+    features.push("serialport");
+    #[cfg(all(
+        feature = "avfoundation",
+        target_os = "macos",
+        not(feature = "virtual-adapters")
+    ))]
+    features.push("avfoundation");
+    #[cfg(all(
+        feature = "mediafoundation",
+        windows,
+        not(feature = "virtual-adapters")
+    ))]
+    features.push("mediafoundation");
     #[cfg(feature = "pcan")]
     features.push("pcan");
     #[cfg(feature = "socketcan")]
     features.push("socketcan");
+    #[cfg(all(feature = "nusb", not(feature = "virtual-adapters")))]
+    features.push("nusb");
+    #[cfg(all(
+        feature = "linux-gpio",
+        target_os = "linux",
+        not(feature = "virtual-adapters")
+    ))]
+    features.push("linux-gpio");
+    #[cfg(all(feature = "windows-gpio", windows, not(feature = "virtual-adapters")))]
+    features.push("windows-gpio");
+    #[cfg(all(
+        feature = "v4l2",
+        target_os = "linux",
+        not(feature = "virtual-adapters")
+    ))]
+    features.push("v4l2");
     #[cfg(feature = "virtual-adapters")]
     features.push("virtual-adapters");
+    features.sort_unstable();
     features
 }
 

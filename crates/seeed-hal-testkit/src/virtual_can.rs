@@ -50,6 +50,15 @@ struct BusInner {
 impl VirtualCanAdapter {
     /// Creates a bounded, deterministic loopback channel.
     pub fn loopback(resource_id: impl Into<String>) -> Self {
+        Self::loopback_with_mode(resource_id, CanMode::Classic)
+    }
+
+    /// Creates a bounded deterministic loopback channel active in CAN FD mode.
+    pub fn loopback_fd(resource_id: impl Into<String>) -> Self {
+        Self::loopback_with_mode(resource_id, CanMode::Fd)
+    }
+
+    fn loopback_with_mode(resource_id: impl Into<String>, mode: CanMode) -> Self {
         let id = ResourceId::parse(resource_id.into()).expect("valid virtual CAN resource id");
         let endpoint = format!("virtual://can/{}", id.as_str());
         let descriptor = ResourceDescriptor::new(
@@ -75,9 +84,10 @@ impl VirtualCanAdapter {
         );
         let nominal =
             CanBitTiming::new(500_000, None, None).expect("virtual CAN default timing is valid");
-        let active =
-            CanActiveConfig::new(CanMode::Classic, nominal, None, false, true, CLOCK_DOMAIN)
-                .expect("virtual CAN default configuration is valid");
+        let data = (mode == CanMode::Fd)
+            .then(|| CanBitTiming::new(2_000_000, None, None).expect("valid virtual data timing"));
+        let active = CanActiveConfig::new(mode, nominal, data, false, true, CLOCK_DOMAIN)
+            .expect("virtual CAN default configuration is valid");
         Self {
             descriptor,
             state: Arc::new(SharedState {
@@ -176,21 +186,49 @@ impl VirtualCanAdapter {
         self.wait_transition(timeout, false)
     }
 
+    pub fn open_transition(&self) -> usize {
+        self.state
+            .inner
+            .lock()
+            .expect("virtual CAN mutex poisoned")
+            .open_count
+    }
+
+    pub fn close_transition(&self) -> usize {
+        self.state
+            .inner
+            .lock()
+            .expect("virtual CAN mutex poisoned")
+            .close_count
+    }
+
+    pub fn wait_for_open_after(&self, transition: usize, timeout: Duration) -> bool {
+        self.wait_for_transition_after(transition, timeout, true)
+    }
+
+    pub fn wait_for_close_after(&self, transition: usize, timeout: Duration) -> bool {
+        self.wait_for_transition_after(transition, timeout, false)
+    }
+
     fn wait_transition(&self, timeout: Duration, open: bool) -> bool {
+        let transition = if open {
+            self.open_transition()
+        } else {
+            self.close_transition()
+        };
+        self.wait_for_transition_after(transition, timeout, open)
+    }
+
+    fn wait_for_transition_after(&self, transition: usize, timeout: Duration, open: bool) -> bool {
         let deadline = Instant::now() + timeout;
         let mut guard = self.state.inner.lock().expect("virtual CAN mutex poisoned");
-        let baseline = if open {
-            guard.open_count
-        } else {
-            guard.close_count
-        };
         loop {
             let current = if open {
                 guard.open_count
             } else {
                 guard.close_count
             };
-            if current > baseline {
+            if current > transition {
                 return true;
             }
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {

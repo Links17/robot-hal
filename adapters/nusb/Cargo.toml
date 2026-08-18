@@ -1,0 +1,23 @@
+[package]
+name = "seeed-hal-adapter-nusb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Dependency audit (2026-08-17): nusb 0.2.7 is Apache-2.0 OR MIT, declares
+# Rust 1.85, and exposes only the `tokio` optional feature.  The adapter uses
+# its blocking API exclusively from the runtime-owned terminal worker.
+[features]
+hardware-tests = []
+
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+percent-encoding = { workspace = true }
+seeed-hal-core = { path = "../../crates/seeed-hal-core", version = "=0.5.0-rc.1"}
+seeed-hal-usb = { path = "../../crates/seeed-hal-usb", version = "=0.5.0-rc.1"}
+tokio = { workspace = true }
+
+[target.'cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))'.dependencies]
+nusb = "=0.2.7"

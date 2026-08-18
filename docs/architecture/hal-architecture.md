@@ -1,7 +1,7 @@
 # Seeed HAL Architecture
 
-**Status:** v0.1 core and Serial implemented; later hardware classes planned
-**Date:** 2026-08-14  
+**Status:** v0.4 Camera software implementation landed; v0.5 release-conformance infrastructure has local evidence, while hosted and native hardware qualification remain open
+**Date:** 2026-08-18
 **Scope:** Team-reusable Rust HAL; `lerobot-easy` is the first consumer, not the domain model.
 
 ## 1. Objective
@@ -54,7 +54,7 @@ The broker constructs the same runtime and exposes it through versioned local IP
 
 The broker is a deployment adapter, not a separate implementation. Platform handles never cross IPC.
 
-The v0.1 broker accepts frames up to exactly 1 MiB. Each connection has a 32-request admission
+The broker accepts frames up to exactly 1 MiB. Each connection has a 32-request admission
 queue, at most 32 executing requests, and a 64-response queue; runtime event subscriptions retain
 64 events. Request or execution admission overflow returns `runtime.queue.full`. Response overflow
 returns `runtime.queue.response_full`, closes the connection, and is recorded in its cleanup outcome
@@ -74,10 +74,10 @@ Connection teardown revokes the owner before waiting for socket reader/writer ta
 permits only a bounded response drain and aborts a stalled task after the connection-task shutdown
 deadline, so a peer that stops reading cannot retain hardware ownership.
 
-The Rust broker client keeps a remote Serial handle reusable when a close request is rejected by
-local bounded-queue admission, allowing the caller to retry `close(&mut self)`. Once a close
-response succeeds, that handle is terminal and rejects every later operation locally; dropping an
-unclosed handle still relies on owner cleanup when its client connection terminates.
+The Rust broker client keeps remote Serial, CAN, USB, GPIO, and Camera handles reusable when a close request
+is rejected by local bounded-queue admission, allowing the caller to retry `close(&mut self)`.
+Once a close response succeeds, that handle is terminal and rejects every later operation locally;
+dropping an unclosed handle still relies on owner cleanup when its client connection terminates.
 
 Each launch creates a 256-bit startup token. The handshake compares it in constant time and rejects
 incompatible protocol versions, unsupported required capabilities, and invalid frame/read/write
@@ -93,7 +93,8 @@ For Electron applications, Electron Main owns broker process lifecycle and updat
 
 ### 3.4 Python broker client
 
-The Python binding exposes protobuf-independent async `HalClient` and `SerialSession` types. It
+The Python binding exposes protobuf-independent async `HalClient`, `SerialSession`, `CanSession`,
+`UsbSession`, `GpioSession`, and `CameraSession` types. It
 performs authentication and limit negotiation before starting one bounded writer task and one
 reader task. Pending requests, cancellation and completion tombstones, writer admission, and event
 delivery are bounded; request IDs are nonzero and correlated independently of response order.
@@ -130,7 +131,11 @@ seeed-hal/
 │   ├── pcan/
 │   ├── nusb/
 │   ├── linux-gpio/
-│   └── camera-platform/
+│   ├── windows-gpio/
+│   ├── avfoundation/
+│   ├── v4l2/
+│   ├── mediafoundation/
+│   └── shared-memory/
 ├── bindings/
 │   ├── python/
 │   └── node/
@@ -247,19 +252,33 @@ The initial Serial interface covers:
 - line-control operations where supported;
 - explicit close and idempotent cleanup.
 
-CAN, USB, GPIO, and Camera add separate interfaces in later vertical slices while reusing core identity, session, lease, error, and event behavior.
+CAN/CAN FD, USB, GPIO, and Camera have separate interfaces while reusing core identity, session,
+lease, error, and event behavior. USB exposes bounded Control/Bulk/Interrupt transfers per claimed
+interface. GPIO exposes bounded line read/write/configuration and rising/falling edge requests with
+monotonic timestamps; its bounded edge delivery queue drops oldest events and reports structured
+lag. Camera exposes exclusive format-negotiated capture, capability-gated controls, and frame
+metadata without product-level image semantics.
 
 ## 7. Camera data plane
 
 Camera belongs in HAL at the capture interface: enumeration, stable identity, format negotiation, controls, frames, timestamps, hotplug, and lifecycle. Preview, encoding policy, recording, image processing, inference, and application camera roles remain outside HAL.
 
-Camera control uses normal broker IPC. Frame payloads use a bounded shared-memory ring or an equivalent explicitly negotiated zero/low-copy data plane. Protobuf carries descriptors and ownership metadata, not full-rate video frames.
+Camera control uses wire-major 1, minor 3 broker IPC. Frame payloads use the bounded named
+shared-memory ring implemented by `adapters/shared-memory`; Protobuf carries descriptors,
+credentials, and ownership metadata, not full-rate video frames. The active target contributes one
+native adapter: AVFoundation on macOS, V4L2 on Linux, or Media Foundation on Windows. The virtual
+camera adapter is conformance-only and does not claim native device availability.
 
 ## 8. Concurrency and cleanup
 
 - The runtime owns one task or blocking worker per opened resource as required by its adapter.
 - Blocking vendor calls never execute on Tokio executor workers.
 - Operation queues are bounded and preserve documented ordering.
+- USB owns one bounded terminal worker per claimed interface and GPIO owns one per opened line group.
+  USB transfers are bounded to 16 KiB with at most 64 pending transfers; GPIO edge requests are
+  bounded to 1,024 events, with a default delivery capacity of 256 and oldest-drop lag reporting.
+  A finite close deadline quarantines an uninterruptible native worker rather than releasing its
+  resource for reuse prematurely.
 - Cancellation has a deadline; adapters that cannot cancel synchronously are isolated in a disposable worker.
 - The Python Windows transport uses one bounded, per-transport actor thread as the sole steady-state
   owner of its Named Pipe handle. Its command capacity is four; full or closed admission fails
@@ -311,10 +330,22 @@ The library emits structured tracing spans and metrics but never installs a subs
 1. **v0.1:** core, runtime, broker, Rust/Python clients, virtual adapter, Serial.
 2. **v0.2:** CAN/CAN FD, SocketCAN, and PCAN.
 3. **v0.3:** USB and GPIO, with GPIO-through-USB adapters supported on desktop platforms.
-4. **v0.4:** Camera control plus shared-memory frame data plane.
+4. **v0.4:** Camera control plus shared-memory frame data plane and target-native adapters.
 5. **v1.0:** stabilized interfaces, compatibility guarantees, and cross-platform conformance qualification.
 
 Each version is a working vertical slice. Later modules may refine core only through backward-compatible additions or an explicit contract revision.
+
+### 11.1 v0.5 release conformance
+
+v0.5 adds release and conformance infrastructure rather than a new HAL
+hardware-class feature. The RC workflow derives its macOS, Linux, and Windows
+target matrix from one artifact contract; builds immutable production-broker,
+Rust-source, and Python candidates; verifies per-host broker execution and
+separate hardware-free virtual conformance; then aggregates exact artifacts
+only after all hosted evidence is present. Attestation and prerelease creation
+are a separately permissioned final workflow job. Local candidates, hosted
+evidence, and physical-hardware evidence are recorded separately in the
+[v0.5 RC qualification record](../releases/v0.5.0-rc-qualification.md).
 
 Implementation status is intentionally separate from cross-platform release qualification:
 
@@ -330,9 +361,10 @@ Implementation status is intentionally separate from cross-platform release qual
   Rust/Python clients, Linux SocketCAN, and optional PCAN-Basic loading on Linux/Windows.
   CAN filters, receive queues, timestamps, partial batch results, and Attach/Configure restoration
   are transport-level semantics; queues are bounded and stale leases fail before adapter I/O.
-- Pending external acceptance: native SocketCAN `vcan`, PCAN-Basic runtime/device loopback, and
-  native Linux/Windows CI execution. USB, GPIO, Camera, Node bindings, shared-memory frame
-  transport, device protocols, and consuming-application migration remain planned.
+- Pending external acceptance: native SocketCAN `vcan`, PCAN-Basic runtime/device loopback, native
+  Linux/Windows CI execution, and physical Camera qualification for AVFoundation, V4L2, and Media
+  Foundation. USB/GPIO native qualification, Node bindings, device protocols, and
+  consuming-application migration remain planned.
 
 These modules retain the responsibility boundary defined in
 [HAL responsibility](../contracts/hal-responsibility.md); implementation status does not move

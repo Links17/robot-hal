@@ -1,0 +1,33 @@
+[package]
+name = "seeed-hal-adapter-avfoundation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+hardware-tests = []
+
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+seeed-hal-camera = { path = "../../crates/seeed-hal-camera", version = "=0.5.0-rc.1"}
+seeed-hal-core = { path = "../../crates/seeed-hal-core", version = "=0.5.0-rc.1"}
+tokio = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+dispatch2 = "0.3"
+objc2-av-foundation = { version = "=0.3.1", features = [
+    "AVCaptureDevice",
+    "AVCaptureInput",
+    "AVCaptureOutputBase",
+    "AVCaptureSession",
+    "AVCaptureVideoDataOutput",
+    "AVMediaFormat",
+    "objc2-core-media",
+] }
+objc2-foundation = "=0.3.1"
+objc2-core-foundation = "=0.3.2"
+objc2-core-media = { version = "=0.3.1", features = ["CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMTime", "objc2-core-video"] }
+objc2-core-video = { version = "=0.3.1", features = ["CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }

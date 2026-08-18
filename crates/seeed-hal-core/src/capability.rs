@@ -18,17 +18,8 @@ impl CapabilityId {
                 "missing version",
             )
         })?;
-        let (namespace, name) = contract.split_once('.').ok_or_else(|| {
-            HalError::invalid_argument_error(
-                "capability.id.invalid",
-                "capability.parse",
-                "missing namespace",
-            )
-        })?;
-
-        if namespace.is_empty()
-            || name.is_empty()
-            || contract.matches('.').count() != 1
+        if contract.split('.').any(str::is_empty)
+            || !contract.contains('.')
             || !version.starts_with('v')
         {
             return Err(HalError::invalid_argument_error(

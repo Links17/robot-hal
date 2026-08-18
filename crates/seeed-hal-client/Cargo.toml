@@ -1,6 +1,6 @@
 [package]
 name = "seeed-hal-client"
-version = "0.2.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -9,15 +9,20 @@ license.workspace = true
 bytes = { workspace = true }
 futures-util = { workspace = true }
 prost = { workspace = true }
-seeed-hal-core = { path = "../seeed-hal-core" }
-seeed-hal-can = { path = "../seeed-hal-can" }
-seeed-hal-protocol = { path = "../seeed-hal-protocol" }
-seeed-hal-runtime = { path = "../seeed-hal-runtime" }
-seeed-hal-serial = { path = "../seeed-hal-serial" }
+seeed-hal-core = { path = "../seeed-hal-core", version = "=0.5.0-rc.1"}
+seeed-hal-can = { path = "../seeed-hal-can", version = "=0.5.0-rc.1"}
+seeed-hal-camera = { path = "../seeed-hal-camera", version = "=0.5.0-rc.1"}
+seeed-hal-adapter-shared-memory = { path = "../../adapters/shared-memory", version = "=0.5.0-rc.1"}
+seeed-hal-gpio = { path = "../seeed-hal-gpio", version = "=0.5.0-rc.1"}
+seeed-hal-protocol = { path = "../seeed-hal-protocol", version = "=0.5.0-rc.1"}
+seeed-hal-runtime = { path = "../seeed-hal-runtime", version = "=0.5.0-rc.1"}
+seeed-hal-serial = { path = "../seeed-hal-serial", version = "=0.5.0-rc.1"}
+seeed-hal-usb = { path = "../seeed-hal-usb", version = "=0.5.0-rc.1"}
+subtle = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
-seeed-hal-broker = { path = "../seeed-hal-broker" }
-seeed-hal-testkit = { path = "../seeed-hal-testkit" }
+seeed-hal-broker = { path = "../seeed-hal-broker", version = "=0.5.0-rc.1"}
+seeed-hal-testkit = { path = "../seeed-hal-testkit", version = "=0.5.0-rc.1"}

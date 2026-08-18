@@ -1,0 +1,92 @@
+# RC release artifact contract
+
+## Scope and identity
+
+This contract applies only to Seeed HAL `v0.5.0-rc.N` prereleases, where `N`
+is a non-zero decimal integer without leading zeroes. A release workflow
+checks out the annotated or lightweight tag's resolved commit and rejects a
+dirty checkout, a mismatched ref, a duplicate tag on the resolved commit, or
+an existing GitHub Release for that tag. It never moves a tag, overwrites a
+release, or retries by replacing assets.
+
+The workflow is triggered only by matching tag pushes or a manual dispatch
+that supplies an existing matching tag. Pull requests and branches cannot
+publish releases. Dispatch `dry_run=true` stops after aggregate verification;
+it does not request write permissions, attest, or create a release.
+
+## Final release directory
+
+The aggregate job creates one new private directory. Its contents must be
+exactly the following six primary artifacts and three sidecars:
+
+```text
+seeed-hal-broker-v0.5.0-rc.N-aarch64-apple-darwin.tar.gz
+seeed-hal-broker-v0.5.0-rc.N-x86_64-unknown-linux-gnu.tar.gz
+seeed-hal-broker-v0.5.0-rc.N-x86_64-pc-windows-msvc.zip
+seeed-hal-crates-v0.5.0-rc.N.tar.gz
+seeed_hal-0.5.0rcN-py3-none-any.whl
+seeed_hal-0.5.0rcN.tar.gz
+release-manifest.json
+SHA256SUMS
+conformance-report.json
+```
+
+`release-manifest.json` is canonical JSON and records the exact artifact
+names, sizes, SHA-256 digests, release tag/commit, broker composition, and a
+canonical-byte binding for `conformance-report.json`. `SHA256SUMS` contains
+only the six primary artifact digests in lexical artifact-name order. The
+manifest binding is the second integrity check for conformance evidence; the
+static verifier rejects a changed report even if it is semantically valid.
+
+Candidate directories, platform virtual brokers, and virtual-conformance
+outputs are intermediate evidence only. They are never Release assets.
+
+## Evidence and release gate
+
+Platform inputs are named with the immutable release tag and resolved
+40-character commit. Every consumer obtains artifacts only from the current
+workflow run through dependency edges, verifies its uploaded `SHA256SUMS`,
+and rejects missing, additional, or digest-mismatched files.
+
+Each hosted platform verifies its matching production broker archive and
+executes a separately built virtual broker. The aggregate step accepts only
+one evidence report for each of macOS, Linux, and Windows, with every platform
+job and all wire minors `0..3` marked `Passed`. `Pending`, `Partial`,
+`Blocked`, or `Failed` software evidence is a hard failure. The aggregate job
+then runs `aggregate-release`, `verify-static`, and `verify-artifacts`; only a
+complete static-valid release directory with `release_ready` may reach the
+final job.
+
+Hardware qualification remains separate from software release conformance.
+Its factual status and externally accessible evidence URI are recorded in the
+report; the RC prerelease does not imply that physical hardware has been
+qualified.
+
+## Attestation and publication
+
+Only the final job has `contents: write`, `id-token: write`, and
+`attestations: write`. All other jobs have read-only `contents`. The final job
+re-validates the complete directory, generates GitHub build-provenance
+attestations with the official `actions/attest` action, then creates exactly
+one GitHub prerelease. It passes `--prerelease --latest=false` and attaches
+the six primary artifacts plus all three sidecars.
+
+Consumers can verify any downloaded asset with:
+
+```sh
+gh attestation verify PATH/TO/ARTIFACT -R OWNER/REPOSITORY
+```
+
+No registry publication, package upload, secret, registry token, or release
+asset replacement is part of this contract. A failed or interrupted release is
+investigated as a new immutable attempt; it is never repaired by overwriting
+or deleting historical release state.
+
+## Stable failure categories
+
+Release tooling emits stable names including `release.version.invalid`,
+`release.version.mismatch`, `release.artifact.unexpected`,
+`release.manifest.invalid`, `release.conformance.incomplete`,
+`release.conformance.invalid`, and `release.package.invalid`. Automation and
+consumers must use these names and categories rather than parsing diagnostic
+text.

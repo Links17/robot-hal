@@ -1,0 +1,22 @@
+[package]
+name = "seeed-hal-adapter-linux-gpio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Dependency audit (2026-08-17): libgpiod 1.0.0 is Apache-2.0 OR BSD-3-Clause,
+# declares Rust 1.78, and offers v2_1/vnext feature flags.  This crate uses
+# the libgpiod v2 baseline API without optional features.
+[features]
+hardware-tests = []
+
+[dependencies]
+async-trait = { workspace = true }
+percent-encoding = { workspace = true }
+seeed-hal-core = { path = "../../crates/seeed-hal-core", version = "=0.5.0-rc.1"}
+seeed-hal-gpio = { path = "../../crates/seeed-hal-gpio", version = "=0.5.0-rc.1"}
+tokio = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libgpiod = "=1.0.0"

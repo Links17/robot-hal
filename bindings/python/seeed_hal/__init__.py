@@ -1,5 +1,9 @@
 """Public, protobuf-independent Seeed HAL Python API."""
 
+from importlib.metadata import version as _distribution_version
+
+__version__ = _distribution_version("seeed-hal")
+
 from .client import (
     EventSubscription,
     HalClient,
@@ -49,8 +53,32 @@ from .serial import (
     SerialSession,
     StopBits,
 )
+from .usb import UsbSession, UsbTransfer, UsbTransferKind
+from .gpio import (
+    GpioBias,
+    GpioDirection,
+    GpioDrive,
+    GpioEdge,
+    GpioEdgeEvent,
+    GpioEdgeRequest,
+    GpioLineConfig,
+    GpioSession,
+)
+from .camera import (
+    CameraControlDescriptor,
+    CameraFormat,
+    CameraSession,
+    ControlEnumValues,
+    ControlKind,
+    ControlRange,
+    ControlValue,
+    FrameLease,
+    MappingDescriptor,
+    PixelFormat,
+)
 
 __all__ = [
+    "__version__",
     "ControlLines",
     "CanBatchSendError",
     "CanBitTiming",
@@ -72,6 +100,16 @@ __all__ = [
     "CanMode",
     "CanOpenConfig",
     "CanSession",
+    "CameraControlDescriptor",
+    "CameraFormat",
+    "CameraSession",
+    "ControlEnumValues",
+    "ControlKind",
+    "ControlRange",
+    "ControlValue",
+    "FrameLease",
+    "MappingDescriptor",
+    "PixelFormat",
     "CanTimestamp",
     "CanTimestampSource",
     "ClassicDataFrame",
@@ -80,6 +118,14 @@ __all__ = [
     "ErrorCategory",
     "EventSubscription",
     "FlowControl",
+    "GpioBias",
+    "GpioDirection",
+    "GpioDrive",
+    "GpioEdge",
+    "GpioEdgeEvent",
+    "GpioEdgeRequest",
+    "GpioLineConfig",
+    "GpioSession",
     "HalClient",
     "HalError",
     "IdentityQuality",
@@ -95,4 +141,7 @@ __all__ = [
     "SerialSession",
     "StopBits",
     "TransportKind",
+    "UsbSession",
+    "UsbTransfer",
+    "UsbTransferKind",
 ]

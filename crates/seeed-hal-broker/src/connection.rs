@@ -10,7 +10,7 @@ use seeed_hal_core::{ErrorCategory, HalError, HalResult, OwnerId, SessionId};
 use seeed_hal_protocol::v1::{self, envelope};
 use seeed_hal_protocol::{
     MAX_FRAME_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR_MAXIMUM, PROTOCOL_MINOR_MINIMUM,
-    handshake_minor_range, invalid_message, negotiate_protocol_minor,
+    gpio_config_from_proto, handshake_minor_range, invalid_message, negotiate_protocol_minor,
     open_serial_request_from_proto, parse_serial_session_lease, parse_session_lease,
 };
 use seeed_hal_runtime::{HalRuntime, RuntimeEvent, RuntimeEventKind};
@@ -22,9 +22,16 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::camera_dispatch::{
+    self, CameraSessions, new_session_registry as new_camera_session_registry,
+};
 use crate::can_dispatch::{
     self, CanDispatchLimits, CanSessions, broker_capabilities, is_can_payload, is_can_session,
     new_session_registry,
+};
+use crate::usb_gpio_dispatch::{
+    self, UsbGpioDispatchLimits, UsbGpioSessions,
+    new_session_registry as new_usb_gpio_session_registry,
 };
 use crate::{Broker, StartupToken};
 
@@ -183,6 +190,8 @@ impl Broker {
         let active = Arc::new(Mutex::new(HashSet::new()));
         let can_sessions = new_session_registry();
         let serial_sessions = Arc::new(Mutex::new(SerialSessionRegistry::default()));
+        let usb_gpio_sessions = new_usb_gpio_session_registry();
+        let camera_sessions = new_camera_session_registry();
         let (frame_limit_tx, frame_limit_rx) = watch::channel(None::<usize>);
         let (request_tx, request_rx) = mpsc::channel(self.config.request_queue_capacity);
         let (response_tx, response_rx) = mpsc::channel(self.config.response_queue_capacity);
@@ -215,6 +224,8 @@ impl Broker {
             active,
             can_sessions,
             serial_sessions,
+            usb_gpio_sessions,
+            camera_sessions,
             frame_limit_tx,
             cancel_rx,
         ));
@@ -439,6 +450,8 @@ async fn dispatch_requests(
     active: Arc<Mutex<HashSet<u64>>>,
     can_sessions: CanSessions,
     serial_sessions: SerialSessions,
+    usb_gpio_sessions: UsbGpioSessions,
+    camera_sessions: CameraSessions,
     frame_limit: watch::Sender<Option<usize>>,
     mut cancel: watch::Receiver<bool>,
 ) -> Option<HalError> {
@@ -607,6 +620,8 @@ async fn dispatch_requests(
                 let owner = owner.clone();
                 let can_sessions = can_sessions.clone();
                 let serial_sessions = serial_sessions.clone();
+                let usb_gpio_sessions = usb_gpio_sessions.clone();
+                let camera_sessions = camera_sessions.clone();
                 let limits = limits.expect("successful handshake sets negotiated limits");
                 let payload = request.envelope.payload.take();
                 tasks.spawn(async move {
@@ -618,6 +633,8 @@ async fn dispatch_requests(
                         limits,
                         can_sessions,
                         serial_sessions,
+                        usb_gpio_sessions,
+                        camera_sessions,
                     ).await;
                     (request_id, response)
                 });
@@ -667,7 +684,9 @@ fn validate_handshake(
         PROTOCOL_MINOR_MINIMUM,
         PROTOCOL_MINOR_MAXIMUM,
     )?;
-    let capabilities = broker_capabilities(selected_minor);
+    let mut capabilities = broker_capabilities(selected_minor);
+    capabilities.extend(usb_gpio_dispatch::broker_capabilities(selected_minor));
+    capabilities.extend(camera_dispatch::broker_capabilities(selected_minor));
     for capability in &request.required_capabilities {
         if !capabilities.contains(capability) {
             return Err(protocol_error(
@@ -762,6 +781,7 @@ fn prost_varint_len(mut value: u64) -> usize {
     len
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_operation(
     runtime: HalRuntime,
     owner: OwnerId,
@@ -770,8 +790,31 @@ async fn dispatch_operation(
     limits: NegotiatedLimits,
     can_sessions: CanSessions,
     serial_sessions: SerialSessions,
+    usb_gpio_sessions: UsbGpioSessions,
+    camera_sessions: CameraSessions,
 ) -> v1::Envelope {
     let result = match payload {
+        Some(payload)
+            if is_camera_payload(&payload)
+                && (limits.protocol_minor < camera_dispatch::CAMERA_WIRE_MINOR) =>
+        {
+            Err(protocol_error(
+                "runtime.protocol.unsupported_capability",
+                "runtime.protocol.dispatch",
+                ErrorCategory::Conflict,
+                false,
+                "Camera operations require negotiated protocol minor 3",
+            ))
+        }
+        Some(payload) if is_usb_gpio_payload(&payload) && limits.protocol_minor < 2 => {
+            Err(protocol_error(
+                "runtime.protocol.unsupported_capability",
+                "runtime.protocol.dispatch",
+                ErrorCategory::Conflict,
+                false,
+                "USB and GPIO operations require negotiated protocol minor 2",
+            ))
+        }
         Some(payload) if is_can_payload(&payload) => {
             can_dispatch::dispatch(
                 runtime,
@@ -786,6 +829,23 @@ async fn dispatch_operation(
                 can_sessions,
             )
             .await
+        }
+        Some(payload) if is_usb_gpio_payload(&payload) => {
+            usb_gpio_dispatch::dispatch(
+                runtime,
+                owner,
+                payload,
+                UsbGpioDispatchLimits {
+                    max_frame_bytes: limits.max_frame_bytes,
+                    max_read_bytes: limits.max_read_bytes,
+                    max_write_bytes: limits.max_write_bytes,
+                },
+                usb_gpio_sessions,
+            )
+            .await
+        }
+        Some(payload) if is_camera_payload(&payload) => {
+            camera_dispatch::dispatch(runtime, owner, payload, camera_sessions).await
         }
         payload => {
             dispatch_operation_inner(
@@ -808,6 +868,60 @@ async fn dispatch_operation(
     }
 }
 
+fn is_camera_payload(payload: &envelope::Payload) -> bool {
+    matches!(
+        payload,
+        envelope::Payload::EnumerateCameraRequest(_)
+            | envelope::Payload::EnumerateCameraResponse(_)
+            | envelope::Payload::OpenCameraRequest(_)
+            | envelope::Payload::OpenCameraResponse(_)
+            | envelope::Payload::CaptureCameraRequest(_)
+            | envelope::Payload::CaptureCameraResponse(_)
+            | envelope::Payload::CameraMappingDescriptorRequest(_)
+            | envelope::Payload::CameraMappingDescriptorResponse(_)
+            | envelope::Payload::CameraNextFrameLeaseRequest(_)
+            | envelope::Payload::CameraNextFrameLeaseResponse(_)
+            | envelope::Payload::CameraDroppedCountRequest(_)
+            | envelope::Payload::CameraDroppedCountResponse(_)
+            | envelope::Payload::CameraControlsRequest(_)
+            | envelope::Payload::CameraControlsResponse(_)
+            | envelope::Payload::CameraGetControlRequest(_)
+            | envelope::Payload::CameraGetControlResponse(_)
+            | envelope::Payload::CameraSetControlRequest(_)
+            | envelope::Payload::CameraSetControlResponse(_)
+            | envelope::Payload::CameraSetAutoRequest(_)
+            | envelope::Payload::CameraSetAutoResponse(_)
+            | envelope::Payload::CloseCameraRequest(_)
+            | envelope::Payload::CloseCameraResponse(_)
+    )
+}
+
+fn is_usb_gpio_payload(payload: &envelope::Payload) -> bool {
+    matches!(
+        payload,
+        envelope::Payload::EnumerateUsbRequest(_)
+            | envelope::Payload::EnumerateUsbResponse(_)
+            | envelope::Payload::OpenUsbRequest(_)
+            | envelope::Payload::OpenUsbResponse(_)
+            | envelope::Payload::UsbTransferRequest(_)
+            | envelope::Payload::UsbTransferResponse(_)
+            | envelope::Payload::CloseUsbRequest(_)
+            | envelope::Payload::CloseUsbResponse(_)
+            | envelope::Payload::EnumerateGpioRequest(_)
+            | envelope::Payload::EnumerateGpioResponse(_)
+            | envelope::Payload::OpenGpioRequest(_)
+            | envelope::Payload::OpenGpioResponse(_)
+            | envelope::Payload::GpioReadRequest(_)
+            | envelope::Payload::GpioReadResponse(_)
+            | envelope::Payload::GpioWriteRequest(_)
+            | envelope::Payload::GpioWriteResponse(_)
+            | envelope::Payload::GpioNextEdgeRequest(_)
+            | envelope::Payload::GpioNextEdgeResponse(_)
+            | envelope::Payload::CloseGpioRequest(_)
+            | envelope::Payload::CloseGpioResponse(_)
+    )
+}
+
 async fn dispatch_operation_inner(
     runtime: HalRuntime,
     owner: OwnerId,
@@ -817,13 +931,71 @@ async fn dispatch_operation_inner(
     serial_sessions: SerialSessions,
 ) -> HalResult<envelope::Payload> {
     match payload {
+        Some(envelope::Payload::EnumerateUsbRequest(_)) => {
+            let resources = runtime
+                .enumerate_usb()
+                .await?
+                .iter()
+                .map(TryInto::try_into)
+                .collect::<HalResult<Vec<_>>>()?;
+            Ok(envelope::Payload::EnumerateUsbResponse(
+                v1::EnumerateUsbResponse { resources },
+            ))
+        }
+        Some(envelope::Payload::EnumerateGpioRequest(_)) => {
+            let resources = runtime
+                .enumerate_gpio()
+                .await?
+                .iter()
+                .map(TryInto::try_into)
+                .collect::<HalResult<Vec<_>>>()?;
+            Ok(envelope::Payload::EnumerateGpioResponse(
+                v1::EnumerateGpioResponse { resources },
+            ))
+        }
+        Some(envelope::Payload::OpenUsbRequest(request)) => {
+            let selector = request
+                .selector
+                .ok_or_else(|| invalid_message("usb open selector is required"))?
+                .try_into()?;
+            let interface = u8::try_from(request.interface_number)
+                .map_err(|_| invalid_message("USB interface number exceeds u8"))?;
+            let handle = runtime.open_usb(owner, selector, interface).await?;
+            let (session_id, lease) = handle.into_parts();
+            Ok(envelope::Payload::OpenUsbResponse(v1::OpenUsbResponse {
+                session_id: session_id.as_str().to_owned(),
+                lease: Some((&lease).into()),
+            }))
+        }
+        Some(envelope::Payload::OpenGpioRequest(request)) => {
+            if request.lines.is_empty() {
+                return Err(invalid_message("GPIO open requires at least one line"));
+            }
+            let selector = request
+                .selector
+                .ok_or_else(|| invalid_message("GPIO open selector is required"))?
+                .try_into()?;
+            let config = gpio_config_from_proto(
+                request
+                    .config
+                    .ok_or_else(|| invalid_message("GPIO line configuration is required"))?,
+            )?;
+            let handle = runtime
+                .open_gpio(owner, selector, request.lines, config)
+                .await?;
+            let (session_id, lease) = handle.into_parts();
+            Ok(envelope::Payload::OpenGpioResponse(v1::OpenGpioResponse {
+                session_id: session_id.as_str().to_owned(),
+                lease: Some((&lease).into()),
+            }))
+        }
         Some(envelope::Payload::EnumerateSerialRequest(_)) => {
             let resources = runtime
                 .enumerate_serial()
                 .await?
                 .iter()
-                .map(v1::ResourceDescriptor::from)
-                .collect();
+                .map(TryInto::try_into)
+                .collect::<HalResult<Vec<_>>>()?;
             Ok(envelope::Payload::EnumerateSerialResponse(
                 v1::EnumerateSerialResponse { resources },
             ))

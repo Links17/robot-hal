@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
+mod camera_dispatch;
 mod can_dispatch;
 mod connection;
 pub mod listener;
+mod usb_gpio_dispatch;
 
 use std::io;
 use subtle::ConstantTimeEq;

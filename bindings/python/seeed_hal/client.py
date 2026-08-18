@@ -62,12 +62,29 @@ from .can import (
     ReceivedCanFrame,
     _CanSessionProfile,
 )
+from .usb import UsbSession, UsbTransfer, UsbTransferKind
+from .gpio import (
+    GpioBias, GpioDirection, GpioDrive, GpioEdge, GpioEdgeEvent,
+    GpioEdgeRequest, GpioLineConfig, GpioSession, MAX_GPIO_EVENTS,
+)
+from .camera import (
+    CameraControlDescriptor,
+    CameraFormat,
+    CameraSession,
+    ControlEnumValues,
+    ControlKind,
+    ControlRange,
+    ControlValue,
+    FrameLease,
+    MappingDescriptor,
+    PixelFormat,
+)
 from .transport_unix import HARD_FRAME_BYTES, UnixFramedTransport
 
 
 PROTOCOL_MAJOR = 1
 PROTOCOL_MINOR_MINIMUM = 0
-PROTOCOL_MINOR_MAXIMUM = 1
+PROTOCOL_MINOR_MAXIMUM = 3
 PROTOCOL_MINOR = PROTOCOL_MINOR_MAXIMUM
 SERIAL_CAPABILITY = "serial.bytes/v1"
 CAN_CLASSIC_CAPABILITY = "can.classic/v1"
@@ -75,6 +92,14 @@ CAN_FD_CAPABILITY = "can.fd/v1"
 CAN_CONFIGURE_CAPABILITY = "can.configure/v1"
 CAN_ERROR_FRAMES_CAPABILITY = "can.error-frames/v1"
 CAN_RX_TIMESTAMP_CAPABILITY = "can.rx-timestamp/v1"
+USB_CONTROL_CAPABILITY = "usb.control/v1"
+USB_BULK_CAPABILITY = "usb.bulk/v1"
+USB_INTERRUPT_CAPABILITY = "usb.interrupt/v1"
+GPIO_LINES_CAPABILITY = "gpio.lines/v1"
+GPIO_EDGES_CAPABILITY = "gpio.edges/v1"
+CAMERA_CAPTURE_CAPABILITY = "camera.capture/v1"
+CAMERA_FRAMES_SHM_CAPABILITY = "camera.frames.shm/v1"
+CAMERA_CONTROLS_CAPABILITY = "camera.controls/v1"
 DEFAULT_TRANSFER_BYTES = 64 * 1024
 DEFAULT_CAPACITY = 32
 DEFAULT_EVENT_CAPACITY = 64
@@ -103,6 +128,9 @@ class IdentityQuality(Enum):
 class TransportKind(Enum):
     SERIAL = "serial"
     CAN = "can"
+    USB = "usb"
+    GPIO = "gpio"
+    CAMERA = "camera"
 
 
 class LeaseMode(Enum):
@@ -208,6 +236,7 @@ class _Pending:
     profile: _CanSessionProfile | None = None
     lease_mode: LeaseMode | None = None
     resource_id: str | None = None
+    line_count: int | None = None
 
 
 class HalClient:
@@ -535,6 +564,195 @@ class HalClient:
             generation,
             lease_mode,
             profile,
+        )
+
+    async def enumerate_usb(self) -> list[ResourceDescriptor]:
+        self._require_usb_gpio_capability("usb.enumerate", USB_CONTROL_CAPABILITY)
+        response = await self._request(
+            "enumerate_usb_request",
+            hal_pb2.EnumerateUsbRequest(),
+            "enumerate_usb_response",
+        )
+        assert isinstance(response, hal_pb2.EnumerateUsbResponse)
+        return [
+            _decode_descriptor(item, expected=TransportKind.USB)
+            for item in response.resources
+        ]
+
+    async def open_usb(
+        self, selector: ResourceSelector, interface_number: int
+    ) -> UsbSession:
+        if not isinstance(selector, ResourceSelector):
+            raise _argument_error("usb.open", "selector must be ResourceSelector")
+        if selector.transport is not TransportKind.USB:
+            raise _resource_argument_error(
+                "usb.open",
+                "USB resource selector transport must be USB",
+                selector.resource_id,
+            )
+        if not _is_plain_int(interface_number) or not 0 <= interface_number <= 255:
+            raise _resource_argument_error(
+                "usb.open", "USB interface number is invalid", selector.resource_id
+            )
+        self._require_usb_gpio_capability(
+            "usb.open", USB_CONTROL_CAPABILITY, selector.resource_id
+        )
+        response = await self._request(
+            "open_usb_request",
+            hal_pb2.OpenUsbRequest(
+                selector=_selector_to_proto(selector, "usb.open"),
+                interface_number=interface_number,
+            ),
+            "open_usb_response",
+            resource_id=selector.resource_id,
+        )
+        assert isinstance(response, hal_pb2.OpenUsbResponse)
+        session_id, lease_id, generation, mode = _decode_open_session_response(
+            response, "USB"
+        )
+        return UsbSession(
+            self, session_id, lease_id, generation, mode, selector.resource_id
+        )
+
+    async def enumerate_gpio(self) -> list[ResourceDescriptor]:
+        self._require_usb_gpio_capability("gpio.enumerate", GPIO_LINES_CAPABILITY)
+        response = await self._request(
+            "enumerate_gpio_request",
+            hal_pb2.EnumerateGpioRequest(),
+            "enumerate_gpio_response",
+        )
+        assert isinstance(response, hal_pb2.EnumerateGpioResponse)
+        return [
+            _decode_descriptor(item, expected=TransportKind.GPIO)
+            for item in response.resources
+        ]
+
+    async def open_gpio(
+        self,
+        selector: ResourceSelector,
+        lines: tuple[int, ...],
+        config: GpioLineConfig,
+    ) -> GpioSession:
+        if not isinstance(selector, ResourceSelector):
+            raise _argument_error("gpio.open", "selector must be ResourceSelector")
+        if selector.transport is not TransportKind.GPIO:
+            raise _resource_argument_error(
+                "gpio.open",
+                "GPIO resource selector transport must be GPIO",
+                selector.resource_id,
+            )
+        try:
+            normalized_lines = tuple(lines)
+        except TypeError as error:
+            raise _resource_argument_error(
+                "gpio.open", "GPIO lines are invalid", selector.resource_id
+            ) from error
+        if (
+            not normalized_lines
+            or len(normalized_lines) > MAX_GPIO_EVENTS
+            or any(
+                not _is_plain_int(line) or line < 0 or line > MAX_U32
+                for line in normalized_lines
+            )
+            or len(set(normalized_lines)) != len(normalized_lines)
+        ):
+            raise _resource_argument_error(
+                "gpio.open", "GPIO lines are invalid", selector.resource_id
+            )
+        if not isinstance(config, GpioLineConfig):
+            raise _resource_argument_error(
+                "gpio.open", "GPIO config is invalid", selector.resource_id
+            )
+        self._require_usb_gpio_capability(
+            "gpio.open", GPIO_LINES_CAPABILITY, selector.resource_id
+        )
+        response = await self._request(
+            "open_gpio_request",
+            hal_pb2.OpenGpioRequest(
+                selector=_selector_to_proto(selector, "gpio.open"),
+                lines=normalized_lines,
+                config=_gpio_config_to_proto(config),
+            ),
+            "open_gpio_response",
+            resource_id=selector.resource_id,
+            line_count=len(normalized_lines),
+        )
+        assert isinstance(response, hal_pb2.OpenGpioResponse)
+        session_id, lease_id, generation, mode = _decode_open_session_response(
+            response, "GPIO"
+        )
+        return GpioSession(
+            self,
+            session_id,
+            lease_id,
+            generation,
+            mode,
+            selector.resource_id,
+            len(normalized_lines),
+        )
+
+    async def enumerate_camera(self) -> list[ResourceDescriptor]:
+        self._require_camera_capability("camera.enumerate", CAMERA_CAPTURE_CAPABILITY)
+        response = await self._request(
+            "enumerate_camera_request",
+            hal_pb2.EnumerateCameraRequest(),
+            "enumerate_camera_response",
+        )
+        assert isinstance(response, hal_pb2.EnumerateCameraResponse)
+        return [
+            _decode_descriptor(item, expected=TransportKind.CAMERA)
+            for item in response.resources
+        ]
+
+    async def open_camera(
+        self, selector: ResourceSelector, request: CameraFormat, slot_count: int = 3
+    ) -> CameraSession:
+        if not isinstance(selector, ResourceSelector):
+            raise _argument_error("camera.open", "selector must be ResourceSelector")
+        if selector.transport is not TransportKind.CAMERA:
+            raise _resource_argument_error(
+                "camera.open",
+                "camera resource selector transport must be Camera",
+                selector.resource_id,
+            )
+        if not isinstance(request, CameraFormat):
+            raise _resource_argument_error(
+                "camera.open", "camera format is invalid", selector.resource_id
+            )
+        if not _is_plain_int(slot_count) or not 1 <= slot_count <= 64:
+            raise _resource_argument_error(
+                "camera.open", "camera slot count is invalid", selector.resource_id
+            )
+        self._require_camera_capability(
+            "camera.open", CAMERA_CAPTURE_CAPABILITY, selector.resource_id
+        )
+        response = await self._request(
+            "open_camera_request",
+            hal_pb2.OpenCameraRequest(
+                selector=_selector_to_proto(selector, "camera.open"),
+                request=hal_pb2.CameraRequest(
+                    format=hal_pb2.CameraFormat(
+                        pixel_format=_camera_pixel_format_to_proto(request.pixel_format),
+                        width=request.width,
+                        height=request.height,
+                    ),
+                    slot_count=slot_count,
+                ),
+            ),
+            "open_camera_response",
+            resource_id=selector.resource_id,
+        )
+        assert isinstance(response, hal_pb2.OpenCameraResponse)
+        session_id, lease_id, generation, mode = _decode_open_session_response(
+            response, "Camera"
+        )
+        return CameraSession(
+            self,
+            session_id,
+            lease_id,
+            generation,
+            selector.resource_id,
+            mode,
         )
 
     async def close(self) -> None:
@@ -891,6 +1109,368 @@ class HalClient:
                 raise
             raise attached from error
 
+    async def _usb_transfer(
+        self, session: UsbSession, transfer: UsbTransfer, timeout_ms: int
+    ) -> bytes:
+        if not isinstance(transfer, UsbTransfer):
+            raise _resource_argument_error(
+                "usb.transfer", "transfer must be UsbTransfer", session._resource_id
+            )
+        if not _is_plain_int(timeout_ms) or not 0 <= timeout_ms <= MAX_U64:
+            raise _resource_argument_error(
+                "usb.transfer", "USB timeout is invalid", session._resource_id
+            )
+        capability = _usb_transfer_capability(transfer.kind)
+        self._require_usb_gpio_capability(
+            "usb.transfer", capability, session._resource_id
+        )
+        payload_size = len(transfer.data)
+        requested_read = transfer.max_bytes if _usb_transfer_is_in(transfer.kind) else None
+        if payload_size > self._write_limit or (
+            requested_read is not None and requested_read > self._read_limit
+        ):
+            raise _resource_argument_error(
+                "usb.transfer",
+                "USB transfer exceeds negotiated byte limits",
+                session._resource_id,
+            )
+        response = await self._request(
+            "usb_transfer_request",
+            _usb_transfer_to_proto(session, transfer, timeout_ms),
+            "usb_transfer_response",
+            requested_read=requested_read,
+            resource_id=session._resource_id,
+        )
+        assert isinstance(response, hal_pb2.UsbTransferResponse)
+        return bytes(response.data)
+
+    async def _usb_close(self, session: UsbSession) -> None:
+        await self._request(
+            "close_usb_request",
+            hal_pb2.CloseUsbRequest(
+                session_id=session._session_id, lease=self._usb_gpio_lease(session)
+            ),
+            "close_usb_response",
+            resource_id=session._resource_id,
+        )
+
+    async def _gpio_read(self, session: GpioSession) -> tuple[bool, ...]:
+        response = await self._request(
+            "gpio_read_request",
+            hal_pb2.GpioReadRequest(
+                session_id=session._session_id, lease=self._usb_gpio_lease(session)
+            ),
+            "gpio_read_response",
+            resource_id=session._resource_id,
+            line_count=session._line_count,
+        )
+        assert isinstance(response, hal_pb2.GpioReadResponse)
+        return tuple(response.values)
+
+    async def _gpio_write(self, session: GpioSession, values: tuple[bool, ...]) -> None:
+        try:
+            normalized_values = tuple(values)
+        except TypeError as error:
+            raise _resource_argument_error(
+                "gpio.write", "GPIO values are invalid", session._resource_id
+            ) from error
+        if (
+            len(normalized_values) != session._line_count
+            or not all(isinstance(value, bool) for value in normalized_values)
+        ):
+            raise _resource_argument_error(
+                "gpio.write", "GPIO values are invalid", session._resource_id
+            )
+        await self._request(
+            "gpio_write_request",
+            hal_pb2.GpioWriteRequest(
+                session_id=session._session_id,
+                lease=self._usb_gpio_lease(session),
+                values=normalized_values,
+            ),
+            "gpio_write_response",
+            resource_id=session._resource_id,
+        )
+
+    async def _gpio_next_edge(
+        self, session: GpioSession, request: GpioEdgeRequest, timeout_ms: int
+    ) -> GpioEdgeEvent | None:
+        if not isinstance(request, GpioEdgeRequest):
+            raise _resource_argument_error(
+                "gpio.next_edge", "GPIO edge request is invalid", session._resource_id
+            )
+        if not _is_plain_int(timeout_ms) or not 0 <= timeout_ms <= MAX_U64:
+            raise _resource_argument_error(
+                "gpio.next_edge", "GPIO timeout is invalid", session._resource_id
+            )
+        self._require_usb_gpio_capability(
+            "gpio.next_edge", GPIO_EDGES_CAPABILITY, session._resource_id
+        )
+        response = await self._request(
+            "gpio_next_edge_request",
+            hal_pb2.GpioNextEdgeRequest(
+                session_id=session._session_id,
+                lease=self._usb_gpio_lease(session),
+                rising=request.rising,
+                falling=request.falling,
+                capacity=request.capacity,
+                timeout_ms=timeout_ms,
+            ),
+            "gpio_next_edge_response",
+            resource_id=session._resource_id,
+        )
+        assert isinstance(response, hal_pb2.GpioNextEdgeResponse)
+        if not response.HasField("event"):
+            return None
+        return _gpio_edge_from_proto(response.event)
+
+    async def _gpio_close(self, session: GpioSession) -> None:
+        await self._request(
+            "close_gpio_request",
+            hal_pb2.CloseGpioRequest(
+                session_id=session._session_id, lease=self._usb_gpio_lease(session)
+            ),
+            "close_gpio_response",
+            resource_id=session._resource_id,
+        )
+
+    async def _camera_capture(self, session: CameraSession, timeout_ms: int) -> None:
+        if not _is_plain_int(timeout_ms) or not 0 < timeout_ms <= MAX_U64:
+            raise _resource_argument_error(
+                "camera.capture", "camera timeout is invalid", session._resource_id
+            )
+        self._require_camera_capability(
+            "camera.capture", CAMERA_CAPTURE_CAPABILITY, session._resource_id
+        )
+        await self._request(
+            "capture_camera_request",
+            hal_pb2.CaptureCameraRequest(
+                session_id=session._session_id,
+                lease=self._camera_lease(session),
+                timeout_ms=timeout_ms,
+            ),
+            "capture_camera_response",
+            resource_id=session._resource_id,
+        )
+
+    async def _camera_mapping_descriptor(
+        self, session: CameraSession
+    ) -> MappingDescriptor:
+        self._require_camera_capability(
+            "camera.mapping_descriptor",
+            CAMERA_FRAMES_SHM_CAPABILITY,
+            session._resource_id,
+        )
+        response = await self._request(
+            "camera_mapping_descriptor_request",
+            hal_pb2.CameraMappingDescriptorRequest(
+                session_id=session._session_id, lease=self._camera_lease(session)
+            ),
+            "camera_mapping_descriptor_response",
+            resource_id=session._resource_id,
+        )
+        assert isinstance(response, hal_pb2.CameraMappingDescriptorResponse)
+        if not response.HasField("descriptor"):
+            error = _invalid_message("broker returned invalid camera mapping descriptor")
+            self._terminate(error)
+            raise error
+        try:
+            return _camera_mapping_descriptor_from_proto(response.descriptor)
+        except HalError as error:
+            self._terminate(error)
+            raise
+
+    async def _camera_next_frame_lease(
+        self, session: CameraSession
+    ) -> FrameLease | None:
+        self._require_camera_capability(
+            "camera.next_frame_lease",
+            CAMERA_FRAMES_SHM_CAPABILITY,
+            session._resource_id,
+        )
+        response = await self._request(
+            "camera_next_frame_lease_request",
+            hal_pb2.CameraNextFrameLeaseRequest(
+                session_id=session._session_id, lease=self._camera_lease(session)
+            ),
+            "camera_next_frame_lease_response",
+            resource_id=session._resource_id,
+        )
+        assert isinstance(response, hal_pb2.CameraNextFrameLeaseResponse)
+        if not response.HasField("lease"):
+            return None
+        try:
+            return _frame_lease_from_proto(response.lease)
+        except HalError as error:
+            self._terminate(error)
+            raise
+
+    async def _camera_dropped_count(self, session: CameraSession) -> int:
+        self._require_camera_capability(
+            "camera.dropped_count", CAMERA_CAPTURE_CAPABILITY, session._resource_id
+        )
+        response = await self._request(
+            "camera_dropped_count_request",
+            hal_pb2.CameraDroppedCountRequest(
+                session_id=session._session_id, lease=self._camera_lease(session)
+            ),
+            "camera_dropped_count_response",
+            resource_id=session._resource_id,
+        )
+        assert isinstance(response, hal_pb2.CameraDroppedCountResponse)
+        if response.dropped_count > MAX_U64:
+            error = _invalid_message("camera dropped count exceeds the wire bound")
+            self._terminate(error)
+            raise error
+        return response.dropped_count
+
+    async def _camera_controls(
+        self, session: CameraSession
+    ) -> list[CameraControlDescriptor]:
+        self._require_camera_capability(
+            "camera.controls", CAMERA_CONTROLS_CAPABILITY, session._resource_id
+        )
+        response = await self._request(
+            "camera_controls_request",
+            hal_pb2.CameraControlsRequest(
+                session_id=session._session_id, lease=self._camera_lease(session)
+            ),
+            "camera_controls_response",
+            resource_id=session._resource_id,
+        )
+        assert isinstance(response, hal_pb2.CameraControlsResponse)
+        try:
+            if len(response.controls) > 4:
+                raise ValueError
+            return [_camera_control_descriptor_from_proto(item) for item in response.controls]
+        except (ValueError, HalError) as error:
+            invalid = _invalid_message("broker returned invalid camera controls")
+            self._terminate(invalid)
+            raise invalid from error
+
+    async def _camera_get_control(
+        self, session: CameraSession, kind: ControlKind
+    ) -> ControlValue:
+        self._require_camera_capability(
+            "camera.control.get", CAMERA_CONTROLS_CAPABILITY, session._resource_id
+        )
+        response = await self._request(
+            "camera_get_control_request",
+            hal_pb2.CameraGetControlRequest(
+                session_id=session._session_id,
+                lease=self._camera_lease(session),
+                kind=_camera_control_kind_to_proto(kind),
+            ),
+            "camera_get_control_response",
+            resource_id=session._resource_id,
+        )
+        assert isinstance(response, hal_pb2.CameraGetControlResponse)
+        if not response.HasField("value"):
+            error = _invalid_message("broker returned invalid camera control value")
+            self._terminate(error)
+            raise error
+        try:
+            return _camera_control_value_from_proto(response.value)
+        except HalError as error:
+            self._terminate(error)
+            raise
+
+    async def _camera_set_control(
+        self, session: CameraSession, kind: ControlKind, value: ControlValue
+    ) -> None:
+        self._require_camera_capability(
+            "camera.control.set", CAMERA_CONTROLS_CAPABILITY, session._resource_id
+        )
+        await self._request(
+            "camera_set_control_request",
+            hal_pb2.CameraSetControlRequest(
+                session_id=session._session_id,
+                lease=self._camera_lease(session),
+                kind=_camera_control_kind_to_proto(kind),
+                value=_camera_control_value_to_proto(value),
+            ),
+            "camera_set_control_response",
+            resource_id=session._resource_id,
+        )
+
+    async def _camera_set_auto(
+        self, session: CameraSession, kind: ControlKind, enabled: bool
+    ) -> None:
+        if not isinstance(enabled, bool):
+            raise _resource_argument_error(
+                "camera.control.auto",
+                "camera auto-control value is invalid",
+                session._resource_id,
+            )
+        self._require_camera_capability(
+            "camera.control.auto", CAMERA_CONTROLS_CAPABILITY, session._resource_id
+        )
+        await self._request(
+            "camera_set_auto_request",
+            hal_pb2.CameraSetAutoRequest(
+                session_id=session._session_id,
+                lease=self._camera_lease(session),
+                kind=_camera_control_kind_to_proto(kind),
+                enabled=enabled,
+            ),
+            "camera_set_auto_response",
+            resource_id=session._resource_id,
+        )
+
+    async def _camera_close(self, session: CameraSession) -> None:
+        await self._request(
+            "close_camera_request",
+            hal_pb2.CloseCameraRequest(
+                session_id=session._session_id, lease=self._camera_lease(session)
+            ),
+            "close_camera_response",
+            resource_id=session._resource_id,
+        )
+
+    def _camera_lease(self, session: CameraSession) -> hal_pb2.LeaseToken:
+        return hal_pb2.LeaseToken(
+            lease_id=session._lease_id,
+            generation=session._generation,
+            mode=session._mode,
+        )
+
+    def _usb_gpio_lease(
+        self, session: UsbSession | GpioSession
+    ) -> hal_pb2.LeaseToken:
+        return hal_pb2.LeaseToken(
+            lease_id=session._lease_id,
+            generation=session._generation,
+            mode=session._mode,
+        )
+
+    def _require_camera_capability(
+        self, operation: str, capability: str, resource_id: str | None = None
+    ) -> None:
+        if self._protocol_minor >= 3 and capability in self._capabilities:
+            return
+        error = client_error(
+            "runtime.protocol.capability_unsupported",
+            ErrorCategory.CONFLICT,
+            operation,
+            False,
+            "the negotiated broker protocol does not advertise the required camera capability",
+        )
+        raise error if resource_id is None else _attach_resource(error, resource_id)
+
+    def _require_usb_gpio_capability(
+        self, operation: str, capability: str, resource_id: str | None = None
+    ) -> None:
+        if self._protocol_minor >= 2 and capability in self._capabilities:
+            return
+        error = client_error(
+            "runtime.protocol.capability_unsupported",
+            ErrorCategory.CONFLICT,
+            operation,
+            False,
+            "the negotiated broker protocol does not advertise the required capability",
+        )
+        raise error if resource_id is None else _attach_resource(error, resource_id)
+
     def _require_can_capability(
         self, operation: str, resource_id: str | None = None
     ) -> None:
@@ -920,6 +1500,7 @@ class HalClient:
         profile: _CanSessionProfile | None = None,
         lease_mode: LeaseMode | None = None,
         resource_id: str | None = None,
+        line_count: int | None = None,
     ) -> Message:
         if self._terminal is not None:
             raise _fresh_error(self._terminal)
@@ -946,6 +1527,7 @@ class HalClient:
             profile,
             lease_mode,
             resource_id,
+            line_count,
         )
         try:
             self._writer_queue.put_nowait(request)
@@ -1335,6 +1917,16 @@ def _preflight_frame(frame: bytes, client: HalClient) -> int:
                         raise frame_too_large(
                             "serial read response exceeds the negotiated or requested byte limit"
                         )
+        if field == 67 and wire == 2:
+            for nested_field, nested_wire, nested_value in _fields(value):
+                if nested_field == 1 and nested_wire == 2:
+                    size = len(nested_value)
+                    if size > client._read_limit or (
+                        requested_read is not None and size > requested_read
+                    ):
+                        raise frame_too_large(
+                            "USB transfer response exceeds the negotiated or requested byte limit"
+                        )
         if (
             field == 57
             and wire == 2
@@ -1571,6 +2163,9 @@ def _decode_descriptor(
     transports = {
         hal_pb2.TRANSPORT_KIND_SERIAL: TransportKind.SERIAL,
         hal_pb2.TRANSPORT_KIND_CAN: TransportKind.CAN,
+        hal_pb2.TRANSPORT_KIND_USB: TransportKind.USB,
+        hal_pb2.TRANSPORT_KIND_GPIO: TransportKind.GPIO,
+        hal_pb2.TRANSPORT_KIND_CAMERA: TransportKind.CAMERA,
     }
     transport = transports.get(value.transport)
     if quality is None or transport is None or (
@@ -1584,7 +2179,7 @@ def _decode_descriptor(
     elif transport is TransportKind.SERIAL:
         capabilities = (SERIAL_CAPABILITY,)
     else:
-        raise _invalid_message("CAN resource descriptor capabilities are empty")
+        raise _invalid_message("broker resource descriptor capabilities are empty")
     return ResourceDescriptor(
         resource_id,
         value.endpoint,
@@ -1605,7 +2200,7 @@ def _valid_capability(value: str) -> str:
         raise _invalid_message("resource descriptor has an invalid capability")
     try:
         contract, version = value.split("/")
-        namespace, name = contract.split(".")
+        namespace, name = contract.split(".", 1)
     except ValueError as error:
         raise _invalid_message(
             "resource descriptor has an invalid capability"
@@ -1614,6 +2209,9 @@ def _valid_capability(value: str) -> str:
     if (
         not namespace
         or not name
+        or name.startswith(".")
+        or name.endswith(".")
+        or ".." in name
         or not number
         or not number.isascii()
         or not number.isdigit()
@@ -1735,6 +2333,12 @@ def _transport_to_proto(value: TransportKind) -> int:
         return hal_pb2.TRANSPORT_KIND_SERIAL
     if value is TransportKind.CAN:
         return hal_pb2.TRANSPORT_KIND_CAN
+    if value is TransportKind.USB:
+        return hal_pb2.TRANSPORT_KIND_USB
+    if value is TransportKind.GPIO:
+        return hal_pb2.TRANSPORT_KIND_GPIO
+    if value is TransportKind.CAMERA:
+        return hal_pb2.TRANSPORT_KIND_CAMERA
     raise _argument_error("serial.open", "transport kind is invalid")
 
 
@@ -1753,7 +2357,115 @@ def _transport_to_proto_for_operation(value: TransportKind, operation: str) -> i
         return hal_pb2.TRANSPORT_KIND_SERIAL
     if value is TransportKind.CAN:
         return hal_pb2.TRANSPORT_KIND_CAN
+    if value is TransportKind.USB:
+        return hal_pb2.TRANSPORT_KIND_USB
+    if value is TransportKind.GPIO:
+        return hal_pb2.TRANSPORT_KIND_GPIO
+    if value is TransportKind.CAMERA:
+        return hal_pb2.TRANSPORT_KIND_CAMERA
     raise _argument_error(operation, "transport kind is invalid")
+
+
+def _camera_pixel_format_to_proto(value: PixelFormat) -> int:
+    try:
+        return {
+            PixelFormat.NV12: hal_pb2.CAMERA_PIXEL_FORMAT_NV12,
+            PixelFormat.YUYV: hal_pb2.CAMERA_PIXEL_FORMAT_YUYV,
+            PixelFormat.MJPEG: hal_pb2.CAMERA_PIXEL_FORMAT_MJPEG,
+        }[value]
+    except (KeyError, TypeError) as error:
+        raise _argument_error("camera.open", "camera pixel format is invalid") from error
+
+
+def _camera_control_kind_to_proto(value: ControlKind) -> int:
+    try:
+        return {
+            ControlKind.EXPOSURE: hal_pb2.CAMERA_CONTROL_KIND_EXPOSURE,
+            ControlKind.GAIN: hal_pb2.CAMERA_CONTROL_KIND_GAIN,
+            ControlKind.WHITE_BALANCE: hal_pb2.CAMERA_CONTROL_KIND_WHITE_BALANCE,
+            ControlKind.FOCUS: hal_pb2.CAMERA_CONTROL_KIND_FOCUS,
+        }[value]
+    except (KeyError, TypeError) as error:
+        raise _argument_error("camera.control", "camera control kind is invalid") from error
+
+
+def _camera_control_value_to_proto(value: ControlValue) -> hal_pb2.CameraControlValue:
+    if not isinstance(value, ControlValue):
+        raise _argument_error("camera.control", "camera control value is invalid")
+    if value.integer is not None:
+        return hal_pb2.CameraControlValue(integer_value=value.integer)
+    assert value.enum is not None
+    return hal_pb2.CameraControlValue(enum_value=value.enum)
+
+
+def _camera_control_value_from_proto(value: hal_pb2.CameraControlValue) -> ControlValue:
+    kind = value.WhichOneof("value")
+    if kind == "integer_value":
+        return ControlValue(integer=value.integer_value)
+    if kind == "enum_value":
+        return ControlValue(enum=value.enum_value)
+    raise _invalid_message("broker returned invalid camera control value")
+
+
+def _camera_control_descriptor_from_proto(
+    value: hal_pb2.CameraControlDescriptor,
+) -> CameraControlDescriptor:
+    kinds = {
+        hal_pb2.CAMERA_CONTROL_KIND_EXPOSURE: ControlKind.EXPOSURE,
+        hal_pb2.CAMERA_CONTROL_KIND_GAIN: ControlKind.GAIN,
+        hal_pb2.CAMERA_CONTROL_KIND_WHITE_BALANCE: ControlKind.WHITE_BALANCE,
+        hal_pb2.CAMERA_CONTROL_KIND_FOCUS: ControlKind.FOCUS,
+    }
+    try:
+        if not value.HasField("values"):
+            raise ValueError
+        representation = value.values.WhichOneof("values")
+        if representation == "range":
+            range_values = value.values.range
+            values: ControlRange | ControlEnumValues = ControlRange(
+                range_values.minimum, range_values.maximum, range_values.step
+            )
+        elif representation == "enumerated":
+            values = ControlEnumValues(
+                tuple(
+                    _camera_control_value_from_proto(item)
+                    for item in value.values.enumerated.values
+                )
+            )
+        else:
+            raise ValueError
+        return CameraControlDescriptor(
+            kinds[value.kind],
+            value.readable,
+            value.writable,
+            value.auto_supported,
+            values,
+            value.current_value_available,
+            value.diagnostic or None,
+        )
+    except (KeyError, TypeError, ValueError, HalError) as error:
+        raise _invalid_message("broker returned invalid camera control descriptor") from error
+
+
+def _camera_mapping_descriptor_from_proto(
+    value: hal_pb2.MappingDescriptor,
+) -> MappingDescriptor:
+    try:
+        return MappingDescriptor(
+            value.mapping_name,
+            bytes(value.mapping_identity),
+            bytes(value.capability_token),
+            value.total_length,
+        )
+    except HalError as error:
+        raise _invalid_message("broker returned invalid camera mapping descriptor") from error
+
+
+def _frame_lease_from_proto(value: hal_pb2.FrameLease) -> FrameLease:
+    try:
+        return FrameLease(value.slot_index, value.sequence, value.generation)
+    except HalError as error:
+        raise _invalid_message("broker returned invalid camera frame lease") from error
 
 
 _DATA_BITS_TO_PROTO = {
@@ -2044,6 +2756,107 @@ def _decode_open_can_response(
         raise _invalid_message("broker returned invalid CAN session metadata") from error
 
 
+def _decode_open_session_response(
+    response: hal_pb2.OpenUsbResponse | hal_pb2.OpenGpioResponse, transport: str
+) -> tuple[str, str, int, int]:
+    try:
+        session_id = _valid_identifier(response.session_id, "session.id")
+        if not response.HasField("lease"):
+            raise ValueError
+        lease_id = _valid_identifier(response.lease.lease_id, "lease.id")
+        if (
+            response.lease.generation == 0
+            or response.lease.mode != hal_pb2.LEASE_MODE_CONTROL
+        ):
+            raise ValueError
+        return session_id, lease_id, response.lease.generation, response.lease.mode
+    except (ValueError, HalError) as error:
+        raise _invalid_message(
+            f"broker returned invalid {transport} session metadata"
+        ) from error
+
+
+def _usb_transfer_capability(kind: UsbTransferKind) -> str:
+    if kind in {UsbTransferKind.CONTROL_OUT, UsbTransferKind.CONTROL_IN}:
+        return USB_CONTROL_CAPABILITY
+    if kind in {UsbTransferKind.BULK_OUT, UsbTransferKind.BULK_IN}:
+        return USB_BULK_CAPABILITY
+    if kind in {UsbTransferKind.INTERRUPT_OUT, UsbTransferKind.INTERRUPT_IN}:
+        return USB_INTERRUPT_CAPABILITY
+    raise _argument_error("usb.transfer", "USB transfer kind is invalid")
+
+
+def _usb_transfer_is_in(kind: UsbTransferKind) -> bool:
+    return kind in {
+        UsbTransferKind.CONTROL_IN,
+        UsbTransferKind.BULK_IN,
+        UsbTransferKind.INTERRUPT_IN,
+    }
+
+
+def _usb_transfer_to_proto(
+    session: UsbSession, transfer: UsbTransfer, timeout_ms: int
+) -> hal_pb2.UsbTransferRequest:
+    return hal_pb2.UsbTransferRequest(
+        session_id=session._session_id,
+        lease=hal_pb2.LeaseToken(
+            lease_id=session._lease_id,
+            generation=session._generation,
+            mode=session._mode,
+        ),
+        kind={
+            UsbTransferKind.CONTROL_OUT: hal_pb2.USB_TRANSFER_KIND_CONTROL_OUT,
+            UsbTransferKind.CONTROL_IN: hal_pb2.USB_TRANSFER_KIND_CONTROL_IN,
+            UsbTransferKind.BULK_OUT: hal_pb2.USB_TRANSFER_KIND_BULK_OUT,
+            UsbTransferKind.BULK_IN: hal_pb2.USB_TRANSFER_KIND_BULK_IN,
+            UsbTransferKind.INTERRUPT_OUT: hal_pb2.USB_TRANSFER_KIND_INTERRUPT_OUT,
+            UsbTransferKind.INTERRUPT_IN: hal_pb2.USB_TRANSFER_KIND_INTERRUPT_IN,
+        }[transfer.kind],
+        request_type=transfer.request_type,
+        request=transfer.request,
+        value=transfer.value,
+        index=transfer.index,
+        endpoint=transfer.endpoint or 0,
+        data=transfer.data,
+        max_bytes=transfer.max_bytes,
+        timeout_ms=timeout_ms,
+    )
+
+
+def _gpio_config_to_proto(config: GpioLineConfig) -> hal_pb2.GpioLineConfig:
+    result = hal_pb2.GpioLineConfig(
+        direction={
+            GpioDirection.INPUT: hal_pb2.GPIO_DIRECTION_INPUT,
+            GpioDirection.OUTPUT: hal_pb2.GPIO_DIRECTION_OUTPUT,
+        }[config.direction],
+        active_low=config.active_low,
+        bias={
+            GpioBias.DISABLED: hal_pb2.GPIO_BIAS_DISABLED,
+            GpioBias.PULL_UP: hal_pb2.GPIO_BIAS_PULL_UP,
+            GpioBias.PULL_DOWN: hal_pb2.GPIO_BIAS_PULL_DOWN,
+        }[config.bias],
+    )
+    if config.drive is not None:
+        result.drive = {
+            GpioDrive.PUSH_PULL: hal_pb2.GPIO_DRIVE_PUSH_PULL,
+            GpioDrive.OPEN_DRAIN: hal_pb2.GPIO_DRIVE_OPEN_DRAIN,
+            GpioDrive.OPEN_SOURCE: hal_pb2.GPIO_DRIVE_OPEN_SOURCE,
+        }[config.drive]
+    if config.initial_value is not None:
+        result.initial_value = config.initial_value
+    return result
+
+
+def _gpio_edge_from_proto(value: hal_pb2.GpioEdgeEvent) -> GpioEdgeEvent:
+    edge = {
+        hal_pb2.GPIO_EDGE_RISING: GpioEdge.RISING,
+        hal_pb2.GPIO_EDGE_FALLING: GpioEdge.FALLING,
+    }.get(value.edge)
+    if edge is None or value.sequence == 0:
+        raise _invalid_message("GPIO edge event is invalid")
+    return GpioEdgeEvent(edge, value.monotonic_ns, value.sequence)
+
+
 def _frame_data_length(frame: CanFrame) -> int:
     return len(frame.data) if hasattr(frame, "data") else 0
 
@@ -2058,6 +2871,46 @@ def _frame_allowed(frame: CanFrame, profile: _CanSessionProfile) -> bool:
 
 def _validate_response_payload(value: Message, pending: _Pending) -> None:
     try:
+        if pending.expected == "enumerate_usb_response":
+            assert isinstance(value, hal_pb2.EnumerateUsbResponse)
+            for descriptor in value.resources:
+                _decode_descriptor(descriptor, expected=TransportKind.USB)
+            return
+        if pending.expected == "open_usb_response":
+            assert isinstance(value, hal_pb2.OpenUsbResponse)
+            _decode_open_session_response(value, "USB")
+            return
+        if pending.expected == "usb_transfer_response":
+            assert isinstance(value, hal_pb2.UsbTransferResponse)
+            if (
+                pending.requested_read is not None
+                and len(value.data) > pending.requested_read
+            ):
+                raise _invalid_message(
+                    "USB transfer response exceeds requested byte maximum"
+                )
+            return
+        if pending.expected == "enumerate_gpio_response":
+            assert isinstance(value, hal_pb2.EnumerateGpioResponse)
+            for descriptor in value.resources:
+                _decode_descriptor(descriptor, expected=TransportKind.GPIO)
+            return
+        if pending.expected == "open_gpio_response":
+            assert isinstance(value, hal_pb2.OpenGpioResponse)
+            _decode_open_session_response(value, "GPIO")
+            return
+        if pending.expected == "gpio_read_response":
+            assert isinstance(value, hal_pb2.GpioReadResponse)
+            if pending.line_count is None or len(value.values) != pending.line_count:
+                raise _invalid_message(
+                    "GPIO read response value count does not match session lines"
+                )
+            return
+        if pending.expected == "gpio_next_edge_response":
+            assert isinstance(value, hal_pb2.GpioNextEdgeResponse)
+            if value.HasField("event"):
+                _gpio_edge_from_proto(value.event)
+            return
         if pending.expected == "enumerate_can_response":
             assert isinstance(value, hal_pb2.EnumerateCanResponse)
             for descriptor in value.resources:

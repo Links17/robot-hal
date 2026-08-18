@@ -1,7 +1,14 @@
 [workspace]
 resolver = "3"
 members = [
+    "adapters/avfoundation",
+    "adapters/mediafoundation",
+    "adapters/v4l2",
     "adapters/pcan",
+    "adapters/nusb",
+    "adapters/shared-memory",
+    "adapters/linux-gpio",
+    "adapters/windows-gpio",
     "adapters/socketcan",
     "adapters/serialport",
     "adapters/windows-file",
@@ -10,14 +17,18 @@ members = [
     "crates/seeed-hal-client",
     "crates/seeed-hal-broker",
     "crates/seeed-hal-can",
+    "crates/seeed-hal-camera",
     "crates/seeed-hal-core",
     "crates/seeed-hal-protocol",
     "crates/seeed-hal-runtime",
     "crates/seeed-hal-serial",
     "crates/seeed-hal-testkit",
+    "crates/seeed-hal-usb",
+    "crates/seeed-hal-gpio",
 ]
 
 [workspace.package]
+version = "0.5.0-rc.1"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"

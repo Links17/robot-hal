@@ -1,0 +1,600 @@
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import stat
+import sys
+import tarfile
+import zipfile
+from pathlib import Path
+
+import pytest
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.release.release_tool import (
+    ReleaseFailure,
+    ReleaseVersion,
+    _extract_broker_archive,
+    _target_by_name,
+    aggregate_platform_reports,
+    aggregate_release,
+    load_targets,
+    main,
+    verify_artifacts,
+    verify_static,
+)
+
+
+TAG = "v0.5.0-rc.1"
+COMMIT = "a" * 40
+TARGETS = REPO_ROOT / "release" / "targets.toml"
+
+
+def _broker_manifest(target: str, binary: bytes) -> bytes:
+    values = {
+        "macos": (
+            "aarch64-apple-darwin",
+            "macos",
+            "aarch64",
+            ["avfoundation", "nusb", "serialport"],
+            ["avfoundation", "nusb", "serialport"],
+        ),
+        "linux": (
+            "x86_64-unknown-linux-gnu",
+            "linux",
+            "x86_64",
+            ["linux-gpio", "nusb", "serialport", "socketcan", "v4l2"],
+            ["linux-gpio", "nusb", "serialport", "socketcan", "v4l2"],
+        ),
+        "windows": (
+            "x86_64-pc-windows-msvc",
+            "windows",
+            "x86_64",
+            ["mediafoundation", "nusb", "serialport", "windows-gpio"],
+            ["mediafoundation", "nusb", "serialport", "windows-gpio"],
+        ),
+    }[target]
+    triple, os_name, arch, adapters, features = values
+    return json.dumps(
+        {
+            "schema": {"major": 1},
+            "broker_version": "0.5.0-rc.1",
+            "wire": {"major": 1, "minimum_minor": 0, "maximum_minor": 3},
+            "target": {"triple": triple, "os": os_name, "arch": arch},
+            "enabled": {"adapters": adapters, "features": features},
+            "msrv": "1.85",
+            "artifact_checksum": {
+                "algorithm": "sha256",
+                "value": hashlib.sha256(binary).hexdigest(),
+            },
+            "required_vendor_runtime_libraries": [],
+        },
+        sort_keys=True,
+    ).encode()
+
+
+def _broker_binary() -> bytes:
+    return b"#!/bin/sh\nif [ \"$1\" = \"--manifest\" ]; then cat broker-manifest.json; exit 0; fi\nexit 1\n"
+
+
+def _write_broker_candidate(
+    directory: Path,
+    target: str,
+    *,
+    broker_mode: int = 0o755,
+) -> Path:
+    triple = {
+        "macos": "aarch64-apple-darwin",
+        "linux": "x86_64-unknown-linux-gnu",
+        "windows": "x86_64-pc-windows-msvc",
+    }[target]
+    extension = "zip" if target == "windows" else "tar.gz"
+    archive = directory / f"seeed-hal-broker-v0.5.0-rc.1-{triple}.{extension}"
+    root = f"seeed-hal-broker-v0.5.0-rc.1-{triple}"
+    binary_name = "seeed-hal-broker.exe" if target == "windows" else "seeed-hal-broker"
+    binary = _broker_binary()
+    manifest = _broker_manifest(target, binary)
+    entries = {
+        f"{root}/LICENSE": b"fixture license\n",
+        f"{root}/README.md": b"fixture readme\n",
+        f"{root}/broker-manifest.json": manifest,
+        f"{root}/{binary_name}": binary,
+    }
+    if target == "windows":
+        with zipfile.ZipFile(archive, "w") as contents:
+            contents.writestr(f"{root}/", b"")
+            for name, value in entries.items():
+                contents.writestr(name, value)
+    else:
+        with tarfile.open(archive, "w:gz") as contents:
+            root_info = tarfile.TarInfo(root)
+            root_info.type = tarfile.DIRTYPE
+            contents.addfile(root_info)
+            for name, value in entries.items():
+                info = tarfile.TarInfo(name)
+                info.size = len(value)
+                info.mode = broker_mode if name.endswith(binary_name) else 0o644
+                contents.addfile(info, io.BytesIO(value))
+    return archive
+
+
+def _write_source_candidate(directory: Path) -> Path:
+    directory.mkdir()
+    artifact = directory / "seeed-hal-crates-v0.5.0-rc.1.tar.gz"
+    artifact.write_bytes(b"rust bundle fixture\n")
+    return directory
+
+
+def _write_python_candidate(directory: Path) -> Path:
+    directory.mkdir()
+    (directory / "seeed_hal-0.5.0rc1-py3-none-any.whl").write_bytes(b"wheel\n")
+    (directory / "seeed_hal-0.5.0rc1.tar.gz").write_bytes(b"sdist\n")
+    return directory
+
+
+def _write_report_inputs(directory: Path) -> Path:
+    directory.mkdir()
+    report = {
+        "schema": 1,
+        "tag": TAG,
+        "commit": COMMIT,
+        "qualification": {
+            "software": {
+                "id": "software-conformance",
+                "uri": "https://example.invalid/software",
+            },
+            "hardware": {
+                "id": "hardware-qualification",
+                "uri": "https://example.invalid/hardware",
+            },
+        },
+        "software": {
+            "status": "Partial",
+            "jobs": [
+                {
+                    "platform": "macos",
+                    "result": "Passed",
+                    "command": "verify-artifacts --tag v0.5.0-rc.1",
+                    "ref": "https://example.invalid/jobs/macos",
+                }
+            ],
+            "virtual": [],
+        },
+        "hardware": {
+            "camera-avfoundation": {"status": "Pending", "evidence": None},
+            "camera-v4l2": {"status": "Blocked", "evidence": None},
+        },
+    }
+    (directory / "conformance-report.json").write_text(json.dumps(report), encoding="utf-8")
+    return directory
+
+
+def _platform_report(platform: str) -> dict[str, object]:
+    return {
+        "schema": 1,
+        "tag": TAG,
+        "commit": COMMIT,
+        "qualification": {
+            "software": {
+                "id": "software-conformance",
+                "uri": "https://example.invalid/software",
+            },
+            "hardware": {
+                "id": "hardware-qualification",
+                "uri": "https://example.invalid/hardware",
+            },
+        },
+        "software": {
+            "status": "Partial",
+            "jobs": [
+                {
+                    "platform": platform,
+                    "result": "Passed",
+                    "command": "release platform artifact verification",
+                    "ref": f"https://example.invalid/jobs/{platform}",
+                }
+            ],
+            "virtual": [
+                {
+                    "platform": platform,
+                    "protocol_minor": minor,
+                    "result": "Passed",
+                    "command": "release platform artifact verification",
+                    "ref": f"https://example.invalid/jobs/{platform}/minor-{minor}",
+                }
+                for minor in range(4)
+            ],
+        },
+        "hardware": {"release-hardware": {"status": "Pending", "evidence": None}},
+    }
+def _write_platform_reports(directory: Path) -> Path:
+    directory.mkdir()
+    for platform in ("macos", "linux", "windows"):
+        (directory / f"{platform}.json").write_text(
+            json.dumps(_platform_report(platform)),
+            encoding="utf-8",
+        )
+    return directory
+
+
+def _complete_release(tmp_path: Path) -> Path:
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    brokers = inputs / "brokers"
+    brokers.mkdir()
+    for target in ("macos", "linux", "windows"):
+        _write_broker_candidate(brokers, target)
+    rust = _write_source_candidate(inputs / "rust")
+    python = _write_python_candidate(inputs / "python")
+    report = _write_report_inputs(inputs / "report")
+    release = tmp_path / "release"
+    aggregate_release(
+        tag=TAG,
+        commit=COMMIT,
+        broker_dir=brokers,
+        rust_bundle=rust,
+        python_candidate=python,
+        report_inputs=report,
+        release_dir=release,
+    )
+    return release
+
+
+def test_aggregate_requires_fresh_private_release_directory(tmp_path: Path) -> None:
+    release = tmp_path / "release"
+    release.mkdir()
+
+    with pytest.raises(ReleaseFailure, match="release.artifact.unexpected"):
+        aggregate_release(
+            tag=TAG,
+            commit=COMMIT,
+            broker_dir=tmp_path / "missing",
+            rust_bundle=tmp_path / "missing",
+            python_candidate=tmp_path / "missing",
+            report_inputs=tmp_path / "missing",
+            release_dir=release,
+        )
+
+
+def test_aggregate_cli_dispatches_all_frozen_input_directories(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def record(**kwargs: object) -> Path:
+        observed.update(kwargs)
+        return tmp_path / "release"
+
+    monkeypatch.setattr("scripts.release.release_tool.aggregate_release", record)
+
+    assert main(
+        [
+            "aggregate-release",
+            "--tag",
+            TAG,
+            "--commit",
+            COMMIT,
+            "--broker-dir",
+            str(tmp_path / "brokers"),
+            "--rust-bundle",
+            str(tmp_path / "rust"),
+            "--python-artifacts",
+            str(tmp_path / "python"),
+            "--report-inputs",
+            str(tmp_path / "report"),
+            "--release-dir",
+            str(tmp_path / "release"),
+        ]
+    ) == 0
+    assert observed == {
+        "tag": TAG,
+        "commit": COMMIT,
+        "broker_dir": tmp_path / "brokers",
+        "rust_bundle": tmp_path / "rust",
+        "python_candidate": tmp_path / "python",
+        "report_inputs": tmp_path / "report",
+        "release_dir": tmp_path / "release",
+    }
+
+
+def test_aggregate_creates_complete_mode_0700_release_directory(tmp_path: Path) -> None:
+    release = _complete_release(tmp_path)
+
+    assert stat.S_IMODE(release.stat().st_mode) == 0o700
+    verify_static(release)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        (
+            lambda report: report.__setitem__("tag", "v0.5.0-rc.2"),
+            "release.conformance.invalid",
+        ),
+        (
+            lambda report: report.__setitem__("commit", "b" * 40),
+            "release.conformance.invalid",
+        ),
+        (
+            lambda report: report["software"].__setitem__(
+                "jobs",
+                report["software"]["jobs"] * 2,
+            ),
+            "release.conformance.invalid",
+        ),
+        (
+            lambda report: report["software"]["virtual"].pop(),
+            "release.conformance.incomplete",
+        ),
+    ],
+)
+def test_platform_report_aggregation_rejects_mismatched_or_incomplete_evidence(
+    tmp_path: Path,
+    mutation,
+    error: str,
+) -> None:
+    reports = _write_platform_reports(tmp_path / "reports")
+    macos = json.loads((reports / "macos.json").read_text(encoding="utf-8"))
+    mutation(macos)
+    (reports / "macos.json").write_text(json.dumps(macos), encoding="utf-8")
+
+    with pytest.raises(ReleaseFailure, match=error):
+        aggregate_platform_reports(tag=TAG, commit=COMMIT, report_dir=reports)
+
+
+def test_platform_report_aggregation_requires_exact_platform_evidence(
+    tmp_path: Path,
+) -> None:
+    reports = _write_platform_reports(tmp_path / "reports")
+
+    report = aggregate_platform_reports(tag=TAG, commit=COMMIT, report_dir=reports)
+
+    assert report["software"]["status"] == "Passed"
+    assert {job["platform"] for job in report["software"]["jobs"]} == {
+        "macos",
+        "linux",
+        "windows",
+    }
+
+
+def test_broker_extraction_restores_execution_only_from_validated_tar_metadata(
+    tmp_path: Path,
+) -> None:
+    archive = _write_broker_candidate(tmp_path, "macos")
+    archive.chmod(0o644)
+    target = _target_by_name(load_targets(TARGETS), "macos")
+
+    extracted = _extract_broker_archive(
+        archive,
+        target,
+        ReleaseVersion.parse(TAG),
+        tmp_path / "extracted",
+    )
+
+    binary = extracted / "seeed-hal-broker"
+    assert stat.S_IMODE(binary.stat().st_mode) == 0o700
+    assert stat.S_IMODE(archive.stat().st_mode) == 0o644
+
+
+def test_broker_extraction_rejects_tar_without_owner_execute_metadata(
+    tmp_path: Path,
+) -> None:
+    archive = _write_broker_candidate(tmp_path, "macos", broker_mode=0o644)
+    target = _target_by_name(load_targets(TARGETS), "macos")
+
+    with pytest.raises(ReleaseFailure, match="release.archive.invalid"):
+        _extract_broker_archive(
+            archive,
+            target,
+            ReleaseVersion.parse(TAG),
+            tmp_path / "extracted",
+        )
+
+
+def test_verify_rejects_partial_platform_set(tmp_path: Path) -> None:
+    release = _complete_release(tmp_path)
+    (
+        release / "seeed-hal-broker-v0.5.0-rc.1-x86_64-pc-windows-msvc.zip"
+    ).unlink()
+
+    with pytest.raises(ReleaseFailure, match="release.artifact.unexpected"):
+        verify_artifacts(release, TAG, TARGETS, REPO_ROOT)
+
+
+def test_aggregate_rejects_external_candidate_mutation_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    brokers = inputs / "brokers"
+    brokers.mkdir()
+    for target in ("macos", "linux", "windows"):
+        _write_broker_candidate(brokers, target)
+    rust = _write_source_candidate(inputs / "rust")
+    python = _write_python_candidate(inputs / "python")
+    report = _write_report_inputs(inputs / "report")
+
+    original_copy = __import__("scripts.release.release_tool", fromlist=["_copy_frozen_artifact"])._copy_frozen_artifact
+
+    def mutate_after_first_copy(*args, **kwargs):
+        result = original_copy(*args, **kwargs)
+        (python / "external").write_bytes(b"external write")
+        return result
+
+    monkeypatch.setattr(
+        "scripts.release.release_tool._copy_frozen_artifact",
+        mutate_after_first_copy,
+    )
+
+    with pytest.raises(ReleaseFailure, match="release.artifact.unexpected"):
+        aggregate_release(
+            tag=TAG,
+            commit=COMMIT,
+            broker_dir=brokers,
+            rust_bundle=rust,
+            python_candidate=python,
+            report_inputs=report,
+            release_dir=tmp_path / "release",
+        )
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        "seeed_hal-0.5.0rc1-py3-none-any.whl",
+        "seeed_hal-0.5.0rc1.tar.gz",
+        "seeed-hal-crates-v0.5.0-rc.1.tar.gz",
+        "seeed-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin.tar.gz",
+    ],
+)
+def test_aggregate_rechecks_every_candidate_before_return(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    candidate: str,
+) -> None:
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    brokers = inputs / "brokers"
+    brokers.mkdir()
+    for target in ("macos", "linux", "windows"):
+        _write_broker_candidate(brokers, target)
+    rust = _write_source_candidate(inputs / "rust")
+    python = _write_python_candidate(inputs / "python")
+    report = _write_report_inputs(inputs / "report")
+    source = (
+        python / candidate
+        if candidate.startswith("seeed_hal")
+        else rust / candidate
+        if candidate.startswith("seeed-hal-crates")
+        else brokers / candidate
+    )
+    original_verify = __import__(
+        "scripts.release.release_tool", fromlist=["verify_static"]
+    ).verify_static
+
+    def mutate_before_return(release_dir: Path) -> None:
+        original_verify(release_dir)
+        source.write_bytes(b"replaced after sidecar generation")
+
+    monkeypatch.setattr(
+        "scripts.release.release_tool.verify_static",
+        mutate_before_return,
+    )
+
+    with pytest.raises(ReleaseFailure, match="release.artifact.unexpected"):
+        aggregate_release(
+            tag=TAG,
+            commit=COMMIT,
+            broker_dir=brokers,
+            rust_bundle=rust,
+            python_candidate=python,
+            report_inputs=report,
+            release_dir=tmp_path / "release",
+        )
+
+
+def test_verify_static_release_directory_is_the_only_success_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = _complete_release(tmp_path)
+    with pytest.raises(ReleaseFailure, match="release.conformance.incomplete"):
+        verify_artifacts(release, TAG, TARGETS, REPO_ROOT)
+
+
+def test_verify_artifacts_does_not_run_virtual_conformance_from_release_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = _complete_release(tmp_path)
+    report_path = release / "conformance-report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    software = report["software"]
+    software["status"] = "Passed"
+    software["jobs"] = [
+        {
+            "platform": platform,
+            "result": "Passed",
+            "command": "verify-artifacts --tag v0.5.0-rc.1",
+            "ref": f"https://example.invalid/jobs/{platform}",
+        }
+        for platform in ("macos", "linux", "windows")
+    ]
+    software["virtual"] = [
+        {
+            "platform": platform,
+            "protocol_minor": minor,
+            "result": "Passed",
+            "command": "run-broker-conformance",
+            "ref": f"https://example.invalid/jobs/{platform}/minor-{minor}",
+        }
+        for platform in ("macos", "linux", "windows")
+        for minor in range(4)
+    ]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    def should_not_run(*args, **kwargs) -> None:
+        raise AssertionError("production archive must not run virtual conformance")
+
+    monkeypatch.setattr(
+        "scripts.release.release_tool._run_virtual_conformance",
+        should_not_run,
+    )
+
+    with pytest.raises(ReleaseFailure, match="release.artifact.unexpected"):
+        verify_artifacts(release, TAG, TARGETS, REPO_ROOT)
+
+
+def test_static_verifier_rejects_replaced_passed_conformance_report(
+    tmp_path: Path,
+) -> None:
+    release = _complete_release(tmp_path)
+    report_path = release / "conformance-report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    software = report["software"]
+    software["status"] = "Passed"
+    software["jobs"] = [
+        {
+            "platform": platform,
+            "result": "Passed",
+            "command": "verify-artifacts --tag v0.5.0-rc.1",
+            "ref": f"https://example.invalid/jobs/{platform}",
+        }
+        for platform in ("macos", "linux", "windows")
+    ]
+    software["virtual"] = [
+        {
+            "platform": platform,
+            "protocol_minor": minor,
+            "result": "Passed",
+            "command": "run-broker-conformance",
+            "ref": f"https://example.invalid/jobs/{platform}/minor-{minor}",
+        }
+        for platform in ("macos", "linux", "windows")
+        for minor in range(4)
+    ]
+    report_path.write_text(
+        json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ReleaseFailure, match="release.manifest.invalid"):
+        verify_static(release)
+
+
+def test_static_verifier_rejects_noncanonical_bound_report(tmp_path: Path) -> None:
+    release = _complete_release(tmp_path)
+    report_path = release / "conformance-report.json"
+    report_path.write_text(
+        json.dumps(json.loads(report_path.read_text(encoding="utf-8")), indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ReleaseFailure, match="release.manifest.invalid"):
+        verify_static(release)

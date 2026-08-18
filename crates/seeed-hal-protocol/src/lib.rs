@@ -4,9 +4,20 @@ pub mod v1 {
     include!(concat!(env!("OUT_DIR"), "/seeed.hal.v1.rs"));
 }
 
+mod camera_conversion;
 mod can_conversion;
 mod conversion;
 
+pub use camera_conversion::{
+    WireFrameLease, camera_capture_request_from_proto, camera_control_descriptor_from_proto,
+    camera_control_descriptor_to_proto, camera_control_kind_from_proto,
+    camera_control_value_from_proto, camera_control_value_to_proto,
+    camera_controls_response_from_proto, camera_format_from_proto,
+    camera_mapping_descriptor_from_proto, camera_mapping_descriptor_to_proto,
+    camera_next_frame_lease_response_from_proto, camera_open_request_from_proto,
+    camera_open_response_from_proto, camera_open_response_to_proto, camera_selector_from_proto,
+    camera_session_lease_from_proto, frame_lease_to_proto,
+};
 pub use can_conversion::{
     can_receive_parameters, can_receive_request_from_proto, can_receive_response_from_proto,
     can_send_request_from_proto, can_send_response_from_proto, can_send_response_to_proto,
@@ -16,14 +27,23 @@ pub use can_conversion::{
     replace_can_filters_request_from_proto, send_can_frames_from_proto,
 };
 pub use conversion::{
-    enumerate_serial_response_from_proto, error_from_proto, invalid_message,
-    open_serial_request_from_proto, open_serial_response_from_proto, parse_serial_session_lease,
-    parse_session_lease, serial_selector_from_proto,
+    enumerate_serial_response_from_proto, error_from_proto, gpio_close_request_from_proto,
+    gpio_config_from_proto, gpio_edge_event_from_proto, gpio_edge_request_from_proto,
+    gpio_next_edge_request_from_proto, gpio_next_edge_response_from_proto,
+    gpio_next_edge_response_to_proto, gpio_read_request_from_proto, gpio_read_response_from_proto,
+    gpio_read_response_to_proto, gpio_selector_from_proto, gpio_write_request_from_proto,
+    invalid_message, open_gpio_request_from_proto, open_gpio_response_from_proto,
+    open_gpio_response_to_proto, open_serial_request_from_proto, open_serial_response_from_proto,
+    open_usb_request_from_proto, open_usb_response_from_proto, open_usb_response_to_proto,
+    parse_serial_session_lease, parse_session_lease, serial_selector_from_proto,
+    usb_close_request_from_proto, usb_selector_from_proto, usb_transfer_from_proto,
+    usb_transfer_request_from_proto, usb_transfer_response_from_proto,
+    usb_transfer_response_to_proto,
 };
 
 pub const PROTOCOL_MAJOR: u32 = 1;
 pub const PROTOCOL_MINOR_MINIMUM: u32 = 0;
-pub const PROTOCOL_MINOR_MAXIMUM: u32 = 1;
+pub const PROTOCOL_MINOR_MAXIMUM: u32 = 3;
 /// Legacy exact-minor field value sent to peers that predate range fields.
 pub const PROTOCOL_MINOR: u32 = PROTOCOL_MINOR_MAXIMUM;
 pub const SERIAL_CAPABILITY: &str = "serial.bytes/v1";

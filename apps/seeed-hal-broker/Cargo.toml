@@ -1,14 +1,23 @@
 [package]
 name = "seeed-hal-broker-app"
-version = "0.2.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish = false
 build = "build.rs"
 
 [features]
+default = ["serialport"]
+avfoundation = ["dep:seeed-hal-adapter-avfoundation"]
+mediafoundation = ["dep:seeed-hal-adapter-mediafoundation"]
 pcan = ["dep:seeed-hal-adapter-pcan"]
+serialport = ["dep:seeed-hal-adapter-serialport"]
 socketcan = ["dep:seeed-hal-adapter-socketcan"]
+v4l2 = ["dep:seeed-hal-adapter-v4l2"]
+nusb = ["dep:seeed-hal-adapter-nusb"]
+linux-gpio = ["dep:seeed-hal-adapter-linux-gpio"]
+windows-gpio = ["dep:seeed-hal-adapter-windows-gpio"]
 virtual-adapters = ["dep:seeed-hal-testkit"]
 
 [[bin]]
@@ -17,14 +26,17 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true }
-seeed-hal-adapter-serialport = { path = "../../adapters/serialport" }
-seeed-hal-adapter-pcan = { path = "../../adapters/pcan", optional = true }
-seeed-hal-adapter-socketcan = { path = "../../adapters/socketcan", optional = true }
-seeed-hal-broker = { path = "../../crates/seeed-hal-broker" }
-seeed-hal-core = { path = "../../crates/seeed-hal-core" }
-seeed-hal-protocol = { path = "../../crates/seeed-hal-protocol" }
-seeed-hal-runtime = { path = "../../crates/seeed-hal-runtime" }
-seeed-hal-testkit = { path = "../../crates/seeed-hal-testkit", optional = true }
+seeed-hal-adapter-serialport = { path = "../../adapters/serialport", optional = true, version = "=0.5.0-rc.1"}
+seeed-hal-adapter-pcan = { path = "../../adapters/pcan", optional = true, version = "=0.5.0-rc.1"}
+seeed-hal-adapter-socketcan = { path = "../../adapters/socketcan", optional = true, version = "=0.5.0-rc.1"}
+seeed-hal-adapter-nusb = { path = "../../adapters/nusb", optional = true, version = "=0.5.0-rc.1"}
+seeed-hal-adapter-linux-gpio = { path = "../../adapters/linux-gpio", optional = true, version = "=0.5.0-rc.1"}
+seeed-hal-adapter-windows-gpio = { path = "../../adapters/windows-gpio", optional = true, version = "=0.5.0-rc.1"}
+seeed-hal-broker = { path = "../../crates/seeed-hal-broker", version = "=0.5.0-rc.1"}
+seeed-hal-core = { path = "../../crates/seeed-hal-core", version = "=0.5.0-rc.1"}
+seeed-hal-protocol = { path = "../../crates/seeed-hal-protocol", version = "=0.5.0-rc.1"}
+seeed-hal-runtime = { path = "../../crates/seeed-hal-runtime", version = "=0.5.0-rc.1"}
+seeed-hal-testkit = { path = "../../crates/seeed-hal-testkit", optional = true, version = "=0.5.0-rc.1"}
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -36,15 +48,23 @@ zeroize = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+seeed-hal-adapter-avfoundation = { path = "../../adapters/avfoundation", optional = true, version = "=0.5.0-rc.1"}
+
+[target.'cfg(target_os = "linux")'.dependencies]
+seeed-hal-adapter-v4l2 = { path = "../../adapters/v4l2", optional = true, version = "=0.5.0-rc.1"}
+
 [target.'cfg(windows)'.dependencies]
-seeed-hal-windows-file = { path = "../../adapters/windows-file" }
-seeed-hal-windows-security = { path = "../../adapters/windows-security" }
+seeed-hal-adapter-mediafoundation = { path = "../../adapters/mediafoundation", optional = true, version = "=0.5.0-rc.1"}
+seeed-hal-windows-file = { path = "../../adapters/windows-file", version = "=0.5.0-rc.1"}
+seeed-hal-windows-security = { path = "../../adapters/windows-security", version = "=0.5.0-rc.1"}
 windows-permissions = { workspace = true }
 windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 winapi-util = { workspace = true }
 
 [dev-dependencies]
-seeed-hal-client = { path = "../../crates/seeed-hal-client" }
-seeed-hal-serial = { path = "../../crates/seeed-hal-serial" }
-seeed-hal-testkit = { path = "../../crates/seeed-hal-testkit" }
+seeed-hal-client = { path = "../../crates/seeed-hal-client", version = "=0.5.0-rc.1"}
+seeed-hal-serial = { path = "../../crates/seeed-hal-serial", version = "=0.5.0-rc.1"}
+seeed-hal-testkit = { path = "../../crates/seeed-hal-testkit", version = "=0.5.0-rc.1"}
 serde_json = { workspace = true }
+wait-timeout = "0.2.1"

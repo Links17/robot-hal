@@ -77,6 +77,7 @@ async def fake_broker(
     selected_minor=1,
     minimum_minor=0,
     maximum_minor=1,
+    capabilities: list[str] | None = None,
 ):
     if os.name == "nt":
         pytest.skip("Unix socket protocol fault injection is covered on Unix CI")
@@ -91,7 +92,7 @@ async def fake_broker(
                 assert hello.request_id == 1
                 assert hello.WhichOneof("payload") == "handshake_request"
                 assert hello.handshake_request.protocol_minor_minimum == 0
-                assert hello.handshake_request.protocol_minor_maximum == 1
+                assert hello.handshake_request.protocol_minor_maximum == 3
                 await send_frame(
                     writer_stream,
                     envelope(
@@ -100,7 +101,7 @@ async def fake_broker(
                         hal_pb2.HandshakeResponse(
                             protocol_major=1,
                             protocol_minor=selected_minor,
-                            capabilities=["serial.bytes/v1"],
+                            capabilities=capabilities or ["serial.bytes/v1"],
                             max_frame_bytes=frame,
                             max_read_bytes=read,
                             max_write_bytes=write,
@@ -156,7 +157,7 @@ def test_hal_error_structured_details_are_immutable_copies() -> None:
 
 
 @pytest.mark.asyncio
-async def test_python_client_accepts_overlap_selection_and_rejects_no_shared_minor() -> None:
+async def test_python_client_accepts_overlap_selection_including_minor_three() -> None:
     release = asyncio.Event()
 
     async def handler(_reader, _writer):
@@ -181,11 +182,12 @@ async def test_python_client_accepts_overlap_selection_and_rejects_no_shared_min
         release.set()
 
     async with fake_broker(
-        handler, selected_minor=2, minimum_minor=2, maximum_minor=2
+        handler, selected_minor=3, minimum_minor=3, maximum_minor=3
     ) as endpoint:
-        with pytest.raises(HalError) as caught:
-            await HalClient.connect(endpoint, TOKEN)
-        assert caught.value.name == "runtime.protocol.invalid_handshake"
+        client = await HalClient.connect(endpoint, TOKEN)
+        assert client.protocol_minor == 3
+        await client.close()
+        release.set()
 
 
 @pytest.mark.asyncio
@@ -211,7 +213,7 @@ async def test_invalid_python_arguments_use_stable_hal_errors() -> None:
 @pytest.mark.asyncio
 async def test_python_client_round_trips_complete_serial_contract(broker) -> None:
     client = await HalClient.connect(broker.endpoint, broker.token)
-    assert client.protocol_minor == 1
+    assert client.protocol_minor == 3
     events = client.subscribe()
     resources = await client.enumerate_serial()
     assert resources[0].identity_quality is IdentityQuality.STRONG

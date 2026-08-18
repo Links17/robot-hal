@@ -1,0 +1,404 @@
+# Task 4 Report: Deterministic Release Manifests and Safe Archive Inspection
+
+## Status
+
+DONE
+
+## Changes
+
+- Added standard-library-only release manifest models: `ArtifactRecord`,
+  `ReleaseManifest`, `ConformanceReport`, and `QualificationStatus`.
+- Added deterministic manifest encoding and `SHA256SUMS` generation. The manifest
+  is compact UTF-8 JSON with sorted keys and a trailing newline; artifacts and
+  checksum lines are lexically sorted by basename.
+- Added exact v0.5 artifact basename allowlists, strict identity/composition
+  validation, sensitive-field/value rejection, and static manifest/checksum/artifact
+  validation. `SHA256SUMS` covers release artifacts only; it deliberately excludes
+  `release-manifest.json` and itself to avoid self-reference.
+- Added `generate-manifest` and `verify-static` CLI commands for subsequent release
+  tasks.
+- Added no-extract tar/zip validation that rejects unsafe paths, non-root members,
+  duplicate members, symlinks/hardlinks/devices/non-regular types, and unexpected
+  content.
+- Added deterministic manifest, checksum, static verifier, and archive-safety test
+  coverage plus qualification and valid-fixture directory placeholders.
+
+## RED Evidence
+
+Before implementation:
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_manifest.py tests/release/test_archive_safety.py
+```
+
+Result: exit code 2 during collection, as expected. The test modules could not
+import the missing `encode_manifest` and `validate_archive` interfaces from
+`scripts.release.release_tool`.
+
+## GREEN Evidence and Commands
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_manifest.py tests/release/test_archive_safety.py
+```
+
+Result: `31 passed`.
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+python3 -m compileall -q scripts/release tests/release
+git diff --check
+```
+
+Result: release suite `77 passed`; Python compilation and diff check exited 0.
+IDE diagnostics reported no errors for changed files.
+
+## Commit
+
+- `d4e2f03` — `feat(release): generate and validate artifact manifests`
+- `cfe5f18` — `fix(release): reject empty archive path components`
+
+## Self-review
+
+- All Task 4 business behavior is centralized in `scripts/release/release_tool.py`
+  and uses only Python standard-library modules.
+- Manifest persistence rejects prohibited sensitive field names recursively and does
+  not echo manifest values in diagnostics; all new failure paths use stable
+  `release.manifest.invalid` or `release.archive.invalid` names.
+- Static verification requires an exact artifact set, sizes, hashes, and canonical
+  checksums rather than accepting extra or omitted files.
+- Archive inspection only reads member metadata; it never calls extraction APIs.
+  Member paths explicitly reject empty components, `.`, `..`, backslashes,
+  absolute paths, and Windows drive-like paths.
+- Scope is limited to Task 4 release tooling, focused tests, required fixtures, and
+  this report; no Task 5+ behavior, plans, or design documents were changed.
+
+## Concerns
+
+- Archive content expectations are supplied by future packaging tasks through the
+  `validate_archive(..., expected_root=..., expected_files=...)` interface. This
+  task intentionally establishes strict validation without guessing a future
+  package file inventory.
+
+---
+
+## P0/P1 Review Follow-up
+
+### Status
+
+DONE
+
+### RED Evidence
+
+After adding tests for the reviewed gaps, the required focused command failed as
+expected:
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_manifest.py tests/release/test_archive_safety.py
+```
+
+Result: `16 failed, 35 passed`. Failures demonstrated that the release model
+accepted a partial artifact set, omitted the crates bundle, lacked a controlled
+conformance report sidecar, allowed unsafe qualification URIs, emitted argparse
+usage for malformed CLI input, and did not reject archive case/Unicode
+collisions or empty directories.
+
+### Changes
+
+- The manifest now derives and requires the exact v0.5 RC artifact set from its
+  tag: three broker archives, one Rust crates bundle, wheel, and sdist.
+- `conformance-report.json` is a controlled manifest sidecar with an explicit
+  schema and identity/qualification linkage. It is required by static
+  verification but excluded from artifact checksum coverage, along with
+  `release-manifest.json` and `SHA256SUMS`, to avoid self-reference.
+- Qualification IDs and HTTPS report URIs are schema-validated. Userinfo,
+  query/fragment, local hosts, and private/loopback/link-local IP endpoints are
+  rejected without echoing values.
+- Archive validation now detects case-fold and NFC collisions, canonicalizes
+  expected paths, and permits only the root plus parent directories implied by
+  expected files.
+- CLI parsing maps argument errors to `release.tool.invalid` without argparse
+  usage text or supplied values.
+
+### GREEN Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_manifest.py tests/release/test_archive_safety.py
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+python3 -m compileall -q scripts/release tests/release
+git diff --check
+```
+
+Result: focused suite `51 passed`; complete release suite `97 passed`;
+compileall and diff check passed. IDE diagnostics reported no errors.
+
+### Commit
+
+`7fa8b54` — `fix(release): harden manifest conformance validation`
+
+### Concerns
+
+- The follow-up supplies only the release model and static verification required
+  for later packaging and qualification tasks. It does not perform artifact
+  packaging or cross-platform qualification execution.
+
+---
+
+## Important Review Follow-up
+
+### Status
+
+DONE
+
+### RED Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_manifest.py tests/release/test_archive_safety.py
+```
+
+Result: `4 failed, 52 passed`. The failures demonstrated acceptance of identical
+duplicate records through the artifact map, the old split-path static verifier
+API, and inconsistent NFD-member/NFC-expected archive comparison.
+
+### Changes
+
+- Manifest validation rejects duplicate artifact names before comparing the
+  exact artifact map. Diagnostics remain value-free.
+- `verify-static` is now a complete single-directory gate:
+  `verify-static --release-dir <dir>`. The directory must contain exactly the
+  six tag-derived primary artifacts plus `release-manifest.json`, `SHA256SUMS`,
+  and `conformance-report.json`; every entry must be a regular non-symlink
+  file in that same directory.
+- Archive comparisons use NFC canonical path strings while collision keys use
+  NFC plus case-folding. A single NFD member therefore matches one NFC expected
+  name, but multiple colliding spellings are rejected.
+
+### GREEN Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_manifest.py tests/release/test_archive_safety.py
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+python3 -m compileall -q scripts/release tests/release
+git diff --check
+```
+
+Result: focused suite `56 passed`; full release suite `102 passed`; compileall
+and diff check passed.
+
+### Commit
+
+`842910d` — `fix(release): gate complete release directories`
+
+### Concerns
+
+- This follow-up establishes static directory layout and archive-validation
+  semantics only. It does not add package production or release workflows.
+
+---
+
+## Final Archive Review Follow-up
+
+### Status
+
+DONE
+
+### RED Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_manifest.py tests/release/test_archive_safety.py
+```
+
+Result: `2 failed, 58 passed` after adding tar/zip `root//` and
+`root/subdir//` directory-member tests. The nested malformed tar directory was
+normalized by `tarfile` and bypassed the prior metadata-only check.
+
+### Changes
+
+- Directory members now reject extra trailing slashes; regular members with a
+  trailing slash remain rejected.
+- ZIP names are checked directly. For tar.gz archives, the validator also reads
+  raw 512-byte headers before `tarfile` normalization so malformed directory
+  names cannot bypass the same fail-closed contract.
+- Existing type, traversal, root, NFC/case collision, expected-directory, and
+  no-extraction checks remain in force.
+
+### GREEN Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_manifest.py tests/release/test_archive_safety.py
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+python3 -m compileall -q scripts/release tests/release
+git diff --check
+```
+
+Result: focused suite `60 passed`; full release suite `106 passed`; compileall
+and diff check passed.
+
+### Commit
+
+`c6cf772` — `fix(release): reject malformed tar directory names`
+
+### Concerns
+
+- Raw tar header inspection is intentionally limited to archive metadata needed
+  to catch parser normalization; no artifact extraction or packaging is added.
+
+---
+
+## Final P1 Tar Size Follow-up
+
+### Status
+
+DONE
+
+### RED Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_manifest.py tests/release/test_archive_safety.py
+```
+
+Result: `1 failed, 60 passed`. A small gzip tar fixture declared an 8 GiB legal
+octal member size with a short payload. A read spy failed before allocation when
+the raw-header validator attempted one `read(8589934592)`.
+
+### Changes
+
+- Raw tar payload consumption now reads at most 64 KiB per operation, with a
+  decreasing remaining-byte counter.
+- A short payload, malformed size, or raw-header read failure remains a stable
+  `release.archive.invalid` failure. Raw header slash checks still run before
+  `tarfile`, and validation remains metadata-only without extraction.
+
+### GREEN Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_manifest.py tests/release/test_archive_safety.py
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+python3 -m compileall -q scripts/release tests/release
+git diff --check
+```
+
+Result: focused suite `61 passed`; full release suite `107 passed`; compileall
+and diff check passed.
+
+### Commit
+
+`7b55c7d` — `fix(release): bound raw tar payload reads`
+
+### Concerns
+
+- The bounded loop reads declared payload bytes only until EOF; because each read
+  is capped, a forged huge size cannot allocate a proportional buffer.
+
+---
+
+## Final P1 Raw Tar Decompression Budget
+
+### Status
+
+DONE
+
+### RED Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_manifest.py tests/release/test_archive_safety.py
+```
+
+Result: `1 failed, 61 passed`. The new raw-tar limit test failed because no
+explicit per-member or cumulative decompressed-payload safety budget existed.
+
+### Changes
+
+- Defined and documented `MAX_ARCHIVE_MEMBER_BYTES` (768 MiB) and
+  `MAX_ARCHIVE_UNCOMPRESSED_BYTES` (1 GiB), retaining capacity for expected
+  v0.5 broker binaries and the Rust crates bundle while bounding hostile input.
+- The raw tar scanner checks each declared size before any payload read, then
+  accumulates only declared member payload bytes (never alignment padding).
+- The scanner continues to consume allowable payload with 64 KiB reads; malformed
+  sizes, truncated data, and limit violations map to `release.archive.invalid`.
+- Added tests proving an oversized header is rejected after its header read and
+  before payload consumption, and multiple individually legal members that exceed
+  the aggregate payload budget are rejected stably.
+
+### GREEN Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_manifest.py tests/release/test_archive_safety.py
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+python3 -m compileall -q scripts/release tests/release
+git diff --check
+```
+
+Result: focused suite `62 passed`; full release suite `108 passed`; compileall
+and diff check passed.
+
+### Commit
+
+`df8da40` — `fix(release): cap tar decompression budgets`
+
+### Concerns
+
+- Limits apply to the gzip tar raw-header prescan, preventing declared-size
+  headers from forcing unbounded inflation before `tarfile` receives the stream.
+
+---
+
+## Final P1 Truncated Gzip Decode Handling
+
+### Status
+
+DONE
+
+### RED Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_archive_safety.py
+```
+
+Result: `1 failed, 29 passed`. A truncated gzip deflate stream raised uncaught
+`EOFError` from the raw tar pre-scan rather than a structured release failure.
+
+### Changes
+
+- Added a small truncated gzip tar fixture that enters the raw pre-scan and
+  asserts a stable `release.archive.invalid` failure with a bounded generic
+  diagnostic and no input-path echo.
+- Mapped `EOFError` alongside existing I/O failures at the raw gzip scan
+  boundary to `release.archive.invalid: unable to inspect archive`.
+- Deliberately did not catch broad exceptions, preserving propagation for
+  process-control and resource-exhaustion exceptions while retaining raw-header,
+  size-budget, trailing-slash, and 64 KiB payload checks.
+
+### GREEN Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_manifest.py tests/release/test_archive_safety.py
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+python3 -m compileall -q scripts/release tests/release
+git diff --check
+```
+
+Result: focused suite `63 passed`; full release suite `109 passed`; compileall
+and diff check passed.
+
+### Commit
+
+`327f0a8` — `fix(release): normalize truncated gzip errors`
+
+### Concerns
+
+- The raw pre-scan only maps expected gzip EOF/I/O decode failures. Other
+  unexpected exceptions remain visible instead of being swallowed.

@@ -5,6 +5,10 @@ use std::sync::{Arc, Mutex};
 use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
+use seeed_hal_camera::{
+    CAMERA_CAPTURE_CAPABILITY, CAMERA_CONTROLS_CAPABILITY, CAMERA_FRAMES_SHM_CAPABILITY,
+    CameraRequest,
+};
 use seeed_hal_can::{
     CAN_CLASSIC_CAPABILITY, CAN_CONFIGURE_CAPABILITY, CAN_ERROR_FRAMES_CAPABILITY,
     CAN_FD_CAPABILITY, CAN_RX_TIMESTAMP_CAPABILITY, CanFilterSet, CanMode, CanOpenConfig,
@@ -15,24 +19,37 @@ use seeed_hal_core::{
     ErrorCategory, HalError, HalResult, LeaseMode, ResourceDescriptor, ResourceId,
     ResourceSelector, SessionId,
 };
+use seeed_hal_gpio::{
+    GPIO_EDGES_CAPABILITY, GPIO_LINES_CAPABILITY, GpioLineConfig, MAX_GPIO_EVENTS,
+};
 use seeed_hal_protocol::v1::{self, envelope};
 use seeed_hal_protocol::{
     MAX_FRAME_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR, SERIAL_CAPABILITY,
+    camera_control_value_from_proto, camera_controls_response_from_proto,
+    camera_mapping_descriptor_from_proto, camera_next_frame_lease_response_from_proto,
     can_receive_response_from_proto, can_send_response_from_proto,
     enumerate_can_response_from_proto, enumerate_serial_response_from_proto, error_from_proto,
-    get_can_bus_status_response_from_proto, open_can_response_from_proto,
+    get_can_bus_status_response_from_proto, gpio_next_edge_response_from_proto,
+    gpio_read_response_from_proto, open_can_response_from_proto, open_gpio_response_from_proto,
+    open_usb_response_from_proto, usb_transfer_response_from_proto,
 };
 use seeed_hal_protocol::{
     PROTOCOL_MINOR_MAXIMUM, PROTOCOL_MINOR_MINIMUM, handshake_response_minor_range,
 };
 use seeed_hal_serial::SerialConfig;
+use seeed_hal_usb::{
+    USB_BULK_CAPABILITY, USB_CONTROL_CAPABILITY, USB_INTERRUPT_CAPABILITY, UsbInterfaceClaim,
+    UsbTransfer,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::{RemoteCanHandle, RemoteSerialHandle};
+use crate::{
+    RemoteCameraHandle, RemoteCanHandle, RemoteGpioHandle, RemoteSerialHandle, RemoteUsbHandle,
+};
 
 const DEFAULT_IO_CAPACITY: usize = 32;
 const DEFAULT_EVENT_CAPACITY: usize = 64;
@@ -189,6 +206,21 @@ fn event_closed_error() -> HalError {
     )
 }
 
+fn camera_request_to_proto(request: &CameraRequest) -> v1::CameraRequest {
+    v1::CameraRequest {
+        format: Some(v1::CameraFormat {
+            pixel_format: match request.format().pixel_format() {
+                seeed_hal_camera::CameraPixelFormat::Nv12 => v1::CameraPixelFormat::Nv12,
+                seeed_hal_camera::CameraPixelFormat::Yuyv => v1::CameraPixelFormat::Yuyv,
+                seeed_hal_camera::CameraPixelFormat::Mjpeg => v1::CameraPixelFormat::Mjpeg,
+            } as i32,
+            width: request.format().width(),
+            height: request.format().height(),
+        }),
+        slot_count: request.slot_count() as u32,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanSessionProfile {
     pub(crate) mode: CanMode,
@@ -234,6 +266,66 @@ pub(crate) enum ExpectedResponse {
     CanBusStatus {
         profile: CanSessionProfile,
     },
+    EnumerateUsb,
+    OpenUsb {
+        resource_id: ResourceId,
+    },
+    UsbTransfer {
+        max_read_bytes: usize,
+        resource_id: ResourceId,
+    },
+    CloseUsb {
+        resource_id: ResourceId,
+    },
+    EnumerateGpio,
+    OpenGpio {
+        line_count: usize,
+        resource_id: ResourceId,
+    },
+    GpioRead {
+        line_count: usize,
+        resource_id: ResourceId,
+    },
+    GpioWrite {
+        resource_id: ResourceId,
+    },
+    GpioNextEdge {
+        resource_id: ResourceId,
+    },
+    CloseGpio {
+        resource_id: ResourceId,
+    },
+    EnumerateCamera,
+    OpenCamera {
+        resource_id: ResourceId,
+    },
+    CaptureCamera {
+        resource_id: ResourceId,
+    },
+    CameraMappingDescriptor {
+        resource_id: ResourceId,
+    },
+    CameraNextFrameLease {
+        resource_id: ResourceId,
+    },
+    CameraDroppedCount {
+        resource_id: ResourceId,
+    },
+    CameraControls {
+        resource_id: ResourceId,
+    },
+    CameraGetControl {
+        resource_id: ResourceId,
+    },
+    CameraSetControl {
+        resource_id: ResourceId,
+    },
+    CameraSetAuto {
+        resource_id: ResourceId,
+    },
+    CloseCamera {
+        resource_id: ResourceId,
+    },
 }
 
 impl ExpectedResponse {
@@ -245,6 +337,24 @@ impl ExpectedResponse {
             | Self::ReplaceCanFilters { profile }
             | Self::CanBusStatus { profile }
             | Self::CloseCan { profile } => Some(&profile.resource_id),
+            Self::OpenUsb { resource_id }
+            | Self::UsbTransfer { resource_id, .. }
+            | Self::CloseUsb { resource_id }
+            | Self::OpenGpio { resource_id, .. }
+            | Self::GpioRead { resource_id, .. }
+            | Self::GpioWrite { resource_id }
+            | Self::GpioNextEdge { resource_id }
+            | Self::CloseGpio { resource_id }
+            | Self::OpenCamera { resource_id }
+            | Self::CaptureCamera { resource_id }
+            | Self::CameraMappingDescriptor { resource_id }
+            | Self::CameraNextFrameLease { resource_id }
+            | Self::CameraDroppedCount { resource_id }
+            | Self::CameraControls { resource_id }
+            | Self::CameraGetControl { resource_id }
+            | Self::CameraSetControl { resource_id }
+            | Self::CameraSetAuto { resource_id }
+            | Self::CloseCamera { resource_id } => Some(resource_id),
             _ => None,
         }
     }
@@ -304,6 +414,14 @@ struct Limits {
     #[allow(dead_code)]
     // Retained negotiated limit for the forthcoming timestamped receive surface.
     can_rx_timestamp: bool,
+    usb_control: bool,
+    usb_bulk: bool,
+    usb_interrupt: bool,
+    gpio_lines: bool,
+    gpio_edges: bool,
+    camera_capture: bool,
+    camera_frames_shm: bool,
+    camera_controls: bool,
 }
 
 struct Shared {
@@ -436,6 +554,14 @@ impl HalClient {
             can_configure: false,
             can_error_frames: false,
             can_rx_timestamp: false,
+            usb_control: false,
+            usb_bulk: false,
+            usb_interrupt: false,
+            gpio_lines: false,
+            gpio_edges: false,
+            camera_capture: false,
+            camera_frames_shm: false,
+            camera_controls: false,
         };
         let mut framed = Framed::new(io, frame_codec(requested.frame));
         let negotiated = perform_handshake(&mut framed, &options, requested).await?;
@@ -514,7 +640,7 @@ impl HalClient {
         let payload = self
             .request(
                 envelope::Payload::OpenSerialRequest(v1::OpenSerialRequest {
-                    selector: Some((&selector).into()),
+                    selector: Some((&selector).try_into()?),
                     config: Some((&config).into()),
                 }),
                 ExpectedResponse::OpenSerial,
@@ -551,6 +677,193 @@ impl HalClient {
             self.fail(error.clone());
         }
         result
+    }
+
+    pub async fn enumerate_usb(&self) -> HalResult<Vec<ResourceDescriptor>> {
+        self.require_minor_two("usb.enumerate", None, |limits| limits.usb_control)?;
+        let payload = self
+            .send(
+                envelope::Payload::EnumerateUsbRequest(v1::EnumerateUsbRequest {}),
+                ExpectedResponse::EnumerateUsb,
+            )
+            .await?;
+        let envelope::Payload::EnumerateUsbResponse(response) = payload else {
+            unreachable!()
+        };
+        let result: HalResult<Vec<ResourceDescriptor>> = response
+            .resources
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect();
+        if let Err(error) = &result {
+            self.fail(error.clone());
+        }
+        result
+    }
+
+    pub async fn open_usb(
+        &self,
+        selector: ResourceSelector,
+        claim: UsbInterfaceClaim,
+    ) -> HalResult<RemoteUsbHandle> {
+        if selector.transport() != seeed_hal_core::TransportKind::Usb {
+            return Err(client_error(
+                "runtime.argument.invalid",
+                ErrorCategory::InvalidArgument,
+                "usb.open",
+                false,
+                "USB resource selector transport must be Usb",
+            )
+            .with_resource_id(selector.id().clone()));
+        }
+        self.require_minor_two("usb.open", Some(selector.id()), |limits| limits.usb_control)?;
+        let payload = envelope::Payload::OpenUsbRequest(v1::OpenUsbRequest {
+            selector: Some((&selector).try_into()?),
+            interface_number: u32::from(claim.number()),
+        });
+        self.ensure_payload_for_resource(&payload, "usb.open", selector.id())?;
+        let payload = self
+            .send(
+                payload,
+                ExpectedResponse::OpenUsb {
+                    resource_id: selector.id().clone(),
+                },
+            )
+            .await?;
+        let envelope::Payload::OpenUsbResponse(response) = payload else {
+            unreachable!()
+        };
+        RemoteUsbHandle::from_response(self.clone(), selector.id().clone(), response).inspect_err(
+            |error| {
+                self.fail(error.clone());
+            },
+        )
+    }
+
+    pub async fn enumerate_gpio(&self) -> HalResult<Vec<ResourceDescriptor>> {
+        self.require_minor_two("gpio.enumerate", None, |limits| limits.gpio_lines)?;
+        let payload = self
+            .send(
+                envelope::Payload::EnumerateGpioRequest(v1::EnumerateGpioRequest {}),
+                ExpectedResponse::EnumerateGpio,
+            )
+            .await?;
+        let envelope::Payload::EnumerateGpioResponse(response) = payload else {
+            unreachable!()
+        };
+        let result: HalResult<Vec<ResourceDescriptor>> = response
+            .resources
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect();
+        if let Err(error) = &result {
+            self.fail(error.clone());
+        }
+        result
+    }
+
+    pub async fn open_gpio(
+        &self,
+        selector: ResourceSelector,
+        lines: Vec<u32>,
+        config: GpioLineConfig,
+    ) -> HalResult<RemoteGpioHandle> {
+        if selector.transport() != seeed_hal_core::TransportKind::Gpio
+            || lines.is_empty()
+            || lines.len() > MAX_GPIO_EVENTS
+        {
+            return Err(client_error(
+                "runtime.argument.invalid",
+                ErrorCategory::InvalidArgument,
+                "gpio.open",
+                false,
+                "GPIO selector or lines are invalid",
+            )
+            .with_resource_id(selector.id().clone()));
+        }
+        self.require_minor_two("gpio.open", Some(selector.id()), |limits| limits.gpio_lines)?;
+        let payload = envelope::Payload::OpenGpioRequest(v1::OpenGpioRequest {
+            selector: Some((&selector).try_into()?),
+            lines: lines.clone(),
+            config: Some((&config).into()),
+        });
+        self.ensure_payload_for_resource(&payload, "gpio.open", selector.id())?;
+        let payload = self
+            .send(
+                payload,
+                ExpectedResponse::OpenGpio {
+                    line_count: lines.len(),
+                    resource_id: selector.id().clone(),
+                },
+            )
+            .await?;
+        let envelope::Payload::OpenGpioResponse(response) = payload else {
+            unreachable!()
+        };
+        RemoteGpioHandle::from_response(self.clone(), selector.id().clone(), lines.len(), response)
+            .inspect_err(|error| {
+                self.fail(error.clone());
+            })
+    }
+
+    pub async fn enumerate_camera(&self) -> HalResult<Vec<ResourceDescriptor>> {
+        self.require_camera_capability("camera.enumerate", None, |limits| limits.camera_capture)?;
+        let payload = self
+            .send(
+                envelope::Payload::EnumerateCameraRequest(v1::EnumerateCameraRequest {}),
+                ExpectedResponse::EnumerateCamera,
+            )
+            .await?;
+        let envelope::Payload::EnumerateCameraResponse(response) = payload else {
+            unreachable!()
+        };
+        let result: HalResult<Vec<ResourceDescriptor>> = response
+            .resources
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect();
+        if let Err(error) = &result {
+            self.fail(error.clone());
+        }
+        result
+    }
+
+    pub async fn open_camera(
+        &self,
+        selector: ResourceSelector,
+        request: CameraRequest,
+    ) -> HalResult<RemoteCameraHandle> {
+        if selector.transport() != seeed_hal_core::TransportKind::Camera {
+            return Err(client_error(
+                "runtime.argument.invalid",
+                ErrorCategory::InvalidArgument,
+                "camera.open",
+                false,
+                "camera resource selector transport must be Camera",
+            )
+            .with_resource_id(selector.id().clone()));
+        }
+        self.require_camera_capability("camera.open", Some(selector.id()), |limits| {
+            limits.camera_capture
+        })?;
+        let payload = envelope::Payload::OpenCameraRequest(v1::OpenCameraRequest {
+            selector: Some((&selector).try_into()?),
+            request: Some(camera_request_to_proto(&request)),
+        });
+        self.ensure_payload_for_resource(&payload, "camera.open", selector.id())?;
+        let payload = self
+            .send(
+                payload,
+                ExpectedResponse::OpenCamera {
+                    resource_id: selector.id().clone(),
+                },
+            )
+            .await?;
+        let envelope::Payload::OpenCameraResponse(response) = payload else {
+            unreachable!()
+        };
+        RemoteCameraHandle::from_response(self.clone(), selector.id().clone(), response)
+            .inspect_err(|error| self.fail(error.clone()))
     }
 
     pub async fn open_can(
@@ -597,7 +910,7 @@ impl HalClient {
         validate_can_open_capabilities(&descriptor, &config, &filters)?;
 
         let request = v1::OpenCanRequest {
-            selector: Some((&selector).into()),
+            selector: Some((&selector).try_into()?),
             mode: lease_mode_to_proto(mode) as i32,
             config: Some((&config).into()),
             filters: Some((&filters).into()),
@@ -675,6 +988,66 @@ impl HalClient {
         self.ensure_payload_fits(payload, operation, Some(resource_id))
     }
 
+    pub(crate) fn ensure_payload_for_resource(
+        &self,
+        payload: &envelope::Payload,
+        operation: &'static str,
+        resource_id: &ResourceId,
+    ) -> HalResult<()> {
+        self.ensure_payload_fits(payload, operation, Some(resource_id))
+    }
+
+    pub(crate) fn require_usb_transfer(
+        &self,
+        operation: &'static str,
+        resource_id: &ResourceId,
+        transfer: &UsbTransfer,
+    ) -> HalResult<()> {
+        self.require_minor_two(operation, Some(resource_id), |limits| match transfer {
+            UsbTransfer::ControlOut { .. } | UsbTransfer::ControlIn { .. } => limits.usb_control,
+            UsbTransfer::BulkOut { .. } | UsbTransfer::BulkIn { .. } => limits.usb_bulk,
+            UsbTransfer::InterruptOut { .. } | UsbTransfer::InterruptIn { .. } => {
+                limits.usb_interrupt
+            }
+        })
+    }
+
+    pub(crate) fn require_gpio_edges(
+        &self,
+        operation: &'static str,
+        resource_id: &ResourceId,
+    ) -> HalResult<()> {
+        self.require_minor_two(operation, Some(resource_id), |limits| limits.gpio_edges)
+    }
+
+    pub(crate) fn require_camera_capture(
+        &self,
+        operation: &'static str,
+        resource_id: &ResourceId,
+    ) -> HalResult<()> {
+        self.require_camera_capability(operation, Some(resource_id), |limits| limits.camera_capture)
+    }
+
+    pub(crate) fn require_camera_frames_shm(
+        &self,
+        operation: &'static str,
+        resource_id: &ResourceId,
+    ) -> HalResult<()> {
+        self.require_camera_capability(operation, Some(resource_id), |limits| {
+            limits.camera_frames_shm
+        })
+    }
+
+    pub(crate) fn require_camera_controls(
+        &self,
+        operation: &'static str,
+        resource_id: &ResourceId,
+    ) -> HalResult<()> {
+        self.require_camera_capability(operation, Some(resource_id), |limits| {
+            limits.camera_controls
+        })
+    }
+
     pub(crate) async fn send(
         &self,
         payload: envelope::Payload,
@@ -708,6 +1081,56 @@ impl HalClient {
             operation,
             false,
             "the negotiated broker protocol does not support this CAN operation",
+        );
+        Err(resource_id.map_or(error.clone(), |id| error.with_resource_id(id.clone())))
+    }
+
+    fn require_minor_two(
+        &self,
+        operation: &'static str,
+        resource_id: Option<&ResourceId>,
+        supported: impl FnOnce(Limits) -> bool,
+    ) -> HalResult<()> {
+        let limits = *self
+            .inner
+            .shared
+            .limits
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if limits.protocol_minor >= 2 && supported(limits) {
+            return Ok(());
+        }
+        let error = client_error(
+            "runtime.protocol.capability_unsupported",
+            ErrorCategory::Conflict,
+            operation,
+            false,
+            "the negotiated broker protocol does not support this USB/GPIO operation",
+        );
+        Err(resource_id.map_or(error.clone(), |id| error.with_resource_id(id.clone())))
+    }
+
+    fn require_camera_capability(
+        &self,
+        operation: &'static str,
+        resource_id: Option<&ResourceId>,
+        supported: impl FnOnce(Limits) -> bool,
+    ) -> HalResult<()> {
+        let limits = *self
+            .inner
+            .shared
+            .limits
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if limits.protocol_minor >= 3 && supported(limits) {
+            return Ok(());
+        }
+        let error = client_error(
+            "runtime.protocol.capability_unsupported",
+            ErrorCategory::Conflict,
+            operation,
+            false,
+            "the negotiated broker protocol does not support this Camera operation",
         );
         Err(resource_id.map_or(error.clone(), |id| error.with_resource_id(id.clone())))
     }
@@ -1040,6 +1463,38 @@ where
                     .capabilities
                     .iter()
                     .any(|value| value == CAN_RX_TIMESTAMP_CAPABILITY),
+                usb_control: response
+                    .capabilities
+                    .iter()
+                    .any(|value| value == USB_CONTROL_CAPABILITY),
+                usb_bulk: response
+                    .capabilities
+                    .iter()
+                    .any(|value| value == USB_BULK_CAPABILITY),
+                usb_interrupt: response
+                    .capabilities
+                    .iter()
+                    .any(|value| value == USB_INTERRUPT_CAPABILITY),
+                gpio_lines: response
+                    .capabilities
+                    .iter()
+                    .any(|value| value == GPIO_LINES_CAPABILITY),
+                gpio_edges: response
+                    .capabilities
+                    .iter()
+                    .any(|value| value == GPIO_EDGES_CAPABILITY),
+                camera_capture: response
+                    .capabilities
+                    .iter()
+                    .any(|value| value == CAMERA_CAPTURE_CAPABILITY),
+                camera_frames_shm: response
+                    .capabilities
+                    .iter()
+                    .any(|value| value == CAMERA_FRAMES_SHM_CAPABILITY),
+                camera_controls: response
+                    .capabilities
+                    .iter()
+                    .any(|value| value == CAMERA_CONTROLS_CAPABILITY),
             })
         }
         Some(envelope::Payload::Error(error)) => Err(error_from_proto(error)?),
@@ -1611,6 +2066,170 @@ fn validate_response(expected: ExpectedResponse, payload: &envelope::Payload) ->
         ) => get_can_bus_status_response_from_proto(*response)
             .map(|_| ())
             .map_err(|error| attach_profile(error, &profile)),
+        (ExpectedResponse::EnumerateUsb, envelope::Payload::EnumerateUsbResponse(response)) => {
+            response.resources.iter().try_for_each(|resource| {
+                let descriptor: HalResult<ResourceDescriptor> = resource.clone().try_into();
+                descriptor.and_then(|descriptor| {
+                    (descriptor.transport() == seeed_hal_core::TransportKind::Usb)
+                        .then_some(())
+                        .ok_or_else(|| {
+                            seeed_hal_protocol::invalid_message(
+                                "USB enumeration returned a non-USB descriptor",
+                            )
+                        })
+                })
+            })
+        }
+        (
+            ExpectedResponse::OpenUsb { resource_id },
+            envelope::Payload::OpenUsbResponse(response),
+        ) => open_usb_response_from_proto(response.clone())
+            .map(|_| ())
+            .map_err(|error| attach_resource(error, &resource_id)),
+        (
+            ExpectedResponse::UsbTransfer {
+                max_read_bytes,
+                resource_id,
+            },
+            envelope::Payload::UsbTransferResponse(response),
+        ) => {
+            let data = usb_transfer_response_from_proto(response.clone())
+                .map_err(|error| attach_resource(error, &resource_id))?;
+            (data.len() <= max_read_bytes).then_some(()).ok_or_else(|| {
+                attach_resource(
+                    seeed_hal_protocol::invalid_message(
+                        "USB response exceeds negotiated read maximum",
+                    ),
+                    &resource_id,
+                )
+            })
+        }
+        (ExpectedResponse::CloseUsb { .. }, envelope::Payload::CloseUsbResponse(_)) => Ok(()),
+        (ExpectedResponse::EnumerateGpio, envelope::Payload::EnumerateGpioResponse(response)) => {
+            response.resources.iter().try_for_each(|resource| {
+                let descriptor: HalResult<ResourceDescriptor> = resource.clone().try_into();
+                descriptor.and_then(|descriptor| {
+                    (descriptor.transport() == seeed_hal_core::TransportKind::Gpio)
+                        .then_some(())
+                        .ok_or_else(|| {
+                            seeed_hal_protocol::invalid_message(
+                                "GPIO enumeration returned a non-GPIO descriptor",
+                            )
+                        })
+                })
+            })
+        }
+        (
+            ExpectedResponse::OpenGpio {
+                line_count,
+                resource_id,
+            },
+            envelope::Payload::OpenGpioResponse(response),
+        ) => {
+            (line_count > 0).then_some(()).ok_or_else(|| {
+                attach_resource(
+                    seeed_hal_protocol::invalid_message("GPIO open line count is invalid"),
+                    &resource_id,
+                )
+            })?;
+            open_gpio_response_from_proto(response.clone())
+                .map(|_| ())
+                .map_err(|error| attach_resource(error, &resource_id))
+        }
+        (
+            ExpectedResponse::GpioRead {
+                line_count,
+                resource_id,
+            },
+            envelope::Payload::GpioReadResponse(response),
+        ) => {
+            let values = gpio_read_response_from_proto(response.clone())
+                .map_err(|error| attach_resource(error, &resource_id))?;
+            (values.len() == line_count).then_some(()).ok_or_else(|| {
+                attach_resource(
+                    seeed_hal_protocol::invalid_message(
+                        "GPIO read response length does not match opened lines",
+                    ),
+                    &resource_id,
+                )
+            })
+        }
+        (ExpectedResponse::GpioWrite { .. }, envelope::Payload::GpioWriteResponse(_)) => Ok(()),
+        (
+            ExpectedResponse::GpioNextEdge { resource_id },
+            envelope::Payload::GpioNextEdgeResponse(response),
+        ) => gpio_next_edge_response_from_proto(*response)
+            .map(|_| ())
+            .map_err(|error| attach_resource(error, &resource_id)),
+        (ExpectedResponse::CloseGpio { .. }, envelope::Payload::CloseGpioResponse(_)) => Ok(()),
+        (
+            ExpectedResponse::EnumerateCamera,
+            envelope::Payload::EnumerateCameraResponse(response),
+        ) => response.resources.iter().try_for_each(|resource| {
+            let descriptor: HalResult<ResourceDescriptor> = resource.clone().try_into();
+            descriptor.and_then(|descriptor| {
+                (descriptor.transport() == seeed_hal_core::TransportKind::Camera)
+                    .then_some(())
+                    .ok_or_else(|| {
+                        seeed_hal_protocol::invalid_message(
+                            "Camera enumeration returned a non-Camera descriptor",
+                        )
+                    })
+            })
+        }),
+        (
+            ExpectedResponse::OpenCamera { resource_id },
+            envelope::Payload::OpenCameraResponse(response),
+        ) => seeed_hal_protocol::camera_open_response_from_proto(response.clone())
+            .map(|_| ())
+            .map_err(|error| attach_resource(error, &resource_id)),
+        (ExpectedResponse::CaptureCamera { .. }, envelope::Payload::CaptureCameraResponse(_))
+        | (
+            ExpectedResponse::CameraDroppedCount { .. },
+            envelope::Payload::CameraDroppedCountResponse(_),
+        )
+        | (
+            ExpectedResponse::CameraSetControl { .. },
+            envelope::Payload::CameraSetControlResponse(_),
+        )
+        | (ExpectedResponse::CameraSetAuto { .. }, envelope::Payload::CameraSetAutoResponse(_))
+        | (ExpectedResponse::CloseCamera { .. }, envelope::Payload::CloseCameraResponse(_)) => {
+            Ok(())
+        }
+        (
+            ExpectedResponse::CameraMappingDescriptor { resource_id },
+            envelope::Payload::CameraMappingDescriptorResponse(response),
+        ) => response
+            .descriptor
+            .clone()
+            .ok_or_else(|| {
+                seeed_hal_protocol::invalid_message("camera mapping descriptor is missing")
+            })
+            .and_then(camera_mapping_descriptor_from_proto)
+            .map(|_| ())
+            .map_err(|error| attach_resource(error, &resource_id)),
+        (
+            ExpectedResponse::CameraNextFrameLease { resource_id },
+            envelope::Payload::CameraNextFrameLeaseResponse(response),
+        ) => camera_next_frame_lease_response_from_proto(*response)
+            .map(|_| ())
+            .map_err(|error| attach_resource(error, &resource_id)),
+        (
+            ExpectedResponse::CameraControls { resource_id },
+            envelope::Payload::CameraControlsResponse(response),
+        ) => camera_controls_response_from_proto(response.clone())
+            .map(|_| ())
+            .map_err(|error| attach_resource(error, &resource_id)),
+        (
+            ExpectedResponse::CameraGetControl { resource_id },
+            envelope::Payload::CameraGetControlResponse(response),
+        ) => response
+            .value
+            .clone()
+            .ok_or_else(|| seeed_hal_protocol::invalid_message("camera control value is missing"))
+            .and_then(camera_control_value_from_proto)
+            .map(|_| ())
+            .map_err(|error| attach_resource(error, &resource_id)),
         _ => Err(resource_id.map_or_else(unexpected_response, |resource_id| {
             unexpected_response().with_resource_id(resource_id)
         })),
@@ -2091,6 +2710,50 @@ mod tests {
     }
 
     #[test]
+    fn camera_response_validation_rejects_invalid_associated_payloads() {
+        let resource_id = seeed_hal_core::ResourceId::parse("camera:virtual:validation").unwrap();
+        let mapping = envelope::Payload::CameraMappingDescriptorResponse(
+            v1::CameraMappingDescriptorResponse { descriptor: None },
+        );
+        let lease =
+            envelope::Payload::CameraNextFrameLeaseResponse(v1::CameraNextFrameLeaseResponse {
+                lease: Some(v1::FrameLease {
+                    slot_index: 0,
+                    sequence: 0,
+                    generation: 1,
+                }),
+            });
+        let control = envelope::Payload::CameraGetControlResponse(v1::CameraGetControlResponse {
+            value: None,
+        });
+
+        for (expected, payload) in [
+            (
+                ExpectedResponse::CameraMappingDescriptor {
+                    resource_id: resource_id.clone(),
+                },
+                mapping,
+            ),
+            (
+                ExpectedResponse::CameraNextFrameLease {
+                    resource_id: resource_id.clone(),
+                },
+                lease,
+            ),
+            (
+                ExpectedResponse::CameraGetControl {
+                    resource_id: resource_id.clone(),
+                },
+                control,
+            ),
+        ] {
+            let error = super::validate_response(expected, &payload).unwrap_err();
+            assert_eq!(error.name().as_str(), "runtime.protocol.invalid_message");
+            assert_eq!(error.resource_id(), Some(&resource_id));
+        }
+    }
+
+    #[test]
     fn terminal_transition_retains_all_expected_metadata_and_drains_replies_once() {
         let (first_reply, mut first_rx) = tokio::sync::oneshot::channel();
         let (overflow_reply, mut overflow_rx) = tokio::sync::oneshot::channel();
@@ -2480,6 +3143,14 @@ mod tests {
                     can_configure: true,
                     can_error_frames: true,
                     can_rx_timestamp: true,
+                    usb_control: true,
+                    usb_bulk: true,
+                    usb_interrupt: true,
+                    gpio_lines: true,
+                    gpio_edges: true,
+                    camera_capture: true,
+                    camera_frames_shm: true,
+                    camera_controls: true,
                 }),
                 pending_capacity: 2,
                 tombstone_capacity: 1,
