@@ -95,7 +95,35 @@ def capabilities_for_minor(minor: int) -> tuple[str, ...]:
 def required_capabilities_for_run(
     minor: int, requested: tuple[str, ...]
 ) -> tuple[str, ...]:
-    return requested or capabilities_for_minor(minor)
+    if not requested:
+        return capabilities_for_minor(minor)
+    dependencies = {
+        CAN_FD_CAPABILITY: (CAN_CONFIGURE_CAPABILITY,),
+        CAN_CONFIGURE_CAPABILITY: (CAN_CLASSIC_CAPABILITY,),
+        CAN_ERROR_FRAMES_CAPABILITY: (CAN_CLASSIC_CAPABILITY,),
+        CAN_RX_TIMESTAMP_CAPABILITY: (CAN_CLASSIC_CAPABILITY,),
+        USB_BULK_CAPABILITY: (USB_CONTROL_CAPABILITY,),
+        USB_INTERRUPT_CAPABILITY: (USB_CONTROL_CAPABILITY,),
+        GPIO_EDGES_CAPABILITY: (GPIO_LINES_CAPABILITY,),
+        CAMERA_FRAMES_SHM_CAPABILITY: (CAMERA_CAPTURE_CAPABILITY,),
+        CAMERA_CONTROLS_CAPABILITY: (CAMERA_CAPTURE_CAPABILITY,),
+    }
+    available = set(capabilities_for_minor(minor))
+    closed = []
+
+    def add(capability: str) -> None:
+        if capability not in available:
+            raise ValueError(
+                f"capability {capability} is unavailable at protocol minor {minor}"
+            )
+        for dependency in dependencies.get(capability, ()):
+            add(dependency)
+        if capability not in closed:
+            closed.append(capability)
+
+    for capability in requested:
+        add(capability)
+    return tuple(closed)
 
 
 def operations_for_profile(
@@ -105,10 +133,17 @@ def operations_for_profile(
     operations = []
     if minor >= 0 and SERIAL_CAPABILITY in available:
         operations.append("serial")
-    if minor >= 1 and (
-        CAN_CLASSIC_CAPABILITY in available or CAN_FD_CAPABILITY in available
-    ):
-        operations.append("can")
+    if minor >= 1:
+        if CAN_CLASSIC_CAPABILITY in available:
+            operations.append("can.classic")
+        if CAN_FD_CAPABILITY in available:
+            operations.append("can.fd")
+        if CAN_CONFIGURE_CAPABILITY in available:
+            operations.append("can.configure")
+        if CAN_ERROR_FRAMES_CAPABILITY in available:
+            operations.append("can.error-frames")
+        if CAN_RX_TIMESTAMP_CAPABILITY in available:
+            operations.append("can.rx-timestamp")
     if minor >= 2:
         if USB_CONTROL_CAPABILITY in available:
             operations.append("usb.control")
@@ -137,6 +172,36 @@ def operations_for_profile(
         ):
             operations.append("camera.controls")
     return tuple(operations)
+
+
+def health_operation_for_profile(
+    capabilities: tuple[str, ...] | frozenset[str],
+) -> str:
+    available = frozenset(capabilities)
+    choices = (
+        (SERIAL_CAPABILITY, "enumerate_serial_request"),
+        (CAN_CLASSIC_CAPABILITY, "enumerate_can_request"),
+        (CAN_FD_CAPABILITY, "enumerate_can_request"),
+        (USB_CONTROL_CAPABILITY, "enumerate_usb_request"),
+        (GPIO_LINES_CAPABILITY, "enumerate_gpio_request"),
+        (CAMERA_CAPTURE_CAPABILITY, "enumerate_camera_request"),
+    )
+    for capability, payload in choices:
+        if capability in available:
+            return payload
+    raise ValueError("active capability profile has no health operation")
+
+
+def cleanup_transport_for_profile(
+    capabilities: tuple[str, ...] | frozenset[str],
+) -> str:
+    return {
+        "enumerate_serial_request": "serial",
+        "enumerate_can_request": "can",
+        "enumerate_usb_request": "usb",
+        "enumerate_gpio_request": "gpio",
+        "enumerate_camera_request": "camera",
+    }[health_operation_for_profile(capabilities)]
 
 
 def later_operation_for_minor(minor: int) -> str | None:
@@ -424,7 +489,86 @@ async def _open_serial(client: RawClient, descriptor):
     )
 
 
-async def _exercise_can(client: RawClient) -> None:
+def _can_open_request(descriptor, mode: str):
+    if mode == "fd":
+        config = hal_pb2.CanOpenConfig(
+            configure=hal_pb2.CanConfigureConfig(
+                mode=hal_pb2.CAN_MODE_FD,
+                nominal=hal_pb2.CanBitTiming(bitrate=500_000),
+                data=hal_pb2.CanBitTiming(bitrate=2_000_000),
+                loopback=True,
+            )
+        )
+    elif mode == "configure":
+        config = hal_pb2.CanOpenConfig(
+            configure=hal_pb2.CanConfigureConfig(
+                mode=hal_pb2.CAN_MODE_CLASSIC,
+                nominal=hal_pb2.CanBitTiming(bitrate=500_000),
+                loopback=True,
+            )
+        )
+    else:
+        config = hal_pb2.CanOpenConfig(
+            attach=hal_pb2.CanLinkExpectation(mode=hal_pb2.CAN_MODE_CLASSIC)
+        )
+    filters = hal_pb2.CanFilterSet()
+    if mode == "error-frames":
+        filters.filters.add(
+            id=0,
+            mask=0,
+            format=hal_pb2.CAN_ID_FORMAT_EITHER,
+            classes=hal_pb2.CanFrameClasses(error=True),
+        )
+    return hal_pb2.OpenCanRequest(
+        selector=_selector(descriptor),
+        mode=(
+            hal_pb2.LEASE_MODE_MAINTENANCE
+            if mode in {"fd", "configure"}
+            else hal_pb2.LEASE_MODE_CONTROL
+        ),
+        config=config,
+        filters=filters,
+    )
+
+
+async def _open_can_for_cleanup(client: RawClient, descriptor, mode: str):
+    return await client.request(
+        "open_can_request", _can_open_request(descriptor, mode)
+    )
+
+
+async def _open_usb_for_cleanup(client: RawClient, descriptor, _details):
+    return await client.request(
+        "open_usb_request",
+        hal_pb2.OpenUsbRequest(
+            selector=_selector(descriptor), interface_number=0
+        ),
+    )
+
+
+async def _open_gpio_for_cleanup(client: RawClient, descriptor, _details):
+    return await client.request(
+        "open_gpio_request",
+        hal_pb2.OpenGpioRequest(
+            selector=_selector(descriptor),
+            lines=[0],
+            config=hal_pb2.GpioLineConfig(
+                direction=hal_pb2.GPIO_DIRECTION_OUTPUT,
+                bias=hal_pb2.GPIO_BIAS_DISABLED,
+                drive=hal_pb2.GPIO_DRIVE_PUSH_PULL,
+                initial_value=False,
+            ),
+        ),
+    )
+
+
+async def _exercise_can_mode(
+    client: RawClient,
+    mode: str,
+    capabilities: frozenset[str],
+    *,
+    leave_open: bool = False,
+):
     enumerated = await client.request("enumerate_can_request", hal_pb2.EnumerateCanRequest())
     resources = _expect_payload(enumerated, "enumerate_can_response").resources
     _require(len(resources) == 1, f"expected one virtual CAN resource, got {len(resources)}")
@@ -433,17 +577,80 @@ async def _exercise_can(client: RawClient) -> None:
     opened = _expect_payload(
         await client.request(
             "open_can_request",
-            hal_pb2.OpenCanRequest(
-                selector=_selector(descriptor),
-                mode=hal_pb2.LEASE_MODE_CONTROL,
-                config=hal_pb2.CanOpenConfig(
-                    attach=hal_pb2.CanLinkExpectation(mode=hal_pb2.CAN_MODE_CLASSIC)
-                ),
-                filters=hal_pb2.CanFilterSet(),
-            ),
+            _can_open_request(descriptor, mode),
         ),
         "open_can_response",
     )
+    if mode in {"classic", "fd", "error-frames", "rx-timestamp"}:
+        if mode == "fd":
+            frame = hal_pb2.CanFrame(
+                id=hal_pb2.CanId(
+                    value=0x123, format=hal_pb2.CAN_ID_FORMAT_STANDARD
+                ),
+                kind=hal_pb2.CAN_FRAME_KIND_FD_DATA,
+                data=b"fd-loopback1",
+                bitrate_switch=True,
+            )
+        elif mode == "error-frames":
+            frame = hal_pb2.CanFrame(
+                kind=hal_pb2.CAN_FRAME_KIND_ERROR,
+                data=b"error",
+                error_classes=[hal_pb2.CAN_ERROR_CLASS_BUS_ERROR],
+            )
+        else:
+            frame = hal_pb2.CanFrame(
+                id=hal_pb2.CanId(
+                    value=0x123, format=hal_pb2.CAN_ID_FORMAT_STANDARD
+                ),
+                kind=hal_pb2.CAN_FRAME_KIND_CLASSIC_DATA,
+                data=b"classic",
+            )
+        sent = _expect_payload(
+            await client.request(
+                "can_send_request",
+                hal_pb2.CanSendRequest(
+                    session_id=opened.session_id,
+                    lease=_lease_copy(opened.lease),
+                    frames=[frame],
+                ),
+            ),
+            "can_send_response",
+        )
+        _require(sent.committed_count == 1, "virtual CAN did not commit one frame")
+        received = _expect_payload(
+            await client.request(
+                "can_receive_request",
+                hal_pb2.CanReceiveRequest(
+                    session_id=opened.session_id,
+                    lease=_lease_copy(opened.lease),
+                    max_frames=1,
+                    timeout_ms=250,
+                ),
+            ),
+            "can_receive_response",
+        )
+        _require(len(received.frames) == 1, "virtual CAN loopback returned no frame")
+        if mode == "rx-timestamp":
+            _require(
+                received.frames[0].HasField("timestamp"),
+                "virtual CAN receive timestamp missing",
+            )
+    if mode == "configure":
+        status = _expect_payload(
+            await client.request(
+                "get_can_bus_status_request",
+                hal_pb2.GetCanBusStatusRequest(
+                    session_id=opened.session_id, lease=_lease_copy(opened.lease)
+                ),
+            ),
+            "get_can_bus_status_response",
+        )
+        _require(
+            status.status.state == hal_pb2.CAN_BUS_STATE_ACTIVE,
+            "virtual configured CAN bus was not active",
+        )
+    if leave_open:
+        return ("can", descriptor, mode)
     _expect_payload(
         await client.request(
             "close_session_request",
@@ -451,11 +658,44 @@ async def _exercise_can(client: RawClient) -> None:
         ),
         "close_session_response",
     )
+    return None
+
+
+async def _exercise_can(
+    client: RawClient,
+    capabilities: frozenset[str],
+    *,
+    leave_open: bool = False,
+):
+    operations = operations_for_profile(1, capabilities)
+    modes = []
+    if "can.classic" in operations:
+        modes.append("classic")
+    if "can.fd" in operations:
+        modes.append("fd")
+    if "can.configure" in operations:
+        modes.append("configure")
+    if "can.error-frames" in operations:
+        modes.append("error-frames")
+    if "can.rx-timestamp" in operations:
+        modes.append("rx-timestamp")
+    cleanup = None
+    for index, mode in enumerate(modes):
+        cleanup = await _exercise_can_mode(
+            client,
+            mode,
+            capabilities,
+            leave_open=leave_open and index == len(modes) - 1,
+        )
+    return cleanup
 
 
 async def _exercise_usb(
-    client: RawClient, capabilities: frozenset[str]
-) -> None:
+    client: RawClient,
+    capabilities: frozenset[str],
+    *,
+    leave_open: bool = False,
+):
     enumerated = await client.request("enumerate_usb_request", hal_pb2.EnumerateUsbRequest())
     resources = _expect_payload(enumerated, "enumerate_usb_response").resources
     _require(len(resources) == 1, f"expected one virtual USB resource, got {len(resources)}")
@@ -522,6 +762,8 @@ async def _exercise_usb(
         hal_pb2.USB_TRANSFER_KIND_INTERRUPT_IN,
         endpoint=2,
     )
+    if leave_open:
+        return ("usb", descriptor, 0)
     _expect_payload(
         await client.request(
             "close_usb_request",
@@ -529,11 +771,15 @@ async def _exercise_usb(
         ),
         "close_usb_response",
     )
+    return None
 
 
 async def _exercise_gpio(
-    client: RawClient, capabilities: frozenset[str]
-) -> None:
+    client: RawClient,
+    capabilities: frozenset[str],
+    *,
+    leave_open: bool = False,
+):
     if GPIO_LINES_CAPABILITY not in capabilities:
         return
     enumerated = await client.request("enumerate_gpio_request", hal_pb2.EnumerateGpioRequest())
@@ -556,6 +802,25 @@ async def _exercise_gpio(
         ),
         "open_gpio_response",
     )
+    if GPIO_EDGES_CAPABILITY in capabilities:
+        edge = _expect_payload(
+            await client.request(
+                "gpio_next_edge_request",
+                hal_pb2.GpioNextEdgeRequest(
+                    session_id=opened.session_id,
+                    lease=_lease_copy(opened.lease),
+                    rising=True,
+                    falling=True,
+                    capacity=1,
+                    timeout_ms=1,
+                ),
+            ),
+            "gpio_next_edge_response",
+        )
+        _require(
+            not edge.HasField("event"),
+            "virtual GPIO unexpectedly produced an uninjected edge",
+        )
     _expect_payload(
         await client.request(
             "gpio_write_request",
@@ -573,6 +838,8 @@ async def _exercise_gpio(
         "gpio_read_response",
     )
     _require(list(read.values) == [True], "virtual GPIO write/read changed value")
+    if leave_open:
+        return ("gpio", descriptor, None)
     _expect_payload(
         await client.request(
             "close_gpio_request",
@@ -580,6 +847,7 @@ async def _exercise_gpio(
         ),
         "close_gpio_response",
     )
+    return None
 
 
 async def _open_camera(client: RawClient, descriptor):
@@ -600,8 +868,11 @@ async def _open_camera(client: RawClient, descriptor):
 
 
 async def _exercise_camera(
-    client: RawClient, capabilities: frozenset[str]
-) -> None:
+    client: RawClient,
+    capabilities: frozenset[str],
+    *,
+    leave_open: bool = False,
+):
     enumerated = await client.request(
         "enumerate_camera_request", hal_pb2.EnumerateCameraRequest()
     )
@@ -744,6 +1015,8 @@ async def _exercise_camera(
             ),
             "camera_set_auto_response",
         )
+    if leave_open:
+        return ("camera", descriptor, None)
     _expect_payload(
         await client.request(
             "close_camera_request",
@@ -777,9 +1050,12 @@ async def _exercise_camera(
         ),
         "close_camera_response",
     )
+    return None
 
 
-async def _probe_later_operation(client: RawClient, minor: int) -> None:
+async def _probe_later_operation(
+    client: RawClient, minor: int, capabilities: frozenset[str]
+) -> None:
     payload_name = later_operation_for_minor(minor)
     if payload_name is None:
         return
@@ -797,15 +1073,39 @@ async def _probe_later_operation(client: RawClient, minor: int) -> None:
         response.error.name == later_operation_error_for_minor(minor),
         f"unexpected later-minor operation error {response.error.name}",
     )
-    _expect_payload(
-        await client.request(
-            "enumerate_serial_request", hal_pb2.EnumerateSerialRequest()
+    health_payload = health_operation_for_profile(capabilities)
+    payloads = {
+        "enumerate_serial_request": (
+            hal_pb2.EnumerateSerialRequest,
+            "enumerate_serial_response",
         ),
-        "enumerate_serial_response",
+        "enumerate_can_request": (
+            hal_pb2.EnumerateCanRequest,
+            "enumerate_can_response",
+        ),
+        "enumerate_usb_request": (
+            hal_pb2.EnumerateUsbRequest,
+            "enumerate_usb_response",
+        ),
+        "enumerate_gpio_request": (
+            hal_pb2.EnumerateGpioRequest,
+            "enumerate_gpio_response",
+        ),
+        "enumerate_camera_request": (
+            hal_pb2.EnumerateCameraRequest,
+            "enumerate_camera_response",
+        ),
+    }
+    constructor, response_name = payloads[health_payload]
+    _expect_payload(
+        await client.request(health_payload, constructor()),
+        response_name,
     )
 
 
-async def _exercise_serial(client: RawClient) -> tuple[object, object]:
+async def _exercise_serial(
+    client: RawClient, *, leave_open: bool = True
+):
     enumerated = await client.request(
         "enumerate_serial_request", hal_pb2.EnumerateSerialRequest()
     )
@@ -889,27 +1189,59 @@ async def _exercise_serial(client: RawClient) -> tuple[object, object]:
         stale.error.name == "runtime.lease.stale_generation",
         f"unexpected stale lease error {stale.error.name}",
     )
-    return descriptor, reopened
+    if leave_open:
+        return ("serial", descriptor, None)
+    _expect_payload(
+        await client.request(
+            "close_session_request",
+            hal_pb2.CloseSessionRequest(
+                session_id=reopened.session_id, lease=reopened.lease
+            ),
+        ),
+        "close_session_response",
+    )
+    return None
 
 
 async def _exercise_profile(
     client: RawClient, minor: int, capabilities: frozenset[str]
-) -> tuple[object, object] | None:
+) -> object | None:
     operations = operations_for_profile(minor, capabilities)
-    serial = (
-        await _exercise_serial(client)
-        if "serial" in operations
-        else None
-    )
-    if "can" in operations:
-        await _exercise_can(client)
+    cleanup_transport = cleanup_transport_for_profile(capabilities)
+    cleanup = None
+    if "serial" in operations:
+        cleanup = await _exercise_serial(
+            client, leave_open=cleanup_transport == "serial"
+        )
+    if any(operation.startswith("can.") for operation in operations):
+        result = await _exercise_can(
+            client,
+            capabilities,
+            leave_open=cleanup_transport == "can",
+        )
+        cleanup = result or cleanup
     if any(operation.startswith("usb.") for operation in operations):
-        await _exercise_usb(client, capabilities)
+        result = await _exercise_usb(
+            client,
+            capabilities,
+            leave_open=cleanup_transport == "usb",
+        )
+        cleanup = result or cleanup
     if any(operation.startswith("gpio.") for operation in operations):
-        await _exercise_gpio(client, capabilities)
+        result = await _exercise_gpio(
+            client,
+            capabilities,
+            leave_open=cleanup_transport == "gpio",
+        )
+        cleanup = result or cleanup
     if any(operation.startswith("camera.") for operation in operations):
-        await _exercise_camera(client, capabilities)
-    return serial
+        result = await _exercise_camera(
+            client,
+            capabilities,
+            leave_open=cleanup_transport == "camera",
+        )
+        cleanup = result or cleanup
+    return cleanup
 
 
 async def exercise_contract(
@@ -934,36 +1266,82 @@ async def exercise_contract(
             token, minor=minor, required_capabilities=required
         )
         active_capabilities = negotiated & frozenset(required)
-        serial = await _exercise_profile(
+        cleanup = await _exercise_profile(
             first, minor, active_capabilities
         )
-        await _probe_later_operation(first, minor)
+        await _probe_later_operation(first, minor, active_capabilities)
 
-        # When Serial is part of the selected profile, abruptly disconnect with
-        # its reopened session still owned and verify broker owner cleanup.
+        _require(cleanup is not None, "selected profile produced no cleanup session")
         await first.close()
 
-        if serial is not None:
-            descriptor, _reopened = serial
+        transport, descriptor, details = cleanup
 
-            async def wait_for_resource_reuse() -> None:
-                nonlocal second
-                second = RawClient(await connect_transport(endpoint), timeout)
-                await second.handshake(
-                    token, minor=minor, required_capabilities=required
-                )
-                while True:
+        async def wait_for_resource_reuse() -> None:
+            nonlocal second
+            second = RawClient(await connect_transport(endpoint), timeout)
+            await second.handshake(
+                token, minor=minor, required_capabilities=required
+            )
+            while True:
+                if transport == "serial":
                     response = await _open_serial(second, descriptor)
-                    if response.WhichOneof("payload") == "open_serial_response":
-                        break
-                    _require(
-                        response.WhichOneof("payload") == "error"
-                        and response.error.name == "runtime.lease.conflict",
-                        f"unexpected cleanup response {response.WhichOneof('payload')}",
+                    expected = "open_serial_response"
+                    close_name = "close_session_request"
+                elif transport == "can":
+                    response = await _open_can_for_cleanup(
+                        second, descriptor, details
                     )
-                    await asyncio.sleep(0.025)
+                    expected = "open_can_response"
+                    close_name = "close_session_request"
+                elif transport == "usb":
+                    response = await _open_usb_for_cleanup(
+                        second, descriptor, details
+                    )
+                    expected = "open_usb_response"
+                    close_name = "close_usb_request"
+                elif transport == "gpio":
+                    response = await _open_gpio_for_cleanup(
+                        second, descriptor, details
+                    )
+                    expected = "open_gpio_response"
+                    close_name = "close_gpio_request"
+                else:
+                    response = await _open_camera(second, descriptor)
+                    expected = "open_camera_response"
+                    close_name = "close_camera_request"
+                if response.WhichOneof("payload") == expected:
+                    break
+                _require(
+                    response.WhichOneof("payload") == "error"
+                    and response.error.name
+                    in {"runtime.lease.conflict", "runtime.adapter.conflict"},
+                    f"unexpected cleanup response {response.WhichOneof('payload')}",
+                )
+                await asyncio.sleep(0.025)
+            opened = getattr(response, expected)
+            close_types = {
+                "close_session_request": hal_pb2.CloseSessionRequest,
+                "close_usb_request": hal_pb2.CloseUsbRequest,
+                "close_gpio_request": hal_pb2.CloseGpioRequest,
+                "close_camera_request": hal_pb2.CloseCameraRequest,
+            }
+            response_names = {
+                "close_session_request": "close_session_response",
+                "close_usb_request": "close_usb_response",
+                "close_gpio_request": "close_gpio_response",
+                "close_camera_request": "close_camera_response",
+            }
+            _expect_payload(
+                await second.request(
+                    close_name,
+                    close_types[close_name](
+                        session_id=opened.session_id, lease=opened.lease
+                    ),
+                ),
+                response_names[close_name],
+            )
 
-            await _await_with_cap(wait_for_resource_reuse(), timeout)
+        await _await_with_cap(wait_for_resource_reuse(), timeout)
     finally:
         with contextlib.suppress(Exception):
             await first.close()
@@ -1070,10 +1448,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    required_capabilities = required_capabilities_for_run(
-        args.protocol_minor, tuple(args.require_capability)
-    )
     try:
+        required_capabilities = required_capabilities_for_run(
+            args.protocol_minor, tuple(args.require_capability)
+        )
         asyncio.run(
             run(
                 args.broker,
@@ -1082,7 +1460,7 @@ def main() -> int:
                 required_capabilities=required_capabilities,
             )
         )
-    except (AssertionError, asyncio.TimeoutError, OSError) as error:
+    except (AssertionError, asyncio.TimeoutError, OSError, ValueError) as error:
         print(f"broker conformance failed: {error}", file=sys.stderr)
         return 1
     print(f"broker conformance passed: protocol minor {args.protocol_minor} profile")

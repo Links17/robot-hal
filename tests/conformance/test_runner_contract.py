@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import argparse
 import importlib.util
 from pathlib import Path
 import sys
@@ -192,16 +193,18 @@ async def test_later_minor_rejection_is_followed_by_same_connection_serial_probe
             ),
             hal_pb2.Envelope(
                 request_id=2,
-                enumerate_serial_response=hal_pb2.EnumerateSerialResponse(),
+                enumerate_can_response=hal_pb2.EnumerateCanResponse(),
             ),
         )
     )
 
-    await runner._probe_later_operation(client, 0)
+    await runner._probe_later_operation(
+        client, 0, frozenset((runner.CAN_CLASSIC_CAPABILITY,))
+    )
 
     assert client.requests == [
         "enumerate_can_request",
-        "enumerate_serial_request",
+        "enumerate_can_request",
     ]
 
 
@@ -215,22 +218,30 @@ async def test_explicit_profile_executes_only_selected_capability_operations(
     async def record(name):
         called.append(name)
 
-    monkeypatch.setattr(runner, "_exercise_serial", lambda _client: record("serial"))
-    monkeypatch.setattr(runner, "_exercise_can", lambda _client: record("can"))
+    monkeypatch.setattr(
+        runner,
+        "_exercise_serial",
+        lambda _client, **_kwargs: record("serial"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_exercise_can",
+        lambda _client, _capabilities, **_kwargs: record("can"),
+    )
     monkeypatch.setattr(
         runner,
         "_exercise_usb",
-        lambda _client, _capabilities: record("usb"),
+        lambda _client, _capabilities, **_kwargs: record("usb"),
     )
     monkeypatch.setattr(
         runner,
         "_exercise_gpio",
-        lambda _client, _capabilities: record("gpio"),
+        lambda _client, _capabilities, **_kwargs: record("gpio"),
     )
     monkeypatch.setattr(
         runner,
         "_exercise_camera",
-        lambda _client, _capabilities: record("camera"),
+        lambda _client, _capabilities, **_kwargs: record("camera"),
     )
 
     await runner._exercise_profile(
@@ -246,6 +257,65 @@ async def test_explicit_profile_executes_only_selected_capability_operations(
     assert called == ["usb"]
 
 
+@pytest.mark.asyncio
+async def test_can_profile_exercises_each_selected_mode_and_optional_check(
+    monkeypatch,
+) -> None:
+    runner = load_runner()
+    modes = []
+
+    async def record(_client, mode, capabilities, *, leave_open=False):
+        modes.append((mode, capabilities, leave_open))
+        return None
+
+    monkeypatch.setattr(runner, "_exercise_can_mode", record)
+
+    await runner._exercise_can(
+        object(),
+        frozenset(
+            (
+                runner.CAN_CLASSIC_CAPABILITY,
+                runner.CAN_FD_CAPABILITY,
+                runner.CAN_CONFIGURE_CAPABILITY,
+                runner.CAN_ERROR_FRAMES_CAPABILITY,
+                runner.CAN_RX_TIMESTAMP_CAPABILITY,
+            )
+        ),
+    )
+
+    assert [mode for mode, _capabilities, _leave_open in modes] == [
+        "classic",
+        "fd",
+        "configure",
+        "error-frames",
+        "rx-timestamp",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["can", "usb", "gpio", "camera"])
+async def test_non_serial_profile_returns_cleanup_handle_for_selected_transport(
+    monkeypatch,
+    transport: str,
+) -> None:
+    runner = load_runner()
+    handle = object()
+    capabilities = {
+        "can": frozenset((runner.CAN_CLASSIC_CAPABILITY,)),
+        "usb": frozenset((runner.USB_CONTROL_CAPABILITY,)),
+        "gpio": frozenset((runner.GPIO_LINES_CAPABILITY,)),
+        "camera": frozenset((runner.CAMERA_CAPTURE_CAPABILITY,)),
+    }[transport]
+
+    async def exercise(*_args, **kwargs):
+        assert kwargs["leave_open"]
+        return handle
+
+    monkeypatch.setattr(runner, f"_exercise_{transport}", exercise)
+
+    assert await runner._exercise_profile(object(), 3, capabilities) is handle
+
+
 def test_camera_runner_exercises_control_read_write_and_auto() -> None:
     runner = load_runner()
     source = RUNNER.read_text(encoding="utf-8")
@@ -256,6 +326,28 @@ def test_camera_runner_exercises_control_read_write_and_auto() -> None:
         "camera_set_auto_request",
     ):
         assert payload in source
+
+
+def test_main_reports_stable_validation_error_for_unavailable_capability(
+    monkeypatch, capsys
+) -> None:
+    runner = load_runner()
+    monkeypatch.setattr(
+        runner,
+        "parse_args",
+        lambda: argparse.Namespace(
+            broker=Path("unused"),
+            timeout=1.0,
+            protocol_minor=0,
+            require_capability=[runner.USB_CONTROL_CAPABILITY],
+        ),
+    )
+
+    assert runner.main() == 1
+    assert capsys.readouterr().err == (
+        "broker conformance failed: capability usb.control/v1 "
+        "is unavailable at protocol minor 0\n"
+    )
 
 
 def test_readiness_parser_decodes_windows_endpoint_escaping() -> None:

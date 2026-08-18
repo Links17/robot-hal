@@ -25,26 +25,30 @@ error: CAN currently uses `runtime.protocol.capability_unsupported`, while USB/G
 `runtime.protocol.unsupported_capability`.
 
 By default the handshake requires every capability defined for the selected profile. Repeating
-`--require-capability CAPABILITY` replaces that default requirement set with exactly the capabilities
-listed by the user; it is useful for qualifying a deliberately narrower broker build without
-silently re-adding profile defaults. In that explicit mode, the runner intersects the explicit set
-with the capabilities returned by the handshake and executes only the corresponding checks. A
-transport is not exercised unless one of its capabilities is selected; within a transport, USB
-control/bulk/interrupt and Camera capture/shared-memory/controls checks are independently gated by
-their own advertised capability. Serial owner-cleanup coverage runs only when
-`serial.bytes/v1` is selected.
+`--require-capability CAPABILITY` selects a narrower qualification set. The runner expands that set
+only with real lifecycle prerequisites and requires the complete closure in the handshake: USB
+bulk/interrupt require USB control for open, GPIO edges require GPIO lines, Camera frames/controls
+require Camera capture, and optional CAN checks require a CAN mode. It then executes only checks
+selected by the negotiated closure. CAN Classic and FD use their corresponding modes; configure,
+error-frame, and receive-timestamp capabilities have distinct executable checks.
 
 After a lower-minor next-operation probe receives its exact structured rejection, the same client
-immediately enumerates Serial before closing. This proves the negotiated connection remains usable
-after the fail-closed response.
+performs a side-effect-free enumerate selected from the active profile (Serial, CAN, USB, GPIO, or
+Camera) before closing. This proves the negotiated connection remains usable after fail-closed.
 
 The minor 3 profile retains complete virtual CAN/USB/GPIO enumeration and session operations,
 Serial enumeration/open/write/read/flush/control lines, and Camera
 enumerate/exclusive-open/capture, shared-memory descriptor/frame lease/drop count, controls
 descriptor/get/set/auto, close/reopen, and stale-generation rejection. Camera frame bytes are not
-sent through protobuf. Every profile also covers disconnect owner cleanup with resource reuse and
+sent through protobuf. Every profile leaves one selected resource open across abrupt owner
+disconnect, then has a second connection reopen and close that same resource; non-Serial narrow
+profiles therefore verify CAN, USB, GPIO, or Camera cleanup rather than skipping it. Every profile also covers disconnect owner cleanup with resource reuse and
 cooperative process shutdown. It is virtual broker evidence only, not physical camera
 qualification.
+
+The deterministic virtual CAN loopback can exercise Classic, FD, configure, error-frame filtering
+and frames, and receive timestamps. These are virtual-fixture qualification boundaries, not
+physical bus error injection, hardware timestamp accuracy, or adapter timing qualification.
 
 One monotonic deadline bounds each complete request even when runtime events are interleaved. Process
 startup/readiness, transport connection, disconnect cleanup, cooperative shutdown, kill fallback,

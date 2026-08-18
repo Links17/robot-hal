@@ -125,7 +125,11 @@ def test_default_profile_selects_every_operation_for_the_minor() -> None:
         3, runner.capabilities_for_minor(3)
     ) == (
         "serial",
-        "can",
+        "can.classic",
+        "can.fd",
+        "can.configure",
+        "can.error-frames",
+        "can.rx-timestamp",
         "usb.control",
         "usb.bulk",
         "usb.interrupt",
@@ -148,3 +152,87 @@ def test_dependent_operations_require_their_lifecycle_capability() -> None:
             runner.CAMERA_CONTROLS_CAPABILITY,
         ),
     ) == ()
+
+
+@pytest.mark.parametrize(
+    ("requested", "closed"),
+    [
+        (("usb.bulk/v1",), ("usb.control/v1", "usb.bulk/v1")),
+        (("usb.interrupt/v1",), ("usb.control/v1", "usb.interrupt/v1")),
+        (("gpio.edges/v1",), ("gpio.lines/v1", "gpio.edges/v1")),
+        (
+            ("camera.frames.shm/v1",),
+            ("camera.capture/v1", "camera.frames.shm/v1"),
+        ),
+        (
+            ("camera.controls/v1",),
+            ("camera.capture/v1", "camera.controls/v1"),
+        ),
+        (("can.configure/v1",), ("can.classic/v1", "can.configure/v1")),
+        (("can.error-frames/v1",), ("can.classic/v1", "can.error-frames/v1")),
+        (("can.rx-timestamp/v1",), ("can.classic/v1", "can.rx-timestamp/v1")),
+    ],
+)
+def test_explicit_capability_requirements_add_lifecycle_dependency_closure(
+    requested: tuple[str, ...], closed: tuple[str, ...]
+) -> None:
+    runner = load_runner()
+
+    assert runner.required_capabilities_for_run(3, requested) == closed
+
+
+def test_can_modes_and_optional_capabilities_select_distinct_operations() -> None:
+    runner = load_runner()
+
+    assert runner.operations_for_profile(
+        1,
+        (
+            runner.CAN_CLASSIC_CAPABILITY,
+            runner.CAN_FD_CAPABILITY,
+            runner.CAN_CONFIGURE_CAPABILITY,
+            runner.CAN_ERROR_FRAMES_CAPABILITY,
+            runner.CAN_RX_TIMESTAMP_CAPABILITY,
+        ),
+    ) == (
+        "can.classic",
+        "can.fd",
+        "can.configure",
+        "can.error-frames",
+        "can.rx-timestamp",
+    )
+
+
+@pytest.mark.parametrize(
+    ("capabilities", "payload"),
+    [
+        (("serial.bytes/v1",), "enumerate_serial_request"),
+        (("can.classic/v1",), "enumerate_can_request"),
+        (("usb.control/v1",), "enumerate_usb_request"),
+        (("gpio.lines/v1",), "enumerate_gpio_request"),
+        (("camera.capture/v1",), "enumerate_camera_request"),
+    ],
+)
+def test_post_probe_health_request_uses_active_transport(
+    capabilities: tuple[str, ...], payload: str
+) -> None:
+    runner = load_runner()
+
+    assert runner.health_operation_for_profile(capabilities) == payload
+
+
+@pytest.mark.parametrize(
+    ("capabilities", "transport"),
+    [
+        (("serial.bytes/v1", "can.classic/v1"), "serial"),
+        (("can.classic/v1",), "can"),
+        (("usb.control/v1", "usb.bulk/v1"), "usb"),
+        (("gpio.lines/v1",), "gpio"),
+        (("camera.capture/v1",), "camera"),
+    ],
+)
+def test_cleanup_transport_is_selected_from_active_profile(
+    capabilities: tuple[str, ...], transport: str
+) -> None:
+    runner = load_runner()
+
+    assert runner.cleanup_transport_for_profile(capabilities) == transport

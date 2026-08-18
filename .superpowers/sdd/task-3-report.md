@@ -143,3 +143,46 @@ GREEN:
 ### Follow-up commit
 
 Conventional Commit: `fix(protocol): honor narrow conformance profiles`.
+
+## Important findings second follow-up
+
+The three remaining Important findings were addressed with executable lifecycle closures and
+transport-specific disconnect cleanup.
+
+### TDD evidence
+
+RED:
+
+```text
+25 failed, 28 passed
+```
+
+The failures covered missing dependency closure, distinct CAN capability operations, active-profile
+health request selection, and cleanup handles for CAN, USB, GPIO, and Camera.
+
+GREEN:
+
+```text
+54 passed
+```
+
+### Black-box verification
+
+- Default protocol minor 0, 1, 2, and 3 profiles passed.
+- Explicit CAN Classic-only, USB Bulk (with automatically required USB Control), GPIO Lines-only,
+  and Camera Capture-only profiles passed.
+- Each narrow profile left its selected transport session open across abrupt disconnect and a
+  second connection reopened and closed the same resource.
+- Post-probe health checks now enumerate the active transport on the same connection.
+- CAN Classic, FD, Configure, Error Frames, and RX Timestamp capabilities now have distinct
+  executable virtual-fixture checks.
+
+### Qualification boundary
+
+Virtual CAN verifies deterministic loopback frames, error-frame capability handling/filtering, and
+the presence of virtual receive timestamps. It does not qualify physical bus error injection,
+hardware timestamp accuracy, or real adapter timing.
+
+### Follow-up commit
+
+Conventional Commit: `fix(protocol): complete narrow profile lifecycle`.
