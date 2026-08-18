@@ -318,5 +318,21 @@ def test_isolated_wheel_venv_is_offline_and_uses_current_interpreter(
 
     assert commands[0][:4] == ["uv", "venv", "--offline", "--no-project"]
     assert commands[0][4:6] == ["--python", sys.executable]
+    assert commands[1] == [
+        "uv",
+        "pip",
+        "install",
+        "--python",
+        str(tmp_path / "venv" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")),
+        "--offline",
+        "--no-deps",
+        str(tmp_path / "package.whl"),
+    ]
+    assert commands[2][:3] == [
+        str(tmp_path / "venv" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")),
+        "-I",
+        "-c",
+    ]
+    assert "compileall.compile_dir(package, quiet=1)" in commands[2][3]
     assert all("HTTP_PROXY" not in environment for environment in environments)
     assert all("HTTPS_PROXY" not in environment for environment in environments)

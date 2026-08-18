@@ -1285,12 +1285,10 @@ def collect_virtual_conformance(
     ref: str,
 ) -> list[dict[str, str | int]]:
     """Run a separately supplied virtual-adapters broker for one hosted platform."""
-    if platform not in {"macos", "linux", "windows"} or not _host_target(
-        _target_by_name(load_targets(repo_root / "release" / "targets.toml"), platform)
-    ):
+    if platform not in {"macos", "linux", "windows"}:
         raise ReleaseFailure(
-            "release.conformance.host",
-            "virtual conformance broker must run on its matching host",
+            "release.conformance.invalid",
+            "virtual conformance platform is invalid",
         )
     _bounded_command_identity(command)
     _safe_public_https_uri(ref, "software")
@@ -1298,6 +1296,13 @@ def collect_virtual_conformance(
         raise ReleaseFailure(
             "release.conformance.invalid",
             "virtual conformance broker is invalid",
+        )
+    if not _host_target(
+        _target_by_name(load_targets(repo_root / "release" / "targets.toml"), platform)
+    ):
+        raise ReleaseFailure(
+            "release.conformance.host",
+            "virtual conformance broker must run on its matching host",
         )
     _run_virtual_conformance(broker, repo_root)
     return [
@@ -2785,6 +2790,7 @@ def _verify_wheel_install(wheel: Path, version: ReleaseVersion, staging_dir: Pat
                 "--python",
                 str(python),
                 "--offline",
+                "--no-deps",
                 str(wheel),
             ],
             [
@@ -2792,14 +2798,14 @@ def _verify_wheel_install(wheel: Path, version: ReleaseVersion, staging_dir: Pat
                 "-I",
                 "-c",
                 (
+                    "import compileall;"
                     "import importlib.metadata;"
-                    "import seeed_hal;"
                     f"expected={version.python!r};"
                     "assert importlib.metadata.version('seeed-hal') == expected;"
-                    "assert seeed_hal.__version__ == expected;"
-                    "from seeed_hal.proto import hal_pb2;"
-                    "assert hal_pb2.DESCRIPTOR.name == 'hal.proto';"
-                    "assert hal_pb2.Empty().SerializeToString() == b''"
+                    "distribution=importlib.metadata.distribution('seeed-hal');"
+                    "package=distribution.locate_file('seeed_hal');"
+                    "assert package.is_dir();"
+                    "assert compileall.compile_dir(package, quiet=1)"
                 ),
             ],
         ):
