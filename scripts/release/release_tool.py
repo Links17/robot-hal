@@ -2666,6 +2666,7 @@ def package_rust(*, tag: str, repo_root: Path, output_dir: Path) -> Path:
         _require_frozen_workspace_sources(frozen_sources)
         _check_workspace_source_bundle(staged_archive, root, source_names, staging_dir)
         _require_frozen_workspace_sources(frozen_sources)
+        _require_clean_repository(resolved_root)
         return _publish_staged_artifact(staged_archive, destination)
     except ReleaseFailure:
         raise

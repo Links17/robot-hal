@@ -13,6 +13,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.release.release_tool import (
     ReleaseFailure,
+    _check_workspace_source_bundle,
     _cargo_packageable_members,
     _packageable_workspace_members,
     _require_clean_repository,
@@ -117,6 +118,78 @@ def test_rust_bundle_preserves_path_version_workspace_closure(tmp_path: Path) ->
         "seeed-hal-crates-v0.5.0-rc.1/tracked",
     )
     _check_workspace_bundle(bundle)
+
+
+def test_rust_bundle_is_byte_identical_across_independent_output_directories(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "workspace"
+    repo.mkdir()
+    _write_workspace(repo)
+
+    first = package_rust(
+        tag="v0.5.0-rc.1",
+        repo_root=repo,
+        output_dir=tmp_path / "first-artifacts",
+    )
+    second = package_rust(
+        tag="v0.5.0-rc.1",
+        repo_root=repo,
+        output_dir=tmp_path / "second-artifacts",
+    )
+
+    assert first.read_bytes() == second.read_bytes()
+
+
+def test_rust_bundle_rechecks_repository_cleanliness_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "workspace"
+    repo.mkdir()
+    _write_workspace(repo)
+    original_check_workspace_source_bundle = _check_workspace_source_bundle
+    checks = 0
+
+    def add_untracked_file_after_validation(
+        archive: Path,
+        root: str,
+        expected_files: set[str],
+        staging_dir: Path,
+    ) -> None:
+        original_check_workspace_source_bundle(
+            archive,
+            root,
+            expected_files,
+            staging_dir,
+        )
+        (repo / "late-untracked").write_text("late\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "scripts.release.release_tool._check_workspace_source_bundle",
+        add_untracked_file_after_validation,
+    )
+    original_require_clean_repository = _require_clean_repository
+
+    def record_clean_check(root: Path) -> None:
+        nonlocal checks
+        checks += 1
+        original_require_clean_repository(root)
+
+    monkeypatch.setattr(
+        "scripts.release.release_tool._require_clean_repository",
+        record_clean_check,
+    )
+
+    with pytest.raises(ReleaseFailure, match="repository has uncommitted changes") as failure:
+        package_rust(
+            tag="v0.5.0-rc.1",
+            repo_root=repo,
+            output_dir=tmp_path / "artifacts",
+        )
+
+    assert failure.value.name == "release.package.invalid"
+    assert checks == 2
 
 
 def test_rust_bundle_refuses_existing_artifact(tmp_path: Path) -> None:
