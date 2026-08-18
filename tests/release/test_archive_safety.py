@@ -90,6 +90,88 @@ def _raw_tar_with_claimed_size(path: Path, size: int) -> None:
         archive.write(payload)
 
 
+def _raw_tar_headers(path: Path, sizes: list[int], *, include_payload: bool = False) -> None:
+    payload = bytearray()
+    for index, size in enumerate(sizes):
+        header = bytearray(512)
+        name = f"root/member-{index}.bin".encode()
+        header[: len(name)] = name
+        header[100:108] = b"0000644\x00"
+        header[108:116] = b"0000000\x00"
+        header[116:124] = b"0000000\x00"
+        header[124:136] = f"{size:011o}\0".encode("ascii")
+        header[136:148] = b"00000000000\x00"
+        header[148:156] = b"        "
+        header[156:157] = b"0"
+        header[257:263] = b"ustar\x00"
+        header[263:265] = b"00"
+        header[148:156] = f"{sum(header):06o}\0 ".encode("ascii")
+        payload.extend(header)
+        if include_payload:
+            payload.extend(b"x" * size)
+            payload.extend(b"\0" * (-size % 512))
+    payload.extend(b"\0" * 1024)
+    with gzip.GzipFile(path, "wb", mtime=0) as archive:
+        archive.write(payload)
+
+
+def test_raw_tar_rejects_declared_size_before_payload_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_open = gzip.open
+    archive_path = tmp_path / "member-limit.tar.gz"
+    _raw_tar_headers(archive_path, [release_tool.MAX_ARCHIVE_MEMBER_BYTES + 1])
+    reads: list[int] = []
+
+    class ReadSpyArchive:
+        def __init__(self, archive) -> None:
+            self.archive = archive
+
+        def __enter__(self):
+            self.archive.__enter__()
+            return self
+
+        def __exit__(self, *args) -> None:
+            self.archive.__exit__(*args)
+
+        def read(self, size: int = -1) -> bytes:
+            reads.append(size)
+            return self.archive.read(size)
+
+    monkeypatch.setattr(
+        release_tool.gzip,
+        "open",
+        lambda *args, **kwargs: ReadSpyArchive(original_open(*args, **kwargs)),
+    )
+
+    with pytest.raises(ReleaseFailure) as failure:
+        validate_archive(
+            archive_path,
+            expected_root="root",
+            expected_files={"member-0.bin"},
+        )
+
+    assert failure.value.name == "release.archive.invalid"
+    assert reads == [512]
+
+    monkeypatch.setattr(release_tool, "MAX_ARCHIVE_MEMBER_BYTES", 16)
+    monkeypatch.setattr(release_tool, "MAX_ARCHIVE_UNCOMPRESSED_BYTES", 24)
+    archive_path = tmp_path / "total-limit.tar.gz"
+    _raw_tar_headers(archive_path, [16, 16], include_payload=True)
+    reads.clear()
+
+    with pytest.raises(ReleaseFailure) as failure:
+        validate_archive(
+            archive_path,
+            expected_root="root",
+            expected_files={"member-0.bin", "member-1.bin"},
+        )
+
+    assert failure.value.name == "release.archive.invalid"
+    assert reads == [512, 512, 512]
+
+
 def test_raw_tar_size_is_consumed_in_bounded_chunks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

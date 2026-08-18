@@ -102,6 +102,10 @@ RELEASE_SIDECARS = frozenset(
     {"release-manifest.json", "SHA256SUMS", CONFORMANCE_REPORT_NAME}
 )
 ARCHIVE_READ_CHUNK_SIZE = 64 * 1024
+# Release bundles may contain large broker binaries and Rust crate sources, but
+# raw archive inspection must retain bounded CPU and I/O under hostile headers.
+MAX_ARCHIVE_MEMBER_BYTES = 768 * 1024 * 1024
+MAX_ARCHIVE_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024
 SENSITIVE_FIELD = re.compile(
     r"(?:token|secret|password|serial|payload|mapping|endpoint|address)",
     re.IGNORECASE,
@@ -898,6 +902,7 @@ def _validate_raw_tar_directory_names(archive_path: Path) -> None:
     """Reject slash forms tarfile normalizes before exposing TarInfo names."""
     try:
         with gzip.open(archive_path, "rb") as archive:
+            total_payload_size = 0
             while header := archive.read(512):
                 if len(header) != 512:
                     _archive_invalid("tar archive has a truncated header")
@@ -924,6 +929,11 @@ def _validate_raw_tar_directory_names(archive_path: Path) -> None:
                         "release.archive.invalid",
                         "tar archive member size is invalid",
                     ) from error
+                if size > MAX_ARCHIVE_MEMBER_BYTES:
+                    _archive_invalid("tar archive member size exceeds safety limit")
+                total_payload_size += size
+                if total_payload_size > MAX_ARCHIVE_UNCOMPRESSED_BYTES:
+                    _archive_invalid("tar archive payload exceeds safety limit")
                 remaining = (size + 511) // 512 * 512
                 while remaining:
                     chunk_size = min(remaining, ARCHIVE_READ_CHUNK_SIZE)
