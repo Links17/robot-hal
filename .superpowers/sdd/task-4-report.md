@@ -192,7 +192,7 @@ and diff check passed.
 
 ### Commit
 
-Pending.
+`842910d` — `fix(release): gate complete release directories`
 
 ### Concerns
 
