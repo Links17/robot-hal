@@ -51,6 +51,16 @@ def test_broker_command_uses_only_production_startup_arguments(tmp_path: Path) -
     assert "virtual" not in " ".join(command).lower()
 
 
+def test_runner_requires_camera_minor_three_capabilities() -> None:
+    runner = load_runner()
+
+    assert runner.PROTOCOL_MINOR_MINIMUM == 3
+    assert runner.PROTOCOL_MINOR_MAXIMUM == 3
+    assert runner.CAMERA_CAPTURE_CAPABILITY == "camera.capture/v1"
+    assert runner.CAMERA_FRAMES_SHM_CAPABILITY == "camera.frames.shm/v1"
+    assert runner.CAMERA_CONTROLS_CAPABILITY == "camera.controls/v1"
+
+
 def test_readiness_parser_decodes_windows_endpoint_escaping() -> None:
     runner = load_runner()
 

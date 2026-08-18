@@ -26,8 +26,8 @@ from seeed_hal.transport_unix import UnixFramedTransport  # noqa: E402
 
 
 PROTOCOL_MAJOR = 1
-PROTOCOL_MINOR_MINIMUM = 2
-PROTOCOL_MINOR_MAXIMUM = 2
+PROTOCOL_MINOR_MINIMUM = 3
+PROTOCOL_MINOR_MAXIMUM = 3
 PROTOCOL_MINOR = PROTOCOL_MINOR_MAXIMUM
 SERIAL_CAPABILITY = "serial.bytes/v1"
 CAN_CLASSIC_CAPABILITY = "can.classic/v1"
@@ -37,6 +37,9 @@ USB_BULK_CAPABILITY = "usb.bulk/v1"
 USB_INTERRUPT_CAPABILITY = "usb.interrupt/v1"
 GPIO_LINES_CAPABILITY = "gpio.lines/v1"
 GPIO_EDGES_CAPABILITY = "gpio.edges/v1"
+CAMERA_CAPTURE_CAPABILITY = "camera.capture/v1"
+CAMERA_FRAMES_SHM_CAPABILITY = "camera.frames.shm/v1"
+CAMERA_CONTROLS_CAPABILITY = "camera.controls/v1"
 TRANSFER_LIMIT = 64 * 1024
 FRAME_LIMIT = 1024 * 1024
 DIAGNOSTIC_LIMIT = 64 * 1024
@@ -232,6 +235,9 @@ class RawClient:
                     USB_INTERRUPT_CAPABILITY,
                     GPIO_LINES_CAPABILITY,
                     GPIO_EDGES_CAPABILITY,
+                    CAMERA_CAPTURE_CAPABILITY,
+                    CAMERA_FRAMES_SHM_CAPABILITY,
+                    CAMERA_CONTROLS_CAPABILITY,
                 ],
                 max_frame_bytes=FRAME_LIMIT,
                 max_read_bytes=TRANSFER_LIMIT,
@@ -255,6 +261,9 @@ class RawClient:
         _require(USB_INTERRUPT_CAPABILITY in handshake.capabilities, "USB Interrupt capability missing")
         _require(GPIO_LINES_CAPABILITY in handshake.capabilities, "GPIO lines capability missing")
         _require(GPIO_EDGES_CAPABILITY in handshake.capabilities, "GPIO edges capability missing")
+        _require(CAMERA_CAPTURE_CAPABILITY in handshake.capabilities, "Camera capture capability missing")
+        _require(CAMERA_FRAMES_SHM_CAPABILITY in handshake.capabilities, "Camera frames capability missing")
+        _require(CAMERA_CONTROLS_CAPABILITY in handshake.capabilities, "Camera controls capability missing")
         self.transport.set_frame_limit(handshake.max_frame_bytes)
 
     async def close(self) -> None:
@@ -437,6 +446,125 @@ async def _exercise_gpio(client: RawClient) -> None:
     )
 
 
+async def _open_camera(client: RawClient, descriptor):
+    return await client.request(
+        "open_camera_request",
+        hal_pb2.OpenCameraRequest(
+            selector=_selector(descriptor),
+            request=hal_pb2.CameraRequest(
+                format=hal_pb2.CameraFormat(
+                    pixel_format=hal_pb2.CAMERA_PIXEL_FORMAT_NV12,
+                    width=640,
+                    height=480,
+                ),
+                slot_count=4,
+            ),
+        ),
+    )
+
+
+async def _exercise_camera(client: RawClient) -> None:
+    enumerated = await client.request(
+        "enumerate_camera_request", hal_pb2.EnumerateCameraRequest()
+    )
+    resources = _expect_payload(enumerated, "enumerate_camera_response").resources
+    _require(len(resources) == 1, f"expected one virtual Camera resource, got {len(resources)}")
+    descriptor = resources[0]
+    _require(descriptor.properties.get("adapter") == "virtual", "Camera adapter was not virtual")
+    _require(CAMERA_CAPTURE_CAPABILITY in descriptor.capabilities, "Camera capture missing")
+    _require(CAMERA_FRAMES_SHM_CAPABILITY in descriptor.capabilities, "Camera frames missing")
+    _require(CAMERA_CONTROLS_CAPABILITY in descriptor.capabilities, "Camera controls missing")
+
+    opened = _expect_payload(await _open_camera(client, descriptor), "open_camera_response")
+    lease = _lease_copy(opened.lease)
+    _require(lease.generation > 0, "Camera lease generation must be nonzero")
+    conflict = await _open_camera(client, descriptor)
+    _require(conflict.WhichOneof("payload") == "error", "second Camera open was accepted")
+    _require(
+        conflict.error.name in {"runtime.lease.conflict", "runtime.adapter.conflict"},
+        f"unexpected Camera exclusive-open error {conflict.error.name}",
+    )
+    _expect_payload(
+        await client.request(
+            "capture_camera_request",
+            hal_pb2.CaptureCameraRequest(
+                session_id=opened.session_id, lease=lease, timeout_ms=250
+            ),
+        ),
+        "capture_camera_response",
+    )
+    mapping = _expect_payload(
+        await client.request(
+            "camera_mapping_descriptor_request",
+            hal_pb2.CameraMappingDescriptorRequest(
+                session_id=opened.session_id, lease=lease
+            ),
+        ),
+        "camera_mapping_descriptor_response",
+    ).descriptor
+    _require(mapping.mapping_name != "", "Camera mapping name must be nonempty")
+    _require(len(mapping.mapping_identity) == 32, "Camera mapping identity must be 32 bytes")
+    _require(len(mapping.capability_token) == 32, "Camera mapping token must be 32 bytes")
+    _require(mapping.total_length > 0, "Camera mapping length must be nonzero")
+    frame = _expect_payload(
+        await client.request(
+            "camera_next_frame_lease_request",
+            hal_pb2.CameraNextFrameLeaseRequest(session_id=opened.session_id, lease=lease),
+        ),
+        "camera_next_frame_lease_response",
+    ).lease
+    _require(frame.sequence > 0, "Camera frame lease sequence must be nonzero")
+    _require(frame.generation == lease.generation, "Camera frame lease generation mismatched")
+    dropped = _expect_payload(
+        await client.request(
+            "camera_dropped_count_request",
+            hal_pb2.CameraDroppedCountRequest(session_id=opened.session_id, lease=lease),
+        ),
+        "camera_dropped_count_response",
+    )
+    _require(dropped.dropped_count >= 0, "Camera dropped count must be nonnegative")
+    controls = _expect_payload(
+        await client.request(
+            "camera_controls_request",
+            hal_pb2.CameraControlsRequest(session_id=opened.session_id, lease=lease),
+        ),
+        "camera_controls_response",
+    ).controls
+    _require(len(controls) == 4, f"expected four virtual Camera controls, got {len(controls)}")
+    _expect_payload(
+        await client.request(
+            "close_camera_request",
+            hal_pb2.CloseCameraRequest(session_id=opened.session_id, lease=lease),
+        ),
+        "close_camera_response",
+    )
+    reopened = _expect_payload(await _open_camera(client, descriptor), "open_camera_response")
+    _require(
+        reopened.lease.generation > lease.generation,
+        "Camera resource reuse did not advance the fencing generation",
+    )
+    stale = await client.request(
+        "capture_camera_request",
+        hal_pb2.CaptureCameraRequest(
+            session_id=reopened.session_id, lease=lease, timeout_ms=250
+        ),
+    )
+    _require(stale.WhichOneof("payload") == "error", "stale Camera lease was accepted")
+    _require(
+        stale.error.name == "runtime.lease.stale_generation",
+        f"unexpected stale Camera lease error {stale.error.name}",
+    )
+    _expect_payload(
+        await client.request(
+            "close_camera_request",
+            hal_pb2.CloseCameraRequest(
+                session_id=reopened.session_id, lease=reopened.lease
+            ),
+        ),
+        "close_camera_response",
+    )
+
+
 async def exercise_contract(endpoint: str, token: bytes, timeout: float) -> None:
     first = RawClient(
         await _await_with_cap(connect_transport(endpoint), timeout), timeout
@@ -447,6 +575,7 @@ async def exercise_contract(endpoint: str, token: bytes, timeout: float) -> None
         await _exercise_can(first)
         await _exercise_usb(first)
         await _exercise_gpio(first)
+        await _exercise_camera(first)
         enumerated = await first.request(
             "enumerate_serial_request", hal_pb2.EnumerateSerialRequest()
         )
@@ -638,7 +767,7 @@ def main() -> int:
     except (AssertionError, asyncio.TimeoutError, OSError) as error:
         print(f"broker conformance failed: {error}", file=sys.stderr)
         return 1
-    print("broker conformance passed: Serial, CAN, USB, and GPIO contract checks")
+    print("broker conformance passed: Serial, CAN, USB, GPIO, and Camera contract checks")
     return 0
 
 
