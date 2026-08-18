@@ -111,8 +111,9 @@ def test_python_candidate_rejects_external_write_during_validation(
         wheel: Path,
         version: ReleaseVersion,
         staging_dir: Path,
+        dependency_project: Path,
     ) -> None:
-        original_verify(wheel, version, staging_dir)
+        original_verify(wheel, version, staging_dir, dependency_project)
         (output / "external-write").write_bytes(b"unexpected")
 
     monkeypatch.setattr(release_tool, "_verify_wheel_install", write_external_file)
@@ -142,8 +143,9 @@ def test_python_candidate_rejects_external_directory_replacement(
         wheel: Path,
         version: ReleaseVersion,
         staging_dir: Path,
+        dependency_project: Path,
     ) -> None:
-        original_verify(wheel, version, staging_dir)
+        original_verify(wheel, version, staging_dir, dependency_project)
         output.rename(replacement)
         output.symlink_to(replacement, target_is_directory=True)
 
@@ -191,8 +193,9 @@ def test_python_candidate_rejects_artifact_replacement_after_validation(
         wheel: Path,
         version: ReleaseVersion,
         staging_dir: Path,
+        dependency_project: Path,
     ) -> None:
-        original_verify(wheel, version, staging_dir)
+        original_verify(wheel, version, staging_dir, dependency_project)
         artifact = output / artifact_name
         artifact.unlink()
         if replacement_kind == "symlink":
@@ -314,6 +317,7 @@ def test_isolated_wheel_venv_is_offline_and_uses_current_interpreter(
         tmp_path / "package.whl",
         ReleaseVersion.parse("v0.5.0-rc.1"),
         tmp_path,
+        REPO_ROOT / "bindings" / "python",
     )
 
     assert commands[0][:4] == ["uv", "venv", "--offline", "--no-project"]
@@ -333,6 +337,13 @@ def test_isolated_wheel_venv_is_offline_and_uses_current_interpreter(
         "-I",
         "-c",
     ]
-    assert "compileall.compile_dir(package, quiet=1)" in commands[2][3]
+    assert "sys.path.extend(json.loads(sys.argv[1]))" in commands[2][3]
+    assert "import seeed_hal;" in commands[2][3]
+    assert "from seeed_hal.proto import hal_pb2;" in commands[2][3]
+    assert "hal_pb2.Empty().SerializeToString() == b''" in commands[2][3]
+    assert "google.protobuf.__version__ == '6.32.1'" in commands[2][3]
+    assert commands[2][4] == release_tool.json.dumps(
+        release_tool._project_site_paths(REPO_ROOT / "bindings" / "python")
+    )
     assert all("HTTP_PROXY" not in environment for environment in environments)
     assert all("HTTPS_PROXY" not in environment for environment in environments)

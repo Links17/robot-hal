@@ -2764,9 +2764,15 @@ def _sdist_metadata(sdist: Path, version: ReleaseVersion) -> None:
         _package_invalid("Python source distribution content is invalid")
 
 
-def _verify_wheel_install(wheel: Path, version: ReleaseVersion, staging_dir: Path) -> None:
+def _verify_wheel_install(
+    wheel: Path,
+    version: ReleaseVersion,
+    staging_dir: Path,
+    dependency_project: Path,
+) -> None:
     virtualenv = staging_dir / "venv"
     python = virtualenv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    dependency_paths = _project_site_paths(dependency_project)
     environment = {
         key: value
         for key, value in os.environ.items()
@@ -2798,15 +2804,20 @@ def _verify_wheel_install(wheel: Path, version: ReleaseVersion, staging_dir: Pat
                 "-I",
                 "-c",
                 (
-                    "import compileall;"
+                    "import json, sys;"
+                    "sys.path.extend(json.loads(sys.argv[1]));"
                     "import importlib.metadata;"
+                    "import seeed_hal;"
                     f"expected={version.python!r};"
                     "assert importlib.metadata.version('seeed-hal') == expected;"
-                    "distribution=importlib.metadata.distribution('seeed-hal');"
-                    "package=distribution.locate_file('seeed_hal');"
-                    "assert package.is_dir();"
-                    "assert compileall.compile_dir(package, quiet=1)"
+                    "assert seeed_hal.__version__ == expected;"
+                    "from seeed_hal.proto import hal_pb2;"
+                    "import google.protobuf;"
+                    "assert google.protobuf.__version__ == '6.32.1';"
+                    "assert hal_pb2.DESCRIPTOR.name == 'hal.proto';"
+                    "assert hal_pb2.Empty().SerializeToString() == b''"
                 ),
+                json.dumps(dependency_paths),
             ],
         ):
             result = subprocess.run(
@@ -2876,7 +2887,7 @@ def package_python(*, tag: str, project: Path, output_dir: Path) -> tuple[Path, 
         _wheel_metadata(wheel, version)
         _sdist_metadata(sdist, version)
         with tempfile.TemporaryDirectory(prefix=".package-python-validate-") as directory:
-            _verify_wheel_install(wheel, version, Path(directory))
+            _verify_wheel_install(wheel, version, Path(directory), project)
         _require_python_candidate_entries(output_dir, candidate_identity, expected)
         _require_python_candidate_artifact_identity(wheel, wheel_identity)
         _require_python_candidate_artifact_identity(sdist, sdist_identity)
