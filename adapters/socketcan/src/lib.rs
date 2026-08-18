@@ -78,7 +78,7 @@ impl CanAdapter for SocketCanAdapter {
 #[cfg(target_os = "linux")]
 fn enumerate_sync() -> HalResult<Vec<ResourceDescriptor>> {
     let interfaces = socketcan::available_interfaces()
-        .map_err(|error| discovery_error("can.enumerate", error))?;
+        .map_err(|error| discovery_error("can.enumerate", &error))?;
     interfaces
         .into_iter()
         .map(|interface| descriptor_from_interface(&interface))
@@ -90,7 +90,7 @@ fn descriptor_from_interface(interface: &str) -> HalResult<ResourceDescriptor> {
     let metadata = identity::metadata_from_sysfs(interface);
     let identity = identity_from_metadata(&metadata)?;
     let details = link::details_for_descriptor(interface)
-        .map_err(|error| discovery_error("can.enumerate", error))?;
+        .map_err(|error| discovery_error("can.enumerate", &error))?;
     let nonvirtual_sysfs_evidence = !metadata.virtual_interface && metadata.stable_path.is_some();
     let (supports_fd, supports_configure) =
         link::capabilities_for_details(&details, nonvirtual_sysfs_evidence);
@@ -173,7 +173,7 @@ fn open_sync(
 }
 
 #[cfg(target_os = "linux")]
-fn discovery_error(operation: &'static str, error: impl std::error::Error) -> HalError {
+fn discovery_error<E: std::error::Error + ?Sized>(operation: &'static str, error: &E) -> HalError {
     HalError::new(
         "runtime.transport.unavailable",
         ErrorCategory::Unavailable,
@@ -206,4 +206,21 @@ fn join_error(operation: &'static str, error: tokio::task::JoinError) -> HalErro
         format!("SocketCAN blocking worker failed: {error}"),
     )
     .expect("static SocketCAN error metadata is valid")
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::discovery_error;
+
+    #[test]
+    fn discovery_error_accepts_boxed_error_trait_object() {
+        let error: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(std::io::Error::other("netlink discovery failed"));
+
+        let mapped = discovery_error("can.enumerate", error.as_ref());
+
+        assert_eq!(mapped.name(), "runtime.transport.unavailable");
+        assert_eq!(mapped.operation(), "can.enumerate");
+        assert!(mapped.debug_message().contains("netlink discovery failed"));
+    }
 }
