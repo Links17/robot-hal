@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gzip
 import hashlib
 import ipaddress
@@ -1131,6 +1132,7 @@ def _package_invalid(diagnostic: str) -> NoReturn:
 def _package_diagnostic(name: str) -> str:
     diagnostics = {
         "release.archive.invalid": "archive validation failed",
+        "release.artifact.unexpected": "final broker archive already exists",
         "release.manifest.invalid": "broker manifest is invalid",
         "release.package.invalid": "unable to package broker",
         "release.target.invalid": "unknown target",
@@ -1177,6 +1179,30 @@ def _package_members(
         (binary_name, _package_file(binary, binary_name), 0o755),
     )
     return tuple((f"{root}/{name}", path, mode) for name, path, mode in files)
+
+
+def _freeze_package_inputs(
+    staging_dir: Path,
+    binary_name: str,
+    binary: Path,
+    manifest: Path,
+    repo_root: Path,
+) -> tuple[Path, Path]:
+    inputs_dir = staging_dir / "inputs"
+    inputs_dir.mkdir(mode=0o700)
+    copies = (
+        (binary, inputs_dir / binary_name),
+        (manifest, inputs_dir / "broker-manifest.json"),
+        (repo_root / "LICENSE", inputs_dir / "LICENSE"),
+        (repo_root / "README.md", inputs_dir / "README.md"),
+    )
+    for source, destination in copies:
+        _package_file(source, source.name)
+        with source.open("rb") as input_file, destination.open("xb") as output_file:
+            while chunk := input_file.read(ARCHIVE_READ_CHUNK_SIZE):
+                output_file.write(chunk)
+        destination.chmod(0o600)
+    return (inputs_dir / binary_name, inputs_dir / "broker-manifest.json")
 
 
 def _write_deterministic_tar(
@@ -1261,6 +1287,7 @@ def package_broker(
     manifest_path: Path,
     repo_root: Path,
 ) -> Path:
+    staging_dir: Path | None = None
     try:
         version = ReleaseVersion.parse(tag)
         targets = load_targets(targets_path)
@@ -1278,29 +1305,71 @@ def package_broker(
         if not resolved_root.is_dir() or repo_root.is_symlink():
             _package_invalid("repository root is invalid")
         root = _package_root(version, target)
-        members = _package_members(root, binary_name, binary, manifest, resolved_root)
         output_dir.mkdir(parents=True, exist_ok=True)
         if output_dir.is_symlink() or not output_dir.is_dir():
             _package_invalid("package output directory is invalid")
         archive_path = output_dir / _package_archive_name(version, target)
-        if archive_path.exists() and (not archive_path.is_file() or archive_path.is_symlink()):
-            _package_invalid("package output path is invalid")
+        if archive_path.exists():
+            raise ReleaseFailure(
+                "release.artifact.unexpected",
+                "final broker archive already exists",
+            )
+        staging_dir = Path(
+            tempfile.mkdtemp(prefix=".package-broker-", dir=output_dir)
+        )
+        staging_dir.chmod(0o700)
+        frozen_binary, frozen_manifest = _freeze_package_inputs(
+            staging_dir,
+            binary_name,
+            binary,
+            manifest,
+            resolved_root,
+        )
+        verify_broker_manifest(
+            _read_json(frozen_manifest, "release.manifest.invalid"),
+            target,
+            frozen_binary,
+            version,
+        )
+        members = _package_members(
+            root,
+            binary_name,
+            frozen_binary,
+            frozen_manifest,
+            staging_dir / "inputs",
+        )
+        staged_archive = staging_dir / archive_path.name
         if target.archive == "tar.gz":
-            _write_deterministic_tar(archive_path, root, members)
+            _write_deterministic_tar(staged_archive, root, members)
         elif target.archive == "zip":
-            _write_deterministic_zip(archive_path, root, members)
+            _write_deterministic_zip(staged_archive, root, members)
         else:
             _package_invalid("target archive format is unsupported")
         validate_archive(
-            archive_path,
+            staged_archive,
             expected_root=root,
             expected_files={name.rsplit("/", 1)[1] for name, _, _ in members},
         )
+        if archive_path.exists():
+            raise ReleaseFailure(
+                "release.artifact.unexpected",
+                "final broker archive already exists",
+            )
+        os.replace(staged_archive, archive_path)
         return archive_path
     except ReleaseFailure as error:
         raise ReleaseFailure(error.name, _package_diagnostic(error.name)) from error
     except OSError as error:
         raise ReleaseFailure("release.package.invalid", "unable to package broker") from error
+    finally:
+        if staging_dir is not None:
+            with contextlib.suppress(OSError):
+                for path in sorted(staging_dir.rglob("*"), reverse=True):
+                    if path.is_dir():
+                        path.rmdir()
+                    else:
+                        path.unlink()
+                staging_dir.rmdir()
 
 
 class _ReleaseArgumentParser(argparse.ArgumentParser):

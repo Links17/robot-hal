@@ -14,6 +14,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
+from scripts.release import release_tool
 from scripts.release.release_tool import ReleaseFailure, package_broker
 
 
@@ -181,6 +182,112 @@ def test_broker_package_diagnostic_does_not_echo_manifest_path(tmp_path: Path) -
 
     assert failure.value.name == "release.package.invalid"
     assert "secret" not in failure.value.diagnostic
+
+
+def test_validation_failure_leaves_no_final_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, targets = _fixture_repo(tmp_path)
+    binary = tmp_path / "seeed-hal-broker"
+    binary.write_bytes(b"broker fixture\n")
+    manifest = tmp_path / "broker-manifest.json"
+    _write_fixture_manifest("macos", binary, manifest)
+    output = tmp_path / "output"
+
+    def reject_archive(*args, **kwargs) -> None:
+        raise ReleaseFailure("release.archive.invalid", "fixture validation failure")
+
+    monkeypatch.setattr(release_tool, "validate_archive", reject_archive)
+
+    with pytest.raises(ReleaseFailure) as failure:
+        package_broker(
+            tag="v0.5.0-rc.1",
+            target_name="macos",
+            targets_path=targets,
+            binary_path=binary,
+            output_dir=output,
+            manifest_path=manifest,
+            repo_root=repo,
+        )
+
+    assert failure.value.name == "release.archive.invalid"
+    assert tuple(output.iterdir()) == ()
+
+
+def test_existing_final_archive_is_never_overwritten(tmp_path: Path) -> None:
+    repo, targets = _fixture_repo(tmp_path)
+    binary = tmp_path / "seeed-hal-broker"
+    binary.write_bytes(b"broker fixture\n")
+    manifest = tmp_path / "broker-manifest.json"
+    _write_fixture_manifest("macos", binary, manifest)
+    output = tmp_path / "output"
+    output.mkdir()
+    archive = output / "seeed-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin.tar.gz"
+    archive.write_bytes(b"pre-existing archive")
+
+    with pytest.raises(ReleaseFailure) as failure:
+        package_broker(
+            tag="v0.5.0-rc.1",
+            target_name="macos",
+            targets_path=targets,
+            binary_path=binary,
+            output_dir=output,
+            manifest_path=manifest,
+            repo_root=repo,
+        )
+
+    assert failure.value.name == "release.artifact.unexpected"
+    assert archive.read_bytes() == b"pre-existing archive"
+    assert {path.name for path in output.iterdir()} == {archive.name}
+
+
+def test_packaging_uses_frozen_staged_input_copies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, targets = _fixture_repo(tmp_path)
+    binary = tmp_path / "seeed-hal-broker"
+    binary.write_bytes(b"broker fixture\n")
+    manifest = tmp_path / "broker-manifest.json"
+    _write_fixture_manifest("macos", binary, manifest)
+    original_manifest = manifest.read_bytes()
+    observed: list[Path] = []
+    original_writer = release_tool._write_deterministic_tar
+
+    def mutate_sources_after_staging(
+        archive_path: Path,
+        root: str,
+        members: tuple[tuple[str, Path, int], ...],
+    ) -> None:
+        observed.extend(path for _, path, _ in members)
+        binary.write_bytes(b"mutated binary\n")
+        manifest.write_text("{}", encoding="utf-8")
+        (repo / "LICENSE").write_text("mutated license\n", encoding="utf-8")
+        (repo / "README.md").write_text("mutated readme\n", encoding="utf-8")
+        original_writer(archive_path, root, members)
+
+    monkeypatch.setattr(release_tool, "_write_deterministic_tar", mutate_sources_after_staging)
+
+    archive = package_broker(
+        tag="v0.5.0-rc.1",
+        target_name="macos",
+        targets_path=targets,
+        binary_path=binary,
+        output_dir=tmp_path / "output",
+        manifest_path=manifest,
+        repo_root=repo,
+    )
+
+    assert all(path.parent.name == "inputs" for path in observed)
+    with tarfile.open(archive, "r:gz") as contents:
+        assert contents.extractfile(
+            "seeed-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin/seeed-hal-broker"
+        ).read() == b"broker fixture\n"
+        assert contents.extractfile(
+            "seeed-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin/broker-manifest.json"
+        ).read() == original_manifest
+    assert not any(path.name.startswith(".package-broker-") for path in archive.parent.iterdir())
 
 
 def test_cli_rejects_missing_tag_with_stable_failure(tmp_path: Path) -> None:

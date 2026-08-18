@@ -119,3 +119,71 @@ tests, but their broker binaries were not built or run on this machine.
   hosted release jobs; it is not claimed here.
 - Full `verify-static` is intentionally deferred until later tasks produce the
   exact complete release artifact set.
+
+---
+
+## Important Review Follow-up: Staged Atomic Publication
+
+### Status
+
+DONE
+
+### RED Evidence
+
+After adding the review regression cases:
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_package_broker.py
+```
+
+Result: `3 failed, 8 passed`, as expected. The failures showed that an archive
+validation failure left the final artifact behind, an existing final archive was
+silently overwritten, and archive writers received live source paths instead
+of private frozen input copies.
+
+### Changes
+
+- `package_broker` now creates a unique hidden `.package-broker-*` workspace
+  inside the requested output directory with owner-only permissions.
+- It copies the verified binary, manifest, license, and README into a private
+  `inputs/` directory, then packages exclusively from those frozen files.
+- Archive creation and exact no-extract validation run only against a staging
+  archive. The final path is published only after validation using same-directory
+  `os.replace`.
+- A pre-existing final archive fails closed as
+  `release.artifact.unexpected`; it is never overwritten.
+- `finally` removes staging inputs and staged archives for both success and
+  failure, leaving pre-existing output entries intact. Failure diagnostics remain
+  structured and do not expose staging paths or input values.
+
+### GREEN Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_package_broker.py
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+python3 -m compileall -q scripts/release tests/release
+git diff --check
+```
+
+Result: Task 5 focused suite `11 passed`; complete release suite `120 passed`;
+Python compilation and whitespace validation exited 0. IDE diagnostics reported
+no errors for edited files.
+
+The macOS arm64 release invocation was also re-run successfully with
+`--no-default-features --features serialport,nusb,avfoundation`, runtime
+manifest generation, `package-broker.sh`, and `verify-broker-manifest`.
+
+### Commit
+
+`fix(release): stage broker archive publication`
+
+### Concerns
+
+- The final existence check before `os.replace` avoids normal accidental
+  overwrite. It cannot provide a cross-process no-clobber primitive with the
+  standard portable `os.replace` API; release jobs should continue to own
+  isolated artifact directories.
+- Linux and Windows native binary build/runtime validation remains unperformed
+  on this macOS arm64 host.
