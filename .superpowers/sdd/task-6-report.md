@@ -149,4 +149,9 @@ uv run --project bindings/python --python 3.11 --frozen pytest -q bindings/pytho
 ```
 
 The in-progress pre-commit Rust package attempt correctly failed closed on the
-strict dirty-tree gate.  A post-commit clean-tree attempt is recorded below.
+strict dirty-tree gate.  After commit `fc58a5c`, a clean-tree
+`scripts/release/package-rust.sh v0.5.0-rc.1 target/task6-review-rust-clean`
+passed that gate and again reached the existing Cargo package boundary:
+`release.cargo.failed: cargo package failed`.  This is the already documented
+unpublished crates.io dependency closure; no dependency source was changed and
+no publication was attempted.
