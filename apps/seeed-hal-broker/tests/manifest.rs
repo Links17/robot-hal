@@ -35,6 +35,7 @@ fn manifest_is_deterministic_business_independent_and_hardware_free() {
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     let manifest: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(manifest["schema"], serde_json::json!({"major": 1}));
     assert_eq!(manifest["broker_version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(manifest["wire"]["major"], 1);
     assert_eq!(manifest["wire"]["minimum_minor"], 0);

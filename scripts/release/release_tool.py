@@ -64,6 +64,7 @@ EXPECTED_TARGETS = (
     },
 )
 BROKER_MANIFEST_FIELDS = {
+    "schema",
     "broker_version",
     "wire",
     "target",
@@ -72,7 +73,7 @@ BROKER_MANIFEST_FIELDS = {
     "artifact_checksum",
     "required_vendor_runtime_libraries",
 }
-BROKER_VERSION = "0.5.0-rc.1"
+BROKER_MANIFEST_SCHEMA_MAJOR = 1
 BROKER_WIRE = {
     "major": 1,
     "minimum_minor": 0,
@@ -376,13 +377,23 @@ def verify_broker_manifest(
     manifest: object,
     target: ReleaseTarget,
     artifact: Path,
+    expected_version: ReleaseVersion,
 ) -> None:
     document = _require_object(manifest, "manifest")
+
+    schema = _require_object(document.get("schema"), "schema")
+    _require_exact_fields(schema, {"major"}, "schema")
+    major = schema["major"]
+    if type(major) is not int:
+        _manifest_invalid("schema.major must be an integer")
+    if major != BROKER_MANIFEST_SCHEMA_MAJOR:
+        _manifest_invalid(f"unsupported manifest schema major {major}")
+
     missing_fields = BROKER_MANIFEST_FIELDS - set(document)
     if missing_fields:
         _manifest_invalid("manifest is missing required fields")
 
-    if document["broker_version"] != BROKER_VERSION:
+    if document["broker_version"] != expected_version.cargo:
         _manifest_invalid("broker version does not match")
 
     wire = _require_object(document["wire"], "wire")
@@ -445,6 +456,7 @@ def _parser() -> argparse.ArgumentParser:
     check.add_argument("--repo-root", required=True, type=Path)
     check.add_argument("--cargo", default="cargo")
     verify = subcommands.add_parser("verify-broker-manifest")
+    verify.add_argument("--tag", required=True)
     verify.add_argument("--manifest", required=True, type=Path)
     verify.add_argument("--target", required=True)
     verify.add_argument("--targets", required=True, type=Path)
@@ -472,6 +484,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _read_json(arguments.manifest, "release.manifest.invalid"),
                 _target_by_name(targets, arguments.target),
                 arguments.artifact,
+                ReleaseVersion.parse(arguments.tag),
             )
     except ReleaseFailure as error:
         _fail(error)

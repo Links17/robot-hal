@@ -14,6 +14,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.release.release_tool import (
     ReleaseFailure,
+    ReleaseVersion,
     load_targets,
     verify_broker_manifest,
 )
@@ -45,6 +46,7 @@ def valid_manifest(name: str, artifact: Path) -> dict[str, object]:
     release_target = target(name)
     os_name, arch = TARGET_PLATFORM[name]
     return {
+        "schema": {"major": 1},
         "broker_version": "0.5.0-rc.1",
         "wire": {
             "major": 1,
@@ -71,14 +73,61 @@ def valid_manifest(name: str, artifact: Path) -> dict[str, object]:
 
 @pytest.mark.parametrize("name", ["macos", "linux", "windows"])
 def test_manifest_accepts_exact_target_composition(name: str, artifact: Path) -> None:
-    verify_broker_manifest(valid_manifest(name, artifact), target(name), artifact)
+    verify_broker_manifest(
+        valid_manifest(name, artifact),
+        target(name),
+        artifact,
+        ReleaseVersion.parse("v0.5.0-rc.1"),
+    )
+
+
+def test_manifest_accepts_version_from_explicit_tag(artifact: Path) -> None:
+    manifest = valid_manifest("macos", artifact)
+    manifest["broker_version"] = "0.5.0-rc.2"
+
+    verify_broker_manifest(
+        manifest,
+        target("macos"),
+        artifact,
+        ReleaseVersion.parse("v0.5.0-rc.2"),
+    )
+
+
+def test_manifest_rejects_unknown_schema_major_before_other_fields() -> None:
+    with pytest.raises(ReleaseFailure) as failure:
+        verify_broker_manifest(
+            {"schema": {"major": 2}},
+            target("macos"),
+            Path("/path/that/must/not/be/read"),
+            ReleaseVersion.parse("v0.5.0-rc.1"),
+        )
+
+    assert failure.value.name == "release.manifest.invalid"
+    assert failure.value.diagnostic == "unsupported manifest schema major 2"
+
+
+def test_manifest_rejects_manifest_tag_version_mismatch(artifact: Path) -> None:
+    with pytest.raises(ReleaseFailure) as failure:
+        verify_broker_manifest(
+            valid_manifest("macos", artifact),
+            target("macos"),
+            artifact,
+            ReleaseVersion.parse("v0.5.0-rc.2"),
+        )
+
+    assert failure.value.name == "release.manifest.invalid"
 
 
 def test_manifest_accepts_additive_top_level_field(artifact: Path) -> None:
     manifest = valid_manifest("macos", artifact)
     manifest["future_field"] = {"safe": True}
 
-    verify_broker_manifest(manifest, target("macos"), artifact)
+    verify_broker_manifest(
+        manifest,
+        target("macos"),
+        artifact,
+        ReleaseVersion.parse("v0.5.0-rc.1"),
+    )
 
 
 @pytest.mark.parametrize(
@@ -112,7 +161,12 @@ def test_manifest_rejects_one_field_mutations(
     mutate(manifest)
 
     with pytest.raises(ReleaseFailure) as failure:
-        verify_broker_manifest(manifest, target(name), artifact)
+        verify_broker_manifest(
+            manifest,
+            target(name),
+            artifact,
+            ReleaseVersion.parse("v0.5.0-rc.1"),
+        )
 
     assert failure.value.name == "release.manifest.invalid"
 
@@ -131,7 +185,12 @@ def test_manifest_rejects_missing_or_mistyped_fields(mutate, artifact: Path) -> 
     mutate(manifest)
 
     with pytest.raises(ReleaseFailure) as failure:
-        verify_broker_manifest(manifest, target("macos"), artifact)
+        verify_broker_manifest(
+            manifest,
+            target("macos"),
+            artifact,
+            ReleaseVersion.parse("v0.5.0-rc.1"),
+        )
 
     assert failure.value.name == "release.manifest.invalid"
 
@@ -141,7 +200,12 @@ def test_manifest_rejects_unreadable_artifact(artifact: Path) -> None:
     artifact.unlink()
 
     with pytest.raises(ReleaseFailure) as failure:
-        verify_broker_manifest(manifest, target("macos"), artifact)
+        verify_broker_manifest(
+            manifest,
+            target("macos"),
+            artifact,
+            ReleaseVersion.parse("v0.5.0-rc.1"),
+        )
 
     assert failure.value.name == "release.manifest.invalid"
 
@@ -167,6 +231,8 @@ def test_cli_maps_invalid_json_without_traceback(
             sys.executable,
             str(RELEASE_TOOL_PATH),
             "verify-broker-manifest",
+            "--tag",
+            "v0.5.0-rc.1",
             "--manifest",
             str(manifest_path),
             "--target",
@@ -203,6 +269,8 @@ def test_cli_rejects_unknown_target_without_traceback(
             sys.executable,
             str(RELEASE_TOOL_PATH),
             "verify-broker-manifest",
+            "--tag",
+            "v0.5.0-rc.1",
             "--manifest",
             str(manifest_path),
             "--target",

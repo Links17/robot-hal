@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 
 #[derive(Serialize)]
 pub struct BrokerManifest {
+    schema: ManifestSchema,
     broker_version: &'static str,
     wire: WireRange,
     target: Target,
@@ -12,6 +13,11 @@ pub struct BrokerManifest {
     msrv: &'static str,
     artifact_checksum: ArtifactChecksum,
     required_vendor_runtime_libraries: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+struct ManifestSchema {
+    major: u32,
 }
 
 #[derive(Serialize)]
@@ -54,6 +60,7 @@ impl BrokerManifest {
             hasher.update(&buffer[..read]);
         }
         Ok(Self {
+            schema: ManifestSchema { major: 1 },
             broker_version: env!("CARGO_PKG_VERSION"),
             wire: WireRange {
                 major: seeed_hal_protocol::PROTOCOL_MAJOR,
