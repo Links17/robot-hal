@@ -98,6 +98,47 @@ def required_capabilities_for_run(
     return requested or capabilities_for_minor(minor)
 
 
+def operations_for_profile(
+    minor: int, capabilities: tuple[str, ...] | frozenset[str]
+) -> tuple[str, ...]:
+    available = frozenset(capabilities)
+    operations = []
+    if minor >= 0 and SERIAL_CAPABILITY in available:
+        operations.append("serial")
+    if minor >= 1 and (
+        CAN_CLASSIC_CAPABILITY in available or CAN_FD_CAPABILITY in available
+    ):
+        operations.append("can")
+    if minor >= 2:
+        if USB_CONTROL_CAPABILITY in available:
+            operations.append("usb.control")
+        if USB_BULK_CAPABILITY in available:
+            operations.append("usb.bulk")
+        if USB_INTERRUPT_CAPABILITY in available:
+            operations.append("usb.interrupt")
+        if GPIO_LINES_CAPABILITY in available:
+            operations.append("gpio.lines")
+        if (
+            GPIO_LINES_CAPABILITY in available
+            and GPIO_EDGES_CAPABILITY in available
+        ):
+            operations.append("gpio.edges")
+    if minor >= 3:
+        if CAMERA_CAPTURE_CAPABILITY in available:
+            operations.append("camera.capture")
+        if (
+            CAMERA_CAPTURE_CAPABILITY in available
+            and CAMERA_FRAMES_SHM_CAPABILITY in available
+        ):
+            operations.append("camera.frames")
+        if (
+            CAMERA_CAPTURE_CAPABILITY in available
+            and CAMERA_CONTROLS_CAPABILITY in available
+        ):
+            operations.append("camera.controls")
+    return tuple(operations)
+
+
 def later_operation_for_minor(minor: int) -> str | None:
     probes = {
         0: "enumerate_can_request",
@@ -301,7 +342,7 @@ class RawClient:
         *,
         minor: int,
         required_capabilities: tuple[str, ...],
-    ) -> None:
+    ) -> frozenset[str]:
         response = await self.request(
             "handshake_request",
             hal_pb2.HandshakeRequest(
@@ -329,6 +370,7 @@ class RawClient:
                 f"required capability missing: {capability}",
             )
         self.transport.set_frame_limit(handshake.max_frame_bytes)
+        return frozenset(handshake.capabilities)
 
     async def close(self) -> None:
         await _await_with_cap(self.transport.close(), self.timeout)
@@ -411,7 +453,9 @@ async def _exercise_can(client: RawClient) -> None:
     )
 
 
-async def _exercise_usb(client: RawClient) -> None:
+async def _exercise_usb(
+    client: RawClient, capabilities: frozenset[str]
+) -> None:
     enumerated = await client.request("enumerate_usb_request", hal_pb2.EnumerateUsbRequest())
     resources = _expect_payload(enumerated, "enumerate_usb_response").resources
     _require(len(resources) == 1, f"expected one virtual USB resource, got {len(resources)}")
@@ -424,36 +468,60 @@ async def _exercise_usb(client: RawClient) -> None:
         ),
         "open_usb_response",
     )
-    payload = b"seeed-hal-usb-black-box"
-    _expect_payload(
-        await client.request(
-            "usb_transfer_request",
-            hal_pb2.UsbTransferRequest(
-                session_id=opened.session_id,
-                lease=_lease_copy(opened.lease),
-                kind=hal_pb2.USB_TRANSFER_KIND_BULK_OUT,
-                endpoint=1,
-                data=payload,
-                timeout_ms=250,
-            ),
-        ),
-        "usb_transfer_response",
+    async def round_trip(
+        capability: str,
+        out_kind: int,
+        in_kind: int,
+        *,
+        endpoint: int = 0,
+    ) -> None:
+        if capability not in capabilities:
+            return
+        payload = f"seeed-hal-{capability}".encode()
+        common = {
+            "session_id": opened.session_id,
+            "lease": _lease_copy(opened.lease),
+            "timeout_ms": 250,
+        }
+        out = hal_pb2.UsbTransferRequest(kind=out_kind, data=payload, **common)
+        incoming = hal_pb2.UsbTransferRequest(
+            kind=in_kind, max_bytes=len(payload), **common
+        )
+        if capability == USB_CONTROL_CAPABILITY:
+            incoming.request_type = 0x80
+        if endpoint:
+            out.endpoint = endpoint
+            incoming.endpoint = endpoint | 0x80
+        _expect_payload(
+            await client.request("usb_transfer_request", out),
+            "usb_transfer_response",
+        )
+        received = _expect_payload(
+            await client.request("usb_transfer_request", incoming),
+            "usb_transfer_response",
+        )
+        _require(
+            received.data == payload,
+            f"virtual USB {capability} round trip changed payload bytes",
+        )
+
+    await round_trip(
+        USB_CONTROL_CAPABILITY,
+        hal_pb2.USB_TRANSFER_KIND_CONTROL_OUT,
+        hal_pb2.USB_TRANSFER_KIND_CONTROL_IN,
     )
-    received = _expect_payload(
-        await client.request(
-            "usb_transfer_request",
-            hal_pb2.UsbTransferRequest(
-                session_id=opened.session_id,
-                lease=_lease_copy(opened.lease),
-                kind=hal_pb2.USB_TRANSFER_KIND_BULK_IN,
-                endpoint=0x81,
-                max_bytes=len(payload),
-                timeout_ms=250,
-            ),
-        ),
-        "usb_transfer_response",
+    await round_trip(
+        USB_BULK_CAPABILITY,
+        hal_pb2.USB_TRANSFER_KIND_BULK_OUT,
+        hal_pb2.USB_TRANSFER_KIND_BULK_IN,
+        endpoint=1,
     )
-    _require(received.data == payload, "virtual USB round trip changed payload bytes")
+    await round_trip(
+        USB_INTERRUPT_CAPABILITY,
+        hal_pb2.USB_TRANSFER_KIND_INTERRUPT_OUT,
+        hal_pb2.USB_TRANSFER_KIND_INTERRUPT_IN,
+        endpoint=2,
+    )
     _expect_payload(
         await client.request(
             "close_usb_request",
@@ -463,7 +531,11 @@ async def _exercise_usb(client: RawClient) -> None:
     )
 
 
-async def _exercise_gpio(client: RawClient) -> None:
+async def _exercise_gpio(
+    client: RawClient, capabilities: frozenset[str]
+) -> None:
+    if GPIO_LINES_CAPABILITY not in capabilities:
+        return
     enumerated = await client.request("enumerate_gpio_request", hal_pb2.EnumerateGpioRequest())
     resources = _expect_payload(enumerated, "enumerate_gpio_response").resources
     _require(len(resources) == 1, f"expected one virtual GPIO resource, got {len(resources)}")
@@ -527,7 +599,9 @@ async def _open_camera(client: RawClient, descriptor):
     )
 
 
-async def _exercise_camera(client: RawClient) -> None:
+async def _exercise_camera(
+    client: RawClient, capabilities: frozenset[str]
+) -> None:
     enumerated = await client.request(
         "enumerate_camera_request", hal_pb2.EnumerateCameraRequest()
     )
@@ -535,9 +609,15 @@ async def _exercise_camera(client: RawClient) -> None:
     _require(len(resources) == 1, f"expected one virtual Camera resource, got {len(resources)}")
     descriptor = resources[0]
     _require(descriptor.properties.get("adapter") == "virtual", "Camera adapter was not virtual")
-    _require(CAMERA_CAPTURE_CAPABILITY in descriptor.capabilities, "Camera capture missing")
-    _require(CAMERA_FRAMES_SHM_CAPABILITY in descriptor.capabilities, "Camera frames missing")
-    _require(CAMERA_CONTROLS_CAPABILITY in descriptor.capabilities, "Camera controls missing")
+    for capability in capabilities & {
+        CAMERA_CAPTURE_CAPABILITY,
+        CAMERA_FRAMES_SHM_CAPABILITY,
+        CAMERA_CONTROLS_CAPABILITY,
+    }:
+        _require(
+            capability in descriptor.capabilities,
+            f"Camera capability missing: {capability}",
+        )
 
     opened = _expect_payload(await _open_camera(client, descriptor), "open_camera_response")
     lease = _lease_copy(opened.lease)
@@ -548,119 +628,122 @@ async def _exercise_camera(client: RawClient) -> None:
         conflict.error.name in {"runtime.lease.conflict", "runtime.adapter.conflict"},
         f"unexpected Camera exclusive-open error {conflict.error.name}",
     )
-    _expect_payload(
-        await client.request(
-            "capture_camera_request",
-            hal_pb2.CaptureCameraRequest(
-                session_id=opened.session_id, lease=lease, timeout_ms=250
+    if CAMERA_CAPTURE_CAPABILITY in capabilities:
+        _expect_payload(
+            await client.request(
+                "capture_camera_request",
+                hal_pb2.CaptureCameraRequest(
+                    session_id=opened.session_id, lease=lease, timeout_ms=250
+                ),
             ),
-        ),
-        "capture_camera_response",
-    )
-    mapping = _expect_payload(
-        await client.request(
-            "camera_mapping_descriptor_request",
-            hal_pb2.CameraMappingDescriptorRequest(
-                session_id=opened.session_id, lease=lease
+            "capture_camera_response",
+        )
+    if CAMERA_FRAMES_SHM_CAPABILITY in capabilities:
+        mapping = _expect_payload(
+            await client.request(
+                "camera_mapping_descriptor_request",
+                hal_pb2.CameraMappingDescriptorRequest(
+                    session_id=opened.session_id, lease=lease
+                ),
             ),
-        ),
-        "camera_mapping_descriptor_response",
-    ).descriptor
-    _require(mapping.mapping_name != "", "Camera mapping name must be nonempty")
-    _require(len(mapping.mapping_identity) == 32, "Camera mapping identity must be 32 bytes")
-    _require(len(mapping.capability_token) == 32, "Camera mapping token must be 32 bytes")
-    _require(mapping.total_length > 0, "Camera mapping length must be nonzero")
-    frame = _expect_payload(
-        await client.request(
-            "camera_next_frame_lease_request",
-            hal_pb2.CameraNextFrameLeaseRequest(session_id=opened.session_id, lease=lease),
-        ),
-        "camera_next_frame_lease_response",
-    ).lease
-    _require(frame.sequence > 0, "Camera frame lease sequence must be nonzero")
-    _require(frame.generation == lease.generation, "Camera frame lease generation mismatched")
-    dropped = _expect_payload(
-        await client.request(
-            "camera_dropped_count_request",
-            hal_pb2.CameraDroppedCountRequest(session_id=opened.session_id, lease=lease),
-        ),
-        "camera_dropped_count_response",
-    )
-    _require(dropped.dropped_count >= 0, "Camera dropped count must be nonnegative")
-    controls = _expect_payload(
-        await client.request(
-            "camera_controls_request",
-            hal_pb2.CameraControlsRequest(session_id=opened.session_id, lease=lease),
-        ),
-        "camera_controls_response",
-    ).controls
-    _require(len(controls) == 4, f"expected four virtual Camera controls, got {len(controls)}")
-    exposure = next(
-        (control for control in controls if control.kind == hal_pb2.CAMERA_CONTROL_KIND_EXPOSURE),
-        None,
-    )
-    _require(exposure is not None, "virtual Camera exposure control missing")
-    _require(exposure.readable, "virtual Camera exposure must be readable")
-    _require(exposure.writable, "virtual Camera exposure must be writable")
-    before = _expect_payload(
-        await client.request(
-            "camera_get_control_request",
-            hal_pb2.CameraGetControlRequest(
-                session_id=opened.session_id,
-                lease=lease,
-                kind=hal_pb2.CAMERA_CONTROL_KIND_EXPOSURE,
+            "camera_mapping_descriptor_response",
+        ).descriptor
+        _require(mapping.mapping_name != "", "Camera mapping name must be nonempty")
+        _require(len(mapping.mapping_identity) == 32, "Camera mapping identity must be 32 bytes")
+        _require(len(mapping.capability_token) == 32, "Camera mapping token must be 32 bytes")
+        _require(mapping.total_length > 0, "Camera mapping length must be nonzero")
+        frame = _expect_payload(
+            await client.request(
+                "camera_next_frame_lease_request",
+                hal_pb2.CameraNextFrameLeaseRequest(session_id=opened.session_id, lease=lease),
             ),
-        ),
-        "camera_get_control_response",
-    ).value
-    _require(
-        before.WhichOneof("value") == "integer_value",
-        "virtual Camera exposure must use integer values",
-    )
-    _expect_payload(
-        await client.request(
-            "camera_set_control_request",
-            hal_pb2.CameraSetControlRequest(
-                session_id=opened.session_id,
-                lease=lease,
-                kind=hal_pb2.CAMERA_CONTROL_KIND_EXPOSURE,
-                value=hal_pb2.CameraControlValue(integer_value=101),
+            "camera_next_frame_lease_response",
+        ).lease
+        _require(frame.sequence > 0, "Camera frame lease sequence must be nonzero")
+        _require(frame.generation == lease.generation, "Camera frame lease generation mismatched")
+        dropped = _expect_payload(
+            await client.request(
+                "camera_dropped_count_request",
+                hal_pb2.CameraDroppedCountRequest(session_id=opened.session_id, lease=lease),
             ),
-        ),
-        "camera_set_control_response",
-    )
-    after = _expect_payload(
-        await client.request(
-            "camera_get_control_request",
-            hal_pb2.CameraGetControlRequest(
-                session_id=opened.session_id,
-                lease=lease,
-                kind=hal_pb2.CAMERA_CONTROL_KIND_EXPOSURE,
+            "camera_dropped_count_response",
+        )
+        _require(dropped.dropped_count >= 0, "Camera dropped count must be nonnegative")
+    if CAMERA_CONTROLS_CAPABILITY in capabilities:
+        controls = _expect_payload(
+            await client.request(
+                "camera_controls_request",
+                hal_pb2.CameraControlsRequest(session_id=opened.session_id, lease=lease),
             ),
-        ),
-        "camera_get_control_response",
-    ).value
-    _require(
-        after.WhichOneof("value") == "integer_value" and after.integer_value == 101,
-        "virtual Camera exposure set/get did not retain the requested value",
-    )
-    focus = next(
-        (control for control in controls if control.kind == hal_pb2.CAMERA_CONTROL_KIND_FOCUS),
-        None,
-    )
-    _require(focus is not None and focus.auto_supported, "virtual Camera focus auto missing")
-    _expect_payload(
-        await client.request(
-            "camera_set_auto_request",
-            hal_pb2.CameraSetAutoRequest(
-                session_id=opened.session_id,
-                lease=lease,
-                kind=hal_pb2.CAMERA_CONTROL_KIND_FOCUS,
-                enabled=True,
+            "camera_controls_response",
+        ).controls
+        _require(len(controls) == 4, f"expected four virtual Camera controls, got {len(controls)}")
+        exposure = next(
+            (control for control in controls if control.kind == hal_pb2.CAMERA_CONTROL_KIND_EXPOSURE),
+            None,
+        )
+        _require(exposure is not None, "virtual Camera exposure control missing")
+        _require(exposure.readable, "virtual Camera exposure must be readable")
+        _require(exposure.writable, "virtual Camera exposure must be writable")
+        before = _expect_payload(
+            await client.request(
+                "camera_get_control_request",
+                hal_pb2.CameraGetControlRequest(
+                    session_id=opened.session_id,
+                    lease=lease,
+                    kind=hal_pb2.CAMERA_CONTROL_KIND_EXPOSURE,
+                ),
             ),
-        ),
-        "camera_set_auto_response",
-    )
+            "camera_get_control_response",
+        ).value
+        _require(
+            before.WhichOneof("value") == "integer_value",
+            "virtual Camera exposure must use integer values",
+        )
+        _expect_payload(
+            await client.request(
+                "camera_set_control_request",
+                hal_pb2.CameraSetControlRequest(
+                    session_id=opened.session_id,
+                    lease=lease,
+                    kind=hal_pb2.CAMERA_CONTROL_KIND_EXPOSURE,
+                    value=hal_pb2.CameraControlValue(integer_value=101),
+                ),
+            ),
+            "camera_set_control_response",
+        )
+        after = _expect_payload(
+            await client.request(
+                "camera_get_control_request",
+                hal_pb2.CameraGetControlRequest(
+                    session_id=opened.session_id,
+                    lease=lease,
+                    kind=hal_pb2.CAMERA_CONTROL_KIND_EXPOSURE,
+                ),
+            ),
+            "camera_get_control_response",
+        ).value
+        _require(
+            after.WhichOneof("value") == "integer_value" and after.integer_value == 101,
+            "virtual Camera exposure set/get did not retain the requested value",
+        )
+        focus = next(
+            (control for control in controls if control.kind == hal_pb2.CAMERA_CONTROL_KIND_FOCUS),
+            None,
+        )
+        _require(focus is not None and focus.auto_supported, "virtual Camera focus auto missing")
+        _expect_payload(
+            await client.request(
+                "camera_set_auto_request",
+                hal_pb2.CameraSetAutoRequest(
+                    session_id=opened.session_id,
+                    lease=lease,
+                    kind=hal_pb2.CAMERA_CONTROL_KIND_FOCUS,
+                    enabled=True,
+                ),
+            ),
+            "camera_set_auto_response",
+        )
     _expect_payload(
         await client.request(
             "close_camera_request",
@@ -673,17 +756,18 @@ async def _exercise_camera(client: RawClient) -> None:
         reopened.lease.generation > lease.generation,
         "Camera resource reuse did not advance the fencing generation",
     )
-    stale = await client.request(
-        "capture_camera_request",
-        hal_pb2.CaptureCameraRequest(
-            session_id=reopened.session_id, lease=lease, timeout_ms=250
-        ),
-    )
-    _require(stale.WhichOneof("payload") == "error", "stale Camera lease was accepted")
-    _require(
-        stale.error.name == "runtime.lease.stale_generation",
-        f"unexpected stale Camera lease error {stale.error.name}",
-    )
+    if CAMERA_CAPTURE_CAPABILITY in capabilities:
+        stale = await client.request(
+            "capture_camera_request",
+            hal_pb2.CaptureCameraRequest(
+                session_id=reopened.session_id, lease=lease, timeout_ms=250
+            ),
+        )
+        _require(stale.WhichOneof("payload") == "error", "stale Camera lease was accepted")
+        _require(
+            stale.error.name == "runtime.lease.stale_generation",
+            f"unexpected stale Camera lease error {stale.error.name}",
+        )
     _expect_payload(
         await client.request(
             "close_camera_request",
@@ -712,6 +796,12 @@ async def _probe_later_operation(client: RawClient, minor: int) -> None:
     _require(
         response.error.name == later_operation_error_for_minor(minor),
         f"unexpected later-minor operation error {response.error.name}",
+    )
+    _expect_payload(
+        await client.request(
+            "enumerate_serial_request", hal_pb2.EnumerateSerialRequest()
+        ),
+        "enumerate_serial_response",
     )
 
 
@@ -802,6 +892,26 @@ async def _exercise_serial(client: RawClient) -> tuple[object, object]:
     return descriptor, reopened
 
 
+async def _exercise_profile(
+    client: RawClient, minor: int, capabilities: frozenset[str]
+) -> tuple[object, object] | None:
+    operations = operations_for_profile(minor, capabilities)
+    serial = (
+        await _exercise_serial(client)
+        if "serial" in operations
+        else None
+    )
+    if "can" in operations:
+        await _exercise_can(client)
+    if any(operation.startswith("usb.") for operation in operations):
+        await _exercise_usb(client, capabilities)
+    if any(operation.startswith("gpio.") for operation in operations):
+        await _exercise_gpio(client, capabilities)
+    if any(operation.startswith("camera.") for operation in operations):
+        await _exercise_camera(client, capabilities)
+    return serial
+
+
 async def exercise_contract(
     endpoint: str,
     token: bytes,
@@ -820,41 +930,40 @@ async def exercise_contract(
     )
     second = None
     try:
-        await first.handshake(
+        negotiated = await first.handshake(
             token, minor=minor, required_capabilities=required
         )
-        descriptor, _reopened = await _exercise_serial(first)
-        if minor >= 1:
-            await _exercise_can(first)
-        if minor >= 2:
-            await _exercise_usb(first)
-            await _exercise_gpio(first)
-        if minor >= 3:
-            await _exercise_camera(first)
+        active_capabilities = negotiated & frozenset(required)
+        serial = await _exercise_profile(
+            first, minor, active_capabilities
+        )
         await _probe_later_operation(first, minor)
 
-        # Abruptly disconnect with the reopened session still owned. A fresh owner
-        # must be able to reuse the resource after broker cleanup completes.
+        # When Serial is part of the selected profile, abruptly disconnect with
+        # its reopened session still owned and verify broker owner cleanup.
         await first.close()
 
-        async def wait_for_resource_reuse() -> None:
-            nonlocal second
-            second = RawClient(await connect_transport(endpoint), timeout)
-            await second.handshake(
-                token, minor=minor, required_capabilities=required
-            )
-            while True:
-                response = await _open_serial(second, descriptor)
-                if response.WhichOneof("payload") == "open_serial_response":
-                    break
-                _require(
-                    response.WhichOneof("payload") == "error"
-                    and response.error.name == "runtime.lease.conflict",
-                    f"unexpected cleanup response {response.WhichOneof('payload')}",
-                )
-                await asyncio.sleep(0.025)
+        if serial is not None:
+            descriptor, _reopened = serial
 
-        await _await_with_cap(wait_for_resource_reuse(), timeout)
+            async def wait_for_resource_reuse() -> None:
+                nonlocal second
+                second = RawClient(await connect_transport(endpoint), timeout)
+                await second.handshake(
+                    token, minor=minor, required_capabilities=required
+                )
+                while True:
+                    response = await _open_serial(second, descriptor)
+                    if response.WhichOneof("payload") == "open_serial_response":
+                        break
+                    _require(
+                        response.WhichOneof("payload") == "error"
+                        and response.error.name == "runtime.lease.conflict",
+                        f"unexpected cleanup response {response.WhichOneof('payload')}",
+                    )
+                    await asyncio.sleep(0.025)
+
+            await _await_with_cap(wait_for_resource_reuse(), timeout)
     finally:
         with contextlib.suppress(Exception):
             await first.close()

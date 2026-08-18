@@ -107,3 +107,39 @@ Conventional Commit: `test(protocol): cover wire minor compatibility matrix`.
   names rather than accepting arbitrary errors.
 - Ruff is not installed in the frozen Python project environment; syntax compilation, pytest,
   Cargo formatting, IDE diagnostics, and whitespace checks were used instead.
+
+## Important findings follow-up
+
+Two review findings were fixed in a separate follow-up commit.
+
+### TDD evidence
+
+RED:
+
+```text
+5 failed, 23 passed
+```
+
+The failures proved that the handshake did not return negotiated capabilities, explicit profiles
+did not select operations, and the later-minor rejection was not followed by a same-connection
+request.
+
+GREEN:
+
+```text
+29 passed
+```
+
+### Behavior and profile verification
+
+- Explicit required capabilities now constrain execution to the intersection of the explicit set
+  and handshake-advertised capabilities.
+- USB control/bulk/interrupt and Camera capture/shared-memory/controls are independently selected.
+- After a lower-minor structured rejection, the same `RawClient` enumerates Serial before close.
+- Default minor 0, 1, 2, and 3 profiles all passed.
+- An actual narrow minor 3 profile requiring only `usb.control/v1` passed without exercising
+  Serial, CAN, GPIO, Camera, USB bulk, or USB interrupt.
+
+### Follow-up commit
+
+Conventional Commit: `fix(protocol): honor narrow conformance profiles`.

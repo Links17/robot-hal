@@ -142,13 +142,16 @@ async def test_handshake_offers_and_requires_the_exact_selected_profile() -> Non
     transport = HandshakeTransport(1, required)
     client = runner.RawClient(transport, timeout=0.2)
 
-    await client.handshake(bytes(32), minor=1, required_capabilities=required)
+    negotiated = await client.handshake(
+        bytes(32), minor=1, required_capabilities=required
+    )
 
     request = transport.sent[0].handshake_request
     assert request.protocol_minor == 1
     assert request.protocol_minor_minimum == 1
     assert request.protocol_minor_maximum == 1
     assert list(request.required_capabilities) == ["can.classic/v1"]
+    assert negotiated == frozenset(required)
 
 
 @pytest.mark.asyncio
@@ -163,6 +166,84 @@ async def test_handshake_rejects_a_selection_other_than_the_exact_offer() -> Non
             minor=1,
             required_capabilities=runner.capabilities_for_minor(1),
         )
+
+
+class RecordingClient:
+    def __init__(self, responses) -> None:
+        self.responses = iter(responses)
+        self.requests = []
+
+    async def request(self, payload_name: str, payload):
+        self.requests.append(payload_name)
+        return next(self.responses)
+
+
+@pytest.mark.asyncio
+async def test_later_minor_rejection_is_followed_by_same_connection_serial_probe() -> None:
+    runner = load_runner()
+    client = RecordingClient(
+        (
+            hal_pb2.Envelope(
+                request_id=1,
+                error=hal_pb2.Error(
+                    name="runtime.protocol.capability_unsupported",
+                    operation="runtime.protocol.dispatch",
+                ),
+            ),
+            hal_pb2.Envelope(
+                request_id=2,
+                enumerate_serial_response=hal_pb2.EnumerateSerialResponse(),
+            ),
+        )
+    )
+
+    await runner._probe_later_operation(client, 0)
+
+    assert client.requests == [
+        "enumerate_can_request",
+        "enumerate_serial_request",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_explicit_profile_executes_only_selected_capability_operations(
+    monkeypatch,
+) -> None:
+    runner = load_runner()
+    called = []
+
+    async def record(name):
+        called.append(name)
+
+    monkeypatch.setattr(runner, "_exercise_serial", lambda _client: record("serial"))
+    monkeypatch.setattr(runner, "_exercise_can", lambda _client: record("can"))
+    monkeypatch.setattr(
+        runner,
+        "_exercise_usb",
+        lambda _client, _capabilities: record("usb"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_exercise_gpio",
+        lambda _client, _capabilities: record("gpio"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_exercise_camera",
+        lambda _client, _capabilities: record("camera"),
+    )
+
+    await runner._exercise_profile(
+        object(),
+        3,
+        frozenset(
+            (
+                runner.USB_CONTROL_CAPABILITY,
+            )
+        ),
+    )
+
+    assert called == ["usb"]
 
 
 def test_camera_runner_exercises_control_read_write_and_auto() -> None:

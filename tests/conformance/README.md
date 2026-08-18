@@ -27,7 +27,16 @@ error: CAN currently uses `runtime.protocol.capability_unsupported`, while USB/G
 By default the handshake requires every capability defined for the selected profile. Repeating
 `--require-capability CAPABILITY` replaces that default requirement set with exactly the capabilities
 listed by the user; it is useful for qualifying a deliberately narrower broker build without
-silently re-adding profile defaults.
+silently re-adding profile defaults. In that explicit mode, the runner intersects the explicit set
+with the capabilities returned by the handshake and executes only the corresponding checks. A
+transport is not exercised unless one of its capabilities is selected; within a transport, USB
+control/bulk/interrupt and Camera capture/shared-memory/controls checks are independently gated by
+their own advertised capability. Serial owner-cleanup coverage runs only when
+`serial.bytes/v1` is selected.
+
+After a lower-minor next-operation probe receives its exact structured rejection, the same client
+immediately enumerates Serial before closing. This proves the negotiated connection remains usable
+after the fail-closed response.
 
 The minor 3 profile retains complete virtual CAN/USB/GPIO enumeration and session operations,
 Serial enumeration/open/write/read/flush/control lines, and Camera
