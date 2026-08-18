@@ -15,8 +15,12 @@ uv run --project bindings/python --frozen python \
 On Windows, pass `target/debug/seeed-hal-broker.exe`. The Python 3.11 runner creates a unique local
 endpoint and startup token, waits with bounded deadlines, exchanges length-prefixed protobuf
 frames, and removes its token, endpoint, temporary directory, and child process. It covers
-minor-1 handshake, virtual CAN enumeration/open/close, Serial enumeration/open/write/read/flush/control lines, stale-generation rejection,
-disconnect owner cleanup with resource reuse, and cooperative process shutdown.
+wire-major-1/minor-3 handshake, virtual CAN/USB/GPIO enumeration and session operations, Serial
+enumeration/open/write/read/flush/control lines, and Camera enumerate/exclusive-open/capture,
+shared-memory descriptor/frame lease/drop count, controls descriptor/get/set/auto, close/reopen,
+and stale-generation rejection. Camera frame bytes are not sent through protobuf. The suite also
+covers disconnect owner cleanup with resource reuse and cooperative process shutdown. It is virtual
+broker evidence only, not physical camera qualification.
 
 One monotonic deadline bounds each complete request even when runtime events are interleaved. Process
 startup/readiness, transport connection, disconnect cleanup, cooperative shutdown, kill fallback,

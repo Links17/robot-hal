@@ -61,6 +61,18 @@ def test_runner_requires_camera_minor_three_capabilities() -> None:
     assert runner.CAMERA_CONTROLS_CAPABILITY == "camera.controls/v1"
 
 
+def test_camera_runner_exercises_control_read_write_and_auto() -> None:
+    runner = load_runner()
+    source = RUNNER.read_text(encoding="utf-8")
+
+    for payload in (
+        "camera_get_control_request",
+        "camera_set_control_request",
+        "camera_set_auto_request",
+    ):
+        assert payload in source
+
+
 def test_readiness_parser_decodes_windows_endpoint_escaping() -> None:
     runner = load_runner()
 

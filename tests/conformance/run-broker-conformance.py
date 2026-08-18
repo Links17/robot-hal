@@ -531,6 +531,72 @@ async def _exercise_camera(client: RawClient) -> None:
         "camera_controls_response",
     ).controls
     _require(len(controls) == 4, f"expected four virtual Camera controls, got {len(controls)}")
+    exposure = next(
+        (control for control in controls if control.kind == hal_pb2.CAMERA_CONTROL_KIND_EXPOSURE),
+        None,
+    )
+    _require(exposure is not None, "virtual Camera exposure control missing")
+    _require(exposure.readable, "virtual Camera exposure must be readable")
+    _require(exposure.writable, "virtual Camera exposure must be writable")
+    before = _expect_payload(
+        await client.request(
+            "camera_get_control_request",
+            hal_pb2.CameraGetControlRequest(
+                session_id=opened.session_id,
+                lease=lease,
+                kind=hal_pb2.CAMERA_CONTROL_KIND_EXPOSURE,
+            ),
+        ),
+        "camera_get_control_response",
+    ).value
+    _require(
+        before.WhichOneof("value") == "integer_value",
+        "virtual Camera exposure must use integer values",
+    )
+    _expect_payload(
+        await client.request(
+            "camera_set_control_request",
+            hal_pb2.CameraSetControlRequest(
+                session_id=opened.session_id,
+                lease=lease,
+                kind=hal_pb2.CAMERA_CONTROL_KIND_EXPOSURE,
+                value=hal_pb2.CameraControlValue(integer_value=101),
+            ),
+        ),
+        "camera_set_control_response",
+    )
+    after = _expect_payload(
+        await client.request(
+            "camera_get_control_request",
+            hal_pb2.CameraGetControlRequest(
+                session_id=opened.session_id,
+                lease=lease,
+                kind=hal_pb2.CAMERA_CONTROL_KIND_EXPOSURE,
+            ),
+        ),
+        "camera_get_control_response",
+    ).value
+    _require(
+        after.WhichOneof("value") == "integer_value" and after.integer_value == 101,
+        "virtual Camera exposure set/get did not retain the requested value",
+    )
+    focus = next(
+        (control for control in controls if control.kind == hal_pb2.CAMERA_CONTROL_KIND_FOCUS),
+        None,
+    )
+    _require(focus is not None and focus.auto_supported, "virtual Camera focus auto missing")
+    _expect_payload(
+        await client.request(
+            "camera_set_auto_request",
+            hal_pb2.CameraSetAutoRequest(
+                session_id=opened.session_id,
+                lease=lease,
+                kind=hal_pb2.CAMERA_CONTROL_KIND_FOCUS,
+                enabled=True,
+            ),
+        ),
+        "camera_set_auto_response",
+    )
     _expect_payload(
         await client.request(
             "close_camera_request",
