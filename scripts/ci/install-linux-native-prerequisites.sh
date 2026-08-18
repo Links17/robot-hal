@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Source and release metadata: https://www.kernel.org/pub/software/libs/libgpiod/
 LIBGPIOD_VERSION=2.2.1
-LIBGPIOD_SHA256=95689033324c16a13c32e947b9933553258544d6538466b04859a5d1ba950798
+LIBGPIOD_SHA256=8f8f88f4ce764b02d03cc376f0a88cab028c63f94149e2cb5074301423f99098
 LIBGPIOD_ARCHIVE="libgpiod-${LIBGPIOD_VERSION}.tar.gz"
 LIBGPIOD_URL="https://www.kernel.org/pub/software/libs/libgpiod/${LIBGPIOD_ARCHIVE}"
 PREFIX="${RUNNER_TEMP:-/tmp}/seeed-hal-native"

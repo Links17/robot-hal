@@ -94,7 +94,7 @@ availability limitation, not a passing result.
 - libgpiod version: `2.2.1`
 - archive: `libgpiod-2.2.1.tar.gz`
 - SHA-256:
-  `95689033324c16a13c32e947b9933553258544d6538466b04859a5d1ba950798`
+  `8f8f88f4ce764b02d03cc376f0a88cab028c63f94149e2cb5074301423f99098`
 - source and release metadata:
   <https://www.kernel.org/pub/software/libs/libgpiod/>
 
@@ -117,3 +117,33 @@ requires `pkg-config --exists 'libgpiod >= 2'` plus
 
 - `329a477 ci: provision Linux native dependencies`
 - Pending: fail-closed runtime resolution review fix
+
+## Important review resolution: exact libgpiod archive digest
+
+The prior SHA-256 value was not the digest of
+`libgpiod-2.2.1.tar.gz`, so every Linux job failed deterministically at the
+archive integrity check before it could build libgpiod. The static contract
+test was first changed to require the exact `2.2.1` archive URL construction
+and its corrected SHA-256; it failed against the old script value as expected.
+
+The minimal script correction now pins:
+
+```text
+LIBGPIOD_VERSION=2.2.1
+LIBGPIOD_SHA256=8f8f88f4ce764b02d03cc376f0a88cab028c63f94149e2cb5074301423f99098
+```
+
+No dynamic or unverified digest resolution was introduced. A fresh download
+from the pinned kernel.org URL was independently hashed locally with
+`shasum -a 256` and produced the same digest.
+
+### Verification
+
+```sh
+uv run --project bindings/python --python 3.11 --frozen pytest -q \
+  tests/release/test_linux_prerequisites_contract.py \
+  tests/release/test_workflow_contract.py
+bash -n scripts/ci/install-linux-native-prerequisites.sh
+```
+
+Result: **23 passed**; shell parsing passed.
