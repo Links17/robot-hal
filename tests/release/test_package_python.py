@@ -18,6 +18,7 @@ from scripts.release import release_tool
 from scripts.release.release_tool import (
     _locked_protobuf_wheel,
     _locked_protobuf_record_mapping,
+    _installed_protobuf_record_validation_script,
     ReleaseFailure,
     ReleaseVersion,
     _verify_installed_protobuf_record,
@@ -420,6 +421,64 @@ def test_installed_protobuf_record_rejects_extra_injected_file_and_record(
         _verify_installed_protobuf_record(root, record, expected)
 
     assert failure.value.name == "release.package.invalid"
+
+
+def test_inline_installed_protobuf_record_validation_rejects_substituted_hash_and_size(
+    tmp_path: Path,
+) -> None:
+    wheel = _strict_protobuf_wheel(tmp_path / "protobuf-6.32.1-py3-none-any.whl")
+    expected = _locked_protobuf_record_mapping(wheel)
+    site = tmp_path / "site-packages"
+    package = site / "google" / "protobuf"
+    dist_info = site / "protobuf-6.32.1.dist-info"
+    package.mkdir(parents=True)
+    dist_info.mkdir()
+    (site / "google" / "__init__.py").write_bytes(b"")
+    replacement = b"__version__ = '6.32.1-replaced'\n"
+    metadata = b"Metadata-Version: 2.4\nName: protobuf\nVersion: 6.32.1\n"
+    (package / "__init__.py").write_bytes(replacement)
+    (dist_info / "METADATA").write_bytes(metadata)
+    permitted_metadata = {
+        "INSTALLER": b"uv\n",
+        "REQUESTED": b"",
+        "direct_url.json": b"{}",
+        "uv_cache.json": b"{}",
+    }
+    for name, contents in permitted_metadata.items():
+        (dist_info / name).write_bytes(contents)
+    record = dist_info / "RECORD"
+    record.write_text(
+        _record_entry("google/protobuf/__init__.py", replacement)
+        + "\n"
+        + _record_entry("protobuf-6.32.1.dist-info/METADATA", metadata)
+        + "\n"
+        + "\n".join(
+            _record_entry(f"protobuf-6.32.1.dist-info/{name}", contents)
+            for name, contents in permitted_metadata.items()
+        )
+        + "\nprotobuf-6.32.1.dist-info/RECORD,,\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            f"import sys;sys.path.insert(0, {str(site)!r});"
+            + "import importlib.metadata,pathlib;"
+            + f"site=pathlib.Path({str(site)!r});"
+            + "Distribution=type('Distribution',(),"
+            + "{'files':(pathlib.PurePosixPath('protobuf-6.32.1.dist-info/RECORD'),),"
+            + "'locate_file':lambda self,path:site/path});"
+            + "importlib.metadata.distribution=lambda name:Distribution();"
+            + _installed_protobuf_record_validation_script(expected),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
 
 
 def test_wheel_metadata_rejects_backslash_protobuf_shadowing(tmp_path: Path) -> None:

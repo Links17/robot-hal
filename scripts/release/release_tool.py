@@ -3030,14 +3030,19 @@ def _verify_installed_protobuf_record(
 def _installed_protobuf_record_validation_script(
     expected: dict[str, tuple[str | None, int | None]],
 ) -> str:
+    canonical_expected = json.dumps(
+        {path: [encoded, size] for path, (encoded, size) in expected.items()},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return (
-        "import base64, csv, hashlib, importlib.metadata, pathlib\n"
+        "import base64, csv, hashlib, importlib.metadata, json, pathlib\n"
         "import google.protobuf;"
         "dist=importlib.metadata.distribution('protobuf');"
         "record=dist.locate_file(next(path for path in dist.files if path.name == 'RECORD'));"
         "site=record.parent.parent;"
         "assert record.is_file() and pathlib.Path(google.protobuf.__file__).is_relative_to(site);"
-        f"expected_entries={expected!r};"
+        f"expected_entries={{path:(entry[0],entry[1]) for path,entry in json.loads({canonical_expected!r}).items()}};"
         "installed_entries={};"
         "exec(\"for row in csv.reader(record.read_text(encoding='utf-8').splitlines()):\\n"
         " assert len(row) == 3 and row[0] and row[0] not in installed_entries\\n"
@@ -3054,6 +3059,7 @@ def _installed_protobuf_record_validation_script(
         "actual_non_record={path for path in installed_entries if not path.endswith('.dist-info/RECORD')};"
         "assert actual_non_record - {record.parent.relative_to(site).as_posix() + '/' + name for name in permitted_metadata} == expected_non_record, (actual_non_record - {record.parent.relative_to(site).as_posix() + '/' + name for name in permitted_metadata}) ^ expected_non_record;"
         "assert installed_entries[record.relative_to(site).as_posix()] == (None, None);"
+        "assert {path:entry for path,entry in installed_entries.items() if path not in {record.parent.relative_to(site).as_posix() + '/' + name for name in permitted_metadata}} == expected_entries;"
         "actual_files={path.relative_to(site).as_posix() for scope in (site / 'google' / 'protobuf', record.parent) for path in scope.rglob('*') if path.is_file() and not path.is_symlink() and path.suffix != '.pyc'};"
         "assert actual_files == set(expected_entries) | {record.parent.relative_to(site).as_posix() + '/' + name for name in permitted_metadata}, actual_files ^ (set(expected_entries) | {record.parent.relative_to(site).as_posix() + '/' + name for name in permitted_metadata});"
     )

@@ -46,8 +46,9 @@ pure-Python `protobuf` wheel into a fresh offline environment. The candidate
 wheel is rejected when a safe, normalized wheel member—or the installed target
 of its `.data/purelib/` or `.data/platlib/` member—would occupy top-level
 `google`. The installed `protobuf` distribution must have the exact normalized
-`RECORD` mapping from that wheel: non-`RECORD` rows require SHA-256 and size,
-and additional, missing, duplicate, or hashless entries fail validation.
+`RECORD` mapping from that wheel, including each entry's SHA-256 and size:
+non-`RECORD` rows require SHA-256 and size, and additional, missing, duplicate,
+hashless, or hash- or size-mismatched entries fail validation.
 
 Private staging and candidate identity checks detect replacement before a
 candidate is accepted, but do not claim a no-replace boundary against a
