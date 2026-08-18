@@ -221,3 +221,65 @@ Task 6 focused tests: 18 passed
 tests/release: 145 passed
 compileall and git diff --check: passed
 ```
+
+## Approved candidate-output architecture correction
+
+Task 6 no longer treats Python wheel/sdist files as final release artifacts or
+publishes them into a shared release directory. `package-python` now takes a
+`--candidate-dir` path which must not exist when invoked. It creates that
+private directory, builds the exact PEP 440 wheel/sdist pair directly there,
+performs the existing strict wheel/sdist inspection and offline
+venv/import/protobuf validation, then returns the pair only when the directory
+contains exactly those two regular, non-symlink files.
+
+The old `.reserve-package-*` protocol, hard-link publishing, and all
+per-artifact cleanup were removed. This eliminates the reservation-cleanup
+TOCTOU class rather than attempting to distinguish ownership during deletion.
+Any pre-existing candidate directory fails closed without modification. Any
+unexpected or external write before successful return also fails closed. A
+failed candidate may remain for diagnostics, but it has neither sidecars nor
+the required complete release contents, so `verify-static` rejects it.
+
+The POSIX and PowerShell wrappers now describe their second argument as a
+new candidate directory and invoke the CLI with `--candidate-dir`. Task 7
+remains unimplemented and is solely responsible for aggregating verified
+candidates into a new, exclusive complete release directory, generating
+sidecars, and applying the exact `verify-static` gate. Task 9 must consume
+only that completed Task 7 directory.
+
+TDD RED:
+
+```text
+uv run --project bindings/python --python 3.11 --frozen pytest -q \
+  tests/release/test_package_python.py
+# 1 failed, 8 passed: existing candidate directory incorrectly reached build
+```
+
+Initial GREEN:
+
+```text
+uv run --project bindings/python --python 3.11 --frozen pytest -q \
+  tests/release/test_package_python.py
+# 9 passed
+```
+
+Candidate directory identity (`st_dev`, `st_ino`) is captured immediately
+after creation and checked before and after offline validation. This rejects a
+directory replacement or symlink substitution as well as unexpected entries.
+
+Final verification:
+
+```text
+Task 6 focused package tests: 20 passed
+tests/release: 147 passed
+bindings/python/tests: 187 passed
+actual package-python candidate build: passed
+verify-static candidate rejection: expected release.manifest.invalid
+cargo fmt --all --check: passed
+cargo clippy --workspace --all-targets --all-features -- -D warnings: passed
+cargo test --workspace --all-features: passed
+```
+
+The first full Rust test run had one `usb_runtime` close-timeout failure. Its
+exact standalone rerun and a subsequent full workspace gate passed. No runtime
+code was changed for this Task 6 correction.

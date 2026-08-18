@@ -2,7 +2,7 @@
 set -eu
 
 if [ "$#" -ne 2 ]; then
-    printf '%s\n' "release.tool.invalid: expected tag output-dir" >&2
+    printf '%s\n' "release.tool.invalid: expected tag new-candidate-dir" >&2
     exit 1
 fi
 
@@ -12,4 +12,4 @@ repo_root=$(CDPATH= cd -- "$script_dir/../.." && pwd)
 exec python3 "$script_dir/release_tool.py" package-python \
     --tag "$1" \
     --project "$repo_root/bindings/python" \
-    --output-dir "$2"
+    --candidate-dir "$2"

@@ -1,16 +1,16 @@
 param(
     [Parameter(Position = 0)][string]$Tag,
-    [Parameter(Position = 1)][string]$OutputDir,
+    [Parameter(Position = 1)][string]$CandidateDir,
     [Parameter(ValueFromRemainingArguments = $true)][string[]]$Remaining
 )
 
 $ErrorActionPreference = "Stop"
 if (
     [string]::IsNullOrEmpty($Tag) -or
-    [string]::IsNullOrEmpty($OutputDir) -or
+    [string]::IsNullOrEmpty($CandidateDir) -or
     $Remaining.Count -ne 0
 ) {
-    [Console]::Error.WriteLine("release.tool.invalid: expected tag output-dir")
+    [Console]::Error.WriteLine("release.tool.invalid: expected tag new-candidate-dir")
     exit 1
 }
 
@@ -20,5 +20,5 @@ $RepoRoot = (Resolve-Path (Join-Path $ScriptDir "../..")).Path
 & python $ScriptDir/release_tool.py package-python `
     --tag $Tag `
     --project (Join-Path $RepoRoot "bindings/python") `
-    --output-dir $OutputDir
+    --candidate-dir $CandidateDir
 exit $LASTEXITCODE

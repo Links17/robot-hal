@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-import errno
+import stat
 import subprocess
 import zipfile
 from pathlib import Path
@@ -28,22 +28,23 @@ def test_python_artifact_names_use_pep440() -> None:
     )
 
 
-def test_python_package_reserves_both_artifacts_before_build(
+def test_python_package_requires_a_new_candidate_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project = REPO_ROOT / "bindings" / "python"
-    output = tmp_path / "artifacts"
+    output = tmp_path / "python-candidate"
     observed_build = False
 
     def should_not_build(*args, **kwargs) -> None:
         nonlocal observed_build
         observed_build = True
-        raise AssertionError("build must not begin after reservation failure")
+        raise AssertionError("build must not begin for an existing candidate directory")
 
     monkeypatch.setattr(release_tool.subprocess, "run", should_not_build)
     output.mkdir()
-    (output / "seeed_hal-0.5.0rc1.tar.gz").write_bytes(b"external sdist")
+    sentinel = output / "external-input"
+    sentinel.write_bytes(b"must remain untouched")
 
     with pytest.raises(ReleaseFailure) as failure:
         release_tool.package_python(
@@ -54,111 +55,150 @@ def test_python_package_reserves_both_artifacts_before_build(
 
     assert failure.value.name == "release.artifact.unexpected"
     assert not observed_build
-    assert (output / "seeed_hal-0.5.0rc1.tar.gz").read_bytes() == b"external sdist"
-    assert not (output / "seeed_hal-0.5.0rc1-py3-none-any.whl").exists()
+    assert {path.name for path in output.iterdir()} == {sentinel.name}
+    assert sentinel.read_bytes() == b"must remain untouched"
 
 
-def test_failed_second_reservation_cleans_only_our_wheel_reservation(
+def test_python_package_does_not_create_reservations_for_candidate_outputs(
     tmp_path: Path,
 ) -> None:
-    output = tmp_path / "artifacts"
-    output.mkdir()
-    sdist_reservation = output / ".reserve-package-seeed_hal-0.5.0rc1.tar.gz"
-    sdist_reservation.write_bytes(b"external reservation")
-
-    with pytest.raises(ReleaseFailure) as failure:
-        release_tool.package_python(
-            tag="v0.5.0-rc.1",
-            project=REPO_ROOT / "bindings" / "python",
-            output_dir=output,
-        )
-
-    assert failure.value.name == "release.artifact.unexpected"
-    assert not (
-        output / ".reserve-package-seeed_hal-0.5.0rc1-py3-none-any.whl"
-    ).exists()
-    assert sdist_reservation.read_bytes() == b"external reservation"
-
-
-def test_cleanup_preserves_externally_replaced_wheel_reservation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    output = tmp_path / "artifacts"
-    output.mkdir()
-    wheel_reservation = output / ".reserve-package-seeed_hal-0.5.0rc1-py3-none-any.whl"
-    replacement = b"external replacement"
-    original_reserve = release_tool._reserve_package_artifact
-
-    def replace_wheel_after_reserving(
-        output_dir: Path,
-        name: str,
-    ) -> tuple[Path, tuple[int, int]]:
-        reservation, identity = original_reserve(output_dir, name)
-        if name.endswith(".whl"):
-            reservation.unlink()
-            reservation.write_bytes(replacement)
-        return reservation, identity
-
-    monkeypatch.setattr(
-        release_tool,
-        "_reserve_package_artifact",
-        replace_wheel_after_reserving,
-    )
-    (output / ".reserve-package-seeed_hal-0.5.0rc1.tar.gz").write_bytes(
-        b"external sdist reservation"
-    )
-
-    with pytest.raises(ReleaseFailure):
-        release_tool.package_python(
-            tag="v0.5.0-rc.1",
-            project=REPO_ROOT / "bindings" / "python",
-            output_dir=output,
-        )
-
-    assert wheel_reservation.read_bytes() == replacement
-
-
-def test_python_package_rolls_back_wheel_when_sdist_link_fails(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    project = REPO_ROOT / "bindings" / "python"
-    output = tmp_path / "artifacts"
-    original_link = release_tool.os.link
-    calls = 0
-
-    def fail_second_link(source: Path, destination: Path) -> None:
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            destination.write_bytes(b"external sdist")
-            raise FileExistsError(errno.EEXIST, "exists", str(destination))
-        original_link(source, destination)
-
-    monkeypatch.setattr(release_tool.os, "link", fail_second_link)
-
-    with pytest.raises(ReleaseFailure) as failure:
-        release_tool.package_python(
-            tag="v0.5.0-rc.1",
-            project=project,
-            output_dir=output,
-        )
-
-    assert failure.value.name == "release.artifact.unexpected"
-    assert not (output / "seeed_hal-0.5.0rc1-py3-none-any.whl").exists()
-    assert (output / "seeed_hal-0.5.0rc1.tar.gz").read_bytes() == b"external sdist"
-
-
-def test_python_package_publishes_the_complete_pair(tmp_path: Path) -> None:
+    output = tmp_path / "python-candidate"
     wheel, sdist = release_tool.package_python(
         tag="v0.5.0-rc.1",
         project=REPO_ROOT / "bindings" / "python",
-        output_dir=tmp_path / "artifacts",
+        output_dir=output,
+    )
+
+    assert wheel.parent == output
+    assert sdist.parent == output
+    assert not tuple(output.glob(".reserve-package-*"))
+
+
+def test_failed_python_candidate_is_not_a_complete_release_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "python-candidate"
+
+    def failed_build(command, **kwargs):
+        return subprocess.CompletedProcess(command, 1, "", "build failed")
+
+    monkeypatch.setattr(release_tool.subprocess, "run", failed_build)
+
+    with pytest.raises(ReleaseFailure) as failure:
+        release_tool.package_python(
+            tag="v0.5.0-rc.1",
+            project=REPO_ROOT / "bindings" / "python",
+            output_dir=output,
+        )
+
+    assert failure.value.name == "release.package.invalid"
+    assert output.is_dir()
+    assert not tuple(output.glob(".reserve-package-*"))
+    with pytest.raises(ReleaseFailure) as static_failure:
+        release_tool.verify_static(output)
+    assert static_failure.value.name == "release.manifest.invalid"
+
+
+def test_python_candidate_rejects_external_write_during_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "python-candidate"
+    original_verify = release_tool._verify_wheel_install
+
+    def write_external_file(
+        wheel: Path,
+        version: ReleaseVersion,
+        staging_dir: Path,
+    ) -> None:
+        original_verify(wheel, version, staging_dir)
+        (output / "external-write").write_bytes(b"unexpected")
+
+    monkeypatch.setattr(release_tool, "_verify_wheel_install", write_external_file)
+
+    with pytest.raises(ReleaseFailure) as failure:
+        release_tool.package_python(
+            tag="v0.5.0-rc.1",
+            project=REPO_ROOT / "bindings" / "python",
+            output_dir=output,
+        )
+
+    assert failure.value.name == "release.artifact.unexpected"
+    assert (output / "external-write").read_bytes() == b"unexpected"
+    with pytest.raises(ReleaseFailure):
+        release_tool.verify_static(output)
+
+
+def test_python_candidate_rejects_external_directory_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "python-candidate"
+    replacement = tmp_path / "external-replacement"
+    original_verify = release_tool._verify_wheel_install
+
+    def replace_candidate_directory(
+        wheel: Path,
+        version: ReleaseVersion,
+        staging_dir: Path,
+    ) -> None:
+        original_verify(wheel, version, staging_dir)
+        output.rename(replacement)
+        output.symlink_to(replacement, target_is_directory=True)
+
+    monkeypatch.setattr(
+        release_tool,
+        "_verify_wheel_install",
+        replace_candidate_directory,
+    )
+
+    with pytest.raises(ReleaseFailure) as failure:
+        release_tool.package_python(
+            tag="v0.5.0-rc.1",
+            project=REPO_ROOT / "bindings" / "python",
+            output_dir=output,
+        )
+
+    assert failure.value.name == "release.artifact.unexpected"
+    assert output.is_symlink()
+    assert {path.name for path in replacement.iterdir()} == {
+        "seeed_hal-0.5.0rc1-py3-none-any.whl",
+        "seeed_hal-0.5.0rc1.tar.gz",
+    }
+
+
+def test_package_python_cli_and_wrappers_describe_candidate_directory() -> None:
+    arguments = release_tool._parser().parse_args(
+        [
+            "package-python",
+            "--tag",
+            "v0.5.0-rc.1",
+            "--project",
+            "bindings/python",
+            "--candidate-dir",
+            "target/python-candidate",
+        ]
+    )
+
+    assert arguments.candidate_dir == Path("target/python-candidate")
+    for wrapper in ("package-python.sh", "package-python.ps1"):
+        contents = (REPO_ROOT / "scripts" / "release" / wrapper).read_text(
+            encoding="utf-8"
+        )
+        assert "candidate" in contents.lower()
+
+
+def test_python_package_builds_and_validates_complete_candidate_pair(tmp_path: Path) -> None:
+    wheel, sdist = release_tool.package_python(
+        tag="v0.5.0-rc.1",
+        project=REPO_ROOT / "bindings" / "python",
+        output_dir=tmp_path / "python-candidate",
     )
 
     assert wheel.is_file()
     assert sdist.is_file()
+    assert stat.S_IMODE(wheel.parent.stat().st_mode) == 0o700
     assert {path.name for path in wheel.parent.iterdir()} == {wheel.name, sdist.name}
 
 

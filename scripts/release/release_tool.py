@@ -13,6 +13,7 @@ import ipaddress
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1218,6 +1219,35 @@ def _require_package_output_entries(
         )
 
 
+def _candidate_directory_identity(output_dir: Path) -> tuple[int, int]:
+    try:
+        directory = output_dir.lstat()
+    except OSError as error:
+        raise ReleaseFailure(
+            "release.package.invalid",
+            "unable to inspect Python candidate directory",
+        ) from error
+    if not stat.S_ISDIR(directory.st_mode) or output_dir.is_symlink():
+        raise ReleaseFailure(
+            "release.artifact.unexpected",
+            "Python candidate directory changed during build",
+        )
+    return (directory.st_dev, directory.st_ino)
+
+
+def _require_python_candidate_entries(
+    output_dir: Path,
+    identity: tuple[int, int],
+    expected: frozenset[str],
+) -> None:
+    if _candidate_directory_identity(output_dir) != identity:
+        raise ReleaseFailure(
+            "release.artifact.unexpected",
+            "Python candidate directory changed during build",
+        )
+    _require_package_output_entries(output_dir, expected)
+
+
 def _create_package_output_directory(output_dir: Path) -> None:
     try:
         output_dir.mkdir(parents=True)
@@ -1505,55 +1535,6 @@ def _publish_staged_artifact(staged: Path, destination: Path) -> Path:
             "unable to publish final package artifact",
         ) from error
     return destination
-
-
-def _reserve_package_artifact(
-    output_dir: Path,
-    name: str,
-) -> tuple[Path, tuple[int, int]]:
-    # Reservations coordinate cooperative publishers. os.link below is the
-    # atomic no-clobber boundary against external output-directory races.
-    reservation = output_dir / f".reserve-package-{name}"
-    try:
-        descriptor = os.open(reservation, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError as error:
-        raise ReleaseFailure(
-            "release.artifact.unexpected",
-            "final package artifact is already reserved",
-        ) from error
-    except OSError as error:
-        raise ReleaseFailure(
-            "release.package.invalid",
-            "unable to reserve final package artifact",
-        ) from error
-    try:
-        identity = os.fstat(descriptor)
-    finally:
-        os.close(descriptor)
-    return reservation, (identity.st_dev, identity.st_ino)
-
-
-def _unlink_owned_reservation(path: Path, identity: tuple[int, int]) -> None:
-    try:
-        stat = path.lstat()
-        if (
-            not path.is_file()
-            or path.is_symlink()
-            or (stat.st_dev, stat.st_ino) != identity
-        ):
-            return
-        path.unlink()
-    except OSError:
-        return
-
-
-def _unlink_published_artifact(path: Path, identity: tuple[int, int]) -> None:
-    try:
-        stat = path.stat()
-        if (stat.st_dev, stat.st_ino) == identity:
-            path.unlink()
-    except OSError:
-        return
 
 
 PYTHON_GENERATED_FILES = frozenset(
@@ -1955,68 +1936,60 @@ def _verify_wheel_install(wheel: Path, version: ReleaseVersion, staging_dir: Pat
 
 
 def package_python(*, tag: str, project: Path, output_dir: Path) -> tuple[Path, Path]:
-    reservations: list[tuple[Path, tuple[int, int]]] = []
-    published: list[tuple[Path, tuple[int, int]]] = []
-    completed = False
+    """Build and validate a private wheel/sdist candidate pair.
+
+    The caller must provide a path that does not exist.  This function creates
+    and owns that candidate directory; it never publishes into a shared
+    release directory.  Task 7 aggregates validated candidates separately.
+    """
     try:
         version = ReleaseVersion.parse(tag)
         pyproject = _read_toml(project / "pyproject.toml", "release.package.invalid")
         metadata = pyproject.get("project")
         if not isinstance(metadata, dict) or metadata.get("version") != version.python:
             _package_invalid("Python project version does not match release tag")
-        _package_output_directory(output_dir)
         wheel_name, sdist_name = python_artifact_names(version)
-        wheel_destination = _published_artifact_path(output_dir, wheel_name)
-        sdist_destination = _published_artifact_path(output_dir, sdist_name)
-        reservations.append(_reserve_package_artifact(output_dir, wheel_name))
-        reservations.append(_reserve_package_artifact(output_dir, sdist_name))
-        with tempfile.TemporaryDirectory(prefix=".package-python-", dir=output_dir) as directory:
-            staging_dir = Path(directory)
-            result = subprocess.run(
-                [
-                    "uv",
-                    "run",
-                    "--project",
-                    str(project),
-                    "--frozen",
-                    "python",
-                    "-m",
-                    "build",
-                    "--outdir",
-                    str(staging_dir),
-                    str(project),
-                ],
-                cwd=project.parent.parent,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=120,
+        _create_package_output_directory(output_dir)
+        output_dir.chmod(0o700)
+        candidate_identity = _candidate_directory_identity(output_dir)
+        result = subprocess.run(
+            [
+                "uv",
+                "run",
+                "--project",
+                str(project),
+                "--frozen",
+                "python",
+                "-m",
+                "build",
+                "--outdir",
+                str(output_dir),
+                str(project),
+            ],
+            cwd=project.parent.parent,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            _package_invalid(
+                _bounded_subprocess_summary(result.stderr, "Python build failed")
             )
-            if result.returncode != 0:
-                _package_invalid(
-                    _bounded_subprocess_summary(result.stderr, "Python build failed")
-                )
-            wheel = staging_dir / wheel_name
-            sdist = staging_dir / sdist_name
-            if not wheel.is_file() or not sdist.is_file():
-                _package_invalid("Python build did not produce expected artifacts")
-            _wheel_metadata(wheel, version)
-            _sdist_metadata(sdist, version)
-            _verify_wheel_install(wheel, version, staging_dir)
-            for staged, destination in ((wheel, wheel_destination), (sdist, sdist_destination)):
-                final = _publish_staged_artifact(staged, destination)
-                stat = final.stat()
-                published.append((final, (stat.st_dev, stat.st_ino)))
-            completed = True
-            return (wheel_destination, sdist_destination)
+        wheel = output_dir / wheel_name
+        sdist = output_dir / sdist_name
+        expected = frozenset({wheel_name, sdist_name})
+        _require_python_candidate_entries(output_dir, candidate_identity, expected)
+        if not wheel.is_file() or wheel.is_symlink() or not sdist.is_file() or sdist.is_symlink():
+            _package_invalid("Python build did not produce expected artifacts")
+        _wheel_metadata(wheel, version)
+        _sdist_metadata(sdist, version)
+        with tempfile.TemporaryDirectory(prefix=".package-python-validate-") as directory:
+            _verify_wheel_install(wheel, version, Path(directory))
+        _require_python_candidate_entries(output_dir, candidate_identity, expected)
+        return (wheel, sdist)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ReleaseFailure("release.package.invalid", "Python build failed") from error
-    finally:
-        if not completed:
-            for path, identity in reversed(published):
-                _unlink_published_artifact(path, identity)
-        for reservation, identity in reservations:
-            _unlink_owned_reservation(reservation, identity)
 
 
 class _ReleaseArgumentParser(argparse.ArgumentParser):
@@ -2048,10 +2021,13 @@ def _parser() -> argparse.ArgumentParser:
     rust.add_argument("--tag", required=True)
     rust.add_argument("--repo-root", required=True, type=Path)
     rust.add_argument("--output-dir", required=True, type=Path)
-    python = subcommands.add_parser("package-python")
+    python = subcommands.add_parser(
+        "package-python",
+        help="build and validate a private Python candidate output pair",
+    )
     python.add_argument("--tag", required=True)
     python.add_argument("--project", required=True, type=Path)
-    python.add_argument("--output-dir", required=True, type=Path)
+    python.add_argument("--candidate-dir", required=True, type=Path)
     generate = subcommands.add_parser("generate-manifest")
     generate.add_argument("--tag", required=True)
     generate.add_argument("--commit", required=True)
@@ -2106,7 +2082,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             package_python(
                 tag=arguments.tag,
                 project=arguments.project,
-                output_dir=arguments.output_dir,
+                output_dir=arguments.candidate_dir,
             )
         elif arguments.command == "generate-manifest":
             manifest = generate_manifest(
