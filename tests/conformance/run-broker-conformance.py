@@ -98,7 +98,6 @@ def required_capabilities_for_run(
     if not requested:
         return capabilities_for_minor(minor)
     dependencies = {
-        CAN_FD_CAPABILITY: (CAN_CONFIGURE_CAPABILITY,),
         CAN_CONFIGURE_CAPABILITY: (CAN_CLASSIC_CAPABILITY,),
         CAN_ERROR_FRAMES_CAPABILITY: (CAN_CLASSIC_CAPABILITY,),
         CAN_RX_TIMESTAMP_CAPABILITY: (CAN_CLASSIC_CAPABILITY,),
@@ -492,11 +491,8 @@ async def _open_serial(client: RawClient, descriptor):
 def _can_open_request(descriptor, mode: str):
     if mode == "fd":
         config = hal_pb2.CanOpenConfig(
-            configure=hal_pb2.CanConfigureConfig(
+            attach=hal_pb2.CanLinkExpectation(
                 mode=hal_pb2.CAN_MODE_FD,
-                nominal=hal_pb2.CanBitTiming(bitrate=500_000),
-                data=hal_pb2.CanBitTiming(bitrate=2_000_000),
-                loopback=True,
             )
         )
     elif mode == "configure":
@@ -508,9 +504,7 @@ def _can_open_request(descriptor, mode: str):
             )
         )
     else:
-        config = hal_pb2.CanOpenConfig(
-            attach=hal_pb2.CanLinkExpectation(mode=hal_pb2.CAN_MODE_CLASSIC)
-        )
+        config = hal_pb2.CanOpenConfig(attach=hal_pb2.CanLinkExpectation())
     filters = hal_pb2.CanFilterSet()
     if mode == "error-frames":
         filters.filters.add(
@@ -523,7 +517,7 @@ def _can_open_request(descriptor, mode: str):
         selector=_selector(descriptor),
         mode=(
             hal_pb2.LEASE_MODE_MAINTENANCE
-            if mode in {"fd", "configure"}
+            if mode == "configure"
             else hal_pb2.LEASE_MODE_CONTROL
         ),
         config=config,

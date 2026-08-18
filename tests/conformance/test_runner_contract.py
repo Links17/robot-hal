@@ -292,6 +292,22 @@ async def test_can_profile_exercises_each_selected_mode_and_optional_check(
     ]
 
 
+def test_can_fd_open_uses_fd_attach_without_configure() -> None:
+    runner = load_runner()
+    descriptor = hal_pb2.ResourceDescriptor(
+        resource_id="virtual-can",
+        identity_quality=hal_pb2.IDENTITY_QUALITY_STRONG,
+        transport=hal_pb2.TRANSPORT_KIND_CAN,
+    )
+
+    request = runner._can_open_request(descriptor, "fd")
+
+    assert request.mode == hal_pb2.LEASE_MODE_CONTROL
+    assert request.config.WhichOneof("config") == "attach"
+    assert request.config.attach.mode == hal_pb2.CAN_MODE_FD
+    assert not request.config.HasField("configure")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["can", "usb", "gpio", "camera"])
 async def test_non_serial_profile_returns_cleanup_handle_for_selected_transport(

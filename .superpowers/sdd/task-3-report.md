@@ -186,3 +186,40 @@ hardware timestamp accuracy, or real adapter timing.
 ### Follow-up commit
 
 Conventional Commit: `fix(protocol): complete narrow profile lifecycle`.
+
+## Final Important finding follow-up
+
+CAN FD qualification now follows the actual Attach contract rather than requiring Configure and
+Classic.
+
+### TDD evidence
+
+RED:
+
+```text
+2 failed
+```
+
+The failures proved that FD-only closure incorrectly added Configure and Classic, and that the FD
+open request used a Maintenance Configure request instead of a Control Attach(FD) request.
+
+GREEN:
+
+```text
+56 passed
+```
+
+### Verification
+
+- `can.fd/v1` has no lifecycle dependency on `can.configure/v1` or `can.classic/v1`.
+- FD open uses Control lease plus `Attach(mode=FD)` and sends/receives an FD frame.
+- Configure remains a distinct Classic Configure qualification.
+- The virtual broker fixture starts with an FD-active CAN loopback so an actual FD-only Attach
+  profile is executable without silently configuring the link.
+- Default minor 0, 1, 2, and 3 profiles passed.
+- An explicit minor 1 FD-only profile passed, including abrupt disconnect cleanup and same-resource
+  reopen/close.
+
+### Follow-up commit
+
+Conventional Commit: `fix(protocol): qualify CAN FD via attach`.

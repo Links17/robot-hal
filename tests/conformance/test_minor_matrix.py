@@ -181,6 +181,18 @@ def test_explicit_capability_requirements_add_lifecycle_dependency_closure(
     assert runner.required_capabilities_for_run(3, requested) == closed
 
 
+def test_can_fd_requirement_has_no_classic_or_configure_dependency() -> None:
+    runner = load_runner()
+
+    assert runner.required_capabilities_for_run(
+        1, (runner.CAN_FD_CAPABILITY,)
+    ) == (runner.CAN_FD_CAPABILITY,)
+
+    assert runner.operations_for_profile(
+        1, (runner.CAN_FD_CAPABILITY,)
+    ) == ("can.fd",)
+
+
 def test_can_modes_and_optional_capabilities_select_distinct_operations() -> None:
     runner = load_runner()
 

@@ -177,7 +177,7 @@ fn build_runtime(required: &[RequiredAdapter]) -> Result<HalRuntime, Box<dyn std
     {
         builder = builder
             .serial_adapter(VirtualSerialAdapter::loopback("serial:virtual:broker-app"))
-            .can_adapter(VirtualCanAdapter::loopback("can:virtual:broker-app"))
+            .can_adapter(VirtualCanAdapter::loopback_fd("can:virtual:broker-app"))
             .usb_adapter(VirtualUsbAdapter::loopback("usb:virtual:broker-app"))
             .gpio_adapter(VirtualGpioAdapter::line_bank("gpio:virtual:broker-app", 2))
             .camera_adapter(VirtualCameraAdapter::pattern("camera:virtual:broker-app"));
