@@ -78,4 +78,4 @@ requires `pkg-config --exists 'libgpiod >= 2'` plus
 
 ## Commit
 
-- Pending: `ci: provision Linux native dependencies`
+- `329a477 ci: provision Linux native dependencies`
