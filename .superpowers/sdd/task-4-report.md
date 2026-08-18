@@ -137,7 +137,7 @@ compileall and diff check passed. IDE diagnostics reported no errors.
 
 ### Commit
 
-Pending.
+`7fa8b54` — `fix(release): harden manifest conformance validation`
 
 ### Concerns
 
