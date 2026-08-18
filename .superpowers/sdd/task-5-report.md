@@ -326,3 +326,80 @@ The macOS arm64 release build, runtime manifest generation,
   the contract.
 - Linux and Windows native binary build/runtime validation remains outside
   this macOS arm64 execution.
+
+---
+
+## Important Review Follow-up: Atomic No-clobber Link Publication
+
+### Status
+
+DONE
+
+### RED Evidence
+
+The uncommitted link-publication regressions ran before the production change:
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_package_broker.py
+```
+
+Result: `3 failed, 14 passed`. The failures confirmed the prior implementation
+never invoked `os.link`, so it could not prevent an external writer from being
+silently replaced by `os.replace`.
+
+### Changes
+
+- Final publication now atomically creates `archive_path` as a hard link to
+  the validated same-directory staging archive with `os.link`.
+- A destination created by another publisher causes `FileExistsError`, which
+  maps to `release.artifact.unexpected`; the external archive is retained
+  byte-for-byte.
+- `EXDEV`, `EPERM`, and any other link failure fail closed as
+  `release.package.invalid`; no copy or replacement fallback exists.
+- After a successful link publish the staging link is removed, preserving the
+  published archive while normal staging and reservation cleanup continues.
+- The existing output-directory contract, reservation, frozen inputs, and
+  archive validation remain defense-in-depth only. The hard-link create is the
+  final no-clobber primitive; snapshot checks are not claimed to ensure
+  no-clobber on their own.
+
+### GREEN Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_package_broker.py
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+python3 -m compileall -q scripts/release tests/release
+git diff --check
+```
+
+Result: focused Task 5 suite `17 passed`; complete release suite `126 passed`;
+Python compilation and whitespace validation exited 0. IDE diagnostics reported
+no errors for edited Python files.
+
+### Actual macOS arm64 Package Verification
+
+The local macOS arm64 broker was built with
+`--no-default-features --features serialport,nusb,avfoundation`. Runtime
+manifest generation, `package-broker.sh`, `verify-broker-manifest`, and
+`validate_archive` against the produced archive all completed successfully.
+Linux and Windows binaries were not built or run on this host.
+
+### Commit
+
+`fix(release): prevent broker archive clobber`
+
+### Self-review
+
+- A concurrent final-name creation reaches the atomic `link(2)` create and
+  cannot overwrite its bytes.
+- Link publication has no `os.replace` or copy fallback.
+- Staging inputs, validation, reservation, and cleanup are retained.
+
+### Concerns
+
+- Hard-link publication requires source and destination to share a filesystem,
+  which is ensured by staging inside the output directory. Filesystems that
+  reject hard links fail closed.
+- Crash-left reservations remain fail-closed by design.

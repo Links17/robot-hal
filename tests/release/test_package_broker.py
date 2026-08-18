@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import subprocess
@@ -405,6 +406,73 @@ def test_external_final_after_reservation_is_not_overwritten(
     assert failure.value.name == "release.artifact.unexpected"
     archive = output / "seeed-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin.tar.gz"
     assert archive.read_bytes() == external_bytes
+
+
+def test_link_publish_rejects_external_final_without_overwrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, targets = _fixture_repo(tmp_path)
+    binary = tmp_path / "seeed-hal-broker"
+    binary.write_bytes(b"broker fixture\n")
+    manifest = tmp_path / "broker-manifest.json"
+    _write_fixture_manifest("macos", binary, manifest)
+    output = tmp_path / "output"
+    external_bytes = b"external final archive"
+
+    def inject_external_final(source: Path, destination: Path) -> None:
+        destination.write_bytes(external_bytes)
+        raise FileExistsError(errno.EEXIST, "destination exists", str(destination))
+
+    monkeypatch.setattr(release_tool.os, "link", inject_external_final)
+
+    with pytest.raises(ReleaseFailure) as failure:
+        package_broker(
+            tag="v0.5.0-rc.1",
+            target_name="macos",
+            targets_path=targets,
+            binary_path=binary,
+            output_dir=output,
+            manifest_path=manifest,
+            repo_root=repo,
+        )
+
+    assert failure.value.name == "release.artifact.unexpected"
+    archive = output / "seeed-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin.tar.gz"
+    assert archive.read_bytes() == external_bytes
+
+
+@pytest.mark.parametrize("error_number", [errno.EXDEV, errno.EPERM])
+def test_link_publish_fails_closed_when_unsupported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_number: int,
+) -> None:
+    repo, targets = _fixture_repo(tmp_path)
+    binary = tmp_path / "seeed-hal-broker"
+    binary.write_bytes(b"broker fixture\n")
+    manifest = tmp_path / "broker-manifest.json"
+    _write_fixture_manifest("macos", binary, manifest)
+    output = tmp_path / "output"
+
+    def unsupported_link(source: Path, destination: Path) -> None:
+        raise OSError(error_number, "link unavailable")
+
+    monkeypatch.setattr(release_tool.os, "link", unsupported_link)
+
+    with pytest.raises(ReleaseFailure) as failure:
+        package_broker(
+            tag="v0.5.0-rc.1",
+            target_name="macos",
+            targets_path=targets,
+            binary_path=binary,
+            output_dir=output,
+            manifest_path=manifest,
+            repo_root=repo,
+        )
+
+    assert failure.value.name == "release.package.invalid"
+    assert not output.exists() or not any(output.iterdir())
 
 
 def test_cli_rejects_missing_tag_with_stable_failure(tmp_path: Path) -> None:

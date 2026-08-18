@@ -1416,7 +1416,19 @@ def package_broker(
             output_dir,
             frozenset({reservation_path.name, staging_dir.name}),
         )
-        os.replace(staged_archive, archive_path)
+        try:
+            os.link(staged_archive, archive_path)
+        except FileExistsError as error:
+            raise ReleaseFailure(
+                "release.artifact.unexpected",
+                "final broker archive already exists",
+            ) from error
+        except OSError as error:
+            raise ReleaseFailure(
+                "release.package.invalid",
+                "unable to publish final broker archive",
+            ) from error
+        staged_archive.unlink()
         return archive_path
     except ReleaseFailure as error:
         raise ReleaseFailure(error.name, _package_diagnostic(error.name)) from error
