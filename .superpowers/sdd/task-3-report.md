@@ -320,3 +320,46 @@ and push, the controller must obtain one real GitHub Actions run showing all
 three platform matrix entries green, each with production manifest verification
 and virtual protocol-minor coverage 0–3. Only then may the qualification record
 include a run URL, commit, and Passed hosted evidence.
+
+## Important review follow-up: source-gate package isolation
+
+The prior source-gate Rust commands used `--workspace --no-default-features`.
+That is not platform isolation: Cargo still selects every workspace member,
+including native adapter packages such as Linux GPIO and V4L2, and can therefore
+compile their native ABI surfaces.
+
+### TDD evidence
+
+RED:
+
+```text
+1 failed, 22 passed
+AssertionError: '--workspace' is contained here:
+cargo +1.85 clippy --workspace --all-targets --no-default-features -- -D warnings
+```
+
+GREEN:
+
+```text
+23 passed in 0.19s
+```
+
+The workflow contract now rejects workspace-wide source-gate Rust commands and
+requires both Clippy and tests to enumerate the platform-neutral public
+libraries explicitly: client, broker, CAN, camera, core, GPIO, protocol,
+runtime, serial, testkit, and USB. It also rejects all native adapter package
+names and the broker application from source-gate commands.
+
+Native adapter and production broker-app builds remain exclusively in the
+`platform-conformance` matrix, which derives the macOS, Linux, and Windows
+targets from `release/targets.toml`.
+
+### Verification
+
+- Workflow contract: **23 passed**.
+- Full release suite: **213 passed**.
+- Explicit platform-neutral Rust package set: `cargo +1.85 clippy --all-targets
+  ... -- -D warnings` and `cargo +1.85 test ...` passed.
+- `cargo +1.85 fmt --all --check` passed.
+- `./scripts/check-generated-protocol.sh` passed.
+- No hosted workflow was pushed, dispatched, or triggered.

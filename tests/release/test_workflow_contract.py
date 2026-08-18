@@ -99,14 +99,58 @@ def test_source_gate_declares_the_required_frozen_checks() -> None:
         "rustup toolchain install 1.85 --profile minimal --component rustfmt --component clippy",
         "./scripts/check-generated-protocol.sh",
         "cargo +1.85 fmt --all --check",
-        "cargo +1.85 clippy --workspace --all-targets --no-default-features -- -D warnings",
-        "cargo +1.85 test --workspace --no-default-features",
         "uv run --project bindings/python --python 3.11 --frozen pytest -q",
         "pytest -q tests/release",
         "test_minor_matrix.py",
     ):
         assert command in commands
     assert "--all-features" not in commands
+
+
+def test_source_gate_limits_rust_checks_to_platform_neutral_packages() -> None:
+    workflow = load_workflow("ci.yml")
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+    source_gate = jobs["source-gate"]
+    commands = "\n".join(
+        step["run"] for step in source_gate["steps"] if "run" in step
+    )
+
+    neutral_packages = (
+        "seeed-hal-client",
+        "seeed-hal-broker",
+        "seeed-hal-can",
+        "seeed-hal-camera",
+        "seeed-hal-core",
+        "seeed-hal-gpio",
+        "seeed-hal-protocol",
+        "seeed-hal-runtime",
+        "seeed-hal-serial",
+        "seeed-hal-testkit",
+        "seeed-hal-usb",
+    )
+    for command in ("cargo +1.85 clippy", "cargo +1.85 test"):
+        assert command in commands
+        command_line = next(
+            line for line in commands.splitlines() if line.startswith(command)
+        )
+        assert "--workspace" not in command_line
+        for package in neutral_packages:
+            assert f"-p {package}" in command_line
+
+    for native_package in (
+        "seeed-hal-adapter-avfoundation",
+        "seeed-hal-adapter-linux-gpio",
+        "seeed-hal-adapter-mediafoundation",
+        "seeed-hal-adapter-nusb",
+        "seeed-hal-adapter-pcan",
+        "seeed-hal-adapter-serialport",
+        "seeed-hal-adapter-socketcan",
+        "seeed-hal-adapter-v4l2",
+        "seeed-hal-adapter-windows-gpio",
+        "seeed-hal-broker-app",
+    ):
+        assert native_package not in commands
 
 
 def test_linux_platform_jobs_install_shared_prerequisites_before_linux_gpio_builds() -> None:
