@@ -152,6 +152,22 @@ async fn multiple_observers_receive_independent_fanout() {
 }
 
 #[tokio::test]
+async fn receive_returns_available_frames_below_requested_maximum() {
+    let adapter = VirtualCanAdapter::loopback("can:runtime:receive-maximum");
+    let runtime = HalRuntime::builder().can_adapter(adapter.clone()).build();
+    let observer = open(&runtime, &adapter, "receive-maximum", LeaseMode::Observe).await;
+    adapter.inject_received(frame(1), None).unwrap();
+
+    let received = observer
+        .receive(2, Duration::from_millis(100))
+        .await
+        .unwrap();
+
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].frame(), &frame(1));
+}
+
+#[tokio::test]
 async fn exactly_one_controller_can_share_with_observers() {
     let adapter = VirtualCanAdapter::loopback("can:runtime:controller");
     let runtime = HalRuntime::builder().can_adapter(adapter.clone()).build();

@@ -2588,7 +2588,24 @@ async fn minor_one_handshake_enumerates_and_opens_can_with_exact_capabilities() 
 #[tokio::test]
 async fn can_classic_batch_receive_filter_and_status_use_correlated_responses_only() {
     let adapter = VirtualCanAdapter::loopback("can:virtual:broker-operations");
-    let broker = Broker::with_startup_token(can_runtime(adapter), StartupToken::from_bytes(TOKEN));
+    adapter
+        .inject_received(
+            CanFrame::classic_data(CanId::standard(0x123).unwrap(), Bytes::from_static(&[1]))
+                .unwrap(),
+            None,
+        )
+        .unwrap();
+    adapter
+        .inject_received(
+            CanFrame::classic_data(CanId::standard(0x123).unwrap(), Bytes::from_static(&[2]))
+                .unwrap(),
+            None,
+        )
+        .unwrap();
+    let broker = Broker::with_startup_token(
+        can_runtime(adapter.clone()),
+        StartupToken::from_bytes(TOKEN),
+    );
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
     let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
     let mut client = Client::new(client_io);
@@ -2629,7 +2646,7 @@ async fn can_classic_batch_receive_filter_and_status_use_correlated_responses_on
                 response
                     .frames
                     .iter()
-                    .all(|frame| frame.timestamp.is_some())
+                    .all(|frame| frame.timestamp.is_none())
             );
         }
         other => panic!("expected CAN receive response, got {other:?}"),
