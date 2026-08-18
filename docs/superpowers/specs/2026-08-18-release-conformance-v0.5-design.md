@@ -152,7 +152,8 @@ Workflow permissions are minimal:
 
 - pull-request and source-conformance jobs use read-only repository contents;
 - build and verification jobs cannot write releases;
-- only the final release job receives `contents: write` and `id-token: write`;
+- only the final release job receives `contents: write`, `id-token: write`, and
+  `attestations: write`;
 - no job receives package-registry publication permission.
 
 If checksum, manifest, signature, version, target, feature, adapter, or conformance evidence differs,
