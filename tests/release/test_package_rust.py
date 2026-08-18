@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import tarfile
 import subprocess
+import tempfile
 from pathlib import Path
 
 
@@ -55,6 +56,23 @@ def _bundle_members(bundle: Path) -> tuple[str, ...]:
         return tuple(member.name for member in archive.getmembers() if member.isfile())
 
 
+def _check_packaged_crate(crate: Path) -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        destination = Path(directory)
+        with tarfile.open(crate, "r:gz") as archive:
+            archive.extractall(destination, filter="data")
+            root = next(path for path in destination.iterdir() if path.is_dir())
+        result = subprocess.run(
+            ["cargo", "check", "--locked"],
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    assert result.returncode == 0, result.stderr
+
+
 def test_rust_bundle_contains_every_publishable_package(tmp_path: Path) -> None:
     repo = tmp_path / "workspace"
     repo.mkdir()
@@ -71,6 +89,14 @@ def test_rust_bundle_contains_every_publishable_package(tmp_path: Path) -> None:
         "seeed-hal-crates-v0.5.0-rc.1/alpha-0.5.0-rc.1.crate",
         "seeed-hal-crates-v0.5.0-rc.1/beta-0.5.0-rc.1.crate",
     )
+    with tarfile.open(bundle, "r:gz") as archive:
+        crate_member = archive.extractfile(
+            "seeed-hal-crates-v0.5.0-rc.1/alpha-0.5.0-rc.1.crate"
+        )
+        assert crate_member is not None
+        crate = tmp_path / "alpha-0.5.0-rc.1.crate"
+        crate.write_bytes(crate_member.read())
+    _check_packaged_crate(crate)
 
 
 def test_rust_bundle_refuses_existing_artifact(tmp_path: Path) -> None:

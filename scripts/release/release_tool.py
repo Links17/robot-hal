@@ -1614,6 +1614,28 @@ def _build_local_crate(
     return crate
 
 
+def _check_packaged_crate(crate: Path, staging_dir: Path) -> None:
+    root, _ = _crate_root_and_files(crate)
+    extract_root = staging_dir / "checked" / root
+    try:
+        extract_root.parent.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(crate, "r:gz") as archive:
+            archive.extractall(extract_root.parent, filter="data")
+        result = subprocess.run(
+            ["cargo", "check", "--locked"],
+            cwd=extract_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env={**os.environ, "CARGO_TARGET_DIR": str(staging_dir / "check-target")},
+        )
+    except (OSError, tarfile.TarError, subprocess.TimeoutExpired) as error:
+        raise ReleaseFailure("release.cargo.failed", "packaged crate validation failed") from error
+    if result.returncode != 0:
+        raise ReleaseFailure("release.cargo.failed", "packaged crate validation failed")
+
+
 def package_rust(*, tag: str, repo_root: Path, output_dir: Path) -> Path:
     """Create a deterministic local source bundle without registry publication."""
     staging_dir: Path | None = None
@@ -1633,6 +1655,8 @@ def package_rust(*, tag: str, repo_root: Path, output_dir: Path) -> Path:
         staged_crates = tuple(
             _build_local_crate(package, resolved_root, staging_dir) for package in packages
         )
+        for crate in staged_crates:
+            _check_packaged_crate(crate, staging_dir)
         root = f"seeed-hal-crates-v{version.cargo}"
         members = tuple(
             (f"{root}/{crate.name}", crate, 0o644) for crate in staged_crates
