@@ -4,76 +4,94 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
-  verify:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+  source-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      targets: ${{ steps.targets.outputs.targets }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
       - uses: astral-sh/setup-uv@v5
-      - name: Check generated Python protocol bindings
-        shell: bash
+      - name: Install Rust 1.85
+        run: rustup toolchain install 1.85 --profile minimal
+      - name: Check generated protocol
         run: ./scripts/check-generated-protocol.sh
-      - name: Detect workspace packages
-        id: workspace
-        shell: bash
-        run: |
-          has_packages="$(cargo metadata --no-deps --format-version 1 | python -c 'import json, sys; print("true" if json.load(sys.stdin)["packages"] else "false")')"
-          echo "has-packages=$has_packages" >> "$GITHUB_OUTPUT"
       - name: Check Rust formatting
-        if: ${{ steps.workspace.outputs.has-packages == 'true' }}
-        run: cargo fmt --all --check
+        run: cargo +1.85 fmt --all --check
       - name: Run Rust clippy
-        if: ${{ steps.workspace.outputs.has-packages == 'true' }}
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo +1.85 clippy --workspace --all-targets --all-features -- -D warnings
       - name: Run Rust tests
-        if: ${{ steps.workspace.outputs.has-packages == 'true' }}
-        run: cargo test --workspace --all-features
-      - name: Verify broker manifests
-        if: ${{ steps.workspace.outputs.has-packages == 'true' }}
+        run: cargo +1.85 test --workspace --all-features
+      - name: Run frozen Python and release tests
         run: |
-          cargo test -p seeed-hal-broker-app --no-default-features --test manifest
-          cargo test -p seeed-hal-broker-app --features virtual-adapters --test manifest
-          cargo test -p seeed-hal-broker-app --features socketcan,pcan,virtual-adapters --test manifest
-          cargo test -p seeed-hal-broker-app --features nusb --test manifest
-      - name: Check native adapter target paths
-        if: ${{ steps.workspace.outputs.has-packages == 'true' }}
+          uv run --project bindings/python --python 3.11 --frozen pytest -q
+          uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+      - name: Check protocol minor matrix
+        run: uv run --project bindings/python --python 3.11 --frozen pytest -q tests/conformance/test_minor_matrix.py
+      - id: targets
+        name: Derive release target matrix
         shell: bash
         run: |
-          if [[ "$RUNNER_OS" == "Linux" ]]; then
-            cargo clippy -p seeed-hal-adapter-linux-gpio --all-targets -- -D warnings
-            cargo clippy -p seeed-hal-adapter-nusb --all-targets -- -D warnings
-          fi
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            cargo clippy -p seeed-hal-adapter-windows-gpio --all-targets -- -D warnings
-            cargo clippy -p seeed-hal-adapter-nusb --all-targets -- -D warnings
-          fi
-      - name: Confirm native hardware tests remain ignored
-        if: ${{ steps.workspace.outputs.has-packages == 'true' }}
+          targets="$(python3 scripts/release/release_tool.py print-target --targets release/targets.toml --format github-matrix)"
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+
+  platform-conformance:
+    needs: source-gate
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.source-gate.outputs.targets).include }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v5
+      - name: Install Rust 1.85
+        shell: bash
+        run: rustup toolchain install 1.85 --profile minimal
+      - name: Build production broker
         shell: bash
         run: |
-          cargo test -p seeed-hal-adapter-nusb --test hardware
-          cargo test -p seeed-hal-adapter-linux-gpio --test hardware
-          cargo test -p seeed-hal-adapter-windows-gpio --test hardware
-      - name: Build broker conformance executable
-        if: ${{ steps.workspace.outputs.has-packages == 'true' }}
-        run: cargo build -p seeed-hal-broker-app --features virtual-adapters
-      - name: Run broker black-box conformance
-        if: ${{ steps.workspace.outputs.has-packages == 'true' }}
+          cargo +1.85 build -p seeed-hal-broker-app --no-default-features --features "${{ matrix.features }}"
+          mkdir -p ci-evidence/production
+          broker="target/debug/seeed-hal-broker"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then broker="${broker}.exe"; fi
+          "$broker" --manifest > ci-evidence/production/broker-manifest.json
+          python3 scripts/release/release_tool.py verify-broker-manifest \
+            --tag v0.5.0-rc.1 \
+            --manifest ci-evidence/production/broker-manifest.json \
+            --target "${{ matrix.name }}" \
+            --targets release/targets.toml \
+            --artifact "$broker"
+      - name: Build and qualify virtual broker
         shell: bash
         run: |
-          broker_path="target/debug/seeed-hal-broker"
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            broker_path="${broker_path}.exe"
-          fi
-          uv run --project bindings/python --frozen pytest -q tests/conformance/test_runner_contract.py
-          uv run --project bindings/python --frozen python tests/conformance/run-broker-conformance.py --broker "$broker_path"
-      - name: Run Python binding tests
-        if: ${{ hashFiles('bindings/python/tests/**') != '' }}
-        working-directory: bindings/python
-        run: uv run --frozen pytest -q
+          cargo +1.85 build -p seeed-hal-broker-app --no-default-features --features virtual-adapters
+          broker="target/debug/seeed-hal-broker"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then broker="${broker}.exe"; fi
+          python3 scripts/release/release_tool.py run-virtual-conformance \
+            --platform "${{ matrix.name }}" \
+            --broker "$broker" \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --command-identity "ci platform virtual conformance" \
+            --ref "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            > ci-evidence/virtual-conformance.json
+      - name: Upload conformance evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-${{ matrix.name }}
+          path: ci-evidence/*.json
+          if-no-files-found: error

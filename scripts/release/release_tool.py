@@ -1820,6 +1820,24 @@ def _target_by_name(
     raise ReleaseFailure("release.target.invalid", "unknown target")
 
 
+def print_target_matrix(targets_path: Path) -> str:
+    """Encode the release targets as a GitHub Actions matrix."""
+    return json.dumps(
+        {
+            "include": [
+                {
+                    "name": target.name,
+                    "runner": target.runner,
+                    "features": ",".join(target.features),
+                }
+                for target in load_targets(targets_path)
+            ]
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 def _package_invalid(diagnostic: str) -> NoReturn:
     raise ReleaseFailure("release.package.invalid", diagnostic)
 
@@ -2750,6 +2768,9 @@ def _parser() -> argparse.ArgumentParser:
     virtual.add_argument("--repo-root", required=True, type=Path)
     virtual.add_argument("--command-identity", required=True)
     virtual.add_argument("--ref", required=True)
+    target = subcommands.add_parser("print-target")
+    target.add_argument("--targets", required=True, type=Path)
+    target.add_argument("--format", required=True, choices=("github-matrix",))
     static = subcommands.add_parser("verify-static")
     static.add_argument("--release-dir", required=True, type=Path)
     artifacts = subcommands.add_parser("verify-artifacts")
@@ -2852,6 +2873,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     separators=(",", ":"),
                 )
             )
+        elif arguments.subcommand == "print-target":
+            print(print_target_matrix(arguments.targets))
         elif arguments.subcommand == "verify-static":
             verify_static(arguments.release_dir)
         elif arguments.subcommand == "verify-artifacts":

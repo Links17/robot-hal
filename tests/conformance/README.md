@@ -46,6 +46,11 @@ profiles therefore verify CAN, USB, GPIO, or Camera cleanup rather than skipping
 cooperative process shutdown. It is virtual broker evidence only, not physical camera
 qualification.
 
+The CI workflow builds production brokers independently with only the feature set derived from
+`release/targets.toml`, then verifies each production manifest. It builds a second,
+`--no-default-features --features virtual-adapters` broker solely for this suite, records minor
+0–3 results as test evidence, and never combines production and virtual adapter features.
+
 The deterministic virtual CAN loopback can exercise Classic, FD, configure, error-frame filtering
 and frames, and receive timestamps. These are virtual-fixture qualification boundaries, not
 physical bus error injection, hardware timestamp accuracy, or adapter timing qualification.

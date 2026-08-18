@@ -73,6 +73,12 @@ cd bindings/python && uv run --frozen pytest -q
 The hardware-free executable conformance command is documented in
 [`tests/conformance/README.md`](tests/conformance/README.md).
 
+Pull requests and pushes run a read-only GitHub Actions source gate, followed by native
+macOS/Linux/Windows broker conformance. The hosted platform matrix is derived from
+[`release/targets.toml`](release/targets.toml); each job verifies a production broker manifest
+and separately qualifies a `virtual-adapters` broker for protocol minors 0 through 3. Hosted
+conformance JSON is retained only as test evidence and is not a release artifact.
+
 Run the Camera v0.4 hardware-free release gate with:
 
 ```bash

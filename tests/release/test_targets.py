@@ -1,3 +1,5 @@
+import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -11,6 +13,7 @@ from scripts.release.release_tool import ReleaseFailure, load_targets
 
 TARGETS = REPO_ROOT / "release" / "targets.toml"
 VALID_TARGETS = TARGETS.read_text(encoding="utf-8")
+RELEASE_TOOL = REPO_ROOT / "scripts" / "release" / "release_tool.py"
 
 
 def _load_text(tmp_path: Path, contents: str) -> None:
@@ -118,3 +121,44 @@ def test_target_matrix_rejects_non_utf8_input(tmp_path: Path) -> None:
 
     with pytest.raises(ReleaseFailure, match="release.targets.invalid"):
         load_targets(path)
+
+
+def test_print_target_emits_a_machine_readable_github_matrix() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(RELEASE_TOOL),
+            "print-target",
+            "--targets",
+            str(TARGETS),
+            "--format",
+            "github-matrix",
+        ],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert json.loads(result.stdout) == {
+        "include": [
+            {
+                "name": "macos",
+                "runner": "macos-14",
+                "features": "serialport,nusb,avfoundation",
+            },
+            {
+                "name": "linux",
+                "runner": "ubuntu-24.04",
+                "features": "serialport,nusb,socketcan,linux-gpio,v4l2",
+            },
+            {
+                "name": "windows",
+                "runner": "windows-2025",
+                "features": "serialport,nusb,windows-gpio,mediafoundation",
+            },
+        ]
+    }
