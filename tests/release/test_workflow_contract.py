@@ -61,14 +61,26 @@ def test_ci_uses_reviewed_actions_without_persisted_credentials() -> None:
     assert isinstance(jobs, dict)
     steps = [step for job in jobs.values() for step in job["steps"]]
 
-    checkouts = [step for step in steps if step.get("uses") == "actions/checkout@v6"]
+    checkouts = [step for step in steps if step.get("uses", "").startswith("actions/checkout@")]
     assert checkouts
     assert all(
         step.get("with", {}).get("persist-credentials") is False
         for step in checkouts
     )
-    assert any(step.get("uses") == "actions/setup-python@v6" for step in steps)
-    assert any(step.get("uses") == "astral-sh/setup-uv@v5" for step in steps)
+
+    uses = [step["uses"] for step in steps if "uses" in step]
+    assert uses
+    assert all(
+        re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}", action)
+        for action in uses
+    )
+
+    workflow_text = CI.read_text(encoding="utf-8")
+    for action in uses:
+        assert re.search(
+            rf"(?m)^\s*(?:-\s+)?uses:\s+{re.escape(action)}\s+#\s+.+$",
+            workflow_text,
+        )
 
 
 def test_source_gate_declares_the_required_frozen_checks() -> None:
@@ -81,7 +93,7 @@ def test_source_gate_declares_the_required_frozen_checks() -> None:
     )
 
     for command in (
-        "rustup toolchain install 1.85",
+        "rustup toolchain install 1.85 --profile minimal --component rustfmt --component clippy",
         "./scripts/check-generated-protocol.sh",
         "cargo +1.85 fmt --all --check",
         "cargo +1.85 clippy --workspace --all-targets --all-features -- -D warnings",
@@ -135,4 +147,6 @@ def test_platform_job_separates_production_manifest_and_virtual_conformance() ->
     assert "verify-broker-manifest" in commands
     assert "cargo +1.85 build -p seeed-hal-broker-app --no-default-features --features virtual-adapters" in commands
     assert "run-virtual-conformance" in commands
-    assert "actions/upload-artifact@v4" in json.dumps(platform_job)
+    assert "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02" in json.dumps(
+        platform_job
+    )

@@ -14,15 +14,15 @@ jobs:
     outputs:
       targets: ${{ steps.targets.outputs.targets }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.11"
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
       - name: Install Rust 1.85
-        run: rustup toolchain install 1.85 --profile minimal
+        run: rustup toolchain install 1.85 --profile minimal --component rustfmt --component clippy
       - name: Check generated protocol
         run: ./scripts/check-generated-protocol.sh
       - name: Check Rust formatting
@@ -52,16 +52,16 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.11"
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
       - name: Install Rust 1.85
         shell: bash
-        run: rustup toolchain install 1.85 --profile minimal
+        run: rustup toolchain install 1.85 --profile minimal --component rustfmt --component clippy
       - name: Build production broker
         shell: bash
         run: |
@@ -90,7 +90,7 @@ jobs:
             --ref "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             > ci-evidence/virtual-conformance.json
       - name: Upload conformance evidence
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: conformance-${{ matrix.name }}
           path: ci-evidence/*.json

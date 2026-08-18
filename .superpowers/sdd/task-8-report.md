@@ -8,22 +8,29 @@
   failed with `release.tool.invalid`.
 - Implemented the least-privilege source/platform workflow and read-only target-matrix command.
   Workflow and target contracts then passed: 18 passed.
+- Task 8 review required explicit Rust formatter/linter installation and immutable action
+  references. The added contracts failed against the reviewed workflow (2 failed, 5 passed),
+  then passed after remediation (7 passed).
 
 ## Workflow facts
 
 - `.github/workflows/ci.yml` has only `source-gate` and `platform-conformance` jobs, top-level
   `permissions: {contents: read}`, and a 45-minute timeout on every job.
-- `source-gate` installs Rust 1.85 and runs generated-protocol, format, clippy, full workspace,
-  frozen Python, release, and minor-matrix checks.
+- Both jobs install Rust 1.85 with explicit `rustfmt` and `clippy` components. `source-gate`
+  then runs generated-protocol, format, clippy, full workspace, frozen Python, release, and
+  minor-matrix checks.
 - The platform matrix is generated from `release/targets.toml` through
   `scripts/release/release_tool.py print-target --format github-matrix`; the workflow has no
   copied adapter feature list.
 - Every platform builds a production broker with `--no-default-features` and its matrix feature
   list, obtains and validates its manifest, then separately builds a virtual-only broker for
   minor 0–3 conformance. JSON uploads are Actions test artifacts only.
-- Checkout uses current reviewed `actions/checkout@v6` with `persist-credentials: false`;
-  Python uses `actions/setup-python@v6`; `astral-sh/setup-uv@v5` and
-  `actions/upload-artifact@v4` remain reviewed major versions.
+- Every third-party action is pinned to a full immutable commit SHA with a readable reviewed
+  version comment: checkout v6 (`d23441a48e516b6c34aea4fa41551a30e30af803`),
+  setup-python v6 (`ece7cb06caefa5fff74198d8649806c4678c61a1`), setup-uv v5
+  (`e58605a9b6da7c637471fab8847a5e5a6b8df081`), and upload-artifact v4
+  (`ea165f8d65b6e75b540449e92b4886f43607fa02`). These SHAs were resolved through each
+  action's GitHub tag reference. Checkout retains `persist-credentials: false`.
 
 ## Local verification
 
@@ -39,6 +46,8 @@
 - `python3 -m compileall -q scripts/release/release_tool.py
   tests/release/test_workflow_contract.py tests/release/test_targets.py` and `git diff --check`
   — passed.
+- Review remediation: `tests/release/test_workflow_contract.py` — 7 passed; `tests/release`
+  — 183 passed; `compileall` and `git diff --check` — passed.
 
 ## Hosted boundary, self-review, and concerns
 
