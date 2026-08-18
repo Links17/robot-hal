@@ -2778,6 +2778,14 @@ def _parser() -> argparse.ArgumentParser:
     artifacts.add_argument("--artifacts-dir", required=True, type=Path)
     artifacts.add_argument("--targets", required=True, type=Path)
     artifacts.add_argument("--repo-root", required=True, type=Path)
+    aggregate = subcommands.add_parser("aggregate-release")
+    aggregate.add_argument("--tag", required=True)
+    aggregate.add_argument("--commit", required=True)
+    aggregate.add_argument("--broker-dir", required=True, type=Path)
+    aggregate.add_argument("--rust-bundle", required=True, type=Path)
+    aggregate.add_argument("--python-artifacts", required=True, type=Path)
+    aggregate.add_argument("--report-inputs", required=True, type=Path)
+    aggregate.add_argument("--release-dir", required=True, type=Path)
     return parser
 
 
@@ -2883,6 +2891,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.tag,
                 arguments.targets,
                 arguments.repo_root,
+            )
+        elif arguments.subcommand == "aggregate-release":
+            aggregate_release(
+                tag=arguments.tag,
+                commit=arguments.commit,
+                broker_dir=arguments.broker_dir,
+                rust_bundle=arguments.rust_bundle,
+                python_candidate=arguments.python_artifacts,
+                report_inputs=arguments.report_inputs,
+                release_dir=arguments.release_dir,
             )
     except ReleaseFailure as error:
         _fail(error)

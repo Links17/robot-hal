@@ -1,0 +1,390 @@
+name: RC prerelease
+
+on:
+  push:
+    tags:
+      - "v0.5.0-rc.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing v0.5.0-rc.N tag to release
+        required: true
+        type: string
+      dry_run:
+        description: Verify only; do not attest or create a release
+        default: false
+        required: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+
+jobs:
+  validate:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.ref_type == 'tag' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      commit: ${{ steps.identity.outputs.commit }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - name: Validate immutable tag and checkout identity
+        id: identity
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$TAG"
+          [[ "$tag" =~ ^v0\.5\.0-rc\.([1-9][0-9]*)$ ]]
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            [[ "${{ github.ref_type }}" == "tag" ]]
+            [[ "${{ github.ref_name }}" == "$tag" ]]
+          fi
+          git fetch --tags origin
+          test -z "$(git status --porcelain)"
+          commit="$(git rev-parse "${tag}^{commit}")"
+          test "$commit" = "$(git rev-list -n 1 "$tag")"
+          test "$commit" = "$(git rev-parse HEAD)"
+          test "$(git tag --points-at "$commit" | rg -x "$tag")" = "$tag"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release already exists for $tag" >&2
+            exit 1
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - name: Validate release version and source gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/release/release_tool.py check-version --tag "$TAG" --repo-root .
+          ./scripts/check-generated-protocol.sh
+          cargo +1.85 fmt --all --check
+          cargo +1.85 clippy --workspace --all-targets --all-features -- -D warnings
+          cargo +1.85 test --workspace --all-features
+          uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+
+  platform-build:
+    needs: validate
+    strategy:
+      matrix:
+        include:
+          - name: macos
+            runner: macos-14
+            features: serialport,nusb,avfoundation
+          - name: linux
+            runner: ubuntu-24.04
+            features: serialport,nusb,socketcan,linux-gpio,v4l2
+          - name: windows
+            runner: windows-2025
+            features: serialport,nusb,windows-gpio,mediafoundation
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - name: Install Rust and Linux prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.85 --profile minimal
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo apt-get update
+            sudo apt-get install --yes libgpiod-dev pkg-config
+          fi
+      - name: Build and package production broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence output
+          cargo +1.85 build -p seeed-hal-broker-app --no-default-features --features "${{ matrix.features }}"
+          broker="target/debug/seeed-hal-broker"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then broker="${broker}.exe"; fi
+          "$broker" --manifest > evidence/broker-manifest.json
+          python3 scripts/release/release_tool.py verify-broker-manifest --tag "$TAG" --manifest evidence/broker-manifest.json --target "${{ matrix.name }}" --targets release/targets.toml --artifact "$broker"
+          python3 scripts/release/release_tool.py package-broker --tag "$TAG" --target "${{ matrix.name }}" --targets release/targets.toml --binary "$broker" --manifest evidence/broker-manifest.json --output-dir output
+      - name: Build virtual conformance broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +1.85 build -p seeed-hal-broker-app --no-default-features --features virtual-adapters
+          virtual="target/debug/seeed-hal-broker"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then virtual="${virtual}.exe"; fi
+          cp "$virtual" "output/virtual-${{ matrix.name }}"
+          shasum -a 256 output/* > output/SHA256SUMS
+      - name: Upload immutable platform artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-platform-${{ env.TAG }}-${{ needs.validate.outputs.commit }}-${{ matrix.name }}
+          path: output
+          if-no-files-found: error
+          overwrite: false
+
+  client-build:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - name: Build exact Rust and Python release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/rust output/python
+          python3 scripts/release/release_tool.py package-rust --tag "$TAG" --repo-root . --output-dir output/rust
+          python3 scripts/release/release_tool.py package-python --tag "$TAG" --project bindings/python --candidate-dir output/python
+          shasum -a 256 output/rust/* output/python/* > output/SHA256SUMS
+      - name: Upload immutable client artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-client-${{ env.TAG }}-${{ needs.validate.outputs.commit }}
+          path: output
+          if-no-files-found: error
+          overwrite: false
+
+  platform-verify:
+    needs: [validate, platform-build]
+    strategy:
+      matrix:
+        include:
+          - name: macos
+            runner: macos-14
+          - name: linux
+            runner: ubuntu-24.04
+          - name: windows
+            runner: windows-2025
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - name: Download matching immutable platform artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-platform-${{ env.TAG }}-${{ needs.validate.outputs.commit }}-${{ matrix.name }}
+          path: input
+      - name: Verify artifact digest and execute isolated conformance broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd input && shasum -a 256 --check SHA256SUMS)
+          shopt -s nullglob
+          archives=(input/seeed-hal-broker-v"${TAG}"-*.tar.gz input/seeed-hal-broker-v"${TAG}"-*.zip)
+          if [[ "${#archives[@]}" -ne 1 ]]; then
+            echo "expected one production broker archive" >&2
+            exit 1
+          fi
+          production="${archives[0]}"
+          if [[ "$production" == *.tar.gz ]]; then
+            tar -xzf "$production" -C input
+          else
+            unzip -q "$production" -d input
+          fi
+          case "${{ matrix.name }}" in
+            macos) triple="aarch64-apple-darwin" ;;
+            linux) triple="x86_64-unknown-linux-gnu" ;;
+            windows) triple="x86_64-pc-windows-msvc" ;;
+            *) exit 1 ;;
+          esac
+          package="input/seeed-hal-broker-v${TAG}-${triple}"
+          production_broker="$package/seeed-hal-broker"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then production_broker="${production_broker}.exe"; fi
+          "$production_broker" --manifest > production-manifest.json
+          python3 scripts/release/release_tool.py verify-broker-manifest --tag "$TAG" --manifest production-manifest.json --target "${{ matrix.name }}" --targets release/targets.toml --artifact "$production_broker"
+          broker="input/virtual-${{ matrix.name }}"
+          chmod +x "$broker"
+          python3 scripts/release/release_tool.py run-virtual-conformance --platform "${{ matrix.name }}" --broker "$broker" --repo-root "$GITHUB_WORKSPACE" --command-identity "release platform artifact verification" --ref "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" > virtual.json
+          python3 - <<'PY'
+          import json, os
+          platform = os.environ["PLATFORM"]
+          tag = os.environ["TAG"]
+          commit = os.environ["COMMIT"]
+          virtual = json.load(open("virtual.json", encoding="utf-8"))
+          report = {
+              "schema": 1, "tag": tag, "commit": commit,
+              "qualification": {
+                  "software": {"id": "software-conformance", "uri": "https://github.com/" + os.environ["REPOSITORY"] + "/actions/runs/" + os.environ["RUN_ID"]},
+                  "hardware": {"id": "hardware-qualification", "uri": "https://github.com/" + os.environ["REPOSITORY"] + "/blob/" + commit + "/docs/contracts/release-artifacts.md"},
+              },
+              "software": {"status": "Partial", "jobs": [{"platform": platform, "result": "Passed", "command": "release platform artifact verification", "ref": "https://github.com/" + os.environ["REPOSITORY"] + "/actions/runs/" + os.environ["RUN_ID"]}], "virtual": virtual},
+              "hardware": {"release-hardware": {"status": "Pending", "evidence": None}},
+          }
+          with open("conformance-report.json", "w", encoding="utf-8") as output:
+              json.dump(report, output, sort_keys=True, separators=(",", ":"))
+              output.write("\n")
+          PY
+        env:
+          PLATFORM: ${{ matrix.name }}
+          COMMIT: ${{ needs.validate.outputs.commit }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+      - name: Upload verified platform conformance evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-evidence-${{ env.TAG }}-${{ needs.validate.outputs.commit }}-${{ matrix.name }}
+          path: conformance-report.json
+          if-no-files-found: error
+          overwrite: false
+
+  aggregate:
+    needs: [validate, platform-build, client-build, platform-verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-platform-${{ env.TAG }}-${{ needs.validate.outputs.commit }}-*
+          path: downloaded/platforms
+          merge-multiple: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-client-${{ env.TAG }}-${{ needs.validate.outputs.commit }}
+          path: downloaded/client
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-evidence-${{ env.TAG }}-${{ needs.validate.outputs.commit }}-*
+          path: downloaded/evidence
+          merge-multiple: false
+      - name: Fail closed on downloaded artifact digests and evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          for sums in downloaded/platforms/*/SHA256SUMS downloaded/client/SHA256SUMS; do
+            directory="$(dirname "$sums")"
+            (cd "$directory" && shasum -a 256 --check SHA256SUMS)
+          done
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          reports = []
+          for path in sorted(Path("downloaded/evidence").glob("*/conformance-report.json")):
+              reports.append(json.loads(path.read_text(encoding="utf-8")))
+          if len(reports) != 3:
+              raise SystemExit("expected exactly three platform reports")
+          jobs = [report["software"]["jobs"][0] for report in reports]
+          virtual = [item for report in reports for item in report["software"]["virtual"]]
+          if {job["platform"] for job in jobs} != {"macos", "linux", "windows"}:
+              raise SystemExit("platform report selection is incomplete")
+          if any(job["result"] != "Passed" for job in jobs) or any(item["result"] != "Passed" for item in virtual):
+              raise SystemExit("conformance evidence is not passed")
+          output = reports[0]
+          output["software"] = {"status": "Passed", "jobs": jobs, "virtual": virtual}
+          Path("report-input").mkdir()
+          Path("report-input/conformance-report.json").write_text(json.dumps(output, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+          PY
+      - name: Aggregate exact release directory and run full verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p inputs/brokers inputs/rust inputs/python
+          cp downloaded/platforms/macos/*.tar.gz inputs/brokers/
+          cp downloaded/platforms/linux/*.tar.gz inputs/brokers/
+          cp downloaded/platforms/windows/*.zip inputs/brokers/
+          cp downloaded/client/rust/*.tar.gz inputs/rust/
+          cp downloaded/client/python/* inputs/python/
+          python3 scripts/release/release_tool.py aggregate-release --tag "$TAG" --commit "${{ needs.validate.outputs.commit }}" --broker-dir inputs/brokers --rust-bundle inputs/rust --python-artifacts inputs/python --report-inputs report-input --release-dir release
+          python3 scripts/release/release_tool.py verify-static --release-dir release
+          python3 scripts/release/release_tool.py verify-artifacts --tag "$TAG" --artifacts-dir release --targets release/targets.toml --repo-root .
+          python3 - <<'PY'
+          import json
+          from scripts.release.release_tool import release_ready, validate_conformance_report
+          report = json.load(open("release/conformance-report.json", encoding="utf-8"))
+          release_ready(validate_conformance_report(report))
+          PY
+      - name: Upload immutable final release directory
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-final-${{ env.TAG }}-${{ needs.validate.outputs.commit }}
+          path: release
+          if-no-files-found: error
+          overwrite: false
+
+  attest-and-release:
+    needs: [validate, aggregate]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-final-${{ env.TAG }}-${{ needs.validate.outputs.commit }}
+          path: release
+      - name: Verify final release directory before attestation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/release/release_tool.py verify-static --release-dir release
+          python3 scripts/release/release_tool.py verify-artifacts --tag "$TAG" --artifacts-dir release --targets release/targets.toml --repo-root .
+      - name: Attest exact final release assets
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: release/*
+      - name: Create immutable prerelease after attestation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release already exists for $TAG" >&2
+            exit 1
+          fi
+          PYTHON_VERSION="${TAG#v}"
+          PYTHON_VERSION="${PYTHON_VERSION/-rc./rc}"
+          gh release create "$TAG" \
+            "release/seeed-hal-broker-v${TAG}-aarch64-apple-darwin.tar.gz" \
+            "release/seeed-hal-broker-v${TAG}-x86_64-unknown-linux-gnu.tar.gz" \
+            "release/seeed-hal-broker-v${TAG}-x86_64-pc-windows-msvc.zip" \
+            "release/seeed-hal-crates-v${TAG}.tar.gz" \
+            "release/seeed_hal-${PYTHON_VERSION}-py3-none-any.whl" \
+            "release/seeed_hal-${PYTHON_VERSION}.tar.gz" \
+            "release/release-manifest.json" \
+            "release/SHA256SUMS" \
+            "release/conformance-report.json" \
+            --prerelease --latest=false --title "$TAG"

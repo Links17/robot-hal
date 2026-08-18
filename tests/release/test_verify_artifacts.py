@@ -18,6 +18,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from scripts.release.release_tool import (
     ReleaseFailure,
     aggregate_release,
+    main,
     verify_artifacts,
     verify_static,
 )
@@ -199,6 +200,48 @@ def test_aggregate_requires_fresh_private_release_directory(tmp_path: Path) -> N
             report_inputs=tmp_path / "missing",
             release_dir=release,
         )
+
+
+def test_aggregate_cli_dispatches_all_frozen_input_directories(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def record(**kwargs: object) -> Path:
+        observed.update(kwargs)
+        return tmp_path / "release"
+
+    monkeypatch.setattr("scripts.release.release_tool.aggregate_release", record)
+
+    assert main(
+        [
+            "aggregate-release",
+            "--tag",
+            TAG,
+            "--commit",
+            COMMIT,
+            "--broker-dir",
+            str(tmp_path / "brokers"),
+            "--rust-bundle",
+            str(tmp_path / "rust"),
+            "--python-artifacts",
+            str(tmp_path / "python"),
+            "--report-inputs",
+            str(tmp_path / "report"),
+            "--release-dir",
+            str(tmp_path / "release"),
+        ]
+    ) == 0
+    assert observed == {
+        "tag": TAG,
+        "commit": COMMIT,
+        "broker_dir": tmp_path / "brokers",
+        "rust_bundle": tmp_path / "rust",
+        "python_candidate": tmp_path / "python",
+        "report_inputs": tmp_path / "report",
+        "release_dir": tmp_path / "release",
+    }
 
 
 def test_aggregate_creates_complete_mode_0700_release_directory(tmp_path: Path) -> None:

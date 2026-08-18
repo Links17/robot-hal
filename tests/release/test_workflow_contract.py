@@ -11,6 +11,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 CI = WORKFLOWS / "ci.yml"
+RELEASE = WORKFLOWS / "release-rc.yml"
 RELEASE_TOOL = REPO_ROOT / "scripts" / "release" / "release_tool.py"
 
 
@@ -192,3 +193,220 @@ def test_platform_job_separates_production_manifest_and_virtual_conformance() ->
     assert "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02" in json.dumps(
         platform_job
     )
+
+
+def _release_workflow() -> tuple[dict[str, object], dict[str, object], str]:
+    workflow = load_workflow("release-rc.yml")
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+    return workflow, jobs, RELEASE.read_text(encoding="utf-8")
+
+
+def _job_commands(job: dict[str, object]) -> str:
+    steps = job["steps"]
+    assert isinstance(steps, list)
+    return "\n".join(
+        step["run"] for step in steps if isinstance(step, dict) and "run" in step
+    )
+
+
+def test_rc_release_is_manual_or_strict_rc_tag_only() -> None:
+    workflow, _, text = _release_workflow()
+
+    assert workflow["on"] == {
+        "push": {"tags": ["v0.5.0-rc.*"]},
+        "workflow_dispatch": {
+            "inputs": {
+                "version": {
+                    "description": "Existing v0.5.0-rc.N tag to release",
+                    "required": True,
+                    "type": "string",
+                },
+                "dry_run": {
+                    "description": "Verify only; do not attest or create a release",
+                    "default": False,
+                    "required": False,
+                    "type": "boolean",
+                },
+            }
+        },
+    }
+    assert "pull_request:" not in text
+    assert "branches:" not in text
+    assert "github.ref_type == 'tag'" in text
+    assert "github.ref_name =~" not in text
+    assert '[[ "$tag" =~ ^v0\\.5\\.0-rc\\.([1-9][0-9]*)$ ]]' in text
+
+
+def test_rc_release_declares_only_required_jobs_and_read_only_default() -> None:
+    workflow, jobs, _ = _release_workflow()
+
+    assert workflow["permissions"] == {"contents": "read"}
+    assert set(jobs) == {
+        "validate",
+        "platform-build",
+        "client-build",
+        "platform-verify",
+        "aggregate",
+        "attest-and-release",
+    }
+    for name, job in jobs.items():
+        assert job["timeout-minutes"] == 45, name
+
+
+def test_rc_release_grants_write_permissions_only_to_final_job() -> None:
+    _, jobs, text = _release_workflow()
+
+    assert jobs["attest-and-release"]["permissions"] == {
+        "attestations": "write",
+        "contents": "write",
+        "id-token": "write",
+    }
+    for name, job in jobs.items():
+        if name != "attest-and-release":
+            assert "permissions" not in job, name
+    assert "packages: write" not in text
+
+
+def test_rc_release_uses_full_sha_pinned_actions_and_nonpersistent_checkout() -> None:
+    _, jobs, text = _release_workflow()
+    steps = [
+        step
+        for job in jobs.values()
+        for step in job["steps"]
+        if isinstance(step, dict)
+    ]
+    checkouts = [
+        step for step in steps if step.get("uses", "").startswith("actions/checkout@")
+    ]
+    assert checkouts
+    assert all(
+        step.get("with", {}).get("persist-credentials") is False
+        for step in checkouts
+    )
+    uses = [step["uses"] for step in steps if "uses" in step]
+    assert uses
+    assert all(
+        re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}", action)
+        for action in uses
+    )
+    for action in uses:
+        assert re.search(
+            rf"(?m)^\s*(?:-\s+)?uses:\s+{re.escape(action)}\s+#\s+.+$",
+            text,
+        )
+
+
+def test_rc_release_validate_job_fails_closed_on_identity_and_existing_release() -> None:
+    _, jobs, _ = _release_workflow()
+    commands = _job_commands(jobs["validate"])
+
+    for required in (
+        "git status --porcelain",
+        "git rev-parse",
+        "git rev-list -n 1",
+        "git tag --points-at",
+        "check-version",
+        "gh release view",
+        "git fetch --tags",
+    ):
+        assert required in commands
+    assert "gh release delete" not in commands
+    assert "git tag -f" not in commands
+    assert "git push --force" not in commands
+    assert "git fetch --force" not in commands
+
+
+def test_rc_release_builds_unique_verified_platform_and_client_artifacts() -> None:
+    _, jobs, text = _release_workflow()
+    platform_commands = _job_commands(jobs["platform-build"])
+    client_commands = _job_commands(jobs["client-build"])
+
+    for commands in (platform_commands, client_commands):
+        assert "github.run_id" not in commands
+    assert "${{ env.TAG }}" in text
+    assert "${{ needs.validate.outputs.commit }}" in text
+    for required in (
+        "package-broker",
+        "verify-broker-manifest",
+        "virtual-adapters",
+        "package-rust",
+        "package-python",
+    ):
+        assert required in platform_commands + client_commands
+    assert "release/" in text
+
+
+def test_rc_release_downloads_only_immutable_same_run_inputs_and_verifies_them() -> None:
+    _, jobs, _ = _release_workflow()
+    verify_commands = _job_commands(jobs["platform-verify"])
+    aggregate_commands = _job_commands(jobs["aggregate"])
+    serialized = json.dumps({"verify": jobs["platform-verify"], "aggregate": jobs["aggregate"]})
+
+    assert "actions/download-artifact@" in serialized
+    assert "github.run_id" not in json.dumps(
+        [
+            step
+            for job in (jobs["platform-verify"], jobs["aggregate"])
+            for step in job["steps"]
+            if step.get("uses", "").startswith("actions/download-artifact@")
+        ]
+    )
+    for commands in (verify_commands, aggregate_commands):
+        assert "shasum -a 256 --check" in commands
+    for required in (
+        "verify-static",
+        "verify-artifacts",
+        "release_ready",
+        "Passed",
+        "macos",
+        "linux",
+        "windows",
+    ):
+        assert required in aggregate_commands
+
+
+def test_rc_release_gates_attestation_and_prerelease_after_aggregate() -> None:
+    _, jobs, text = _release_workflow()
+    final_job = jobs["attest-and-release"]
+    final_commands = _job_commands(final_job)
+
+    assert final_job["needs"] == ["validate", "aggregate"]
+    assert final_job["if"] == "${{ !inputs.dry_run }}"
+    assert "actions/attest@" in text
+    assert "subject-path:" in text
+    assert "gh release create" in final_commands
+    assert "--prerelease" in final_commands
+    assert "--latest=false" in final_commands
+    assert "gh release view" in final_commands
+    assert "gh release upload" not in final_commands
+    assert "gh release edit" not in final_commands
+    assert "release-manifest.json" in final_commands
+    assert "SHA256SUMS" in final_commands
+    assert "conformance-report.json" in final_commands
+    assert "--prerelease --latest=false" in final_commands
+
+
+def test_rc_release_attests_and_publishes_only_exact_final_assets() -> None:
+    _, _, text = _release_workflow()
+
+    for required in (
+        "seeed-hal-broker-v${TAG}-aarch64-apple-darwin.tar.gz",
+        "seeed-hal-broker-v${TAG}-x86_64-unknown-linux-gnu.tar.gz",
+        "seeed-hal-broker-v${TAG}-x86_64-pc-windows-msvc.zip",
+        "seeed-hal-crates-v${TAG}.tar.gz",
+        "seeed_hal-${PYTHON_VERSION}-py3-none-any.whl",
+        "seeed_hal-${PYTHON_VERSION}.tar.gz",
+    ):
+        assert required in text
+    for forbidden in (
+        "virtual-broker",
+        "candidate/",
+        "cargo publish",
+        "twine upload",
+        "maturin publish",
+        "PYPI",
+        "CARGO_REGISTRY_TOKEN",
+        "secrets.",
+    ):
+        assert forbidden not in text
