@@ -19,6 +19,8 @@ use camera_manager::CameraManager;
 use can_manager::CanManager;
 pub use events::{EventSubscription, RuntimeEvent, RuntimeEventKind};
 use gpio_manager::GpioManager;
+#[cfg(feature = "test-support")]
+pub use gpio_manager::GpioQueueObserver;
 use registry::{CloseAction, Registry};
 use seeed_hal_adapter_shared_memory::{FrameLease, MappingDescriptor};
 use seeed_hal_camera::{
@@ -51,6 +53,8 @@ pub struct HalRuntimeBuilder {
     usb_close_timeout: Duration,
     gpio_adapter: Option<Arc<dyn GpioAdapter>>,
     gpio_close_timeout: Duration,
+    #[cfg(feature = "test-support")]
+    gpio_queue_observer: Option<GpioQueueObserver>,
     camera_adapter: Option<Arc<dyn CameraAdapter>>,
     camera_close_timeout: Duration,
 }
@@ -73,6 +77,8 @@ impl Default for HalRuntimeBuilder {
             usb_close_timeout: Duration::from_secs(2),
             gpio_adapter: None,
             gpio_close_timeout: Duration::from_secs(2),
+            #[cfg(feature = "test-support")]
+            gpio_queue_observer: None,
             camera_adapter: None,
             camera_close_timeout: Duration::from_secs(2),
         }
@@ -127,6 +133,13 @@ impl HalRuntimeBuilder {
         A: GpioAdapter + 'static,
     {
         self.gpio_adapter = Some(Arc::new(adapter));
+        self
+    }
+
+    /// Registers a test-only observer for GPIO command queue admissions.
+    #[cfg(feature = "test-support")]
+    pub fn gpio_queue_observer(mut self, observer: GpioQueueObserver) -> Self {
+        self.gpio_queue_observer = Some(observer);
         self
     }
 
@@ -192,7 +205,12 @@ impl HalRuntimeBuilder {
                 serial_close_timeout: self.serial_close_timeout,
                 can_manager,
                 usb_manager: UsbManager::new(self.usb_adapter, self.usb_close_timeout),
-                gpio_manager: GpioManager::new(self.gpio_adapter, self.gpio_close_timeout),
+                gpio_manager: GpioManager::new(
+                    self.gpio_adapter,
+                    self.gpio_close_timeout,
+                    #[cfg(feature = "test-support")]
+                    self.gpio_queue_observer,
+                ),
                 camera_manager: CameraManager::new(self.camera_adapter, self.camera_close_timeout),
             }),
         }

@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 bytes = { workspace = true }
 seeed-hal-core = { path = "../seeed-hal-core", version = "=0.5.0-rc.1"}
@@ -21,3 +24,7 @@ uuid = { workspace = true }
 async-trait = { workspace = true }
 seeed-hal-testkit = { path = "../seeed-hal-testkit", version = "=0.5.0-rc.1"}
 tokio = { workspace = true, features = ["test-util"] }
+
+[[test]]
+name = "gpio_runtime"
+required-features = ["test-support"]
