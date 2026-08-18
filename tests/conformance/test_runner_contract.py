@@ -51,14 +51,118 @@ def test_broker_command_uses_only_production_startup_arguments(tmp_path: Path) -
     assert "virtual" not in " ".join(command).lower()
 
 
-def test_runner_requires_camera_minor_three_capabilities() -> None:
+def test_runner_defines_complete_camera_minor_three_capabilities() -> None:
     runner = load_runner()
 
-    assert runner.PROTOCOL_MINOR_MINIMUM == 3
-    assert runner.PROTOCOL_MINOR_MAXIMUM == 3
     assert runner.CAMERA_CAPTURE_CAPABILITY == "camera.capture/v1"
     assert runner.CAMERA_FRAMES_SHM_CAPABILITY == "camera.frames.shm/v1"
     assert runner.CAMERA_CONTROLS_CAPABILITY == "camera.controls/v1"
+
+
+def test_protocol_minor_cli_is_exact_and_capabilities_are_repeatable(
+    monkeypatch,
+) -> None:
+    runner = load_runner()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(RUNNER),
+            "--broker",
+            "broker",
+            "--protocol-minor",
+            "1",
+            "--require-capability",
+            "can.classic/v1",
+            "--require-capability",
+            "can.fd/v1",
+        ],
+    )
+
+    args = runner.parse_args()
+
+    assert args.protocol_minor == 1
+    assert args.require_capability == ["can.classic/v1", "can.fd/v1"]
+
+
+def test_protocol_minor_cli_defaults_to_latest_profile(monkeypatch) -> None:
+    runner = load_runner()
+    monkeypatch.setattr(sys, "argv", [str(RUNNER), "--broker", "broker"])
+
+    args = runner.parse_args()
+
+    assert args.protocol_minor == 3
+    assert args.require_capability == []
+
+
+def test_explicit_required_capabilities_replace_profile_defaults() -> None:
+    runner = load_runner()
+
+    assert runner.required_capabilities_for_run(2, ()) == runner.capabilities_for_minor(2)
+    assert runner.required_capabilities_for_run(
+        2, ("usb.control/v1", "gpio.lines/v1")
+    ) == ("usb.control/v1", "gpio.lines/v1")
+
+
+class HandshakeTransport:
+    def __init__(self, protocol_minor: int, capabilities: tuple[str, ...]) -> None:
+        self.sent = []
+        self.frame_limit = None
+        self.response = hal_pb2.Envelope(
+            request_id=1,
+            handshake_response=hal_pb2.HandshakeResponse(
+                protocol_major=1,
+                protocol_minor=protocol_minor,
+                capabilities=capabilities,
+                max_frame_bytes=1024 * 1024,
+                max_read_bytes=64 * 1024,
+                max_write_bytes=64 * 1024,
+                protocol_minor_minimum=0,
+                protocol_minor_maximum=3,
+            ),
+        ).SerializeToString()
+
+    async def send(self, payload: bytes) -> None:
+        self.sent.append(hal_pb2.Envelope.FromString(payload))
+
+    async def receive(self) -> bytes:
+        return self.response
+
+    async def close(self) -> None:
+        return None
+
+    def set_frame_limit(self, frame_limit: int) -> None:
+        self.frame_limit = frame_limit
+
+
+@pytest.mark.asyncio
+async def test_handshake_offers_and_requires_the_exact_selected_profile() -> None:
+    runner = load_runner()
+    required = ("can.classic/v1",)
+    transport = HandshakeTransport(1, required)
+    client = runner.RawClient(transport, timeout=0.2)
+
+    await client.handshake(bytes(32), minor=1, required_capabilities=required)
+
+    request = transport.sent[0].handshake_request
+    assert request.protocol_minor == 1
+    assert request.protocol_minor_minimum == 1
+    assert request.protocol_minor_maximum == 1
+    assert list(request.required_capabilities) == ["can.classic/v1"]
+
+
+@pytest.mark.asyncio
+async def test_handshake_rejects_a_selection_other_than_the_exact_offer() -> None:
+    runner = load_runner()
+    transport = HandshakeTransport(2, runner.capabilities_for_minor(2))
+    client = runner.RawClient(transport, timeout=0.2)
+
+    with pytest.raises(AssertionError, match="exact offered protocol minor"):
+        await client.handshake(
+            bytes(32),
+            minor=1,
+            required_capabilities=runner.capabilities_for_minor(1),
+        )
 
 
 def test_camera_runner_exercises_control_read_write_and_auto() -> None:

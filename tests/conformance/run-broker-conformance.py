@@ -26,12 +26,13 @@ from seeed_hal.transport_unix import UnixFramedTransport  # noqa: E402
 
 
 PROTOCOL_MAJOR = 1
-PROTOCOL_MINOR_MINIMUM = 3
 PROTOCOL_MINOR_MAXIMUM = 3
-PROTOCOL_MINOR = PROTOCOL_MINOR_MAXIMUM
 SERIAL_CAPABILITY = "serial.bytes/v1"
 CAN_CLASSIC_CAPABILITY = "can.classic/v1"
 CAN_FD_CAPABILITY = "can.fd/v1"
+CAN_CONFIGURE_CAPABILITY = "can.configure/v1"
+CAN_ERROR_FRAMES_CAPABILITY = "can.error-frames/v1"
+CAN_RX_TIMESTAMP_CAPABILITY = "can.rx-timestamp/v1"
 USB_CONTROL_CAPABILITY = "usb.control/v1"
 USB_BULK_CAPABILITY = "usb.bulk/v1"
 USB_INTERRUPT_CAPABILITY = "usb.interrupt/v1"
@@ -43,6 +44,81 @@ CAMERA_CONTROLS_CAPABILITY = "camera.controls/v1"
 TRANSFER_LIMIT = 64 * 1024
 FRAME_LIMIT = 1024 * 1024
 DIAGNOSTIC_LIMIT = 64 * 1024
+
+
+def capabilities_for_minor(minor: int) -> tuple[str, ...]:
+    profiles = (
+        (SERIAL_CAPABILITY,),
+        (
+            SERIAL_CAPABILITY,
+            CAN_CLASSIC_CAPABILITY,
+            CAN_FD_CAPABILITY,
+            CAN_CONFIGURE_CAPABILITY,
+            CAN_ERROR_FRAMES_CAPABILITY,
+            CAN_RX_TIMESTAMP_CAPABILITY,
+        ),
+        (
+            SERIAL_CAPABILITY,
+            CAN_CLASSIC_CAPABILITY,
+            CAN_FD_CAPABILITY,
+            CAN_CONFIGURE_CAPABILITY,
+            CAN_ERROR_FRAMES_CAPABILITY,
+            CAN_RX_TIMESTAMP_CAPABILITY,
+            USB_CONTROL_CAPABILITY,
+            USB_BULK_CAPABILITY,
+            USB_INTERRUPT_CAPABILITY,
+            GPIO_LINES_CAPABILITY,
+            GPIO_EDGES_CAPABILITY,
+        ),
+        (
+            SERIAL_CAPABILITY,
+            CAN_CLASSIC_CAPABILITY,
+            CAN_FD_CAPABILITY,
+            CAN_CONFIGURE_CAPABILITY,
+            CAN_ERROR_FRAMES_CAPABILITY,
+            CAN_RX_TIMESTAMP_CAPABILITY,
+            USB_CONTROL_CAPABILITY,
+            USB_BULK_CAPABILITY,
+            USB_INTERRUPT_CAPABILITY,
+            GPIO_LINES_CAPABILITY,
+            GPIO_EDGES_CAPABILITY,
+            CAMERA_CAPTURE_CAPABILITY,
+            CAMERA_FRAMES_SHM_CAPABILITY,
+            CAMERA_CONTROLS_CAPABILITY,
+        ),
+    )
+    if minor < 0 or minor >= len(profiles):
+        raise ValueError(f"unsupported protocol minor {minor}")
+    return profiles[minor]
+
+
+def required_capabilities_for_run(
+    minor: int, requested: tuple[str, ...]
+) -> tuple[str, ...]:
+    return requested or capabilities_for_minor(minor)
+
+
+def later_operation_for_minor(minor: int) -> str | None:
+    probes = {
+        0: "enumerate_can_request",
+        1: "enumerate_usb_request",
+        2: "enumerate_camera_request",
+        3: None,
+    }
+    if minor not in probes:
+        raise ValueError(f"unsupported protocol minor {minor}")
+    return probes[minor]
+
+
+def later_operation_error_for_minor(minor: int) -> str:
+    errors = {
+        0: "runtime.protocol.capability_unsupported",
+        1: "runtime.protocol.unsupported_capability",
+        2: "runtime.protocol.unsupported_capability",
+    }
+    if minor not in errors:
+        raise ValueError(f"protocol minor {minor} has no later operation probe")
+    return errors[minor]
 
 
 def endpoint_for_platform(directory: Path, nonce: str, os_name: str) -> str:
@@ -219,51 +295,39 @@ class RawClient:
 
         return await _await_with_cap(exchange(), self.timeout)
 
-    async def handshake(self, token: bytes) -> None:
+    async def handshake(
+        self,
+        token: bytes,
+        *,
+        minor: int,
+        required_capabilities: tuple[str, ...],
+    ) -> None:
         response = await self.request(
             "handshake_request",
             hal_pb2.HandshakeRequest(
                 startup_token=token,
                 protocol_major=PROTOCOL_MAJOR,
-                protocol_minor=PROTOCOL_MINOR,
-                required_capabilities=[
-                    SERIAL_CAPABILITY,
-                    CAN_CLASSIC_CAPABILITY,
-                    CAN_FD_CAPABILITY,
-                    USB_CONTROL_CAPABILITY,
-                    USB_BULK_CAPABILITY,
-                    USB_INTERRUPT_CAPABILITY,
-                    GPIO_LINES_CAPABILITY,
-                    GPIO_EDGES_CAPABILITY,
-                    CAMERA_CAPTURE_CAPABILITY,
-                    CAMERA_FRAMES_SHM_CAPABILITY,
-                    CAMERA_CONTROLS_CAPABILITY,
-                ],
+                protocol_minor=minor,
+                required_capabilities=required_capabilities,
                 max_frame_bytes=FRAME_LIMIT,
                 max_read_bytes=TRANSFER_LIMIT,
                 max_write_bytes=TRANSFER_LIMIT,
-                protocol_minor_minimum=PROTOCOL_MINOR_MINIMUM,
-                protocol_minor_maximum=PROTOCOL_MINOR_MAXIMUM,
+                protocol_minor_minimum=minor,
+                protocol_minor_maximum=minor,
             ),
         )
         _expect_payload(response, "handshake_response")
         handshake = response.handshake_response
         _require(handshake.protocol_major == PROTOCOL_MAJOR, "protocol major mismatch")
         _require(
-            PROTOCOL_MINOR_MINIMUM <= handshake.protocol_minor <= PROTOCOL_MINOR_MAXIMUM,
-            "selected protocol minor is outside the offered range",
+            handshake.protocol_minor == minor,
+            "selected protocol minor differs from exact offered protocol minor",
         )
-        _require(SERIAL_CAPABILITY in handshake.capabilities, "Serial capability missing")
-        _require(CAN_CLASSIC_CAPABILITY in handshake.capabilities, "Classic CAN capability missing")
-        _require(CAN_FD_CAPABILITY in handshake.capabilities, "CAN FD capability missing")
-        _require(USB_CONTROL_CAPABILITY in handshake.capabilities, "USB Control capability missing")
-        _require(USB_BULK_CAPABILITY in handshake.capabilities, "USB Bulk capability missing")
-        _require(USB_INTERRUPT_CAPABILITY in handshake.capabilities, "USB Interrupt capability missing")
-        _require(GPIO_LINES_CAPABILITY in handshake.capabilities, "GPIO lines capability missing")
-        _require(GPIO_EDGES_CAPABILITY in handshake.capabilities, "GPIO edges capability missing")
-        _require(CAMERA_CAPTURE_CAPABILITY in handshake.capabilities, "Camera capture capability missing")
-        _require(CAMERA_FRAMES_SHM_CAPABILITY in handshake.capabilities, "Camera frames capability missing")
-        _require(CAMERA_CONTROLS_CAPABILITY in handshake.capabilities, "Camera controls capability missing")
+        for capability in required_capabilities:
+            _require(
+                capability in handshake.capabilities,
+                f"required capability missing: {capability}",
+            )
         self.transport.set_frame_limit(handshake.max_frame_bytes)
 
     async def close(self) -> None:
@@ -631,100 +695,143 @@ async def _exercise_camera(client: RawClient) -> None:
     )
 
 
-async def exercise_contract(endpoint: str, token: bytes, timeout: float) -> None:
+async def _probe_later_operation(client: RawClient, minor: int) -> None:
+    payload_name = later_operation_for_minor(minor)
+    if payload_name is None:
+        return
+    payloads = {
+        "enumerate_can_request": hal_pb2.EnumerateCanRequest,
+        "enumerate_usb_request": hal_pb2.EnumerateUsbRequest,
+        "enumerate_camera_request": hal_pb2.EnumerateCameraRequest,
+    }
+    response = await client.request(payload_name, payloads[payload_name]())
+    _require(
+        response.WhichOneof("payload") == "error",
+        f"later-minor operation {payload_name} was accepted",
+    )
+    _require(
+        response.error.name == later_operation_error_for_minor(minor),
+        f"unexpected later-minor operation error {response.error.name}",
+    )
+
+
+async def _exercise_serial(client: RawClient) -> tuple[object, object]:
+    enumerated = await client.request(
+        "enumerate_serial_request", hal_pb2.EnumerateSerialRequest()
+    )
+    resources = _expect_payload(enumerated, "enumerate_serial_response").resources
+    _require(len(resources) == 1, f"expected one virtual Serial resource, got {len(resources)}")
+    descriptor = resources[0]
+    _require(
+        descriptor.properties.get("adapter") == "virtual",
+        "broker was not built with the virtual adapter",
+    )
+
+    opened = _expect_payload(await _open_serial(client, descriptor), "open_serial_response")
+    first_session = opened.session_id
+    first_lease = _lease_copy(opened.lease)
+    _require(first_lease.generation > 0, "lease generation must be nonzero")
+
+    payload = b"seeed-hal-black-box"
+    _expect_payload(
+        await client.request(
+            "serial_write_request",
+            hal_pb2.SerialWriteRequest(
+                session_id=first_session, lease=first_lease, data=payload
+            ),
+        ),
+        "serial_write_response",
+    )
+    _expect_payload(
+        await client.request(
+            "serial_flush_request",
+            hal_pb2.SerialFlushRequest(session_id=first_session, lease=first_lease),
+        ),
+        "serial_flush_response",
+    )
+    _expect_payload(
+        await client.request(
+            "set_serial_control_lines_request",
+            hal_pb2.SetSerialControlLinesRequest(
+                session_id=first_session,
+                lease=first_lease,
+                data_terminal_ready=True,
+                request_to_send=True,
+            ),
+        ),
+        "set_serial_control_lines_response",
+    )
+    read = _expect_payload(
+        await client.request(
+            "serial_read_request",
+            hal_pb2.SerialReadRequest(
+                session_id=first_session,
+                lease=first_lease,
+                max_bytes=len(payload),
+            ),
+        ),
+        "serial_read_response",
+    )
+    _require(read.data == payload, "virtual Serial round trip changed payload bytes")
+
+    _expect_payload(
+        await client.request(
+            "close_session_request",
+            hal_pb2.CloseSessionRequest(
+                session_id=first_session, lease=first_lease
+            ),
+        ),
+        "close_session_response",
+    )
+    reopened = _expect_payload(await _open_serial(client, descriptor), "open_serial_response")
+    _require(
+        reopened.lease.generation > first_lease.generation,
+        "resource reuse did not advance the fencing generation",
+    )
+    stale = await client.request(
+        "serial_write_request",
+        hal_pb2.SerialWriteRequest(
+            session_id=reopened.session_id, lease=first_lease, data=b"stale"
+        ),
+    )
+    _require(stale.WhichOneof("payload") == "error", "stale lease was accepted")
+    _require(
+        stale.error.name == "runtime.lease.stale_generation",
+        f"unexpected stale lease error {stale.error.name}",
+    )
+    return descriptor, reopened
+
+
+async def exercise_contract(
+    endpoint: str,
+    token: bytes,
+    timeout: float,
+    *,
+    minor: int = PROTOCOL_MINOR_MAXIMUM,
+    required_capabilities: tuple[str, ...] | None = None,
+) -> None:
+    required = (
+        capabilities_for_minor(minor)
+        if required_capabilities is None
+        else required_capabilities
+    )
     first = RawClient(
         await _await_with_cap(connect_transport(endpoint), timeout), timeout
     )
     second = None
     try:
-        await first.handshake(token)
-        await _exercise_can(first)
-        await _exercise_usb(first)
-        await _exercise_gpio(first)
-        await _exercise_camera(first)
-        enumerated = await first.request(
-            "enumerate_serial_request", hal_pb2.EnumerateSerialRequest()
+        await first.handshake(
+            token, minor=minor, required_capabilities=required
         )
-        resources = _expect_payload(enumerated, "enumerate_serial_response").resources
-        _require(len(resources) == 1, f"expected one virtual Serial resource, got {len(resources)}")
-        descriptor = resources[0]
-        _require(
-            descriptor.properties.get("adapter") == "virtual",
-            "broker was not built with the virtual adapter",
-        )
-
-        opened = _expect_payload(await _open_serial(first, descriptor), "open_serial_response")
-        first_session = opened.session_id
-        first_lease = _lease_copy(opened.lease)
-        _require(first_lease.generation > 0, "lease generation must be nonzero")
-
-        payload = b"seeed-hal-black-box"
-        _expect_payload(
-            await first.request(
-                "serial_write_request",
-                hal_pb2.SerialWriteRequest(
-                    session_id=first_session, lease=first_lease, data=payload
-                ),
-            ),
-            "serial_write_response",
-        )
-        _expect_payload(
-            await first.request(
-                "serial_flush_request",
-                hal_pb2.SerialFlushRequest(session_id=first_session, lease=first_lease),
-            ),
-            "serial_flush_response",
-        )
-        _expect_payload(
-            await first.request(
-                "set_serial_control_lines_request",
-                hal_pb2.SetSerialControlLinesRequest(
-                    session_id=first_session,
-                    lease=first_lease,
-                    data_terminal_ready=True,
-                    request_to_send=True,
-                ),
-            ),
-            "set_serial_control_lines_response",
-        )
-        read = _expect_payload(
-            await first.request(
-                "serial_read_request",
-                hal_pb2.SerialReadRequest(
-                    session_id=first_session,
-                    lease=first_lease,
-                    max_bytes=len(payload),
-                ),
-            ),
-            "serial_read_response",
-        )
-        _require(read.data == payload, "virtual Serial round trip changed payload bytes")
-
-        _expect_payload(
-            await first.request(
-                "close_session_request",
-                hal_pb2.CloseSessionRequest(
-                    session_id=first_session, lease=first_lease
-                ),
-            ),
-            "close_session_response",
-        )
-        reopened = _expect_payload(await _open_serial(first, descriptor), "open_serial_response")
-        _require(
-            reopened.lease.generation > first_lease.generation,
-            "resource reuse did not advance the fencing generation",
-        )
-        stale = await first.request(
-            "serial_write_request",
-            hal_pb2.SerialWriteRequest(
-                session_id=reopened.session_id, lease=first_lease, data=b"stale"
-            ),
-        )
-        _require(stale.WhichOneof("payload") == "error", "stale lease was accepted")
-        _require(
-            stale.error.name == "runtime.lease.stale_generation",
-            f"unexpected stale lease error {stale.error.name}",
-        )
+        descriptor, _reopened = await _exercise_serial(first)
+        if minor >= 1:
+            await _exercise_can(first)
+        if minor >= 2:
+            await _exercise_usb(first)
+            await _exercise_gpio(first)
+        if minor >= 3:
+            await _exercise_camera(first)
+        await _probe_later_operation(first, minor)
 
         # Abruptly disconnect with the reopened session still owned. A fresh owner
         # must be able to reuse the resource after broker cleanup completes.
@@ -733,7 +840,9 @@ async def exercise_contract(endpoint: str, token: bytes, timeout: float) -> None
         async def wait_for_resource_reuse() -> None:
             nonlocal second
             second = RawClient(await connect_transport(endpoint), timeout)
-            await second.handshake(token)
+            await second.handshake(
+                token, minor=minor, required_capabilities=required
+            )
             while True:
                 response = await _open_serial(second, descriptor)
                 if response.WhichOneof("payload") == "open_serial_response":
@@ -774,7 +883,13 @@ async def _graceful_shutdown(process, timeout: float) -> None:
     _require(process.returncode == 0, f"broker shutdown returned {process.returncode}")
 
 
-async def run(broker: Path, timeout: float) -> None:
+async def run(
+    broker: Path,
+    timeout: float,
+    *,
+    minor: int,
+    required_capabilities: tuple[str, ...],
+) -> None:
     broker = broker.resolve()
     _require(broker.is_file(), f"broker executable not found: {broker}")
     with tempfile.TemporaryDirectory(prefix="seeed-hal-conformance-") as temporary:
@@ -806,7 +921,13 @@ async def run(broker: Path, timeout: float) -> None:
         )
         try:
             await _wait_for_readiness(process, endpoint, timeout)
-            await exercise_contract(endpoint, token, timeout)
+            await exercise_contract(
+                endpoint,
+                token,
+                timeout,
+                minor=minor,
+                required_capabilities=required_capabilities,
+            )
             await _graceful_shutdown(process, timeout)
         finally:
             stderr = (await cleanup_process(process, diagnostics, timeout)).decode(
@@ -820,6 +941,18 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--broker", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=10.0)
+    parser.add_argument(
+        "--protocol-minor",
+        type=int,
+        choices=range(PROTOCOL_MINOR_MAXIMUM + 1),
+        default=PROTOCOL_MINOR_MAXIMUM,
+    )
+    parser.add_argument(
+        "--require-capability",
+        action="append",
+        default=[],
+        help="require this exact capability; repeat to require more",
+    )
     args = parser.parse_args()
     if args.timeout <= 0:
         parser.error("--timeout must be greater than zero")
@@ -828,12 +961,22 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    required_capabilities = required_capabilities_for_run(
+        args.protocol_minor, tuple(args.require_capability)
+    )
     try:
-        asyncio.run(run(args.broker, args.timeout))
+        asyncio.run(
+            run(
+                args.broker,
+                args.timeout,
+                minor=args.protocol_minor,
+                required_capabilities=required_capabilities,
+            )
+        )
     except (AssertionError, asyncio.TimeoutError, OSError) as error:
         print(f"broker conformance failed: {error}", file=sys.stderr)
         return 1
-    print("broker conformance passed: Serial, CAN, USB, GPIO, and Camera contract checks")
+    print(f"broker conformance passed: protocol minor {args.protocol_minor} profile")
     return 0
 
 
