@@ -256,3 +256,73 @@ The macOS arm64 release build, runtime manifest generation,
   artifact directories or explicit operator cleanup are therefore required.
 - Linux and Windows native binary build/runtime verification remains outside
   this macOS arm64 execution.
+
+---
+
+## Important Review Follow-up: Isolated Output Directory Contract
+
+### Status
+
+DONE
+
+### RED Evidence
+
+A deterministic external-writer regression injected a final archive after the
+package reservation was acquired but before publication:
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_package_broker.py
+```
+
+Result: `1 failed, 13 passed`. The old path called `os.replace` and silently
+overwrote the injected external bytes.
+
+### Changes
+
+- `package-broker` now creates and exclusively owns a requested output directory
+  that must not already exist. It is therefore a per-invocation isolated artifact
+  directory, suitable for the existing per-platform release jobs and later
+  aggregation into a separate complete release directory.
+- It snapshots the only two permitted in-progress entries (its hidden
+  reservation and private staging directory) after staging is created and
+  immediately before `os.replace`.
+- Any external final archive, stale artifact, reservation, or other output
+  entry changes the snapshot and returns
+  `release.artifact.unexpected`; publication is not attempted. The detected
+  external file is retained byte-for-byte.
+- This is an honest safety precondition rather than a claim of a universal
+  cross-platform atomic no-clobber primitive: the caller supplies a fresh output
+  path and must not permit arbitrary writers during publication.
+
+### GREEN Evidence
+
+```bash
+uv run --project bindings/python --python 3.11 --frozen \
+  pytest -q tests/release/test_package_broker.py
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+python3 -m compileall -q scripts/release tests/release
+git diff --check
+```
+
+Result: Task 5 focused suite `14 passed`; complete release suite `123 passed`;
+Python compilation and whitespace validation exited 0. The external-writer case
+asserts stable failure and unchanged external bytes.
+
+The macOS arm64 release build, runtime manifest generation,
+`package-broker.sh`, and manifest verification were re-run successfully.
+
+### Commit
+
+`fix(release): require isolated broker output`
+
+### Concerns
+
+- The portable standard library has no operation that atomically couples
+  “destination absent” with replacement on both POSIX and Windows. This task
+  therefore deliberately constrains publication to a fresh, exclusively owned
+  per-invocation directory and verifies it before replacement; callers
+  that allow arbitrary external writers after that final verification violate
+  the contract.
+- Linux and Windows native binary build/runtime validation remains outside
+  this macOS arm64 execution.

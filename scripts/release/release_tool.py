@@ -1182,6 +1182,44 @@ def _reserve_package_archive(path: Path) -> None:
         os.close(descriptor)
 
 
+def _package_output_entries(output_dir: Path) -> frozenset[str]:
+    try:
+        return frozenset(path.name for path in output_dir.iterdir())
+    except OSError as error:
+        raise ReleaseFailure(
+            "release.package.invalid",
+            "unable to inspect package output directory",
+        ) from error
+
+
+def _require_package_output_entries(
+    output_dir: Path,
+    expected: frozenset[str],
+) -> None:
+    if _package_output_entries(output_dir) != expected:
+        raise ReleaseFailure(
+            "release.artifact.unexpected",
+            "package output directory changed during publication",
+        )
+
+
+def _create_package_output_directory(output_dir: Path) -> None:
+    try:
+        output_dir.mkdir(parents=True)
+    except FileExistsError as error:
+        raise ReleaseFailure(
+            "release.artifact.unexpected",
+            "package output directory already exists",
+        ) from error
+    except OSError as error:
+        raise ReleaseFailure(
+            "release.package.invalid",
+            "unable to create package output directory",
+        ) from error
+    if output_dir.is_symlink() or not output_dir.is_dir():
+        _package_invalid("package output directory is invalid")
+
+
 def _package_members(
     root: str,
     binary_name: str,
@@ -1328,27 +1366,20 @@ def package_broker(
         if not resolved_root.is_dir() or repo_root.is_symlink():
             _package_invalid("repository root is invalid")
         root = _package_root(version, target)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        if output_dir.is_symlink() or not output_dir.is_dir():
-            _package_invalid("package output directory is invalid")
+        _create_package_output_directory(output_dir)
+        _require_package_output_entries(output_dir, frozenset())
         archive_path = output_dir / _package_archive_name(version, target)
-        if archive_path.exists():
-            raise ReleaseFailure(
-                "release.artifact.unexpected",
-                "final broker archive already exists",
-            )
         reservation_path = _package_reservation_path(output_dir, archive_path.name)
         _reserve_package_archive(reservation_path)
         owns_reservation = True
-        if archive_path.exists():
-            raise ReleaseFailure(
-                "release.artifact.unexpected",
-                "final broker archive already exists",
-            )
         staging_dir = Path(
             tempfile.mkdtemp(prefix=".package-broker-", dir=output_dir)
         )
         staging_dir.chmod(0o700)
+        _require_package_output_entries(
+            output_dir,
+            frozenset({reservation_path.name, staging_dir.name}),
+        )
         frozen_binary, frozen_manifest = _freeze_package_inputs(
             staging_dir,
             binary_name,
@@ -1380,6 +1411,10 @@ def package_broker(
             staged_archive,
             expected_root=root,
             expected_files={name.rsplit("/", 1)[1] for name, _, _ in members},
+        )
+        _require_package_output_entries(
+            output_dir,
+            frozenset({reservation_path.name, staging_dir.name}),
         )
         os.replace(staged_archive, archive_path)
         return archive_path

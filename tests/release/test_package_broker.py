@@ -293,19 +293,10 @@ def test_packaging_uses_frozen_staged_input_copies(
 
 def test_concurrent_publish_reserves_final_archive_without_overwrite(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo, targets = _fixture_repo(tmp_path)
     output = tmp_path / "output"
-    barrier = threading.Barrier(2)
-    original_reserve = release_tool._reserve_package_archive
     results: list[Path | ReleaseFailure] = []
-
-    def synchronized_reserve(path: Path) -> None:
-        barrier.wait(timeout=5)
-        original_reserve(path)
-
-    monkeypatch.setattr(release_tool, "_reserve_package_archive", synchronized_reserve)
 
     def publish(label: str) -> None:
         source = tmp_path / label
@@ -376,6 +367,44 @@ def test_existing_reservation_fails_closed_without_removal(tmp_path: Path) -> No
 
     assert failure.value.name == "release.artifact.unexpected"
     assert reservation.read_bytes() == b"unknown publisher reservation"
+
+
+def test_external_final_after_reservation_is_not_overwritten(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, targets = _fixture_repo(tmp_path)
+    binary = tmp_path / "seeed-hal-broker"
+    binary.write_bytes(b"broker fixture\n")
+    manifest = tmp_path / "broker-manifest.json"
+    _write_fixture_manifest("macos", binary, manifest)
+    output = tmp_path / "output"
+    external_bytes = b"external publisher archive"
+    original_mkdtemp = release_tool.tempfile.mkdtemp
+
+    def stage_then_publish_external_final(*args, **kwargs) -> str:
+        staging = original_mkdtemp(*args, **kwargs)
+        (output / "seeed-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin.tar.gz").write_bytes(
+            external_bytes
+        )
+        return staging
+
+    monkeypatch.setattr(release_tool.tempfile, "mkdtemp", stage_then_publish_external_final)
+
+    with pytest.raises(ReleaseFailure) as failure:
+        package_broker(
+            tag="v0.5.0-rc.1",
+            target_name="macos",
+            targets_path=targets,
+            binary_path=binary,
+            output_dir=output,
+            manifest_path=manifest,
+            repo_root=repo,
+        )
+
+    assert failure.value.name == "release.artifact.unexpected"
+    archive = output / "seeed-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin.tar.gz"
+    assert archive.read_bytes() == external_bytes
 
 
 def test_cli_rejects_missing_tag_with_stable_failure(tmp_path: Path) -> None:
