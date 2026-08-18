@@ -16,6 +16,26 @@ use uuid::Uuid;
 
 const COMMAND_QUEUE_CAPACITY: usize = 64;
 
+/// Observes USB command admissions in tests.
+#[cfg(feature = "test-support")]
+#[derive(Clone)]
+pub struct UsbQueueObserver {
+    admitted: watch::Sender<usize>,
+}
+
+#[cfg(feature = "test-support")]
+impl UsbQueueObserver {
+    /// Creates an observer and its monotonically increasing admission counter.
+    pub fn new() -> (Self, watch::Receiver<usize>) {
+        let (admitted, observed) = watch::channel(0);
+        (Self { admitted }, observed)
+    }
+
+    fn record_admission(&self) {
+        self.admitted.send_modify(|count| *count += 1);
+    }
+}
+
 struct Entry {
     resource: ResourceId,
     owner: OwnerId,
@@ -31,6 +51,8 @@ pub(crate) struct UsbManager {
     adapter: Option<Arc<dyn UsbAdapter>>,
     state: Arc<Mutex<State>>,
     close_timeout: Duration,
+    #[cfg(feature = "test-support")]
+    queue_observer: Option<UsbQueueObserver>,
 }
 
 enum UsbCommand {
@@ -53,6 +75,8 @@ struct UsbWorker {
     commands: mpsc::Sender<UsbCommand>,
     shutdown: watch::Sender<bool>,
     completion: watch::Receiver<Option<HalResult<()>>>,
+    #[cfg(feature = "test-support")]
+    queue_observer: Option<UsbQueueObserver>,
 }
 
 impl UsbWorker {
@@ -68,7 +92,12 @@ impl UsbWorker {
                     "the bounded USB interface command queue has reached its 64-command capacity",
                 ),
                 mpsc::error::TrySendError::Closed(_) => actor_unavailable(operation),
-            })
+            })?;
+        #[cfg(feature = "test-support")]
+        if let Some(observer) = &self.queue_observer {
+            observer.record_admission();
+        }
+        Ok(())
     }
 
     fn request_close(&self) {
@@ -100,6 +129,7 @@ fn spawn_worker(
     adapter: Arc<dyn UsbAdapter>,
     selector: ResourceSelector,
     claim: UsbInterfaceClaim,
+    #[cfg(feature = "test-support")] queue_observer: Option<UsbQueueObserver>,
 ) -> HalResult<(UsbWorker, oneshot::Receiver<HalResult<()>>)> {
     let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
         runtime_error(
@@ -179,6 +209,8 @@ fn spawn_worker(
             commands,
             shutdown,
             completion,
+            #[cfg(feature = "test-support")]
+            queue_observer,
         },
         opened_rx,
     ))
@@ -205,11 +237,17 @@ fn session_closed(operation: &'static str) -> seeed_hal_core::HalError {
 }
 
 impl UsbManager {
-    pub(crate) fn new(adapter: Option<Arc<dyn UsbAdapter>>, close_timeout: Duration) -> Self {
+    pub(crate) fn new(
+        adapter: Option<Arc<dyn UsbAdapter>>,
+        close_timeout: Duration,
+        #[cfg(feature = "test-support")] queue_observer: Option<UsbQueueObserver>,
+    ) -> Self {
         Self {
             adapter,
             state: Arc::new(Mutex::new(State::default())),
             close_timeout,
+            #[cfg(feature = "test-support")]
+            queue_observer,
         }
     }
 
@@ -269,7 +307,13 @@ impl UsbManager {
                 .leases
                 .reserve_control(descriptor.id().clone(), id.clone(), owner.clone())?
         };
-        let (worker, opened) = match spawn_worker(adapter, selector, claim) {
+        let (worker, opened) = match spawn_worker(
+            adapter,
+            selector,
+            claim,
+            #[cfg(feature = "test-support")]
+            self.queue_observer.clone(),
+        ) {
             Ok(worker) => worker,
             Err(e) => {
                 self.state.lock().await.leases.release(descriptor.id(), &id);

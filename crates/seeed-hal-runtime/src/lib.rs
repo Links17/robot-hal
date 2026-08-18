@@ -40,6 +40,8 @@ use seeed_hal_usb::{UsbAdapter, UsbInterfaceClaim, UsbTransfer};
 use serial_actor::{ActorMetadata, SerialCommand, spawn_serial_actor};
 use tokio::sync::{Mutex, oneshot, watch};
 use usb_manager::UsbManager;
+#[cfg(feature = "test-support")]
+pub use usb_manager::UsbQueueObserver;
 use uuid::Uuid;
 
 pub struct HalRuntimeBuilder {
@@ -51,6 +53,8 @@ pub struct HalRuntimeBuilder {
     can_close_timeout: Duration,
     usb_adapter: Option<Arc<dyn UsbAdapter>>,
     usb_close_timeout: Duration,
+    #[cfg(feature = "test-support")]
+    usb_queue_observer: Option<UsbQueueObserver>,
     gpio_adapter: Option<Arc<dyn GpioAdapter>>,
     gpio_close_timeout: Duration,
     #[cfg(feature = "test-support")]
@@ -75,6 +79,8 @@ impl Default for HalRuntimeBuilder {
             can_close_timeout: Duration::from_secs(2),
             usb_adapter: None,
             usb_close_timeout: Duration::from_secs(2),
+            #[cfg(feature = "test-support")]
+            usb_queue_observer: None,
             gpio_adapter: None,
             gpio_close_timeout: Duration::from_secs(2),
             #[cfg(feature = "test-support")]
@@ -125,6 +131,13 @@ impl HalRuntimeBuilder {
     /// blocked in backend I/O keeps its native session and lease quarantined.
     pub fn usb_close_timeout(mut self, timeout: Duration) -> Self {
         self.usb_close_timeout = timeout;
+        self
+    }
+
+    /// Registers a test-only observer for USB command queue admissions.
+    #[cfg(feature = "test-support")]
+    pub fn usb_queue_observer(mut self, observer: UsbQueueObserver) -> Self {
+        self.usb_queue_observer = Some(observer);
         self
     }
 
@@ -204,7 +217,12 @@ impl HalRuntimeBuilder {
                 events,
                 serial_close_timeout: self.serial_close_timeout,
                 can_manager,
-                usb_manager: UsbManager::new(self.usb_adapter, self.usb_close_timeout),
+                usb_manager: UsbManager::new(
+                    self.usb_adapter,
+                    self.usb_close_timeout,
+                    #[cfg(feature = "test-support")]
+                    self.usb_queue_observer,
+                ),
                 gpio_manager: GpioManager::new(
                     self.gpio_adapter,
                     self.gpio_close_timeout,
