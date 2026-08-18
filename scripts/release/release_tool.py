@@ -2176,6 +2176,21 @@ def _write_deterministic_tar(
                 directory.gname = ""
                 directory.mtime = 0
                 archive.addfile(directory)
+                directories = {
+                    PurePosixPath(name).parent.as_posix()
+                    for name, _, _ in members
+                    if PurePosixPath(name).parent.as_posix() != root
+                }
+                for name in sorted(directories, key=lambda item: (item.count("/"), item)):
+                    directory = tarfile.TarInfo(name)
+                    directory.type = tarfile.DIRTYPE
+                    directory.mode = 0o755
+                    directory.uid = 0
+                    directory.gid = 0
+                    directory.uname = ""
+                    directory.gname = ""
+                    directory.mtime = 0
+                    archive.addfile(directory)
                 for name, path, mode in members:
                     contents = path.read_bytes()
                     info = tarfile.TarInfo(name)
@@ -2502,83 +2517,96 @@ def _require_clean_repository(repo_root: Path) -> None:
     _package_invalid("unable to verify repository state")
 
 
-def _crate_root_and_files(crate: Path) -> tuple[str, set[str]]:
-    try:
-        with tarfile.open(crate, "r:gz") as archive:
-            members = archive.getmembers()
-    except (OSError, tarfile.TarError) as error:
-        raise ReleaseFailure("release.archive.invalid", "unable to inspect crate archive") from error
-    if not members:
-        _archive_invalid("crate archive is empty")
-    paths = tuple(
-        _archive_member_path(member.name, member.isdir()) for member in members
-    )
-    roots = {path.parts[0] for path in paths}
-    if len(roots) != 1:
-        _archive_invalid("crate archive root is invalid")
-    root = roots.pop()
-    files: set[str] = set()
-    for member, path in zip(members, paths, strict=True):
-        if path.parts[0] != root or member.issym() or member.islnk():
-            _archive_invalid("crate archive member is invalid")
-        if member.isfile():
-            files.add(PurePosixPath(*path.parts[1:]).as_posix())
-    if "Cargo.toml" not in files or not any(path.startswith("src/") for path in files):
-        _archive_invalid("crate archive does not contain Rust package sources")
-    return root, files
-
-
-def _build_local_crate(
-    package: dict[str, object],
-    repo_root: Path,
-    staging_dir: Path,
-) -> Path:
-    name = str(package["name"])
-    version = str(package["version"])
-    target_dir = staging_dir / "target"
-    environment = {**os.environ, "CARGO_TARGET_DIR": str(target_dir)}
+def _frozen_workspace_source_files(repo_root: Path) -> tuple[tuple[str, Path, tuple[int, int, int, str]], ...]:
     try:
         result = subprocess.run(
-            [
-                "cargo",
-                "package",
-                "--package",
-                name,
-                "--locked",
-                "--allow-dirty",
-                "--no-verify",
-            ],
+            ["git", "ls-files", "-z"],
             cwd=repo_root,
             check=False,
             capture_output=True,
             text=True,
-            timeout=120,
-            env=environment,
+            timeout=30,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
-        raise ReleaseFailure("release.cargo.failed", "cargo package failed") from error
+        raise ReleaseFailure("release.package.invalid", "unable to enumerate repository files") from error
     if result.returncode != 0:
-        raise ReleaseFailure(
-            "release.cargo.failed",
-            _bounded_subprocess_summary(result.stderr, "cargo package failed"),
-        )
-    crate = target_dir / "package" / f"{name}-{version}.crate"
-    if not crate.is_file() or crate.is_symlink():
-        _package_invalid("cargo package did not produce the expected crate")
-    _crate_root_and_files(crate)
-    return crate
+        _package_invalid("unable to enumerate repository files")
+    entries = result.stdout.split("\0")
+    if not entries or entries[-1] != "":
+        _package_invalid("repository file list is invalid")
+    frozen: list[tuple[str, Path, tuple[int, int, int, str]]] = []
+    for entry in entries[:-1]:
+        try:
+            path = _safe_archive_path(entry)
+        except ReleaseFailure as error:
+            raise ReleaseFailure("release.package.invalid", "repository file path is unsafe") from error
+        source = repo_root / Path(*path.parts)
+        try:
+            if source.resolve().parent != source.parent.resolve() or source.is_symlink():
+                _package_invalid("repository source contains a symbolic link")
+            identity = _file_identity(source)
+        except ReleaseFailure as error:
+            raise ReleaseFailure(
+                "release.package.invalid",
+                "repository source file is invalid",
+            ) from error
+        frozen.append((path.as_posix(), source, identity))
+    if not frozen:
+        _package_invalid("repository has no tracked source files")
+    return tuple(sorted(frozen))
 
 
-def _check_packaged_crate(crate: Path, staging_dir: Path) -> None:
-    root, _ = _crate_root_and_files(crate)
-    extract_root = staging_dir / "checked" / root
+def _require_frozen_workspace_sources(
+    files: tuple[tuple[str, Path, tuple[int, int, int, str]], ...],
+) -> None:
+    for _, path, identity in files:
+        if _file_identity(path) != identity:
+            _package_invalid("repository source changed during packaging")
+
+
+def _workspace_source_members(repo_root: Path) -> tuple[dict[str, object], ...]:
     try:
-        extract_root.parent.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(crate, "r:gz") as archive:
-            archive.extractall(extract_root.parent, filter="data")
         result = subprocess.run(
-            ["cargo", "check", "--locked"],
-            cwd=extract_root,
+            ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"],
+            cwd=repo_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        metadata = json.loads(result.stdout) if result.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
+        raise ReleaseFailure("release.cargo.failed", "cargo metadata failed") from error
+    if not isinstance(metadata, dict):
+        raise ReleaseFailure("release.cargo.failed", "cargo metadata failed")
+    packages = metadata.get("packages")
+    members = metadata.get("workspace_members")
+    if not isinstance(packages, list) or not isinstance(members, list):
+        _package_invalid("cargo metadata workspace members are invalid")
+    by_id = {
+        package.get("id"): package
+        for package in packages
+        if isinstance(package, dict) and isinstance(package.get("id"), str)
+    }
+    if not all(isinstance(member, str) and member in by_id for member in members):
+        _package_invalid("cargo metadata workspace members are invalid")
+    return tuple(by_id[member] for member in members)
+
+
+def _check_workspace_source_bundle(
+    archive: Path,
+    root: str,
+    expected_files: set[str],
+    staging_dir: Path,
+) -> None:
+    extract_root = staging_dir / "checked"
+    try:
+        validate_archive(archive, expected_root=root, expected_files=expected_files)
+        with tarfile.open(archive, "r:gz") as contents:
+            contents.extractall(extract_root, filter="data")
+        result = subprocess.run(
+            ["cargo", "check", "--workspace", "--locked"],
+            cwd=extract_root / root,
             check=False,
             capture_output=True,
             text=True,
@@ -2586,16 +2614,16 @@ def _check_packaged_crate(crate: Path, staging_dir: Path) -> None:
             env={**os.environ, "CARGO_TARGET_DIR": str(staging_dir / "check-target")},
         )
     except (OSError, tarfile.TarError, subprocess.TimeoutExpired) as error:
-        raise ReleaseFailure("release.cargo.failed", "packaged crate validation failed") from error
+        raise ReleaseFailure("release.cargo.failed", "workspace source bundle validation failed") from error
     if result.returncode != 0:
         raise ReleaseFailure(
             "release.cargo.failed",
-            _bounded_subprocess_summary(result.stderr, "packaged crate validation failed"),
+            _bounded_subprocess_summary(result.stderr, "workspace source bundle validation failed"),
         )
 
 
 def package_rust(*, tag: str, repo_root: Path, output_dir: Path) -> Path:
-    """Create a deterministic local source bundle without registry publication."""
+    """Create a deterministic complete Rust workspace source bundle."""
     staging_dir: Path | None = None
     try:
         version = ReleaseVersion.parse(tag)
@@ -2603,30 +2631,40 @@ def package_rust(*, tag: str, repo_root: Path, output_dir: Path) -> Path:
         if repo_root.is_symlink() or not resolved_root.is_dir():
             _package_invalid("repository root is invalid")
         _require_clean_repository(resolved_root)
-        packages = _cargo_packageable_members(resolved_root)
-        if any(package["version"] != version.cargo for package in packages):
-            _package_invalid("cargo package version does not match release tag")
+        packages = _workspace_source_members(resolved_root)
+        if any(package.get("version") != version.cargo for package in packages):
+            _package_invalid("cargo workspace version does not match release tag")
+        frozen_sources = _frozen_workspace_source_files(resolved_root)
+        source_names = {name for name, _, _ in frozen_sources}
+        required = {"Cargo.toml", "Cargo.lock"}
+        for package in packages:
+            manifest = package.get("manifest_path")
+            if not isinstance(manifest, str):
+                _package_invalid("cargo metadata workspace manifest is invalid")
+            try:
+                relative = Path(manifest).resolve().relative_to(resolved_root).as_posix()
+            except ValueError as error:
+                raise ReleaseFailure(
+                    "release.package.invalid",
+                    "cargo workspace member is outside repository root",
+                ) from error
+            required.add(relative)
+        if not required.issubset(source_names):
+            _package_invalid("workspace source bundle is missing required files")
         _package_output_directory(output_dir)
         archive_name = f"seeed-hal-crates-v{version.cargo}.tar.gz"
         destination = _published_artifact_path(output_dir, archive_name)
         staging_dir = Path(tempfile.mkdtemp(prefix=".package-rust-", dir=output_dir))
-        staged_crates = tuple(
-            _build_local_crate(package, resolved_root, staging_dir) for package in packages
-        )
-        for crate in staged_crates:
-            _check_packaged_crate(crate, staging_dir)
         root = f"seeed-hal-crates-v{version.cargo}"
         members = tuple(
-            (f"{root}/{crate.name}", crate, 0o644)
-            for crate in sorted(staged_crates, key=lambda item: item.name)
+            (f"{root}/{name}", path, 0o644)
+            for name, path, _ in frozen_sources
         )
         staged_archive = staging_dir / archive_name
         _write_deterministic_tar(staged_archive, root, members)
-        validate_archive(
-            staged_archive,
-            expected_root=root,
-            expected_files={crate.name for crate in staged_crates},
-        )
+        _require_frozen_workspace_sources(frozen_sources)
+        _check_workspace_source_bundle(staged_archive, root, source_names, staging_dir)
+        _require_frozen_workspace_sources(frozen_sources)
         return _publish_staged_artifact(staged_archive, destination)
     except ReleaseFailure:
         raise

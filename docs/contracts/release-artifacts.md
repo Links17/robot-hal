@@ -41,6 +41,25 @@ static verifier rejects a changed report even if it is semantically valid.
 Candidate directories, platform virtual brokers, and virtual-conformance
 outputs are intermediate evidence only. They are never Release assets.
 
+## Rust workspace source bundle
+
+`seeed-hal-crates-v0.5.0-rc.N.tar.gz` is a deterministic, complete Rust
+workspace source bundle. It is not a collection of independently installable
+`.crate` archives and it makes no crates.io availability claim.
+
+The archive has one top-level `seeed-hal-crates-v0.5.0-rc.N/` directory and
+contains the tracked, regular repository files needed to retain the workspace
+source closure, including the root `Cargo.toml`, `Cargo.lock`, and every
+workspace member manifest and source file. Package construction freezes that
+controlled file set; it rejects symlinks, unsafe or unexpected paths, missing
+workspace members, a dirty checkout, changed frozen inputs, and failed or
+timed-out validation.
+
+The packager extracts the archive into a restricted temporary directory and
+runs `cargo check --workspace --locked`. This validates path-and-version
+internal dependencies as one workspace without contacting or publishing to a
+registry. Public crate registry policy is outside this RC artifact contract.
+
 ## Evidence and release gate
 
 Platform inputs are named with the immutable release tag and resolved

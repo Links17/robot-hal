@@ -25,27 +25,39 @@ def _write_workspace(root: Path) -> None:
         """
 [workspace]
 resolver = "3"
-members = ["alpha", "beta", "private"]
+members = ["core", "camera", "adapter"]
 """.strip()
         + "\n",
         encoding="utf-8",
     )
-    for name, private in (("alpha", False), ("beta", False), ("private", True)):
+    for name in ("core", "camera", "adapter"):
         package = root / name
         (package / "src").mkdir(parents=True)
-        publish = "\npublish = false" if private else ""
+        dependencies = {
+            "core": "",
+            "camera": '\n[dependencies]\ncore = { path = "../core", version = "0.5.0-rc.1" }\n',
+            "adapter": '\n[dependencies]\ncamera = { path = "../camera", version = "0.5.0-rc.1" }\n',
+        }[name]
         (package / "Cargo.toml").write_text(
             f"""
 [package]
 name = "{name}"
 version = "0.5.0-rc.1"
-edition = "2024"{publish}
+edition = "2024"{dependencies}
 """.strip()
             + "\n",
             encoding="utf-8",
         )
         (package / "src" / "lib.rs").write_text(
-            f"pub fn {name}() {{}}\n",
+            (
+                "pub fn core() {}\n"
+                if name == "core"
+                else (
+                    "pub fn camera() { core::core(); }\n"
+                    if name == "camera"
+                    else "pub fn adapter() { camera::camera(); }\n"
+                )
+            ),
             encoding="utf-8",
         )
     subprocess.run(
@@ -64,14 +76,14 @@ def _bundle_members(bundle: Path) -> tuple[str, ...]:
         return tuple(member.name for member in archive.getmembers() if member.isfile())
 
 
-def _check_packaged_crate(crate: Path) -> None:
+def _check_workspace_bundle(bundle: Path) -> None:
     with tempfile.TemporaryDirectory() as directory:
         destination = Path(directory)
-        with tarfile.open(crate, "r:gz") as archive:
+        with tarfile.open(bundle, "r:gz") as archive:
             archive.extractall(destination, filter="data")
             root = next(path for path in destination.iterdir() if path.is_dir())
         result = subprocess.run(
-            ["cargo", "check", "--locked"],
+            ["cargo", "check", "--workspace", "--locked"],
             cwd=root,
             check=False,
             capture_output=True,
@@ -81,7 +93,7 @@ def _check_packaged_crate(crate: Path) -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_rust_bundle_contains_every_publishable_package(tmp_path: Path) -> None:
+def test_rust_bundle_preserves_path_version_workspace_closure(tmp_path: Path) -> None:
     repo = tmp_path / "workspace"
     repo.mkdir()
     _write_workspace(repo)
@@ -94,17 +106,17 @@ def test_rust_bundle_contains_every_publishable_package(tmp_path: Path) -> None:
 
     assert bundle.name == "seeed-hal-crates-v0.5.0-rc.1.tar.gz"
     assert _bundle_members(bundle) == (
-        "seeed-hal-crates-v0.5.0-rc.1/alpha-0.5.0-rc.1.crate",
-        "seeed-hal-crates-v0.5.0-rc.1/beta-0.5.0-rc.1.crate",
+        "seeed-hal-crates-v0.5.0-rc.1/Cargo.lock",
+        "seeed-hal-crates-v0.5.0-rc.1/Cargo.toml",
+        "seeed-hal-crates-v0.5.0-rc.1/adapter/Cargo.toml",
+        "seeed-hal-crates-v0.5.0-rc.1/adapter/src/lib.rs",
+        "seeed-hal-crates-v0.5.0-rc.1/camera/Cargo.toml",
+        "seeed-hal-crates-v0.5.0-rc.1/camera/src/lib.rs",
+        "seeed-hal-crates-v0.5.0-rc.1/core/Cargo.toml",
+        "seeed-hal-crates-v0.5.0-rc.1/core/src/lib.rs",
+        "seeed-hal-crates-v0.5.0-rc.1/tracked",
     )
-    with tarfile.open(bundle, "r:gz") as archive:
-        crate_member = archive.extractfile(
-            "seeed-hal-crates-v0.5.0-rc.1/alpha-0.5.0-rc.1.crate"
-        )
-        assert crate_member is not None
-        crate = tmp_path / "alpha-0.5.0-rc.1.crate"
-        crate.write_bytes(crate_member.read())
-    _check_packaged_crate(crate)
+    _check_workspace_bundle(bundle)
 
 
 def test_rust_bundle_refuses_existing_artifact(tmp_path: Path) -> None:
