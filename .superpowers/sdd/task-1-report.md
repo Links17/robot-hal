@@ -47,9 +47,10 @@ all three workspace members, and the path-and-version dependency chain.
 - `docs/superpowers/specs/2026-08-18-release-conformance-v0.5-design.md`
 - `.superpowers/sdd/task-1-report.md`
 
-## Commit
+## Commits
 
-`fix(release): bundle Rust workspace sources`
+- `f82fb46 fix(release): bundle Rust workspace sources`
+- `16169d4 fix(release): preserve source bundle directories`
 
 ## Concerns
 
