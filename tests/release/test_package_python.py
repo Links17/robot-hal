@@ -168,6 +168,52 @@ def test_python_candidate_rejects_external_directory_replacement(
     }
 
 
+@pytest.mark.parametrize(
+    ("artifact_name", "replacement_kind"),
+    [
+        ("seeed_hal-0.5.0rc1-py3-none-any.whl", "different-bytes"),
+        ("seeed_hal-0.5.0rc1.tar.gz", "different-bytes"),
+        ("seeed_hal-0.5.0rc1-py3-none-any.whl", "symlink"),
+        ("seeed_hal-0.5.0rc1.tar.gz", "symlink"),
+    ],
+)
+def test_python_candidate_rejects_artifact_replacement_after_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_name: str,
+    replacement_kind: str,
+) -> None:
+    output = tmp_path / "python-candidate"
+    replacement = tmp_path / "external-replacement"
+    original_verify = release_tool._verify_wheel_install
+
+    def replace_artifact(
+        wheel: Path,
+        version: ReleaseVersion,
+        staging_dir: Path,
+    ) -> None:
+        original_verify(wheel, version, staging_dir)
+        artifact = output / artifact_name
+        artifact.unlink()
+        if replacement_kind == "symlink":
+            replacement.write_bytes(b"external replacement")
+            artifact.symlink_to(replacement)
+        else:
+            artifact.write_bytes(b"external replacement")
+
+    monkeypatch.setattr(release_tool, "_verify_wheel_install", replace_artifact)
+
+    with pytest.raises(ReleaseFailure) as failure:
+        release_tool.package_python(
+            tag="v0.5.0-rc.1",
+            project=REPO_ROOT / "bindings" / "python",
+            output_dir=output,
+        )
+
+    assert failure.value.name == "release.artifact.unexpected"
+    assert not (output / "external-write").exists()
+
+
 def test_package_python_cli_and_wrappers_describe_candidate_directory() -> None:
     arguments = release_tool._parser().parse_args(
         [

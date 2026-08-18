@@ -1248,6 +1248,31 @@ def _require_python_candidate_entries(
     _require_package_output_entries(output_dir, expected)
 
 
+def _python_candidate_artifact_identity(path: Path) -> tuple[int, int, int, str]:
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("candidate artifact is not a regular file")
+        digest = _artifact_sha256(path)
+    except (OSError, ReleaseFailure) as error:
+        raise ReleaseFailure(
+            "release.artifact.unexpected",
+            "Python candidate artifact changed during validation",
+        ) from error
+    return (metadata.st_dev, metadata.st_ino, metadata.st_size, digest)
+
+
+def _require_python_candidate_artifact_identity(
+    path: Path,
+    expected: tuple[int, int, int, str],
+) -> None:
+    if _python_candidate_artifact_identity(path) != expected:
+        raise ReleaseFailure(
+            "release.artifact.unexpected",
+            "Python candidate artifact changed during validation",
+        )
+
+
 def _create_package_output_directory(output_dir: Path) -> None:
     try:
         output_dir.mkdir(parents=True)
@@ -1980,13 +2005,15 @@ def package_python(*, tag: str, project: Path, output_dir: Path) -> tuple[Path, 
         sdist = output_dir / sdist_name
         expected = frozenset({wheel_name, sdist_name})
         _require_python_candidate_entries(output_dir, candidate_identity, expected)
-        if not wheel.is_file() or wheel.is_symlink() or not sdist.is_file() or sdist.is_symlink():
-            _package_invalid("Python build did not produce expected artifacts")
+        wheel_identity = _python_candidate_artifact_identity(wheel)
+        sdist_identity = _python_candidate_artifact_identity(sdist)
         _wheel_metadata(wheel, version)
         _sdist_metadata(sdist, version)
         with tempfile.TemporaryDirectory(prefix=".package-python-validate-") as directory:
             _verify_wheel_install(wheel, version, Path(directory))
         _require_python_candidate_entries(output_dir, candidate_identity, expected)
+        _require_python_candidate_artifact_identity(wheel, wheel_identity)
+        _require_python_candidate_artifact_identity(sdist, sdist_identity)
         return (wheel, sdist)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ReleaseFailure("release.package.invalid", "Python build failed") from error

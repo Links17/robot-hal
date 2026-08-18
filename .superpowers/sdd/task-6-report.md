@@ -283,3 +283,32 @@ cargo test --workspace --all-features: passed
 The first full Rust test run had one `usb_runtime` close-timeout failure. Its
 exact standalone rerun and a subsequent full workspace gate passed. No runtime
 code was changed for this Task 6 correction.
+
+## Candidate artifact replacement review follow-up
+
+The candidate-directory identity and exact-name checks alone could not prove
+that the wheel or sdist remained the inspected and offline-validated file.
+After candidate build completes and before wheel/sdist inspection, Task 6 now
+captures each artifact's `lstat` device, inode, and size plus SHA-256 using the
+bounded existing hashing helper. Immediately before returning candidate success,
+it rechecks both artifacts after the directory identity and exact-entry gate.
+
+A symlink, FIFO, other non-regular file, stat/hash error, changed identity, or
+changed bytes fails closed as `release.artifact.unexpected` with a stable
+no-value diagnostic. No cleanup attempts to delete the potentially external
+replacement; the candidate directory remains available for diagnostics.
+
+TDD RED replaced each of wheel and sdist after offline validation with both a
+same-name symlink and a same-name regular file containing different bytes:
+
+```text
+tests/release/test_package_python.py
+# 4 failed, 12 passed: package_python incorrectly returned candidate success
+```
+
+GREEN:
+
+```text
+tests/release/test_package_python.py
+# 16 passed
+```
