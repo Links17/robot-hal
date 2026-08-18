@@ -102,6 +102,7 @@ RELEASE_SIDECARS = frozenset(
     {"release-manifest.json", "SHA256SUMS", CONFORMANCE_REPORT_NAME}
 )
 ARCHIVE_READ_CHUNK_SIZE = 64 * 1024
+PACKAGE_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 # Release bundles may contain large broker binaries and Rust crate sources, but
 # raw archive inspection must retain bounded CPU and I/O under hostile headers.
 MAX_ARCHIVE_MEMBER_BYTES = 768 * 1024 * 1024
@@ -1120,7 +1121,186 @@ def _target_by_name(
     for target in targets:
         if target.name == name:
             return target
-    raise ReleaseFailure("release.target.invalid", f"unknown target {name}")
+    raise ReleaseFailure("release.target.invalid", "unknown target")
+
+
+def _package_invalid(diagnostic: str) -> NoReturn:
+    raise ReleaseFailure("release.package.invalid", diagnostic)
+
+
+def _package_diagnostic(name: str) -> str:
+    diagnostics = {
+        "release.archive.invalid": "archive validation failed",
+        "release.manifest.invalid": "broker manifest is invalid",
+        "release.package.invalid": "unable to package broker",
+        "release.target.invalid": "unknown target",
+        "release.targets.invalid": "target matrix is invalid",
+        "release.version.invalid": "expected v0.5.0-rc.N",
+    }
+    return diagnostics.get(name, "unable to package broker")
+
+
+def _package_file(path: Path, name: str) -> Path:
+    if path.name != name or not path.is_file() or path.is_symlink():
+        _package_invalid("package input is invalid")
+    return path
+
+
+def _package_binary_name(target: ReleaseTarget) -> str:
+    return "seeed-hal-broker.exe" if target.name == "windows" else "seeed-hal-broker"
+
+
+def _package_root(version: ReleaseVersion, target: ReleaseTarget) -> str:
+    return f"seeed-hal-broker-v{version.cargo}-{target.triple}"
+
+
+def _package_archive_name(version: ReleaseVersion, target: ReleaseTarget) -> str:
+    suffix = "zip" if target.archive == "zip" else "tar.gz"
+    return f"{_package_root(version, target)}.{suffix}"
+
+
+def _package_members(
+    root: str,
+    binary_name: str,
+    binary: Path,
+    manifest: Path,
+    repo_root: Path,
+) -> tuple[tuple[str, Path, int], ...]:
+    files = (
+        ("LICENSE", _package_file(repo_root / "LICENSE", "LICENSE"), 0o644),
+        ("README.md", _package_file(repo_root / "README.md", "README.md"), 0o644),
+        (
+            "broker-manifest.json",
+            _package_file(manifest, "broker-manifest.json"),
+            0o644,
+        ),
+        (binary_name, _package_file(binary, binary_name), 0o755),
+    )
+    return tuple((f"{root}/{name}", path, mode) for name, path, mode in files)
+
+
+def _write_deterministic_tar(
+    archive_path: Path,
+    root: str,
+    members: tuple[tuple[str, Path, int], ...],
+) -> None:
+    with archive_path.open("wb") as destination:
+        with gzip.GzipFile(
+            fileobj=destination,
+            mode="wb",
+            filename="",
+            mtime=0,
+        ) as compressed:
+            with tarfile.open(fileobj=compressed, mode="w") as archive:
+                directory = tarfile.TarInfo(root)
+                directory.type = tarfile.DIRTYPE
+                directory.mode = 0o755
+                directory.uid = 0
+                directory.gid = 0
+                directory.uname = ""
+                directory.gname = ""
+                directory.mtime = 0
+                archive.addfile(directory)
+                for name, path, mode in members:
+                    contents = path.read_bytes()
+                    info = tarfile.TarInfo(name)
+                    info.size = len(contents)
+                    info.mode = mode
+                    info.uid = 0
+                    info.gid = 0
+                    info.uname = ""
+                    info.gname = ""
+                    info.mtime = 0
+                    archive.addfile(info, fileobj=_BytesReader(contents))
+
+
+class _BytesReader:
+    def __init__(self, contents: bytes) -> None:
+        self.contents = contents
+        self.offset = 0
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            size = len(self.contents) - self.offset
+        result = self.contents[self.offset : self.offset + size]
+        self.offset += len(result)
+        return result
+
+
+def _write_deterministic_zip(
+    archive_path: Path,
+    root: str,
+    members: tuple[tuple[str, Path, int], ...],
+) -> None:
+    with zipfile.ZipFile(
+        archive_path,
+        mode="w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=9,
+        strict_timestamps=True,
+    ) as archive:
+        directory = zipfile.ZipInfo(f"{root}/", date_time=PACKAGE_TIMESTAMP)
+        directory.create_system = 3
+        directory.external_attr = (0o40755 << 16) | 0x10
+        archive.writestr(directory, b"")
+        for name, path, mode in members:
+            info = zipfile.ZipInfo(name, date_time=PACKAGE_TIMESTAMP)
+            info.create_system = 3
+            info.external_attr = (0o100000 | mode) << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(info, path.read_bytes(), compress_type=zipfile.ZIP_DEFLATED)
+
+
+def package_broker(
+    *,
+    tag: str,
+    target_name: str,
+    targets_path: Path,
+    binary_path: Path,
+    output_dir: Path,
+    manifest_path: Path,
+    repo_root: Path,
+) -> Path:
+    try:
+        version = ReleaseVersion.parse(tag)
+        targets = load_targets(targets_path)
+        target = _target_by_name(targets, target_name)
+        binary_name = _package_binary_name(target)
+        binary = _package_file(binary_path, binary_name)
+        manifest = _package_file(manifest_path, "broker-manifest.json")
+        verify_broker_manifest(
+            _read_json(manifest, "release.manifest.invalid"),
+            target,
+            binary,
+            version,
+        )
+        resolved_root = repo_root.resolve()
+        if not resolved_root.is_dir() or repo_root.is_symlink():
+            _package_invalid("repository root is invalid")
+        root = _package_root(version, target)
+        members = _package_members(root, binary_name, binary, manifest, resolved_root)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if output_dir.is_symlink() or not output_dir.is_dir():
+            _package_invalid("package output directory is invalid")
+        archive_path = output_dir / _package_archive_name(version, target)
+        if archive_path.exists() and (not archive_path.is_file() or archive_path.is_symlink()):
+            _package_invalid("package output path is invalid")
+        if target.archive == "tar.gz":
+            _write_deterministic_tar(archive_path, root, members)
+        elif target.archive == "zip":
+            _write_deterministic_zip(archive_path, root, members)
+        else:
+            _package_invalid("target archive format is unsupported")
+        validate_archive(
+            archive_path,
+            expected_root=root,
+            expected_files={name.rsplit("/", 1)[1] for name, _, _ in members},
+        )
+        return archive_path
+    except ReleaseFailure as error:
+        raise ReleaseFailure(error.name, _package_diagnostic(error.name)) from error
+    except OSError as error:
+        raise ReleaseFailure("release.package.invalid", "unable to package broker") from error
 
 
 class _ReleaseArgumentParser(argparse.ArgumentParser):
@@ -1141,6 +1321,13 @@ def _parser() -> argparse.ArgumentParser:
     verify.add_argument("--target", required=True)
     verify.add_argument("--targets", required=True, type=Path)
     verify.add_argument("--artifact", required=True, type=Path)
+    package = subcommands.add_parser("package-broker")
+    package.add_argument("--tag", required=True)
+    package.add_argument("--target", required=True)
+    package.add_argument("--targets", required=True, type=Path)
+    package.add_argument("--binary", required=True, type=Path)
+    package.add_argument("--output-dir", required=True, type=Path)
+    package.add_argument("--manifest", required=True, type=Path)
     generate = subcommands.add_parser("generate-manifest")
     generate.add_argument("--tag", required=True)
     generate.add_argument("--commit", required=True)
@@ -1174,6 +1361,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _target_by_name(targets, arguments.target),
                 arguments.artifact,
                 ReleaseVersion.parse(arguments.tag),
+            )
+        elif arguments.command == "package-broker":
+            package_broker(
+                tag=arguments.tag,
+                target_name=arguments.target,
+                targets_path=arguments.targets,
+                binary_path=arguments.binary,
+                output_dir=arguments.output_dir,
+                manifest_path=arguments.manifest,
+                repo_root=Path(__file__).resolve().parents[2],
             )
         elif arguments.command == "generate-manifest":
             manifest = generate_manifest(
