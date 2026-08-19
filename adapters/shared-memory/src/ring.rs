@@ -123,7 +123,10 @@ impl BrokerMapping {
     pub fn close(&mut self) -> HalResult<()> {
         if !self.closed {
             loop {
-                match self.mapping.try_lock_exclusive() {
+                // Terminal teardown may only publish CLOSED. On Windows this is the sole path
+                // allowed to retain WAIT_ABANDONED ownership; it must not inspect, recover, or
+                // publish any frame state that a crashed owner could have left inconsistent.
+                match self.mapping.try_lock_exclusive_for_teardown() {
                     Ok(()) => break,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(std::time::Duration::from_millis(1));

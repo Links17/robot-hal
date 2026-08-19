@@ -54,6 +54,10 @@ mod tests {
     const CLOSE_READER_NAME: &str = "SEEED_HAL_CLOSE_READER_NAME";
     const CLOSE_READER_LENGTH: &str = "SEEED_HAL_CLOSE_READER_LENGTH";
     const CLOSE_READER_READY: &str = "SEEED_HAL_CLOSE_READER_READY";
+    #[cfg(windows)]
+    const ABANDONED_CLOSE_NAME: &str = "SEEED_HAL_ABANDONED_CLOSE_NAME";
+    #[cfg(windows)]
+    const ABANDONED_CLOSE_LENGTH: &str = "SEEED_HAL_ABANDONED_CLOSE_LENGTH";
 
     fn config() -> RingConfig {
         RingConfig::new(
@@ -186,6 +190,46 @@ mod tests {
         broker.close().unwrap();
 
         assert!(client.copy(lease).unwrap().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn abandoned_reader_lock_allows_terminal_close_but_no_frame_recovery() {
+        if let (Ok(name), Ok(length)) = (
+            std::env::var(ABANDONED_CLOSE_NAME),
+            std::env::var(ABANDONED_CLOSE_LENGTH),
+        ) {
+            let mapping =
+                crate::platform::Mapping::open_read_only(&name, length.parse().unwrap()).unwrap();
+            mapping.try_lock_shared().unwrap();
+            // SAFETY: this isolated child intentionally exits while owning the Windows mutex to
+            // simulate a crashed reader. It must not run Rust destructors that would unlock it.
+            unsafe { windows_sys::Win32::System::Threading::ExitProcess(0) };
+        }
+
+        let mut broker = BrokerMapping::create(config()).unwrap();
+        let descriptor = broker.descriptor().clone();
+        broker.writer().publish(metadata(1, 1), &[1; 8]).unwrap();
+        let lease = broker.next_frame_lease().unwrap().unwrap();
+        let mut reader = ReadOnlyMapping::open(&descriptor).unwrap();
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::abandoned_reader_lock_allows_terminal_close_but_no_frame_recovery")
+            .arg("--nocapture")
+            .env(ABANDONED_CLOSE_NAME, &descriptor.name)
+            .env(ABANDONED_CLOSE_LENGTH, descriptor.total_length.to_string())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        broker
+            .close()
+            .expect("terminal close must handle an abandoned reader mutex");
+        assert!(
+            reader.copy(lease).unwrap().is_none(),
+            "close must only publish terminal state, never recover frame data"
+        );
     }
 
     #[test]

@@ -313,3 +313,77 @@ cargo check -p seeed-hal-adapter-shared-memory --target x86_64-pc-windows-msvc
 
 Hosted Windows still needs to run the two tests above: this machine cannot
 execute the test binary, so target checking is compile-only evidence.
+
+---
+
+## Important review resolution: abandoned reader must not prevent terminal close
+
+`BrokerMapping::close` previously used the ordinary exclusive lock. That
+correctly fails closed after `WAIT_ABANDONED`, but it also prevented close from
+publishing the terminal header and invoking the existing local teardown hook.
+
+### RED
+
+Windows-only tests were added before the implementation:
+
+- `abandoned_mutex_shared_lock_is_released_while_still_failing_closed` proves
+  the ordinary shared lock returns `Other` after an abandoned mutex and releases
+  the ownership it was granted, allowing a later exclusive lock to proceed.
+- `teardown_lock_keeps_abandoned_ownership_until_unlocked` requires the new
+  teardown-only API to retain abandoned ownership until its caller releases it;
+  a separate child process observes `WouldBlock` meanwhile.
+- `abandoned_reader_lock_allows_terminal_close_but_no_frame_recovery` creates a
+  ring, has a reader child abandon its mutex ownership, then requires
+  `BrokerMapping::close` to succeed and the already-open reader to return
+  `None` for its lease. It therefore validates terminal closure rather than
+  any recovery or reuse of possibly corrupted frame data.
+
+The first RED check was:
+
+```sh
+cargo test -p seeed-hal-adapter-shared-memory --target x86_64-pc-windows-msvc \
+  platform::windows_tests::teardown_lock_keeps_abandoned_ownership_until_unlocked --no-run
+```
+
+It failed as expected with `E0599`: `Mapping` had no
+`try_lock_exclusive_for_teardown` method.
+
+### GREEN and verification
+
+`try_lock_exclusive_for_teardown` is an internal platform API. On Windows it
+returns success for `WAIT_OBJECT_0` and `WAIT_ABANDONED`, retaining ownership
+only until the caller's existing `unlock` performs `ReleaseMutex`; timeout
+remains `WouldBlock` and all other waits preserve the native error. It is
+called only by `BrokerMapping::close`, whose documented critical section writes
+only `TERMINAL_STATE_CLOSED` before unlocking and invoking the existing
+lifecycle hook. Ordinary shared/exclusive lock paths are unchanged and still
+release abandoned ownership before returning the fail-closed `Other` error.
+
+Commands:
+
+```sh
+cargo fmt --all --check
+cargo test -p seeed-hal-adapter-shared-memory
+cargo clippy -p seeed-hal-adapter-shared-memory --all-targets --all-features -- -D warnings
+cargo check -p seeed-hal-adapter-shared-memory --target x86_64-pc-windows-msvc
+git diff --check
+```
+
+Results: formatting, native adapter tests (**18 passed**), focused clippy, the
+Windows target check, and diff whitespace verification passed. Source review
+confirms the teardown-only API has one production caller: `BrokerMapping::close`;
+all frame, pin, lease, reader, and writer paths retain ordinary lock calls.
+
+### Hosted Windows limitation
+
+The Windows test-binary build was attempted with:
+
+```sh
+cargo test -p seeed-hal-adapter-shared-memory --target x86_64-pc-windows-msvc \
+  platform::windows_tests --no-run
+```
+
+It could not link on this macOS host because `link.exe` is unavailable. The
+Windows target `cargo check` compiles the production and Windows-only test code,
+but Hosted Windows must execute the abandoned shared/exclusive, teardown
+ownership, and close-terminal-state tests to qualify their runtime behavior.

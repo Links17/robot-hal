@@ -210,6 +210,10 @@ impl Mapping {
         self.try_lock(libc::LOCK_EX | libc::LOCK_NB)
     }
 
+    pub(crate) fn try_lock_exclusive_for_teardown(&self) -> io::Result<()> {
+        self.try_lock_exclusive()
+    }
+
     pub(crate) fn unlock(&self) -> io::Result<()> {
         // SAFETY: `lock_fd` is owned by this Mapping and flock(2) releases its advisory lock
         // for this open file description without retaining Rust pointers.
@@ -616,6 +620,24 @@ impl Mapping {
 
     pub(crate) fn try_lock_exclusive(&self) -> io::Result<()> {
         self.try_lock()
+    }
+
+    /// Acquires the mapping mutex solely for terminal teardown. Unlike normal locks, this keeps
+    /// ownership granted with WAIT_ABANDONED so the caller can publish only `CLOSED` and then
+    /// release it. An abandoned owner may have corrupted frame data, so this must never enter
+    /// frame, pin, lease, reader, or writer workflows.
+    pub(crate) fn try_lock_exclusive_for_teardown(&self) -> io::Result<()> {
+        // SAFETY: `lock` is a live mutex handle. A zero timeout cannot block a Tokio executor
+        // worker or any calling thread. On WAIT_ABANDONED Windows grants this thread ownership,
+        // which the terminal-only caller must release with `unlock`.
+        match unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(self.lock, 0) } {
+            windows_sys::Win32::Foundation::WAIT_OBJECT_0
+            | windows_sys::Win32::Foundation::WAIT_ABANDONED => Ok(()),
+            windows_sys::Win32::Foundation::WAIT_TIMEOUT => {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+            _ => Err(io::Error::last_os_error()),
+        }
     }
 
     pub(crate) fn unlock(&self) -> io::Result<()> {
@@ -1029,6 +1051,7 @@ mod windows_tests {
     use super::{Mapping, lock_name, validate_section_length};
 
     const ABANDONED_LOCK_NAME: &str = "SEEED_HAL_ABANDONED_LOCK_NAME";
+    const ABANDONED_LOCK_PHASE: &str = "SEEED_HAL_ABANDONED_LOCK_PHASE";
 
     #[test]
     fn created_mapping_has_a_protected_three_trustee_dacl() {
@@ -1185,6 +1208,92 @@ mod windows_tests {
     }
 
     #[test]
+    fn abandoned_mutex_shared_lock_is_released_while_still_failing_closed() {
+        if let Ok(name) = std::env::var(ABANDONED_LOCK_NAME) {
+            let mapping = Mapping::open_read_only(&name, 4096).unwrap();
+            mapping.try_lock_exclusive().unwrap();
+            // SAFETY: this subprocess deliberately exits while owning the mutex to exercise
+            // the shared normal-lock abandoned branch without running Rust destructors.
+            unsafe { windows_sys::Win32::System::Threading::ExitProcess(0) };
+        }
+
+        let name = test_mapping_name("abandoned-shared");
+        let mapping = Mapping::create(&name, 4096).unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(
+                "platform::windows_tests::abandoned_mutex_shared_lock_is_released_while_still_failing_closed",
+            )
+            .arg("--nocapture")
+            .env(ABANDONED_LOCK_NAME, &name)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let error = mapping.try_lock_shared().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+
+        mapping.try_lock_exclusive().unwrap();
+        mapping.unlock().unwrap();
+        drop(mapping);
+        Mapping::unlink(&name).unwrap();
+    }
+
+    #[test]
+    fn teardown_lock_keeps_abandoned_ownership_until_unlocked() {
+        if let Ok(name) = std::env::var(ABANDONED_LOCK_NAME) {
+            let mapping = Mapping::open_read_only(&name, 4096).unwrap();
+            match std::env::var(ABANDONED_LOCK_PHASE).as_deref() {
+                Ok("abandon") => {
+                    mapping.try_lock_exclusive().unwrap();
+                    // SAFETY: this subprocess deliberately exits while owning the mutex to
+                    // exercise the teardown-only abandoned-mutex branch without destructors.
+                    unsafe { windows_sys::Win32::System::Threading::ExitProcess(0) };
+                }
+                Ok("verify-blocked") => {
+                    assert_eq!(
+                        mapping.try_lock_exclusive().unwrap_err().kind(),
+                        std::io::ErrorKind::WouldBlock
+                    );
+                    return;
+                }
+                _ => panic!("missing teardown abandoned mutex test phase"),
+            }
+        }
+
+        let name = test_mapping_name("teardown-abandoned");
+        let mapping = Mapping::create(&name, 4096).unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("platform::windows_tests::teardown_lock_keeps_abandoned_ownership_until_unlocked")
+            .arg("--nocapture")
+            .env(ABANDONED_LOCK_NAME, &name)
+            .env(ABANDONED_LOCK_PHASE, "abandon")
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        mapping.try_lock_exclusive_for_teardown().unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("platform::windows_tests::teardown_lock_keeps_abandoned_ownership_until_unlocked")
+            .arg("--nocapture")
+            .env(ABANDONED_LOCK_NAME, &name)
+            .env(ABANDONED_LOCK_PHASE, "verify-blocked")
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "teardown lock must retain abandoned ownership"
+        );
+        mapping.unlock().unwrap();
+        mapping.try_lock_exclusive().unwrap();
+        mapping.unlock().unwrap();
+        drop(mapping);
+        Mapping::unlink(&name).unwrap();
+    }
+
+    #[test]
     fn names_retire_after_all_handles_drop_and_can_be_created_fresh() {
         let name = test_mapping_name("retire");
         let first = Mapping::create(&name, 4096).unwrap();
@@ -1274,6 +1383,9 @@ impl Mapping {
     }
     pub(crate) fn try_lock_exclusive(&self) -> io::Result<()> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "unavailable"))
+    }
+    pub(crate) fn try_lock_exclusive_for_teardown(&self) -> io::Result<()> {
+        self.try_lock_exclusive()
     }
     pub(crate) fn unlock(&self) -> io::Result<()> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "unavailable"))
