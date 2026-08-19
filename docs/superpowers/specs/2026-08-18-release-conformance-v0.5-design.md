@@ -86,7 +86,8 @@ After all platform conformance jobs pass, the pipeline builds:
 
 - `seeed-hal-broker-v0.5.0-rc.N-<target>.tar.gz` on macOS/Linux;
 - `seeed-hal-broker-v0.5.0-rc.N-<target>.zip` on Windows;
-- `seeed-hal-rust-crates-v0.5.0-rc.N.tar.gz`;
+- `seeed-hal-crates-v0.5.0-rc.N.tar.gz`, a complete Rust workspace source
+  bundle;
 - `seeed_hal-0.5.0rcN-py3-none-any.whl`;
 - `seeed_hal-0.5.0rcN.tar.gz`;
 - `SHA256SUMS`;
@@ -97,9 +98,17 @@ After all platform conformance jobs pass, the pipeline builds:
 required adapters, and archive format. Build scripts consume this file rather than duplicating
 platform lists.
 
-Rust packaging runs `cargo package` for every publishable workspace crate, checks package file
-lists, and verifies the packaged dependency closure. It does not upload crates. Python packaging
-uses the pinned build backend and emits one pure-Python wheel plus sdist.
+Rust packaging freezes the controlled, tracked workspace source set and creates
+`seeed-hal-crates-v0.5.0-rc.N.tar.gz`. The archive retains the root
+`Cargo.toml`, `Cargo.lock`, every workspace member, and necessary release
+files so internal `path + version` dependencies resolve without registry
+availability. It rejects symlinks, unsafe or unexpected paths, missing
+members, dirty sources, mutated frozen inputs, command failure, and timeout.
+It is unpacked into a restricted temporary directory and validated with
+`cargo check --workspace --locked`. The bundle is a GitHub Release source
+asset, not a set of independently installable `.crate` archives; it does not
+upload or assert readiness for any public registry. Python packaging uses the
+pinned build backend and emits one pure-Python wheel plus sdist.
 
 ### Clean artifact verification
 
@@ -113,7 +122,8 @@ checkout or target directory. They:
    and executable checksum with the release manifest;
 4. start a broker on a private endpoint and run the virtual black-box conformance suite;
 5. install the wheel in clean Python 3.11, 3.12, and 3.13 environments and verify import/version;
-6. unpack each `.crate`, build it from packaged contents, and verify its declared dependencies.
+6. unpack the Rust workspace source bundle and run
+   `cargo check --workspace --locked`.
 
 No artifact reaches a GitHub Release unless every default platform and client artifact verifies.
 Partial-platform prereleases are prohibited.
@@ -168,7 +178,8 @@ v0.5 adds these responsibility-focused files:
 - `release/targets.toml`: platform and adapter matrix;
 - `scripts/release/check-version.*`: unified package/tag version validation;
 - `scripts/release/package-broker.*`: target broker archive creation;
-- `scripts/release/package-rust.*`: deterministic `.crate` collection;
+- `scripts/release/package-rust.*`: deterministic complete Rust workspace
+  source bundle;
 - `scripts/release/package-python.*`: wheel and sdist construction;
 - `scripts/release/generate-manifest.*`: release manifest and checksums;
 - `scripts/release/verify-artifacts.*`: offline clean artifact verification;
@@ -211,7 +222,8 @@ Implementation follows TDD:
 5. broker manifest tests lock version, target, wire range, features, adapters, and checksum;
 6. black-box tests parameterize negotiated minors and capability fail-closed behavior;
 7. wheel tests install/import under Python 3.11 through 3.13;
-8. packaged Rust crate tests build from unpacked package contents;
+8. packaged Rust workspace source bundle tests preserve path-and-version
+   internal dependencies and build from unpacked workspace contents;
 9. workflow contract tests assert trigger constraints and least privilege, and reject crates.io or
    PyPI secrets/publish commands;
 10. end-to-end dry-run builds and verifies the full artifact set without creating a GitHub Release.

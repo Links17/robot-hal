@@ -262,3 +262,153 @@ GREEN:
 ### Follow-up commit
 
 Conventional Commit: `fix(protocol): qualify both virtual CAN modes`.
+
+---
+
+# Task 3 addendum: split three-platform CI conformance
+
+## Outcome
+
+`source-gate` retains only platform-independent generated-protocol, Rust,
+Python, protocol-minor, and release checks. It does not install Linux native
+prerequisites or compile platform adapter feature sets.
+
+`platform-conformance` derives its macOS, Linux, and Windows matrix from
+`release/targets.toml`. Every matrix entry builds and verifies its production
+broker manifest, then separately builds a virtual-adapters broker and records
+virtual protocol conformance for minors 0–3. The production and virtual
+commands run under Python so Windows does not depend on Git Bash `shasum`,
+`chmod`, or archive tooling.
+
+## RED
+
+```sh
+uv run --project bindings/python --python 3.11 --frozen pytest -q \
+  tests/release/test_workflow_contract.py
+```
+
+Result: **1 failed, 21 passed**. The failing contract proved that the two
+platform build steps used Bash rather than Windows-compatible Python release
+tooling.
+
+## GREEN and local verification
+
+```sh
+uv run --project bindings/python --python 3.11 --frozen pytest -q \
+  tests/release/test_workflow_contract.py
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+cargo +1.85 fmt --all --check
+cargo +1.85 clippy --workspace --all-targets --no-default-features -- -D warnings
+cargo +1.85 test --workspace --no-default-features
+./scripts/check-generated-protocol.sh
+```
+
+- Workflow contract tests: **22 passed**.
+- Release tests: **212 passed**.
+- Rust formatting and no-default-features clippy: passed.
+- The final complete no-default-features Rust test run passed. An earlier run
+  transiently failed `gpio_cancelled_queued_read_does_not_start_native_io`
+  with `runtime.session.close_timeout`; its isolated rerun and final full run
+  passed. Task 3 does not modify GPIO runtime code.
+- Generated protocol check: passed.
+
+## Hosted evidence prerequisite
+
+No workflow was pushed, dispatched, or remotely triggered for Task 3. Hosted
+macOS, Linux, and Windows evidence remains pending. After implementation review
+and push, the controller must obtain one real GitHub Actions run showing all
+three platform matrix entries green, each with production manifest verification
+and virtual protocol-minor coverage 0–3. Only then may the qualification record
+include a run URL, commit, and Passed hosted evidence.
+
+## Important review follow-up: source-gate package isolation
+
+The prior source-gate Rust commands used `--workspace --no-default-features`.
+That is not platform isolation: Cargo still selects every workspace member,
+including native adapter packages such as Linux GPIO and V4L2, and can therefore
+compile their native ABI surfaces.
+
+### TDD evidence
+
+RED:
+
+```text
+1 failed, 22 passed
+AssertionError: '--workspace' is contained here:
+cargo +1.85 clippy --workspace --all-targets --no-default-features -- -D warnings
+```
+
+GREEN:
+
+```text
+23 passed in 0.19s
+```
+
+The workflow contract now rejects workspace-wide source-gate Rust commands and
+requires both Clippy and tests to enumerate the platform-neutral public
+libraries explicitly: client, broker, CAN, camera, core, GPIO, protocol,
+runtime, serial, testkit, and USB. It also rejects all native adapter package
+names and the broker application from source-gate commands.
+
+Native adapter and production broker-app builds remain exclusively in the
+`platform-conformance` matrix, which derives the macOS, Linux, and Windows
+targets from `release/targets.toml`.
+
+### Verification
+
+- Workflow contract: **23 passed**.
+- Full release suite: **213 passed**.
+- Explicit platform-neutral Rust package set: `cargo +1.85 clippy --all-targets
+  ... -- -D warnings` and `cargo +1.85 test ...` passed.
+- `cargo +1.85 fmt --all --check` passed.
+- `./scripts/check-generated-protocol.sh` passed.
+- No hosted workflow was pushed, dispatched, or triggered.
+
+## Review follow-up: precise source-gate dependency boundary
+
+The source gate is not defined by the absence of every OS API. Its purpose is
+to isolate build requirements that depend on external Linux native packages or
+compile hardware device adapters, while retaining the production runtime
+closure. This matches the architecture: the runtime owns the bounded
+shared-memory camera data plane, and the broker uses Windows local-IPC security
+when compiled for Windows.
+
+`seeed-hal-adapter-shared-memory` is therefore allowed through
+`seeed-hal-runtime`; its Windows implementation uses Windows memory/security
+APIs, but its manifest has no Linux-target dependency and no `pkg-config`,
+`libgpiod`, or `libudev` prerequisite. `seeed-hal-windows-security` is likewise
+allowed through the broker's `cfg(windows)` dependency, because it provides
+Windows named-pipe/file security rather than a hardware adapter and has no
+Linux native prerequisite.
+
+The excluded closure remains the hardware adapter and production application
+set: AVFoundation, Linux GPIO/libgpiod, Media Foundation, nusb, PCAN,
+serialport, SocketCAN, V4L2, Windows GPIO, and `seeed-hal-broker-app`. Those
+build only in `platform-conformance`; Linux package provisioning stays there
+with the libgpiod/libudev `pkg-config` preflight.
+
+### TDD evidence
+
+RED:
+
+```text
+1 failed, 23 passed
+StopIteration: no step named
+"Run Linux-prerequisite-free Rust clippy ..."
+```
+
+The new workflow contract required source-gate names to describe the actual
+boundary and rejected the inaccurate `platform-neutral` label. It also checked
+that the permitted shared-memory and Windows-security manifests do not declare
+external Linux native prerequisites.
+
+GREEN:
+
+```text
+24 passed in 0.18s
+```
+
+The renamed workflow steps now state that they run only the runtime closure
+requiring no external Linux native prerequisites, and a nearby comment records
+why host-specific shared-memory and Windows-security implementations remain in
+that closure. No hosted workflow was pushed, dispatched, or triggered.

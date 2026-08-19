@@ -78,7 +78,7 @@ impl CanAdapter for SocketCanAdapter {
 #[cfg(target_os = "linux")]
 fn enumerate_sync() -> HalResult<Vec<ResourceDescriptor>> {
     let interfaces = socketcan::available_interfaces()
-        .map_err(|error| discovery_error("can.enumerate", error.as_ref()))?;
+        .map_err(|error| discovery_error("can.enumerate", &error))?;
     interfaces
         .into_iter()
         .map(|interface| descriptor_from_interface(&interface))
@@ -90,7 +90,7 @@ fn descriptor_from_interface(interface: &str) -> HalResult<ResourceDescriptor> {
     let metadata = identity::metadata_from_sysfs(interface);
     let identity = identity_from_metadata(&metadata)?;
     let details = link::details_for_descriptor(interface)
-        .map_err(|error| discovery_error("can.enumerate", error))?;
+        .map_err(|error| discovery_error("can.enumerate", error.as_ref()))?;
     let nonvirtual_sysfs_evidence = !metadata.virtual_interface && metadata.stable_path.is_some();
     let (supports_fd, supports_configure) =
         link::capabilities_for_details(&details, nonvirtual_sysfs_evidence);
@@ -213,7 +213,24 @@ fn join_error(operation: &'static str, error: tokio::task::JoinError) -> HalErro
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::*;
+    use super::discovery_error;
+    use seeed_hal_core::ErrorCategory;
+
+    #[test]
+    fn discovery_error_accepts_socketcan_error() {
+        let source = socketcan::Error::from(std::io::Error::other("interface list unavailable"));
+
+        let error = discovery_error("can.enumerate", &source);
+
+        assert_eq!(error.name().as_str(), "runtime.transport.unavailable");
+        assert_eq!(error.category(), ErrorCategory::Unavailable);
+        assert_eq!(error.operation().as_str(), "can.enumerate");
+        assert!(error.retryable());
+        assert_eq!(
+            error.debug_message(),
+            "SocketCAN discovery failed: interface list unavailable"
+        );
+    }
 
     #[test]
     fn discovery_error_accepts_boxed_send_sync_error() {

@@ -1092,9 +1092,10 @@ fn map_nl_error_unscoped<T: std::fmt::Debug, P: std::fmt::Debug>(
         }
         neli::err::NlError::Wrapped(neli::err::WrappedError::IOError(error)) => {
             let raw_code = error.raw_os_error();
+            let detail = error.to_string();
             let mapped = raw_code.map_or_else(
                 || generic_link_error(operation, error),
-                |raw_code| os_link_error(operation, raw_code, error.to_string()),
+                |raw_code| os_link_error(operation, raw_code, detail),
             );
             mapped
         }

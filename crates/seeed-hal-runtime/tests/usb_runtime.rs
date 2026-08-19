@@ -3,7 +3,7 @@ use seeed_hal_core::{
     CapabilitySet, HalResult, IdentityQuality, OwnerId, ResourceDescriptor, ResourceId,
     ResourceProperties, ResourceSelector, TransportKind,
 };
-use seeed_hal_runtime::HalRuntime;
+use seeed_hal_runtime::{HalRuntime, UsbQueueObserver};
 use seeed_hal_testkit::VirtualUsbAdapter;
 use seeed_hal_usb::{
     MAX_USB_TRANSFER_BYTES, UsbAdapter, UsbInterfaceClaim, UsbInterfaceSession, UsbTransfer,
@@ -319,7 +319,11 @@ async fn usb_close_times_out_while_transfer_blocks_and_keeps_claim_exclusive() {
 #[tokio::test]
 async fn usb_cancelled_queued_transfer_does_not_start_native_io() {
     let adapter = BlockingUsbAdapter::new("usb:runtime:cancelled-queue");
-    let runtime = HalRuntime::builder().usb_adapter(adapter.clone()).build();
+    let (queue_observer, mut queued) = UsbQueueObserver::new();
+    let runtime = HalRuntime::builder()
+        .usb_adapter(adapter.clone())
+        .usb_queue_observer(queue_observer)
+        .build();
     let descriptor = runtime.enumerate_usb().await.unwrap().remove(0);
     let mut handle = runtime
         .open_usb(
@@ -346,6 +350,11 @@ async fn usb_cancelled_queued_transfer_does_not_start_native_io() {
         })
     };
     started.await;
+    assert_eq!(
+        *queued.borrow_and_update(),
+        1,
+        "the first blocked native transfer must be the only admitted command"
+    );
     let cancelled = {
         let runtime = runtime.clone();
         let session = handle.session_id();
@@ -361,8 +370,20 @@ async fn usb_cancelled_queued_transfer_does_not_start_native_io() {
                 .await
         })
     };
-    tokio::task::yield_now().await;
+    queued
+        .changed()
+        .await
+        .expect("USB queue observer remains connected");
+    assert_eq!(
+        *queued.borrow_and_update(),
+        2,
+        "the second transfer must enter the USB command queue before cancellation"
+    );
     cancelled.abort();
+    assert!(
+        cancelled.await.unwrap_err().is_cancelled(),
+        "the queued transfer task must finish cancellation before native I/O is released"
+    );
     adapter.release_transfer.add_permits(1);
     first.await.unwrap().unwrap();
     assert!(

@@ -197,6 +197,68 @@ def test_virtual_conformance_cli_dispatches_and_hides_broker_path(tmp_path: Path
     assert str(broker) not in result.stderr
 
 
+def test_virtual_conformance_cli_rejects_invalid_platform_before_host_check(
+    tmp_path: Path,
+) -> None:
+    broker = tmp_path / "secret-broker"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(RELEASE_TOOL),
+            "run-virtual-conformance",
+            "--platform",
+            "unsupported",
+            "--broker",
+            str(broker),
+            "--repo-root",
+            str(REPO_ROOT),
+            "--command-identity",
+            "hosted virtual conformance",
+            "--ref",
+            "https://example.invalid/jobs/unsupported",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 1
+    assert result.stderr.startswith("release.conformance.invalid:")
+    assert str(broker) not in result.stderr
+
+
+def test_virtual_conformance_cli_rejects_invalid_broker_before_host_check(
+    tmp_path: Path,
+) -> None:
+    broker = tmp_path / "secret-broker"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(RELEASE_TOOL),
+            "run-virtual-conformance",
+            "--platform",
+            "macos",
+            "--broker",
+            str(broker),
+            "--repo-root",
+            str(REPO_ROOT),
+            "--command-identity",
+            "hosted virtual conformance",
+            "--ref",
+            "https://example.invalid/jobs/macos",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 1
+    assert result.stderr.startswith("release.conformance.invalid:")
+    assert str(broker) not in result.stderr
+
+
 def test_virtual_conformance_cli_preserves_command_identity(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -152,6 +152,25 @@ async fn multiple_observers_receive_independent_fanout() {
 }
 
 #[tokio::test]
+async fn receive_returns_available_frames_below_requested_maximum() {
+    let adapter = VirtualCanAdapter::loopback("can:runtime:receive-maximum");
+    let runtime = HalRuntime::builder().can_adapter(adapter.clone()).build();
+    let observer = open(&runtime, &adapter, "receive-maximum", LeaseMode::Observe).await;
+    adapter.inject_received(frame(1), None).unwrap();
+
+    let received = tokio::time::timeout(
+        Duration::from_millis(100),
+        observer.receive(2, Duration::from_secs(1)),
+    )
+    .await
+    .expect("a ready CAN frame must complete before the receive timeout")
+    .unwrap();
+
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].frame(), &frame(1));
+}
+
+#[tokio::test]
 async fn exactly_one_controller_can_share_with_observers() {
     let adapter = VirtualCanAdapter::loopback("can:runtime:controller");
     let runtime = HalRuntime::builder().can_adapter(adapter.clone()).build();
@@ -580,6 +599,7 @@ async fn actor_panic_disconnect_is_reported_without_hanging() {
         )
         .await
         .unwrap();
+    gate.wait_started().await;
     gate.release();
     wait_for_can_session_closed(&observer).await;
 }
@@ -708,6 +728,7 @@ async fn failed_actor_is_reconciled_before_resource_reuse() {
         )
         .await
         .unwrap();
+    gate.wait_started().await;
     gate.release();
     wait_for_can_session_closed(&first).await;
     let second = runtime

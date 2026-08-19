@@ -99,52 +99,129 @@ def test_source_gate_declares_the_required_frozen_checks() -> None:
         "rustup toolchain install 1.85 --profile minimal --component rustfmt --component clippy",
         "./scripts/check-generated-protocol.sh",
         "cargo +1.85 fmt --all --check",
-        "cargo +1.85 clippy --workspace --all-targets --all-features -- -D warnings",
-        "cargo +1.85 test --workspace --all-features",
         "uv run --project bindings/python --python 3.11 --frozen pytest -q",
         "pytest -q tests/release",
         "test_minor_matrix.py",
     ):
         assert command in commands
+    assert "--all-features" not in commands
 
 
-def test_linux_jobs_install_libgpiod_before_linux_gpio_builds() -> None:
+def test_source_gate_limits_rust_checks_to_linux_prerequisite_free_runtime_closure() -> None:
     workflow = load_workflow("ci.yml")
     jobs = workflow["jobs"]
     assert isinstance(jobs, dict)
     source_gate = jobs["source-gate"]
-    platform_job = jobs["platform-conformance"]
-    source_steps = source_gate["steps"]
-    platform_steps = platform_job["steps"]
-    source_prepare = next(
-        step for step in source_steps if step.get("name") == "Install Linux build prerequisites"
+    steps = source_gate["steps"]
+    commands = "\n".join(
+        step["run"] for step in steps if "run" in step
     )
+
+    assert (
+        "only the runtime closure that needs no Linux external native prerequisites"
+        in next(
+            step["name"]
+            for step in steps
+            if step.get("name", "").startswith("Run Linux-prerequisite-free Rust clippy")
+        )
+    )
+    assert (
+        "only the runtime closure that needs no Linux external native prerequisites"
+        in next(
+            step["name"]
+            for step in steps
+            if step.get("name", "").startswith("Run Linux-prerequisite-free Rust tests")
+        )
+    )
+    assert "platform-neutral" not in "\n".join(
+        step.get("name", "") for step in steps
+    ).lower()
+
+    source_packages = (
+        "seeed-hal-client",
+        "seeed-hal-broker",
+        "seeed-hal-can",
+        "seeed-hal-camera",
+        "seeed-hal-core",
+        "seeed-hal-gpio",
+        "seeed-hal-protocol",
+        "seeed-hal-runtime",
+        "seeed-hal-serial",
+        "seeed-hal-testkit",
+        "seeed-hal-usb",
+    )
+    for command in ("cargo +1.85 clippy", "cargo +1.85 test"):
+        assert command in commands
+        command_line = next(
+            line for line in commands.splitlines() if line.startswith(command)
+        )
+        assert "--workspace" not in command_line
+        for package in source_packages:
+            assert f"-p {package}" in command_line
+
+    hardware_adapter_packages = (
+        "seeed-hal-adapter-avfoundation",
+        "seeed-hal-adapter-linux-gpio",
+        "seeed-hal-adapter-mediafoundation",
+        "seeed-hal-adapter-nusb",
+        "seeed-hal-adapter-pcan",
+        "seeed-hal-adapter-serialport",
+        "seeed-hal-adapter-socketcan",
+        "seeed-hal-adapter-v4l2",
+        "seeed-hal-adapter-windows-gpio",
+        "seeed-hal-broker-app",
+    )
+    for native_package in hardware_adapter_packages:
+        assert native_package not in commands
+
+
+def test_source_gate_runtime_closure_allows_os_backends_without_linux_prerequisites() -> None:
+    runtime = (REPO_ROOT / "crates" / "seeed-hal-runtime" / "Cargo.toml").read_text(
+        encoding="utf-8"
+    )
+    broker = (REPO_ROOT / "crates" / "seeed-hal-broker" / "Cargo.toml").read_text(
+        encoding="utf-8"
+    )
+    shared_memory = (
+        REPO_ROOT / "adapters" / "shared-memory" / "Cargo.toml"
+    ).read_text(encoding="utf-8")
+    windows_security = (
+        REPO_ROOT / "adapters" / "windows-security" / "Cargo.toml"
+    ).read_text(encoding="utf-8")
+
+    assert 'seeed-hal-adapter-shared-memory = { path = "../../adapters/shared-memory"' in runtime
+    assert 'seeed-hal-windows-security = { path = "../../adapters/windows-security"' in broker
+
+    for manifest in (shared_memory, windows_security):
+        assert "pkg-config" not in manifest
+        assert "libgpiod" not in manifest
+        assert "libudev" not in manifest
+        assert 'cfg(target_os = "linux")' not in manifest
+
+
+def test_linux_platform_jobs_install_shared_prerequisites_before_linux_gpio_builds() -> None:
+    workflow = load_workflow("ci.yml")
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+    platform_job = jobs["platform-conformance"]
+    platform_steps = platform_job["steps"]
     platform_prepare = next(
         step
         for step in platform_steps
         if step.get("name") == "Install Linux build prerequisites"
     )
 
-    for step in (source_prepare, platform_prepare):
-        assert step["if"] == "${{ runner.os == 'Linux' }}"
-        assert step["run"].strip() == (
-            "sudo apt-get update\n"
-            "sudo apt-get install --yes libgpiod-dev libudev-dev pkg-config"
-        )
-
-    source_prepare_index = source_steps.index(source_prepare)
-    source_clippy_index = next(
-        index
-        for index, step in enumerate(source_steps)
-        if "cargo +1.85 clippy" in step.get("run", "")
+    assert platform_prepare["if"] == "${{ runner.os == 'Linux' }}"
+    assert platform_prepare["run"].strip() == (
+        "./scripts/ci/install-linux-native-prerequisites.sh"
     )
+
     platform_prepare_index = platform_steps.index(platform_prepare)
     platform_build_index = next(
         index
         for index, step in enumerate(platform_steps)
-        if "cargo +1.85 build" in step.get("run", "")
+        if '"cargo",' in step.get("run", "")
     )
-    assert source_prepare_index < source_clippy_index
     assert platform_prepare_index < platform_build_index
 
 
@@ -186,16 +263,19 @@ def test_platform_job_separates_production_manifest_and_virtual_conformance() ->
         step["run"] for step in platform_job["steps"] if "run" in step
     )
 
-    assert "cargo +1.85 build -p seeed-hal-broker-app --no-default-features --features" in commands
+    assert '"cargo",' in commands
+    assert '"seeed-hal-broker-app",' in commands
+    assert '"--no-default-features",' in commands
+    assert '"--features",' in commands
     assert "verify-broker-manifest" in commands
-    assert "cargo +1.85 build -p seeed-hal-broker-app --no-default-features --features virtual-adapters" in commands
+    assert '"virtual-adapters",' in commands
     assert "run-virtual-conformance" in commands
     assert "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02" in json.dumps(
         platform_job
     )
 
 
-def test_platform_job_runs_windows_shared_memory_runtime_tests_before_broker_builds() -> None:
+def test_platform_job_runs_windows_shared_memory_runtime_tests_before_production_broker_build() -> None:
     workflow = load_workflow("ci.yml")
     jobs = workflow["jobs"]
     assert isinstance(jobs, dict)
@@ -211,17 +291,77 @@ def test_platform_job_runs_windows_shared_memory_runtime_tests_before_broker_bui
         "cargo +1.85 test -p seeed-hal-adapter-shared-memory --all-features "
         "platform::windows_tests -- --nocapture"
     )
-    runtime_index = platform_steps.index(runtime_step)
-    for broker_step_name in (
-        "Build production broker",
-        "Build and qualify virtual broker",
+    assert platform_steps.index(runtime_step) < next(
+        index
+        for index, step in enumerate(platform_steps)
+        if step.get("name") == "Build production broker"
+    )
+
+
+def test_source_gate_contains_no_native_or_platform_adapter_prerequisites() -> None:
+    workflow = load_workflow("ci.yml")
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+    source_gate = jobs["source-gate"]
+    commands = "\n".join(
+        step["run"] for step in source_gate["steps"] if "run" in step
+    )
+
+    for forbidden in (
+        "install-linux-native-prerequisites.sh",
+        "matrix.features",
+        "linux-gpio",
+        "windows-gpio",
+        "avfoundation",
+        "v4l2",
+        "mediafoundation",
     ):
-        broker_index = next(
-            index
-            for index, step in enumerate(platform_steps)
-            if step.get("name") == broker_step_name
-        )
-        assert runtime_index < broker_index
+        assert forbidden not in commands
+    assert "check-generated-protocol.sh" in commands
+    assert "pytest -q tests/release" in commands
+
+
+def test_platform_matrix_executes_manifest_and_virtual_minors_on_every_target() -> None:
+    workflow = load_workflow("ci.yml")
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+    platform_job = jobs["platform-conformance"]
+    steps = platform_job["steps"]
+    commands = "\n".join(step["run"] for step in steps if "run" in step)
+
+    assert platform_job["needs"] == "source-gate"
+    assert (
+        platform_job["strategy"]["matrix"]["include"]
+        == "${{ fromJSON(needs.source-gate.outputs.targets).include }}"
+    )
+    assert "verify-broker-manifest" in commands
+    assert "run-virtual-conformance" in commands
+    assert "BROKER_WIRE" not in commands
+    assert "minimum_minor" not in commands
+    assert "maximum_minor" not in commands
+    assert "scripts/release/release_tool.py" in commands
+    assert "ci-evidence/production/broker-manifest.json" in commands
+    assert "ci-evidence/virtual-conformance.json" in commands
+
+
+def test_platform_jobs_use_python_release_tooling_without_git_bash_dependency() -> None:
+    workflow = load_workflow("ci.yml")
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+    platform_job = jobs["platform-conformance"]
+
+    platform_steps = [
+        step
+        for step in platform_job["steps"]
+        if step.get("name") in {"Build production broker", "Build and qualify virtual broker"}
+    ]
+    assert len(platform_steps) == 2
+    assert all(step.get("shell") == "python" for step in platform_steps)
+    commands = "\n".join(step["run"] for step in platform_steps)
+    for forbidden in ("shasum", "chmod", "archive", "[[", "RUNNER_OS", "python3"):
+        assert forbidden not in commands
+    assert "sys.executable" in commands
+    assert "subprocess.run" in commands
 
 
 def _release_workflow() -> tuple[dict[str, object], dict[str, object], str]:

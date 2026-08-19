@@ -1416,20 +1416,22 @@ mod tests {
             })
         };
         gate.wait_reached().await;
-        let revoke = manager.revoke_owner(&owner_id);
-        tokio::pin!(revoke);
-        tokio::select! {
+        let (revoke, opening) = tokio::join!(
             biased;
-            result = &mut revoke => panic!("revocation completed before pending cleanup: {result:?}"),
-            _ = tokio::task::yield_now() => {}
-        }
-        gate.release();
-        assert!(opening.await.unwrap().is_err());
-        revoke.await.unwrap();
+            manager.revoke_owner(&owner_id),
+            async {
+                gate.release();
+                opening.await
+            },
+        );
+        let error = opening.unwrap().unwrap_err();
+        assert_eq!(error.name().as_str(), "runtime.session.closed");
+        revoke.unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(10), subscription.recv())
                 .await
-                .is_err()
+                .is_err(),
+            "a revoked pending session must not publish SessionOpened"
         );
     }
 

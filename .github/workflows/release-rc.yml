@@ -71,8 +71,8 @@ jobs:
           python3 scripts/release/release_tool.py check-version --tag "$TAG" --repo-root .
           ./scripts/check-generated-protocol.sh
           cargo +1.85 fmt --all --check
-          cargo +1.85 clippy --workspace --all-targets --all-features -- -D warnings
-          cargo +1.85 test --workspace --all-features
+          cargo +1.85 clippy --workspace --all-targets --no-default-features -- -D warnings
+          cargo +1.85 test --workspace --no-default-features
           uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
       - name: Derive release target matrix
         id: targets
@@ -98,15 +98,15 @@ jobs:
         with:
           python-version: "3.11"
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
-      - name: Install Rust and Linux prerequisites
+      - name: Install Rust
         shell: bash
         run: |
           set -euo pipefail
           rustup toolchain install 1.85 --profile minimal
-          if [[ "$RUNNER_OS" == "Linux" ]]; then
-            sudo apt-get update
-            sudo apt-get install --yes libgpiod-dev pkg-config
-          fi
+      - name: Install Linux build prerequisites
+        if: ${{ runner.os == 'Linux' }}
+        shell: bash
+        run: ./scripts/ci/install-linux-native-prerequisites.sh
       - name: Build and package production broker
         shell: bash
         run: |
@@ -180,6 +180,10 @@ jobs:
         with:
           python-version: "3.11"
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - name: Install Linux runtime prerequisites
+        if: ${{ runner.os == 'Linux' }}
+        shell: bash
+        run: ./scripts/ci/install-linux-native-prerequisites.sh
       - name: Download matching immutable platform artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:

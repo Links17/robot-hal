@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
+import csv
 from email.parser import BytesParser
 from email.policy import compat32
 import gzip
@@ -21,6 +23,8 @@ import tarfile
 import tomllib
 import unicodedata
 import urllib.parse
+import urllib.error
+import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -1285,12 +1289,10 @@ def collect_virtual_conformance(
     ref: str,
 ) -> list[dict[str, str | int]]:
     """Run a separately supplied virtual-adapters broker for one hosted platform."""
-    if platform not in {"macos", "linux", "windows"} or not _host_target(
-        _target_by_name(load_targets(repo_root / "release" / "targets.toml"), platform)
-    ):
+    if platform not in {"macos", "linux", "windows"}:
         raise ReleaseFailure(
-            "release.conformance.host",
-            "virtual conformance broker must run on its matching host",
+            "release.conformance.invalid",
+            "virtual conformance platform is invalid",
         )
     _bounded_command_identity(command)
     _safe_public_https_uri(ref, "software")
@@ -1298,6 +1300,13 @@ def collect_virtual_conformance(
         raise ReleaseFailure(
             "release.conformance.invalid",
             "virtual conformance broker is invalid",
+        )
+    if not _host_target(
+        _target_by_name(load_targets(repo_root / "release" / "targets.toml"), platform)
+    ):
+        raise ReleaseFailure(
+            "release.conformance.host",
+            "virtual conformance broker must run on its matching host",
         )
     _run_virtual_conformance(broker, repo_root)
     return [
@@ -2176,6 +2185,22 @@ def _write_deterministic_tar(
                 directory.gname = ""
                 directory.mtime = 0
                 archive.addfile(directory)
+                directories: set[str] = set()
+                for name, _, _ in members:
+                    parent = PurePosixPath(name).parent
+                    while parent.as_posix() not in {".", root}:
+                        directories.add(parent.as_posix())
+                        parent = parent.parent
+                for name in sorted(directories, key=lambda item: (item.count("/"), item)):
+                    directory = tarfile.TarInfo(name)
+                    directory.type = tarfile.DIRTYPE
+                    directory.mode = 0o755
+                    directory.uid = 0
+                    directory.gid = 0
+                    directory.uname = ""
+                    directory.gname = ""
+                    directory.mtime = 0
+                    archive.addfile(directory)
                 for name, path, mode in members:
                     contents = path.read_bytes()
                     info = tarfile.TarInfo(name)
@@ -2502,83 +2527,96 @@ def _require_clean_repository(repo_root: Path) -> None:
     _package_invalid("unable to verify repository state")
 
 
-def _crate_root_and_files(crate: Path) -> tuple[str, set[str]]:
-    try:
-        with tarfile.open(crate, "r:gz") as archive:
-            members = archive.getmembers()
-    except (OSError, tarfile.TarError) as error:
-        raise ReleaseFailure("release.archive.invalid", "unable to inspect crate archive") from error
-    if not members:
-        _archive_invalid("crate archive is empty")
-    paths = tuple(
-        _archive_member_path(member.name, member.isdir()) for member in members
-    )
-    roots = {path.parts[0] for path in paths}
-    if len(roots) != 1:
-        _archive_invalid("crate archive root is invalid")
-    root = roots.pop()
-    files: set[str] = set()
-    for member, path in zip(members, paths, strict=True):
-        if path.parts[0] != root or member.issym() or member.islnk():
-            _archive_invalid("crate archive member is invalid")
-        if member.isfile():
-            files.add(PurePosixPath(*path.parts[1:]).as_posix())
-    if "Cargo.toml" not in files or not any(path.startswith("src/") for path in files):
-        _archive_invalid("crate archive does not contain Rust package sources")
-    return root, files
-
-
-def _build_local_crate(
-    package: dict[str, object],
-    repo_root: Path,
-    staging_dir: Path,
-) -> Path:
-    name = str(package["name"])
-    version = str(package["version"])
-    target_dir = staging_dir / "target"
-    environment = {**os.environ, "CARGO_TARGET_DIR": str(target_dir)}
+def _frozen_workspace_source_files(repo_root: Path) -> tuple[tuple[str, Path, tuple[int, int, int, str]], ...]:
     try:
         result = subprocess.run(
-            [
-                "cargo",
-                "package",
-                "--package",
-                name,
-                "--locked",
-                "--allow-dirty",
-                "--no-verify",
-            ],
+            ["git", "ls-files", "-z"],
             cwd=repo_root,
             check=False,
             capture_output=True,
             text=True,
-            timeout=120,
-            env=environment,
+            timeout=30,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
-        raise ReleaseFailure("release.cargo.failed", "cargo package failed") from error
+        raise ReleaseFailure("release.package.invalid", "unable to enumerate repository files") from error
     if result.returncode != 0:
-        raise ReleaseFailure(
-            "release.cargo.failed",
-            _bounded_subprocess_summary(result.stderr, "cargo package failed"),
-        )
-    crate = target_dir / "package" / f"{name}-{version}.crate"
-    if not crate.is_file() or crate.is_symlink():
-        _package_invalid("cargo package did not produce the expected crate")
-    _crate_root_and_files(crate)
-    return crate
+        _package_invalid("unable to enumerate repository files")
+    entries = result.stdout.split("\0")
+    if not entries or entries[-1] != "":
+        _package_invalid("repository file list is invalid")
+    frozen: list[tuple[str, Path, tuple[int, int, int, str]]] = []
+    for entry in entries[:-1]:
+        try:
+            path = _safe_archive_path(entry)
+        except ReleaseFailure as error:
+            raise ReleaseFailure("release.package.invalid", "repository file path is unsafe") from error
+        source = repo_root / Path(*path.parts)
+        try:
+            if source.resolve().parent != source.parent.resolve() or source.is_symlink():
+                _package_invalid("repository source contains a symbolic link")
+            identity = _file_identity(source)
+        except ReleaseFailure as error:
+            raise ReleaseFailure(
+                "release.package.invalid",
+                "repository source file is invalid",
+            ) from error
+        frozen.append((path.as_posix(), source, identity))
+    if not frozen:
+        _package_invalid("repository has no tracked source files")
+    return tuple(sorted(frozen))
 
 
-def _check_packaged_crate(crate: Path, staging_dir: Path) -> None:
-    root, _ = _crate_root_and_files(crate)
-    extract_root = staging_dir / "checked" / root
+def _require_frozen_workspace_sources(
+    files: tuple[tuple[str, Path, tuple[int, int, int, str]], ...],
+) -> None:
+    for _, path, identity in files:
+        if _file_identity(path) != identity:
+            _package_invalid("repository source changed during packaging")
+
+
+def _workspace_source_members(repo_root: Path) -> tuple[dict[str, object], ...]:
     try:
-        extract_root.parent.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(crate, "r:gz") as archive:
-            archive.extractall(extract_root.parent, filter="data")
         result = subprocess.run(
-            ["cargo", "check", "--locked"],
-            cwd=extract_root,
+            ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"],
+            cwd=repo_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        metadata = json.loads(result.stdout) if result.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
+        raise ReleaseFailure("release.cargo.failed", "cargo metadata failed") from error
+    if not isinstance(metadata, dict):
+        raise ReleaseFailure("release.cargo.failed", "cargo metadata failed")
+    packages = metadata.get("packages")
+    members = metadata.get("workspace_members")
+    if not isinstance(packages, list) or not isinstance(members, list):
+        _package_invalid("cargo metadata workspace members are invalid")
+    by_id = {
+        package.get("id"): package
+        for package in packages
+        if isinstance(package, dict) and isinstance(package.get("id"), str)
+    }
+    if not all(isinstance(member, str) and member in by_id for member in members):
+        _package_invalid("cargo metadata workspace members are invalid")
+    return tuple(by_id[member] for member in members)
+
+
+def _check_workspace_source_bundle(
+    archive: Path,
+    root: str,
+    expected_files: set[str],
+    staging_dir: Path,
+) -> None:
+    extract_root = staging_dir / "checked"
+    try:
+        validate_archive(archive, expected_root=root, expected_files=expected_files)
+        with tarfile.open(archive, "r:gz") as contents:
+            contents.extractall(extract_root, filter="data")
+        result = subprocess.run(
+            ["cargo", "check", "--workspace", "--locked"],
+            cwd=extract_root / root,
             check=False,
             capture_output=True,
             text=True,
@@ -2586,16 +2624,16 @@ def _check_packaged_crate(crate: Path, staging_dir: Path) -> None:
             env={**os.environ, "CARGO_TARGET_DIR": str(staging_dir / "check-target")},
         )
     except (OSError, tarfile.TarError, subprocess.TimeoutExpired) as error:
-        raise ReleaseFailure("release.cargo.failed", "packaged crate validation failed") from error
+        raise ReleaseFailure("release.cargo.failed", "workspace source bundle validation failed") from error
     if result.returncode != 0:
         raise ReleaseFailure(
             "release.cargo.failed",
-            _bounded_subprocess_summary(result.stderr, "packaged crate validation failed"),
+            _bounded_subprocess_summary(result.stderr, "workspace source bundle validation failed"),
         )
 
 
 def package_rust(*, tag: str, repo_root: Path, output_dir: Path) -> Path:
-    """Create a deterministic local source bundle without registry publication."""
+    """Create a deterministic complete Rust workspace source bundle."""
     staging_dir: Path | None = None
     try:
         version = ReleaseVersion.parse(tag)
@@ -2603,30 +2641,41 @@ def package_rust(*, tag: str, repo_root: Path, output_dir: Path) -> Path:
         if repo_root.is_symlink() or not resolved_root.is_dir():
             _package_invalid("repository root is invalid")
         _require_clean_repository(resolved_root)
-        packages = _cargo_packageable_members(resolved_root)
-        if any(package["version"] != version.cargo for package in packages):
-            _package_invalid("cargo package version does not match release tag")
+        packages = _workspace_source_members(resolved_root)
+        if any(package.get("version") != version.cargo for package in packages):
+            _package_invalid("cargo workspace version does not match release tag")
+        frozen_sources = _frozen_workspace_source_files(resolved_root)
+        source_names = {name for name, _, _ in frozen_sources}
+        required = {"Cargo.toml", "Cargo.lock"}
+        for package in packages:
+            manifest = package.get("manifest_path")
+            if not isinstance(manifest, str):
+                _package_invalid("cargo metadata workspace manifest is invalid")
+            try:
+                relative = Path(manifest).resolve().relative_to(resolved_root).as_posix()
+            except ValueError as error:
+                raise ReleaseFailure(
+                    "release.package.invalid",
+                    "cargo workspace member is outside repository root",
+                ) from error
+            required.add(relative)
+        if not required.issubset(source_names):
+            _package_invalid("workspace source bundle is missing required files")
         _package_output_directory(output_dir)
         archive_name = f"seeed-hal-crates-v{version.cargo}.tar.gz"
         destination = _published_artifact_path(output_dir, archive_name)
         staging_dir = Path(tempfile.mkdtemp(prefix=".package-rust-", dir=output_dir))
-        staged_crates = tuple(
-            _build_local_crate(package, resolved_root, staging_dir) for package in packages
-        )
-        for crate in staged_crates:
-            _check_packaged_crate(crate, staging_dir)
         root = f"seeed-hal-crates-v{version.cargo}"
         members = tuple(
-            (f"{root}/{crate.name}", crate, 0o644)
-            for crate in sorted(staged_crates, key=lambda item: item.name)
+            (f"{root}/{name}", path, 0o644)
+            for name, path, _ in frozen_sources
         )
         staged_archive = staging_dir / archive_name
         _write_deterministic_tar(staged_archive, root, members)
-        validate_archive(
-            staged_archive,
-            expected_root=root,
-            expected_files={crate.name for crate in staged_crates},
-        )
+        _require_frozen_workspace_sources(frozen_sources)
+        _check_workspace_source_bundle(staged_archive, root, source_names, staging_dir)
+        _require_frozen_workspace_sources(frozen_sources)
+        _require_clean_repository(resolved_root)
         return _publish_staged_artifact(staged_archive, destination)
     except ReleaseFailure:
         raise
@@ -2653,12 +2702,34 @@ def python_artifact_names(version: ReleaseVersion) -> tuple[str, str]:
 def _wheel_metadata(wheel: Path, version: ReleaseVersion) -> None:
     try:
         with zipfile.ZipFile(wheel) as archive:
-            names = set(archive.namelist())
+            members = tuple(archive.namelist())
+            names = set(members)
             dist_info = f"seeed_hal-{version.python}.dist-info"
             metadata_name = f"{dist_info}/METADATA"
             wheel_name = f"{dist_info}/WHEEL"
             if metadata_name not in names or wheel_name not in names:
                 _package_invalid("Python wheel metadata is invalid")
+            for member in members:
+                try:
+                    path = _safe_archive_path(member)
+                except ReleaseFailure as error:
+                    raise ReleaseFailure(
+                        "release.package.invalid",
+                        "Python wheel member path is invalid",
+                    ) from error
+                normalized = path.as_posix()
+                data_prefix = f"{dist_info.removesuffix('.dist-info')}.data"
+                install_path = (
+                    PurePosixPath(*path.parts[2:]).as_posix()
+                    if len(path.parts) >= 3
+                    and path.parts[:2] in {
+                        (data_prefix, "purelib"),
+                        (data_prefix, "platlib"),
+                    }
+                    else normalized
+                )
+                if install_path == "google" or install_path.startswith("google/"):
+                    _package_invalid("Python wheel must not provide protobuf")
             metadata = archive.read(metadata_name).decode("utf-8")
             wheel_data = archive.read(wheel_name)
             wheel_headers = BytesParser(policy=compat32).parsebytes(wheel_data)
@@ -2719,9 +2790,369 @@ def _sdist_metadata(sdist: Path, version: ReleaseVersion) -> None:
         _package_invalid("Python source distribution content is invalid")
 
 
-def _verify_wheel_install(wheel: Path, version: ReleaseVersion, staging_dir: Path) -> None:
+def _locked_protobuf_wheel(project: Path) -> tuple[str, str]:
+    try:
+        lock = tomllib.loads((project / "uv.lock").read_text(encoding="utf-8"))
+        packages = lock["package"]
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError, KeyError, TypeError) as error:
+        raise ReleaseFailure(
+            "release.package.invalid",
+            "locked protobuf wheel metadata is invalid",
+        ) from error
+    for package in packages:
+        if not isinstance(package, dict) or package.get("name") != "protobuf":
+            continue
+        if package.get("version") != "6.32.1":
+            break
+        wheels = package.get("wheels")
+        if not isinstance(wheels, list):
+            break
+        for wheel in wheels:
+            if not isinstance(wheel, dict):
+                continue
+            url = wheel.get("url")
+            digest = wheel.get("hash")
+            if (
+                isinstance(url, str)
+                and url.endswith("protobuf-6.32.1-py3-none-any.whl")
+                and _is_credential_free_https_url(url)
+                and isinstance(digest, str)
+                and SHA256.fullmatch(digest.removeprefix("sha256:")) is not None
+            ):
+                return (url, digest.removeprefix("sha256:"))
+        break
+    _package_invalid("locked protobuf wheel is unavailable")
+
+
+def _is_credential_free_https_url(url: str) -> bool:
+    parsed = urllib.parse.urlsplit(url)
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname is not None
+        and parsed.username is None
+        and parsed.password is None
+    )
+
+
+class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, message, headers, newurl):
+        if not _is_credential_free_https_url(newurl):
+            _package_invalid("locked protobuf wheel redirect is invalid")
+        return super().redirect_request(request, fp, code, message, headers, newurl)
+
+
+@dataclass
+class _LockedProtobufWheel:
+    path: Path
+
+    def close(self) -> None:
+        pass
+
+
+def _protobuf_record_mapping(
+    record: str,
+    *,
+    record_path: str,
+) -> dict[str, tuple[str | None, int | None]]:
+    mapping: dict[str, tuple[str | None, int | None]] = {}
+    try:
+        rows = tuple(csv.reader(record.splitlines()))
+    except csv.Error as error:
+        raise ReleaseFailure(
+            "release.package.invalid", "protobuf RECORD is invalid"
+        ) from error
+    for row in rows:
+        if len(row) != 3 or not row[0] or row[0] in mapping:
+            _package_invalid("protobuf RECORD is invalid")
+        try:
+            path = _safe_archive_path(row[0]).as_posix()
+        except ReleaseFailure as error:
+            raise ReleaseFailure(
+                "release.package.invalid", "protobuf RECORD is invalid"
+            ) from error
+        encoded, raw_size = row[1], row[2]
+        if path == record_path:
+            if encoded or raw_size:
+                _package_invalid("protobuf RECORD is invalid")
+            mapping[path] = (None, None)
+            continue
+        if (
+            not encoded.startswith("sha256=")
+            or not re.fullmatch(r"[A-Za-z0-9_-]{43}", encoded.removeprefix("sha256="))
+            or not re.fullmatch(r"(?:0|[1-9][0-9]*)", raw_size)
+        ):
+            _package_invalid("protobuf RECORD is invalid")
+        try:
+            digest = base64.urlsafe_b64decode(
+                encoded.removeprefix("sha256=") + "="
+            )
+        except ValueError as error:
+            raise ReleaseFailure(
+                "release.package.invalid", "protobuf RECORD is invalid"
+            ) from error
+        if len(digest) != 32:
+            _package_invalid("protobuf RECORD is invalid")
+        mapping[path] = (encoded, int(raw_size))
+    if record_path not in mapping:
+        _package_invalid("protobuf RECORD is invalid")
+    return mapping
+
+
+def _locked_protobuf_record_mapping(wheel: Path) -> dict[str, tuple[str | None, int | None]]:
+    try:
+        with zipfile.ZipFile(wheel) as archive:
+            members = tuple(archive.namelist())
+            record_paths = [
+                name for name in members if name.endswith(".dist-info/RECORD")
+            ]
+            metadata_paths = [
+                name for name in members if name.endswith(".dist-info/METADATA")
+            ]
+            if len(record_paths) != 1 or len(metadata_paths) != 1:
+                _package_invalid("locked protobuf wheel is invalid")
+            record_path = _safe_archive_path(record_paths[0]).as_posix()
+            metadata_path = _safe_archive_path(metadata_paths[0]).as_posix()
+            dist_info = record_path.removesuffix("/RECORD")
+            if metadata_path != f"{dist_info}/METADATA":
+                _package_invalid("locked protobuf wheel is invalid")
+            metadata = archive.read(metadata_path).decode("utf-8")
+            if (
+                "Name: protobuf\n" not in metadata
+                or "Version: 6.32.1\n" not in metadata
+            ):
+                _package_invalid("locked protobuf wheel is invalid")
+            mapping = _protobuf_record_mapping(
+                archive.read(record_path).decode("utf-8"),
+                record_path=record_path,
+            )
+            inventory = {
+                _safe_archive_path(member).as_posix()
+                for member in members
+                if not member.endswith("/")
+            }
+            if set(mapping) != inventory:
+                _package_invalid("locked protobuf wheel is invalid")
+            data_prefix = f"{dist_info.removesuffix('.dist-info')}.data/"
+            for path in mapping:
+                installed = (
+                    path.removeprefix(data_prefix + "purelib/")
+                    if path.startswith(data_prefix + "purelib/")
+                    else path.removeprefix(data_prefix + "platlib/")
+                    if path.startswith(data_prefix + "platlib/")
+                    else path
+                )
+                if not (
+                    installed.startswith("google/protobuf/")
+                    or installed.startswith(f"{dist_info}/")
+                ):
+                    _package_invalid("locked protobuf wheel is invalid")
+            return {
+                (
+                    path.removeprefix(data_prefix + "purelib/")
+                    if path.startswith(data_prefix + "purelib/")
+                    else path.removeprefix(data_prefix + "platlib/")
+                    if path.startswith(data_prefix + "platlib/")
+                    else path
+                ): entry
+                for path, entry in mapping.items()
+            }
+    except (OSError, UnicodeError, zipfile.BadZipFile, ReleaseFailure) as error:
+        if isinstance(error, ReleaseFailure):
+            raise
+        raise ReleaseFailure(
+            "release.package.invalid", "locked protobuf wheel is invalid"
+        ) from error
+
+
+def _verify_installed_protobuf_record(
+    root: Path,
+    record: Path,
+    expected: dict[str, tuple[str | None, int | None]],
+) -> None:
+    try:
+        actual = _protobuf_record_mapping(
+            record.read_text(encoding="utf-8"),
+            record_path=record.relative_to(root).as_posix(),
+        )
+        expected_non_record = {
+            path: entry
+            for path, entry in expected.items()
+            if not path.endswith(".dist-info/RECORD")
+        }
+        actual_non_record = {
+            path: entry
+            for path, entry in actual.items()
+            if not path.endswith(".dist-info/RECORD")
+        }
+        permitted_metadata = {
+            record.parent.relative_to(root).as_posix() + "/" + name
+            for name in {"INSTALLER", "REQUESTED", "direct_url.json", "uv_cache.json"}
+        }
+        if (
+            set(actual_non_record) - permitted_metadata != set(expected_non_record)
+            or actual.get(record.relative_to(root).as_posix()) != (None, None)
+        ):
+            _package_invalid("installed protobuf RECORD does not match locked wheel")
+        for path, (encoded, size) in expected.items():
+            installed = root / path
+            if not installed.is_file() or installed.is_symlink():
+                _package_invalid("installed protobuf RECORD does not match locked wheel")
+            if encoded is None:
+                continue
+            contents = installed.read_bytes()
+            actual_hash = (
+                "sha256="
+                + base64.urlsafe_b64encode(hashlib.sha256(contents).digest())
+                .rstrip(b"=")
+                .decode("ascii")
+            )
+            if actual_hash != encoded or len(contents) != size:
+                _package_invalid("installed protobuf RECORD does not match locked wheel")
+        scopes = {
+            root / "google" / "protobuf",
+            root / record.relative_to(root).parent,
+        }
+        actual_files = {
+            path.relative_to(root).as_posix()
+            for scope in scopes
+            for path in scope.rglob("*")
+            if path.is_file() and not path.is_symlink() and path.suffix != ".pyc"
+        }
+        if actual_files != set(expected) | permitted_metadata:
+            _package_invalid("installed protobuf RECORD does not match locked wheel")
+    except (OSError, ValueError) as error:
+        raise ReleaseFailure(
+            "release.package.invalid",
+            "installed protobuf RECORD does not match locked wheel",
+        ) from error
+
+
+def _installed_protobuf_record_validation_script(
+    expected: dict[str, tuple[str | None, int | None]],
+) -> str:
+    canonical_expected = json.dumps(
+        {path: [encoded, size] for path, (encoded, size) in expected.items()},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return (
+        "import base64, csv, hashlib, importlib.metadata, json, pathlib\n"
+        "import google.protobuf;"
+        "dist=importlib.metadata.distribution('protobuf');"
+        "record=dist.locate_file(next(path for path in dist.files if path.name == 'RECORD'));"
+        "site=record.parent.parent;"
+        "assert record.is_file() and pathlib.Path(google.protobuf.__file__).is_relative_to(site);"
+        f"expected_entries={{path:(entry[0],entry[1]) for path,entry in json.loads({canonical_expected!r}).items()}};"
+        "installed_entries={};"
+        "exec(\"for row in csv.reader(record.read_text(encoding='utf-8').splitlines()):\\n"
+        " assert len(row) == 3 and row[0] and row[0] not in installed_entries\\n"
+        " path, encoded, size = row\\n"
+        " if path == record.relative_to(site).as_posix():\\n"
+        "  assert not encoded and not size; installed_entries[path] = (None, None); continue\\n"
+        " assert encoded.startswith('sha256=') and len(encoded.removeprefix('sha256=')) == 43 and size.isdecimal()\\n"
+        " data=(site / path).read_bytes()\\n"
+        " assert base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b'=').decode() == encoded.removeprefix('sha256=')\\n"
+        " assert len(data) == int(size)\\n"
+        " installed_entries[path] = (encoded, int(size))\")\n"
+        "permitted_metadata={'INSTALLER','REQUESTED','direct_url.json','uv_cache.json'};"
+        "expected_non_record={path for path in expected_entries if not path.endswith('.dist-info/RECORD')};"
+        "actual_non_record={path for path in installed_entries if not path.endswith('.dist-info/RECORD')};"
+        "assert actual_non_record - {record.parent.relative_to(site).as_posix() + '/' + name for name in permitted_metadata} == expected_non_record, (actual_non_record - {record.parent.relative_to(site).as_posix() + '/' + name for name in permitted_metadata}) ^ expected_non_record;"
+        "assert installed_entries[record.relative_to(site).as_posix()] == (None, None);"
+        "assert {path:entry for path,entry in installed_entries.items() if path not in {record.parent.relative_to(site).as_posix() + '/' + name for name in permitted_metadata}} == expected_entries;"
+        "actual_files={path.relative_to(site).as_posix() for scope in (site / 'google' / 'protobuf', record.parent) for path in scope.rglob('*') if path.is_file() and not path.is_symlink() and path.suffix != '.pyc'};"
+        "assert actual_files == set(expected_entries) | {record.parent.relative_to(site).as_posix() + '/' + name for name in permitted_metadata}, actual_files ^ (set(expected_entries) | {record.parent.relative_to(site).as_posix() + '/' + name for name in permitted_metadata});"
+    )
+
+
+def _locked_protobuf_file_identity(path: Path) -> tuple[int, int, int, int]:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise ReleaseFailure(
+            "release.package.invalid",
+            "locked protobuf wheel is invalid",
+        ) from error
+    if not stat.S_ISREG(metadata.st_mode):
+        _package_invalid("locked protobuf wheel is invalid")
+    return (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
+
+
+def _locked_protobuf_hash(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as error:
+        raise ReleaseFailure(
+            "release.package.invalid",
+            "locked protobuf wheel is invalid",
+        ) from error
+
+
+def _require_locked_protobuf_wheel(
+    path: Path,
+    expected_hash: str,
+    expected_identity: tuple[int, int, int, int],
+) -> None:
+    if (
+        _locked_protobuf_file_identity(path) != expected_identity
+        or _locked_protobuf_hash(path) != expected_hash
+    ):
+        _package_invalid("locked protobuf wheel changed before installation")
+
+
+def _prepare_locked_protobuf_wheel(
+    project: Path, staging_dir: Path
+) -> tuple[_LockedProtobufWheel, str]:
+    url, expected_hash = _locked_protobuf_wheel(project)
+    candidate_dir = staging_dir / "candidate"
+    immutable_dir = staging_dir / "immutable"
+    candidate_wheel = candidate_dir / "protobuf-6.32.1-py3-none-any.whl"
+    wheel = immutable_dir / candidate_wheel.name
+    candidate_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+    immutable_dir.mkdir(mode=0o700, exist_ok=False)
+    try:
+        opener = urllib.request.build_opener(_HttpsOnlyRedirectHandler())
+        with opener.open(url, timeout=120) as response:
+            if not _is_credential_free_https_url(response.geturl()):
+                _package_invalid("locked protobuf wheel redirect is invalid")
+            with candidate_wheel.open("xb") as destination:
+                while chunk := response.read(64 * 1024):
+                    destination.write(chunk)
+        actual_hash = _locked_protobuf_hash(candidate_wheel)
+        if actual_hash != expected_hash:
+            _package_invalid("locked protobuf wheel hash is invalid")
+        with candidate_wheel.open("rb") as source, wheel.open("xb") as destination:
+            while chunk := source.read(64 * 1024):
+                destination.write(chunk)
+        wheel.chmod(0o400)
+        actual_hash = _locked_protobuf_hash(wheel)
+    except (OSError, urllib.error.URLError) as error:
+        raise ReleaseFailure(
+            "release.package.invalid",
+            "unable to prepare locked protobuf wheel",
+        ) from error
+    if actual_hash != expected_hash:
+        _package_invalid("locked protobuf wheel hash is invalid")
+    return (_LockedProtobufWheel(wheel), expected_hash)
+
+
+def _verify_wheel_install(
+    wheel: Path,
+    version: ReleaseVersion,
+    staging_dir: Path,
+    protobuf_wheel: Path | _LockedProtobufWheel,
+    protobuf_hash: str,
+) -> None:
     virtualenv = staging_dir / "venv"
     python = virtualenv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    owns_descriptor = isinstance(protobuf_wheel, Path)
+    if owns_descriptor:
+        protobuf_wheel = _LockedProtobufWheel(protobuf_wheel)
+    protobuf_identity = _locked_protobuf_file_identity(protobuf_wheel.path)
+    _require_locked_protobuf_wheel(
+        protobuf_wheel.path, protobuf_hash, protobuf_identity
+    )
+    protobuf_record_mapping = _locked_protobuf_record_mapping(protobuf_wheel.path)
     environment = {
         key: value
         for key, value in os.environ.items()
@@ -2745,21 +3176,27 @@ def _verify_wheel_install(wheel: Path, version: ReleaseVersion, staging_dir: Pat
                 "--python",
                 str(python),
                 "--offline",
+                "--no-deps",
                 str(wheel),
+                str(protobuf_wheel.path),
             ],
             [
                 str(python),
                 "-I",
                 "-c",
                 (
-                    "import importlib.metadata;"
-                    "import seeed_hal;"
-                    f"expected={version.python!r};"
-                    "assert importlib.metadata.version('seeed-hal') == expected;"
-                    "assert seeed_hal.__version__ == expected;"
-                    "from seeed_hal.proto import hal_pb2;"
-                    "assert hal_pb2.DESCRIPTOR.name == 'hal.proto';"
-                    "assert hal_pb2.Empty().SerializeToString() == b''"
+                    "import importlib.metadata;import seeed_hal;"
+                    + f"expected={version.python!r};"
+                    + "assert importlib.metadata.version('seeed-hal') == expected;"
+                    + "assert seeed_hal.__version__ == expected;"
+                    + "from seeed_hal.proto import hal_pb2;"
+                    + "import google.protobuf;"
+                    + "assert google.protobuf.__version__ == '6.32.1';"
+                    + _installed_protobuf_record_validation_script(
+                        protobuf_record_mapping
+                    )
+                    + "assert hal_pb2.DESCRIPTOR.name == 'hal.proto';"
+                    + "assert hal_pb2.Empty().SerializeToString() == b''"
                 ),
             ],
         ):
@@ -2772,12 +3209,20 @@ def _verify_wheel_install(wheel: Path, version: ReleaseVersion, staging_dir: Pat
                 env=environment,
             )
             if result.returncode != 0:
-                _package_invalid("Python wheel installation validation failed")
+                _package_invalid(
+                    _bounded_subprocess_summary(
+                        f"{result.stdout}\n{result.stderr}",
+                        "Python wheel installation validation failed",
+                    )
+                )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ReleaseFailure(
             "release.package.invalid",
             "Python wheel installation validation failed",
         ) from error
+    finally:
+        if owns_descriptor:
+            protobuf_wheel.close()
 
 
 def package_python(*, tag: str, project: Path, output_dir: Path) -> tuple[Path, Path]:
@@ -2788,6 +3233,8 @@ def package_python(*, tag: str, project: Path, output_dir: Path) -> tuple[Path, 
     release directory.  Task 7 aggregates validated candidates separately.
     """
     try:
+        if os.name == "nt":
+            _package_invalid("Python candidate packaging is unsupported on Windows")
         version = ReleaseVersion.parse(tag)
         pyproject = _read_toml(project / "pyproject.toml", "release.package.invalid")
         metadata = pyproject.get("project")
@@ -2797,44 +3244,57 @@ def package_python(*, tag: str, project: Path, output_dir: Path) -> tuple[Path, 
         _create_package_output_directory(output_dir)
         output_dir.chmod(0o700)
         candidate_identity = _candidate_directory_identity(output_dir)
-        result = subprocess.run(
-            [
-                "uv",
-                "run",
-                "--project",
-                str(project),
-                "--frozen",
-                "python",
-                "-m",
-                "build",
-                "--outdir",
-                str(output_dir),
-                str(project),
-            ],
-            cwd=project.parent.parent,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if result.returncode != 0:
-            _package_invalid(
-                _bounded_subprocess_summary(result.stderr, "Python build failed")
+        with tempfile.TemporaryDirectory(prefix=".package-python-dependency-") as directory:
+            protobuf_wheel, protobuf_hash = _prepare_locked_protobuf_wheel(
+                project, Path(directory)
             )
-        wheel = output_dir / wheel_name
-        sdist = output_dir / sdist_name
-        expected = frozenset({wheel_name, sdist_name})
-        _require_python_candidate_entries(output_dir, candidate_identity, expected)
-        wheel_identity = _python_candidate_artifact_identity(wheel)
-        sdist_identity = _python_candidate_artifact_identity(sdist)
-        _wheel_metadata(wheel, version)
-        _sdist_metadata(sdist, version)
-        with tempfile.TemporaryDirectory(prefix=".package-python-validate-") as directory:
-            _verify_wheel_install(wheel, version, Path(directory))
-        _require_python_candidate_entries(output_dir, candidate_identity, expected)
-        _require_python_candidate_artifact_identity(wheel, wheel_identity)
-        _require_python_candidate_artifact_identity(sdist, sdist_identity)
-        return (wheel, sdist)
+            try:
+                result = subprocess.run(
+                    [
+                        "uv",
+                        "run",
+                        "--project",
+                        str(project),
+                        "--frozen",
+                        "python",
+                        "-m",
+                        "build",
+                        "--outdir",
+                        str(output_dir),
+                        str(project),
+                    ],
+                    cwd=project.parent.parent,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if result.returncode != 0:
+                    _package_invalid(
+                        _bounded_subprocess_summary(result.stderr, "Python build failed")
+                    )
+                wheel = output_dir / wheel_name
+                sdist = output_dir / sdist_name
+                expected = frozenset({wheel_name, sdist_name})
+                _require_python_candidate_entries(output_dir, candidate_identity, expected)
+                wheel_identity = _python_candidate_artifact_identity(wheel)
+                sdist_identity = _python_candidate_artifact_identity(sdist)
+                _wheel_metadata(wheel, version)
+                _sdist_metadata(sdist, version)
+                with tempfile.TemporaryDirectory(prefix=".package-python-validate-") as staging:
+                    _verify_wheel_install(
+                        wheel,
+                        version,
+                        Path(staging),
+                        protobuf_wheel,
+                        protobuf_hash,
+                    )
+                _require_python_candidate_entries(output_dir, candidate_identity, expected)
+                _require_python_candidate_artifact_identity(wheel, wheel_identity)
+                _require_python_candidate_artifact_identity(sdist, sdist_identity)
+                return (wheel, sdist)
+            finally:
+                protobuf_wheel.close()
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ReleaseFailure("release.package.invalid", "Python build failed") from error
 

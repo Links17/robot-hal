@@ -6,7 +6,7 @@ use seeed_hal_gpio::{
     GpioAdapter, GpioBias, GpioEdgeEvent, GpioEdgeRequest, GpioLineConfig, GpioLineSession,
     gpio_edges_capability, gpio_lines_capability,
 };
-use seeed_hal_runtime::HalRuntime;
+use seeed_hal_runtime::{GpioQueueObserver, HalRuntime};
 use seeed_hal_testkit::VirtualGpioAdapter;
 use std::sync::Arc;
 use std::time::Duration;
@@ -280,7 +280,11 @@ async fn gpio_close_times_out_while_edge_waits_and_keeps_lines_exclusive() {
 #[tokio::test]
 async fn gpio_cancelled_queued_read_does_not_start_native_io() {
     let adapter = BlockingGpioAdapter::new("gpio:runtime:cancelled-queue");
-    let runtime = HalRuntime::builder().gpio_adapter(adapter.clone()).build();
+    let (queue_observer, mut queued) = GpioQueueObserver::new();
+    let runtime = HalRuntime::builder()
+        .gpio_adapter(adapter.clone())
+        .gpio_queue_observer(queue_observer)
+        .build();
     let descriptor = runtime.enumerate_gpio().await.unwrap().remove(0);
     let mut handle = runtime
         .open_gpio(
@@ -299,14 +303,31 @@ async fn gpio_cancelled_queued_read_does_not_start_native_io() {
         tokio::spawn(async move { runtime.gpio_read(session, &lease).await })
     };
     started.await;
+    assert_eq!(
+        *queued.borrow_and_update(),
+        1,
+        "the first blocked native read must be the only admitted command"
+    );
     let cancelled = {
         let runtime = runtime.clone();
         let session = handle.session_id();
         let lease = handle.lease_token().clone();
         tokio::spawn(async move { runtime.gpio_read(session, &lease).await })
     };
-    tokio::task::yield_now().await;
+    queued
+        .changed()
+        .await
+        .expect("GPIO queue observer remains connected");
+    assert_eq!(
+        *queued.borrow_and_update(),
+        2,
+        "the second read must enter the GPIO command queue before cancellation"
+    );
     cancelled.abort();
+    assert!(
+        cancelled.await.unwrap_err().is_cancelled(),
+        "the queued read task must finish cancellation before native I/O is released"
+    );
     adapter.release_read.add_permits(1);
     first.await.unwrap().unwrap();
     assert!(

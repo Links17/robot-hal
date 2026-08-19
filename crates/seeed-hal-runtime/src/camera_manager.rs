@@ -81,6 +81,11 @@ enum CameraCommand {
     },
 }
 
+enum EnqueueError {
+    Full(HalError),
+    Closed,
+}
+
 impl CameraCommand {
     fn reject_closed(self) {
         match self {
@@ -119,21 +124,27 @@ struct CameraWorker {
     admission: Arc<Mutex<()>>,
     completion: watch::Receiver<Option<HalResult<()>>>,
     terminal_error: watch::Receiver<Option<HalError>>,
+    #[cfg(test)]
+    admission_attempt: Option<mpsc::UnboundedSender<()>>,
 }
 
 impl CameraWorker {
-    fn try_enqueue(&self, command: CameraCommand, operation: &'static str) -> HalResult<()> {
+    fn try_enqueue(
+        &self,
+        command: CameraCommand,
+        operation: &'static str,
+    ) -> Result<(), EnqueueError> {
         self.commands
             .try_send(command)
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => runtime_error(
+                mpsc::error::TrySendError::Full(_) => EnqueueError::Full(runtime_error(
                     "runtime.queue.full",
                     ErrorCategory::Unavailable,
                     operation,
                     true,
                     "the bounded camera command queue has reached its 64-command capacity",
-                ),
-                mpsc::error::TrySendError::Closed(_) => actor_unavailable(operation),
+                )),
+                mpsc::error::TrySendError::Closed(_) => EnqueueError::Closed,
             })
     }
 
@@ -227,7 +238,7 @@ fn spawn_worker(
                         command.reject_closed();
                         break;
                     }
-                    let _admission = runtime.block_on(worker_admission.lock());
+                    let admission = runtime.block_on(worker_admission.lock());
                     if *worker_shutdown.borrow() {
                         command.reject_closed();
                         break;
@@ -313,7 +324,7 @@ fn spawn_worker(
                         }
                     };
                     if let Some(error) = terminal {
-                        let _ = terminal_error_tx.send(Some(error.clone()));
+                        publish_terminal(&admission, &terminal_error_tx, error.clone());
                         terminal_error = Some(error);
                         break;
                     }
@@ -335,17 +346,20 @@ fn spawn_worker(
                 } else {
                     let cleanup = close_result.and(mapping_result);
                     if let Err(error) = &cleanup {
-                        let _ = terminal_error_tx.send(Some(error.clone()));
+                        let admission = runtime.block_on(worker_admission.lock());
+                        publish_terminal(&admission, &terminal_error_tx, error.clone());
                     }
                     cleanup
                 }
             }))
             .unwrap_or_else(|_| Err(actor_unavailable("camera.worker")));
-            if let Err(error) = &result {
-                if terminal_error_tx.borrow().is_none() {
-                    let _ = terminal_error_tx.send(Some(error.clone()));
+            let admission = runtime.block_on(worker_admission.lock());
+            if terminal_error_tx.borrow().is_none() {
+                if let Err(error) = &result {
+                    publish_terminal(&admission, &terminal_error_tx, error.clone());
                 }
             }
+            drop(admission);
             let _ = completion_tx.send(Some(result));
         })
         .map_err(|error| {
@@ -364,6 +378,8 @@ fn spawn_worker(
             admission,
             completion,
             terminal_error,
+            #[cfg(test)]
+            admission_attempt: None,
         },
         opened_rx,
     ))
@@ -405,6 +421,15 @@ impl CameraFrameSink for RuntimeFrameSink {
 fn is_terminal(error: &HalError) -> bool {
     error.category() == ErrorCategory::Unavailable
 }
+
+fn publish_terminal(
+    _admission: &tokio::sync::MutexGuard<'_, ()>,
+    terminal_error_tx: &watch::Sender<Option<HalError>>,
+    error: HalError,
+) {
+    let _ = terminal_error_tx.send(Some(error));
+}
+
 fn actor_unavailable(op: &'static str) -> HalError {
     runtime_error(
         "runtime.actor.unavailable",
@@ -625,10 +650,45 @@ impl CameraManager {
         command: impl FnOnce(oneshot::Sender<HalResult<T>>) -> CameraCommand,
     ) -> HalResult<T> {
         let (worker, resource) = self.worker(&id, lease, op).await?;
+        // This is the linearization point shared with native command execution:
+        // a worker that can publish a terminal result holds this lock until its
+        // result has been sent to `terminal_error`.
+        #[cfg(test)]
+        let admission = if let Some(admission_attempt) = &worker.admission_attempt {
+            let mut lock = std::pin::pin!(worker.admission.lock());
+            std::future::poll_fn(|context| match lock.as_mut().poll(context) {
+                std::task::Poll::Ready(admission) => std::task::Poll::Ready(admission),
+                std::task::Poll::Pending => {
+                    let _ = admission_attempt.send(());
+                    std::task::Poll::Pending
+                }
+            })
+            .await
+        } else {
+            worker.admission.lock().await
+        };
+        #[cfg(not(test))]
+        let admission = worker.admission.lock().await;
+        if worker.is_closing() {
+            return Err(session_closed(op).with_resource_id(resource));
+        }
+        if let Some(error) = worker.terminal_error() {
+            return Err(error.with_resource_id(resource));
+        }
         let (reply, response) = oneshot::channel();
-        worker
-            .try_enqueue(command(reply), op)
-            .map_err(|error| error.with_resource_id(resource.clone()))?;
+        match worker.try_enqueue(command(reply), op) {
+            Ok(()) => {}
+            Err(EnqueueError::Full(error)) => {
+                return Err(error.with_resource_id(resource));
+            }
+            Err(EnqueueError::Closed) => {
+                return Err(worker
+                    .terminal_error()
+                    .unwrap_or_else(|| actor_unavailable(op))
+                    .with_resource_id(resource));
+            }
+        }
+        drop(admission);
         let mut closing = worker.shutdown.subscribe();
         tokio::select! {
             result = response => result.unwrap_or_else(|_| Err(actor_unavailable(op))),
@@ -784,5 +844,186 @@ async fn finish_session(state: &Mutex<State>, id: &SessionId) {
                 terminal_error: entry.worker.terminal_error(),
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn request_replays_published_terminal_error_when_active_worker_channel_is_closed() {
+        let manager = Arc::new(CameraManager::new(None, Duration::from_secs(1)));
+        let resource = ResourceId::parse("camera:runtime:terminal-race").unwrap();
+        let owner = OwnerId::parse("owner:camera-terminal-race").unwrap();
+        let id = SessionId::parse("11111111-1111-1111-1111-111111111111").unwrap();
+        let (commands, mut receiver) = mpsc::channel::<CameraCommand>(1);
+        let (stop_worker, stop_worker_rx) = oneshot::channel();
+        let worker_task = tokio::spawn(async move {
+            tokio::select! {
+                command = receiver.recv() => {
+                    command.expect("the old behavior enqueues a command").reject_closed();
+                    true
+                }
+                _ = stop_worker_rx => false,
+            }
+        });
+        let (shutdown, _) = watch::channel(false);
+        let (_, completion) = watch::channel(None);
+        let (_, terminal_error) = watch::channel(Some(
+            HalError::new(
+                "camera.session.unplugged",
+                ErrorCategory::Unavailable,
+                "camera.capture",
+                false,
+                "camera was unplugged",
+            )
+            .unwrap(),
+        ));
+        let worker = CameraWorker {
+            commands,
+            shutdown,
+            admission: Arc::new(Mutex::new(())),
+            completion,
+            terminal_error,
+            admission_attempt: None,
+        };
+        let lease = {
+            let mut state = manager.state.lock().await;
+            let lease = state
+                .leases
+                .reserve_control(resource.clone(), id.clone(), owner.clone())
+                .unwrap();
+            assert!(state.leases.commit(&resource, &id, &lease));
+            state.sessions.insert(
+                id.clone(),
+                Entry {
+                    resource: resource.clone(),
+                    owner,
+                    lease: lease.clone(),
+                    worker,
+                },
+            );
+            lease
+        };
+
+        let error = manager
+            .capture(id, &lease, Duration::ZERO)
+            .await
+            .expect_err("a closed worker channel must replay its published terminal error");
+
+        assert_eq!(error.name().as_str(), "camera.session.unplugged");
+        assert_eq!(error.resource_id(), Some(&resource));
+        stop_worker
+            .send(())
+            .expect("terminal replay must leave the live worker receiver idle");
+        assert!(
+            !worker_task.await.expect("test worker task must not panic"),
+            "terminal replay must not enqueue a command for cleanup to reject as closed"
+        );
+        assert_eq!(
+            manager.state.lock().await.sessions.len(),
+            1,
+            "the request must exercise the active-session pre-reap window"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_must_not_enqueue_after_terminal_error_is_published() {
+        let manager = Arc::new(CameraManager::new(None, Duration::from_secs(1)));
+        let resource = ResourceId::parse("camera:runtime:terminal-admission-race").unwrap();
+        let owner = OwnerId::parse("owner:camera-terminal-admission-race").unwrap();
+        let id = SessionId::parse("22222222-2222-2222-2222-222222222222").unwrap();
+        let (commands, mut receiver) = mpsc::channel::<CameraCommand>(1);
+        let (shutdown, _) = watch::channel(false);
+        let (_, completion) = watch::channel(None);
+        let (terminal_error_tx, terminal_error) = watch::channel(None);
+        let admission = Arc::new(Mutex::new(()));
+        let (admission_attempt, mut admission_attempts) = mpsc::unbounded_channel();
+        let worker = CameraWorker {
+            commands,
+            shutdown,
+            admission: Arc::clone(&admission),
+            completion,
+            terminal_error,
+            admission_attempt: Some(admission_attempt),
+        };
+        let lease = {
+            let mut state = manager.state.lock().await;
+            let lease = state
+                .leases
+                .reserve_control(resource.clone(), id.clone(), owner.clone())
+                .unwrap();
+            assert!(state.leases.commit(&resource, &id, &lease));
+            state.sessions.insert(
+                id.clone(),
+                Entry {
+                    resource: resource.clone(),
+                    owner,
+                    lease: lease.clone(),
+                    worker,
+                },
+            );
+            lease
+        };
+        let (worker_holding_admission, worker_holding_admission_rx) = oneshot::channel();
+        let (publish_terminal_tx, publish_terminal_rx) = oneshot::channel();
+        let worker = tokio::spawn({
+            let admission = Arc::clone(&admission);
+            async move {
+                let admission = admission.lock().await;
+                worker_holding_admission
+                    .send(())
+                    .expect("worker must report that it holds terminal admission");
+                publish_terminal_rx
+                    .await
+                    .expect("test must release the worker-owned terminal publisher");
+                publish_terminal(
+                    &admission,
+                    &terminal_error_tx,
+                    HalError::new(
+                        "camera.session.unplugged",
+                        ErrorCategory::Unavailable,
+                        "camera.capture",
+                        false,
+                        "camera was unplugged",
+                    )
+                    .unwrap(),
+                );
+            }
+        });
+        worker_holding_admission_rx
+            .await
+            .expect("worker must hold admission before the request starts");
+        let capture = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            let id = id.clone();
+            let lease = lease.clone();
+            async move { manager.capture(id, &lease, Duration::ZERO).await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), admission_attempts.recv())
+            .await
+            .expect("request must reach the admission lock while the worker holds it")
+            .expect("request admission hook must remain connected");
+        assert!(
+            !capture.is_finished(),
+            "a request that observed admission contention must remain blocked"
+        );
+        publish_terminal_tx
+            .send(())
+            .expect("worker publisher must still be waiting at the terminal point");
+
+        let error = capture
+            .await
+            .expect("capture task must not panic")
+            .expect_err(
+                "a post-terminal request must fail without reaching the cleanup command receiver",
+            );
+        assert_eq!(error.name().as_str(), "camera.session.unplugged");
+        assert!(
+            receiver.try_recv().is_err(),
+            "terminal publication wins admission and must leave the command receiver idle"
+        );
+        worker.await.expect("worker publisher task must not panic");
     }
 }

@@ -233,7 +233,7 @@ impl GpioLineSession for LinuxGpioSession {
             .iter()
             .map(|line| {
                 values
-                    .get(line)
+                    .get(*line)
                     .copied()
                     .map(native_to_value)
                     .ok_or_else(|| invalid("gpio.read", "requested GPIO line disappeared"))

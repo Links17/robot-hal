@@ -41,6 +41,42 @@ static verifier rejects a changed report even if it is semantically valid.
 Candidate directories, platform virtual brokers, and virtual-conformance
 outputs are intermediate evidence only. They are never Release assets.
 
+Python candidate validation installs the candidate and the exact locked
+pure-Python `protobuf` wheel into a fresh offline environment. The candidate
+wheel is rejected when a safe, normalized wheel member—or the installed target
+of its `.data/purelib/` or `.data/platlib/` member—would occupy top-level
+`google`. The installed `protobuf` distribution must have the exact normalized
+`RECORD` mapping from that wheel, including each entry's SHA-256 and size:
+non-`RECORD` rows require SHA-256 and size, and additional, missing, duplicate,
+hashless, or hash- or size-mismatched entries fail validation.
+
+Private staging and candidate identity checks detect replacement before a
+candidate is accepted, but do not claim a no-replace boundary against a
+malicious process with the same operating-system UID. Python cannot provide
+that boundary to pathname-consuming installers without an OS-level sandbox or
+file-descriptor-aware installer interface. The current RC package-python
+candidate build is supported on Unix hosts; Windows candidate qualification
+requires hosted evidence before it may be claimed.
+
+## Rust workspace source bundle
+
+`seeed-hal-crates-v0.5.0-rc.N.tar.gz` is a deterministic, complete Rust
+workspace source bundle. It is not a collection of independently installable
+`.crate` archives and it makes no crates.io availability claim.
+
+The archive has one top-level `seeed-hal-crates-v0.5.0-rc.N/` directory and
+contains the tracked, regular repository files needed to retain the workspace
+source closure, including the root `Cargo.toml`, `Cargo.lock`, and every
+workspace member manifest and source file. Package construction freezes that
+controlled file set; it rejects symlinks, unsafe or unexpected paths, missing
+workspace members, a dirty checkout, changed frozen inputs, and failed or
+timed-out validation.
+
+The packager extracts the archive into a restricted temporary directory and
+runs `cargo check --workspace --locked`. This validates path-and-version
+internal dependencies as one workspace without contacting or publishing to a
+registry. Public crate registry policy is outside this RC artifact contract.
+
 ## Evidence and release gate
 
 Platform inputs are named with the immutable release tag and resolved

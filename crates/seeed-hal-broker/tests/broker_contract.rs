@@ -2588,12 +2588,46 @@ async fn minor_one_handshake_enumerates_and_opens_can_with_exact_capabilities() 
 #[tokio::test]
 async fn can_classic_batch_receive_filter_and_status_use_correlated_responses_only() {
     let adapter = VirtualCanAdapter::loopback("can:virtual:broker-operations");
-    let broker = Broker::with_startup_token(can_runtime(adapter), StartupToken::from_bytes(TOKEN));
+    let broker = Broker::with_startup_token(
+        can_runtime(adapter.clone()),
+        StartupToken::from_bytes(TOKEN),
+    );
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
     let server = tokio::spawn(async move { broker.serve_connection(server_io).await });
     let mut client = Client::new(client_io);
     handshake_can(&mut client).await;
     let session = open_virtual_can(&mut client, Some(v1::CanMode::Classic)).await;
+
+    for value in [1, 2] {
+        adapter
+            .inject_received(
+                CanFrame::classic_data(CanId::standard(0x123).unwrap(), Bytes::from(vec![value]))
+                    .unwrap(),
+                None,
+            )
+            .unwrap();
+    }
+
+    for value in [1, 2] {
+        let receive = client
+            .request(envelope::Payload::CanReceiveRequest(
+                v1::CanReceiveRequest {
+                    session_id: session.session_id.clone(),
+                    lease: session.lease.clone(),
+                    max_frames: 1,
+                    timeout_ms: 100,
+                },
+            ))
+            .await;
+        match receive.payload.unwrap() {
+            envelope::Payload::CanReceiveResponse(response) => {
+                assert_eq!(response.frames.len(), 1);
+                assert_eq!(response.frames[0].frame.as_ref().unwrap().data, [value]);
+                assert!(response.frames[0].timestamp.is_none());
+            }
+            other => panic!("expected CAN receive response, got {other:?}"),
+        }
+    }
 
     let send = client
         .request(envelope::Payload::CanSendRequest(v1::CanSendRequest {
@@ -2610,29 +2644,36 @@ async fn can_classic_batch_receive_filter_and_status_use_correlated_responses_on
         other => panic!("expected CAN send response, got {other:?}"),
     }
 
-    let receive = client
-        .request(envelope::Payload::CanReceiveRequest(
-            v1::CanReceiveRequest {
-                session_id: session.session_id.clone(),
-                lease: session.lease.clone(),
-                max_frames: 2,
-                timeout_ms: 100,
-            },
-        ))
-        .await;
-    match receive.payload.unwrap() {
-        envelope::Payload::CanReceiveResponse(response) => {
-            assert_eq!(response.frames.len(), 2);
-            assert_eq!(response.frames[0].frame.as_ref().unwrap().data, [1]);
-            assert_eq!(response.frames[1].frame.as_ref().unwrap().data, [2]);
-            assert!(
-                response
-                    .frames
-                    .iter()
-                    .all(|frame| frame.timestamp.is_some())
-            );
+    for value in [1, 2] {
+        let receive = client
+            .request(envelope::Payload::CanReceiveRequest(
+                v1::CanReceiveRequest {
+                    session_id: session.session_id.clone(),
+                    lease: session.lease.clone(),
+                    max_frames: 1,
+                    timeout_ms: 100,
+                },
+            ))
+            .await;
+        match receive.payload.unwrap() {
+            envelope::Payload::CanReceiveResponse(response) => {
+                assert_eq!(response.frames.len(), 1);
+                assert_eq!(response.frames[0].frame.as_ref().unwrap().data, [value]);
+                assert_eq!(
+                    response.frames[0].timestamp.as_ref().map(|timestamp| (
+                        timestamp.timestamp_ns,
+                        timestamp.source,
+                        timestamp.clock_domain.as_str(),
+                    )),
+                    Some((
+                        0,
+                        v1::CanTimestampSource::HostMonotonic as i32,
+                        "virtual-can",
+                    ))
+                );
+            }
+            other => panic!("expected CAN loopback receive response, got {other:?}"),
         }
-        other => panic!("expected CAN receive response, got {other:?}"),
     }
 
     let replace = client
