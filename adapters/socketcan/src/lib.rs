@@ -78,7 +78,7 @@ impl CanAdapter for SocketCanAdapter {
 #[cfg(target_os = "linux")]
 fn enumerate_sync() -> HalResult<Vec<ResourceDescriptor>> {
     let interfaces = socketcan::available_interfaces()
-        .map_err(|error| discovery_error("can.enumerate", &error))?;
+        .map_err(|error| discovery_error("can.enumerate", error.as_ref()))?;
     interfaces
         .into_iter()
         .map(|interface| descriptor_from_interface(&interface))
@@ -173,7 +173,10 @@ fn open_sync(
 }
 
 #[cfg(target_os = "linux")]
-fn discovery_error<E: std::error::Error + ?Sized>(operation: &'static str, error: &E) -> HalError {
+fn discovery_error(
+    operation: &'static str,
+    error: &(dyn std::error::Error + Send + Sync),
+) -> HalError {
     HalError::new(
         "runtime.transport.unavailable",
         ErrorCategory::Unavailable,
@@ -211,16 +214,22 @@ fn join_error(operation: &'static str, error: tokio::task::JoinError) -> HalErro
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::discovery_error;
+    use seeed_hal_core::ErrorCategory;
 
     #[test]
-    fn discovery_error_accepts_boxed_error_trait_object() {
-        let error: Box<dyn std::error::Error + Send + Sync> =
-            Box::new(std::io::Error::other("netlink discovery failed"));
+    fn discovery_error_accepts_boxed_send_sync_error() {
+        let source: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(std::io::Error::other("interface list unavailable"));
 
-        let mapped = discovery_error("can.enumerate", error.as_ref());
+        let error = discovery_error("can.enumerate", source.as_ref());
 
-        assert_eq!(mapped.name(), "runtime.transport.unavailable");
-        assert_eq!(mapped.operation(), "can.enumerate");
-        assert!(mapped.debug_message().contains("netlink discovery failed"));
+        assert_eq!(error.name().as_str(), "runtime.transport.unavailable");
+        assert_eq!(error.category(), ErrorCategory::Unavailable);
+        assert_eq!(error.operation().as_str(), "can.enumerate");
+        assert!(error.retryable());
+        assert_eq!(
+            error.debug_message(),
+            "SocketCAN discovery failed: interface list unavailable"
+        );
     }
 }
