@@ -684,10 +684,9 @@ impl Mapping {
     #[cfg(test)]
     fn dacl_sddl_for_test(&self) -> io::Result<String> {
         use windows_permissions::constants::SecurityInformation;
-        use windows_permissions::{WindowsSecure, wrappers};
+        use windows_permissions::wrappers;
 
-        let descriptor =
-            BorrowedMappingHandle(self.section).security_descriptor(SecurityInformation::Dacl)?;
+        let descriptor = security_descriptor_for_test(self.section)?;
         Ok(
             wrappers::ConvertSecurityDescriptorToStringSecurityDescriptor(
                 &descriptor,
@@ -700,11 +699,7 @@ impl Mapping {
 
     #[cfg(test)]
     fn trustees_for_test(&self) -> io::Result<std::collections::BTreeSet<String>> {
-        use windows_permissions::WindowsSecure;
-        use windows_permissions::constants::SecurityInformation;
-
-        let descriptor =
-            BorrowedMappingHandle(self.section).security_descriptor(SecurityInformation::Dacl)?;
+        let descriptor = security_descriptor_for_test(self.section)?;
         let dacl = descriptor
             .dacl()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "section has no DACL"))?;
@@ -720,11 +715,7 @@ impl Mapping {
 
     #[cfg(test)]
     fn dacl_ace_count_for_test(&self) -> io::Result<usize> {
-        use windows_permissions::WindowsSecure;
-        use windows_permissions::constants::SecurityInformation;
-
-        let descriptor =
-            BorrowedMappingHandle(self.section).security_descriptor(SecurityInformation::Dacl)?;
+        let descriptor = security_descriptor_for_test(self.section)?;
         descriptor
             .dacl()
             .map(|dacl| dacl.len() as usize)
@@ -965,10 +956,9 @@ unsafe extern "system" {
 #[cfg(all(test, windows))]
 fn dacl_sddl_for_test(handle: windows_sys::Win32::Foundation::HANDLE) -> io::Result<String> {
     use windows_permissions::constants::SecurityInformation;
-    use windows_permissions::{WindowsSecure, wrappers};
+    use windows_permissions::wrappers;
 
-    let descriptor =
-        BorrowedMappingHandle(handle).security_descriptor(SecurityInformation::Dacl)?;
+    let descriptor = security_descriptor_for_test(handle)?;
     Ok(
         wrappers::ConvertSecurityDescriptorToStringSecurityDescriptor(
             &descriptor,
@@ -983,11 +973,7 @@ fn dacl_sddl_for_test(handle: windows_sys::Win32::Foundation::HANDLE) -> io::Res
 fn trustees_for_test(
     handle: windows_sys::Win32::Foundation::HANDLE,
 ) -> io::Result<std::collections::BTreeSet<String>> {
-    use windows_permissions::WindowsSecure;
-    use windows_permissions::constants::SecurityInformation;
-
-    let descriptor =
-        BorrowedMappingHandle(handle).security_descriptor(SecurityInformation::Dacl)?;
+    let descriptor = security_descriptor_for_test(handle)?;
     let dacl = descriptor
         .dacl()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "object has no DACL"))?;
@@ -1003,15 +989,24 @@ fn trustees_for_test(
 
 #[cfg(all(test, windows))]
 fn dacl_ace_count_for_test(handle: windows_sys::Win32::Foundation::HANDLE) -> io::Result<usize> {
-    use windows_permissions::WindowsSecure;
-    use windows_permissions::constants::SecurityInformation;
-
-    let descriptor =
-        BorrowedMappingHandle(handle).security_descriptor(SecurityInformation::Dacl)?;
+    let descriptor = security_descriptor_for_test(handle)?;
     descriptor
         .dacl()
         .map(|dacl| dacl.len() as usize)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "object has no DACL"))
+}
+
+#[cfg(all(test, windows))]
+fn security_descriptor_for_test(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> io::Result<windows_permissions::LocalBox<windows_permissions::SecurityDescriptor>> {
+    use windows_permissions::constants::{SeObjectType, SecurityInformation};
+
+    windows_permissions::wrappers::GetSecurityInfo(
+        &BorrowedMappingHandle(handle),
+        SeObjectType::SE_KERNEL_OBJECT,
+        SecurityInformation::Dacl,
+    )
 }
 
 #[cfg(all(test, windows))]
@@ -1047,6 +1042,8 @@ impl Drop for Mapping {
 mod windows_tests {
     use std::collections::BTreeSet;
     use std::process::Command;
+    use std::sync::mpsc::sync_channel;
+    use std::thread;
 
     use super::{Mapping, lock_name, validate_section_length};
 
@@ -1144,16 +1141,28 @@ mod windows_tests {
     fn reader_lock_contention_is_non_blocking_and_unlock_restores_progress() {
         let name = test_mapping_name("contention");
         let owner = Mapping::create(&name, 4096).unwrap();
-        let reader = Mapping::open_read_only(&name, 4096).unwrap();
+        let (holder_locked_sender, holder_locked_receiver) = sync_channel(0);
+        let (release_holder_sender, release_holder_receiver) = sync_channel(0);
+        let (release_confirmed_sender, release_confirmed_receiver) = sync_channel(0);
+        let holder_name = name.clone();
+        let holder = thread::spawn(move || {
+            let reader = Mapping::open_read_only(&holder_name, 4096).unwrap();
+            reader.try_lock_shared().unwrap();
+            holder_locked_sender.send(()).unwrap();
+            release_holder_receiver.recv().unwrap();
+            reader.unlock().unwrap();
+            release_confirmed_sender.send(()).unwrap();
+        });
 
-        reader.try_lock_shared().unwrap();
+        holder_locked_receiver.recv().unwrap();
         let error = owner.try_lock_exclusive().unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
-        reader.unlock().unwrap();
+        release_holder_sender.send(()).unwrap();
+        release_confirmed_receiver.recv().unwrap();
 
         owner.try_lock_exclusive().unwrap();
         owner.unlock().unwrap();
-        drop(reader);
+        holder.join().unwrap();
         drop(owner);
         Mapping::unlink(&name).unwrap();
     }

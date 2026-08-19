@@ -445,3 +445,74 @@ No existing release-suite failure occurred, so no unrelated test was modified.
 
 This branch-local implementation is committed as
 `ci(shared-memory): gate Windows mapping runtime tests`.
+
+---
+
+## Hosted Windows CI #32207788187 test-infrastructure correction
+
+Hosted run:
+<https://github.com/Seeed-Studio/seeed-hal/actions/runs/32207788187>
+
+### Observed failures and root causes
+
+- `created_mapping_has_a_protected_three_trustee_dacl` failed with
+  `ERROR_INVALID_PARAMETER (87)`. Its Windows-only test helper used the
+  `WindowsSecure` blanket implementation, which queried a section or mutex
+  handle using `SE_UNKNOWN_OBJECT_TYPE`. `GetSecurityInfo` requires the
+  explicit `SE_KERNEL_OBJECT` type for these kernel handles.
+- `reader_lock_contention_is_non_blocking_and_unlock_restores_progress` put
+  the lock holder and exclusive contender on one OS thread. Windows mutexes
+  are reentrant for their owning thread, so the second zero-timeout wait
+  succeeded instead of returning `WouldBlock`.
+
+### RED
+
+Before the helper correction, the Hosted Windows test above reproduced the
+invalid-parameter failure. Before the contention orchestration correction,
+the same-thread test was incapable of exercising contention because the
+native mutex legitimately allowed recursive acquisition.
+
+Locally, the newly written cross-thread test was first compiled with its
+channel endpoints accidentally reversed; the Windows target test build failed
+with `E0599` (`send` on `Receiver` and `recv` on `SyncSender`). Correcting
+only the test orchestration restored the intended test shape before changing
+the security-descriptor helper.
+
+### GREEN and verification
+
+All Windows-only DACL inspection helpers now call
+`windows_permissions::wrappers::GetSecurityInfo` directly with
+`SeObjectType::SE_KERNEL_OBJECT` and `SecurityInformation::Dacl`; this is
+used for both the mapping section and the mutex. The protected `D:P`, exact
+three-ACE, current-SID, `SY`, and `BA` assertions remain unchanged.
+
+The contention test now uses three zero-capacity channels and a distinct
+holder thread: the holder acquires the reader lock and signals readiness; the
+owner's exclusive attempt must return `WouldBlock`; the holder is explicitly
+released and confirms unlock; then the owner acquires and unlocks the mutex.
+No sleep or yield synchronization is used, and each successful acquisition
+has exactly one matching unlock.
+
+Commands:
+
+```sh
+cargo +1.85 test -p seeed-hal-adapter-shared-memory
+cargo +1.85 check -p seeed-hal-adapter-shared-memory --target x86_64-pc-windows-msvc
+cargo +1.85 fmt --all --check
+cargo +1.85 clippy -p seeed-hal-adapter-shared-memory --all-targets --all-features -- -D warnings
+git diff --check
+```
+
+Results: native adapter tests passed (**18 passed**); Windows target check,
+formatting, focused clippy, and whitespace verification passed.
+
+The Windows runtime test build was also attempted:
+
+```sh
+cargo +1.85 test -p seeed-hal-adapter-shared-memory --target x86_64-pc-windows-msvc \
+  platform::windows_tests --no-run
+```
+
+It cannot link on this macOS worktree because `link.exe` is absent. The
+successful target check is compile-only evidence; push this commit and rerun
+Hosted Windows to obtain the actual Windows runtime result.
