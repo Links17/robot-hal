@@ -643,10 +643,18 @@ impl Mapping {
             windows_sys::Win32::Foundation::WAIT_TIMEOUT => {
                 Err(io::Error::from(io::ErrorKind::WouldBlock))
             }
-            windows_sys::Win32::Foundation::WAIT_ABANDONED => Err(io::Error::new(
-                io::ErrorKind::Other,
-                "shared-memory mutex was abandoned",
-            )),
+            windows_sys::Win32::Foundation::WAIT_ABANDONED => {
+                // WAIT_ABANDONED still transfers mutex ownership to this thread. Fail closed
+                // before entering the ring, but first relinquish that ownership so no later
+                // client is permanently blocked.
+                if unsafe { windows_sys::Win32::System::Threading::ReleaseMutex(self.lock) } == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "shared-memory mutex was abandoned",
+                ))
+            }
             _ => Err(io::Error::last_os_error()),
         }
     }
@@ -1128,10 +1136,18 @@ mod windows_tests {
     }
 
     #[test]
-    fn abandoned_mutex_is_rejected_after_child_exit() {
+    fn abandoned_mutex_is_released_while_still_failing_closed() {
         if let Ok(name) = std::env::var(ABANDONED_LOCK_NAME) {
             let mapping = Mapping::open_read_only(&name, 4096).unwrap();
-            mapping.try_lock_exclusive().unwrap();
+            match std::env::var("SEEED_HAL_ABANDONED_LOCK_PHASE").as_deref() {
+                Ok("abandon") => mapping.try_lock_exclusive().unwrap(),
+                Ok("verify-released") => {
+                    mapping.try_lock_exclusive().unwrap();
+                    mapping.unlock().unwrap();
+                    return;
+                }
+                _ => panic!("missing abandoned mutex test phase"),
+            }
             // SAFETY: this subprocess deliberately exits while owning the mutex to exercise
             // the Win32 abandoned-mutex branch without running Rust destructors.
             unsafe { windows_sys::Win32::System::Threading::ExitProcess(0) };
@@ -1141,15 +1157,29 @@ mod windows_tests {
         let mapping = Mapping::create(&name, 4096).unwrap();
         let status = Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
-            .arg("platform::windows_tests::abandoned_mutex_is_rejected_after_child_exit")
+            .arg("platform::windows_tests::abandoned_mutex_is_released_while_still_failing_closed")
             .arg("--nocapture")
             .env(ABANDONED_LOCK_NAME, &name)
+            .env("SEEED_HAL_ABANDONED_LOCK_PHASE", "abandon")
             .status()
             .unwrap();
         assert!(status.success());
 
         let error = mapping.try_lock_exclusive().unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::Other);
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("platform::windows_tests::abandoned_mutex_is_released_while_still_failing_closed")
+            .arg("--nocapture")
+            .env(ABANDONED_LOCK_NAME, &name)
+            .env("SEEED_HAL_ABANDONED_LOCK_PHASE", "verify-released")
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "the abandoned-mutex fail-closed branch must release ownership"
+        );
         drop(mapping);
         Mapping::unlink(&name).unwrap();
     }
@@ -1162,6 +1192,12 @@ mod windows_tests {
         Mapping::unlink(&name).unwrap();
         drop(reader);
         drop(first);
+
+        let error = match Mapping::open_read_only(&name, 4096) {
+            Ok(_) => panic!("retired mapping must not be reopened"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
 
         let fresh = Mapping::create(&name, 4096).unwrap();
         drop(fresh);
