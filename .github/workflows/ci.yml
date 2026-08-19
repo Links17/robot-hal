@@ -69,6 +69,9 @@ jobs:
         shell: bash
         run: rustup toolchain install 1.85 --profile minimal --component rustfmt --component clippy
       - *linux-build-prerequisites
+      - name: Run Windows shared-memory runtime tests
+        if: ${{ runner.os == 'Windows' }}
+        run: cargo +1.85 test -p seeed-hal-adapter-shared-memory --all-features platform::windows_tests -- --nocapture
       - name: Build production broker
         shell: bash
         run: |

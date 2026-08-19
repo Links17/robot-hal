@@ -195,6 +195,35 @@ def test_platform_job_separates_production_manifest_and_virtual_conformance() ->
     )
 
 
+def test_platform_job_runs_windows_shared_memory_runtime_tests_before_broker_builds() -> None:
+    workflow = load_workflow("ci.yml")
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+    platform_steps = jobs["platform-conformance"]["steps"]
+    runtime_step = next(
+        step
+        for step in platform_steps
+        if step.get("name") == "Run Windows shared-memory runtime tests"
+    )
+
+    assert runtime_step["if"] == "${{ runner.os == 'Windows' }}"
+    assert runtime_step["run"].strip() == (
+        "cargo +1.85 test -p seeed-hal-adapter-shared-memory --all-features "
+        "platform::windows_tests -- --nocapture"
+    )
+    runtime_index = platform_steps.index(runtime_step)
+    for broker_step_name in (
+        "Build production broker",
+        "Build and qualify virtual broker",
+    ):
+        broker_index = next(
+            index
+            for index, step in enumerate(platform_steps)
+            if step.get("name") == broker_step_name
+        )
+        assert runtime_index < broker_index
+
+
 def _release_workflow() -> tuple[dict[str, object], dict[str, object], str]:
     workflow = load_workflow("release-rc.yml")
     jobs = workflow["jobs"]
