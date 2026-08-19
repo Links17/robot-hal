@@ -476,13 +476,16 @@ mod tests {
 pub(crate) struct Mapping {
     address: NonNull<u8>,
     length: usize,
-    handle: windows_sys::Win32::Foundation::HANDLE,
+    section: windows_sys::Win32::Foundation::HANDLE,
+    lock: windows_sys::Win32::Foundation::HANDLE,
 }
 
 #[cfg(windows)]
 impl Mapping {
     pub(crate) fn create(name: &str, length: usize) -> io::Result<Self> {
-        let wide_name = wide_name(name)?;
+        validate_mapping_name(name)?;
+        let section_name = wide_name(name)?;
+        let wide_lock_name = wide_name(&lock_name(name)?)?;
         let (descriptor, mut attributes) = protected_attributes()?;
         let (high, low) = split_section_length(length)?;
         // SAFETY: `attributes` and its LocalAlloc-owned descriptor remain live for this
@@ -494,7 +497,7 @@ impl Mapping {
                 windows_sys::Win32::System::Memory::PAGE_READWRITE,
                 high,
                 low,
-                wide_name.as_ptr(),
+                section_name.as_ptr(),
             )
         };
         let _descriptor = descriptor;
@@ -512,8 +515,38 @@ impl Mapping {
                 "named shared mapping already exists",
             ));
         }
+        // SAFETY: the security attributes and NUL-terminated derived lock name are valid for
+        // this call. The mutex name is derived independently and is never reported to callers.
+        let lock = unsafe {
+            windows_sys::Win32::System::Threading::CreateMutexW(
+                (&raw mut attributes).cast(),
+                0,
+                wide_lock_name.as_ptr(),
+            )
+        };
+        if lock.is_null() {
+            let error = io::Error::last_os_error();
+            // SAFETY: `handle` is owned on this error path.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+            return Err(error);
+        }
+        // SAFETY: reads the thread-local status directly after CreateMutexW.
+        if unsafe { windows_sys::Win32::Foundation::GetLastError() }
+            == windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS
+        {
+            // SAFETY: both returned handles are owned on this collision path.
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(lock);
+                windows_sys::Win32::Foundation::CloseHandle(handle);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "named shared mapping already exists",
+            ));
+        }
         map_owned(
             handle,
+            lock,
             length,
             windows_sys::Win32::System::Memory::FILE_MAP_ALL_ACCESS,
         )
@@ -523,7 +556,9 @@ impl Mapping {
         if length == 0 {
             return Err(invalid_section_length());
         }
-        let wide_name = wide_name(name)?;
+        validate_mapping_name(name)?;
+        let section_name = wide_name(name)?;
+        let wide_lock_name = wide_name(&lock_name(name)?)?;
         // SECTION_QUERY is required only to validate the section length with NtQuerySection before
         // mapping. The view itself is always FILE_MAP_READ; this path never requests write or
         // all-access mapping permissions.
@@ -533,7 +568,7 @@ impl Mapping {
                 windows_sys::Win32::System::Memory::FILE_MAP_READ
                     | windows_sys::Win32::System::Memory::SECTION_QUERY,
                 0,
-                wide_name.as_ptr(),
+                section_name.as_ptr(),
             )
         };
         if handle.is_null() {
@@ -548,8 +583,24 @@ impl Mapping {
                 return Err(error);
             }
         }
+        // SAFETY: `wide_lock_name` is derived from a validated mapping name; requesting only
+        // synchronization and release rights is sufficient for the non-blocking mutex protocol.
+        let lock = unsafe {
+            windows_sys::Win32::System::Threading::OpenMutexW(
+                SYNCHRONIZE | windows_sys::Win32::System::Threading::MUTEX_MODIFY_STATE,
+                0,
+                wide_lock_name.as_ptr(),
+            )
+        };
+        if lock.is_null() {
+            let error = io::Error::last_os_error();
+            // SAFETY: `handle` remains owned when mutex opening fails.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+            return Err(error);
+        }
         map_owned(
             handle,
+            lock,
             length,
             windows_sys::Win32::System::Memory::FILE_MAP_READ,
         )
@@ -560,19 +611,44 @@ impl Mapping {
     }
 
     pub(crate) fn try_lock_shared(&self) -> io::Result<()> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "unavailable"))
+        self.try_lock()
     }
 
     pub(crate) fn try_lock_exclusive(&self) -> io::Result<()> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "unavailable"))
+        self.try_lock()
     }
 
     pub(crate) fn unlock(&self) -> io::Result<()> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "unavailable"))
+        // SAFETY: `lock` is a live mutex handle owned by this Mapping. ReleaseMutex only
+        // affects ownership established by WaitForSingleObject on this same thread.
+        if unsafe { windows_sys::Win32::System::Threading::ReleaseMutex(self.lock) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
-    pub(crate) fn unlink(_name: &str) -> io::Result<()> {
+    /// Windows named sections and mutexes retire when their final handles close. This lifecycle
+    /// hook therefore validates the private mapping name but intentionally neither reopens nor
+    /// modifies any named object.
+    pub(crate) fn unlink(name: &str) -> io::Result<()> {
+        validate_mapping_name(name)?;
         Ok(())
+    }
+
+    fn try_lock(&self) -> io::Result<()> {
+        // SAFETY: `lock` is a live mutex handle. A zero timeout cannot block a Tokio executor
+        // worker or any calling thread.
+        match unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(self.lock, 0) } {
+            windows_sys::Win32::Foundation::WAIT_OBJECT_0 => Ok(()),
+            windows_sys::Win32::Foundation::WAIT_TIMEOUT => {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+            windows_sys::Win32::Foundation::WAIT_ABANDONED => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "shared-memory mutex was abandoned",
+            )),
+            _ => Err(io::Error::last_os_error()),
+        }
     }
 
     #[cfg(test)]
@@ -581,7 +657,7 @@ impl Mapping {
         use windows_permissions::{WindowsSecure, wrappers};
 
         let descriptor =
-            BorrowedMappingHandle(self.handle).security_descriptor(SecurityInformation::Dacl)?;
+            BorrowedMappingHandle(self.section).security_descriptor(SecurityInformation::Dacl)?;
         Ok(
             wrappers::ConvertSecurityDescriptorToStringSecurityDescriptor(
                 &descriptor,
@@ -598,7 +674,7 @@ impl Mapping {
         use windows_permissions::constants::SecurityInformation;
 
         let descriptor =
-            BorrowedMappingHandle(self.handle).security_descriptor(SecurityInformation::Dacl)?;
+            BorrowedMappingHandle(self.section).security_descriptor(SecurityInformation::Dacl)?;
         let dacl = descriptor
             .dacl()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "section has no DACL"))?;
@@ -618,7 +694,7 @@ impl Mapping {
         use windows_permissions::constants::SecurityInformation;
 
         let descriptor =
-            BorrowedMappingHandle(self.handle).security_descriptor(SecurityInformation::Dacl)?;
+            BorrowedMappingHandle(self.section).security_descriptor(SecurityInformation::Dacl)?;
         descriptor
             .dacl()
             .map(|dacl| dacl.len() as usize)
@@ -645,6 +721,21 @@ impl Mapping {
         }
         // SAFETY: a nonzero result from VirtualQuery initialized `information`.
         Ok(unsafe { information.assume_init() }.Protect)
+    }
+
+    #[cfg(test)]
+    fn lock_dacl_sddl_for_test(&self) -> io::Result<String> {
+        dacl_sddl_for_test(self.lock)
+    }
+
+    #[cfg(test)]
+    fn lock_trustees_for_test(&self) -> io::Result<std::collections::BTreeSet<String>> {
+        trustees_for_test(self.lock)
+    }
+
+    #[cfg(test)]
+    fn lock_dacl_ace_count_for_test(&self) -> io::Result<usize> {
+        dacl_ace_count_for_test(self.lock)
     }
 }
 
@@ -684,6 +775,42 @@ fn wide_name(name: &str) -> io::Result<Vec<u16>> {
 }
 
 #[cfg(windows)]
+fn validate_mapping_name(name: &str) -> io::Result<()> {
+    const PREFIX: &str = "/seeed-hal-";
+    let suffix = name.strip_prefix(PREFIX).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid private shared-memory mapping name",
+        )
+    })?;
+    if suffix.len() != 18 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid private shared-memory mapping name",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn lock_name(name: &str) -> io::Result<String> {
+    use sha2::Digest;
+
+    validate_mapping_name(name)?;
+    let digest = sha2::Sha256::digest(name.as_bytes());
+    Ok(format!(
+        "Local\\seeed-hal-lock-{}",
+        digest[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
+}
+
+#[cfg(windows)]
+const SYNCHRONIZE: u32 = 0x0010_0000;
+
+#[cfg(windows)]
 fn split_section_length(length: usize) -> io::Result<(u32, u32)> {
     let length = u64::try_from(length).map_err(|_| invalid_section_length())?;
     if length == 0 {
@@ -714,18 +841,22 @@ fn validate_section_length(section_length: io::Result<usize>, requested: usize) 
 
 #[cfg(windows)]
 fn map_owned(
-    handle: windows_sys::Win32::Foundation::HANDLE,
+    section: windows_sys::Win32::Foundation::HANDLE,
+    lock: windows_sys::Win32::Foundation::HANDLE,
     length: usize,
     access: windows_sys::Win32::System::Memory::FILE_MAP,
 ) -> io::Result<Mapping> {
-    // SAFETY: `handle` is exclusively owned by this function; `length` was checked and is
+    // SAFETY: `section` and `lock` are exclusively owned by this function; `length` was checked and is
     // bounded; the mapping API retains neither Rust pointer and returns null on failure.
     let address =
-        unsafe { windows_sys::Win32::System::Memory::MapViewOfFile(handle, access, 0, 0, length) };
+        unsafe { windows_sys::Win32::System::Memory::MapViewOfFile(section, access, 0, 0, length) };
     if address.Value.is_null() {
         let error = io::Error::last_os_error();
-        // SAFETY: this function owns `handle` when view mapping fails.
-        unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+        // SAFETY: this function owns both handles when view mapping fails.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(lock);
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
         return Err(error);
     }
     // SAFETY: a non-null MapViewOfFile result is a valid base for exactly `length` bytes.
@@ -733,7 +864,8 @@ fn map_owned(
     Ok(Mapping {
         address,
         length,
-        handle,
+        section,
+        lock,
     })
 }
 
@@ -801,6 +933,58 @@ unsafe extern "system" {
 }
 
 #[cfg(all(test, windows))]
+fn dacl_sddl_for_test(handle: windows_sys::Win32::Foundation::HANDLE) -> io::Result<String> {
+    use windows_permissions::constants::SecurityInformation;
+    use windows_permissions::{WindowsSecure, wrappers};
+
+    let descriptor =
+        BorrowedMappingHandle(handle).security_descriptor(SecurityInformation::Dacl)?;
+    Ok(
+        wrappers::ConvertSecurityDescriptorToStringSecurityDescriptor(
+            &descriptor,
+            SecurityInformation::Dacl,
+        )?
+        .to_string_lossy()
+        .into_owned(),
+    )
+}
+
+#[cfg(all(test, windows))]
+fn trustees_for_test(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> io::Result<std::collections::BTreeSet<String>> {
+    use windows_permissions::WindowsSecure;
+    use windows_permissions::constants::SecurityInformation;
+
+    let descriptor =
+        BorrowedMappingHandle(handle).security_descriptor(SecurityInformation::Dacl)?;
+    let dacl = descriptor
+        .dacl()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "object has no DACL"))?;
+    (0..dacl.len())
+        .map(|index| {
+            dacl.get_ace(index)
+                .and_then(|ace| ace.sid())
+                .map(|sid| sid.to_string())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid DACL ACE"))
+        })
+        .collect()
+}
+
+#[cfg(all(test, windows))]
+fn dacl_ace_count_for_test(handle: windows_sys::Win32::Foundation::HANDLE) -> io::Result<usize> {
+    use windows_permissions::WindowsSecure;
+    use windows_permissions::constants::SecurityInformation;
+
+    let descriptor =
+        BorrowedMappingHandle(handle).security_descriptor(SecurityInformation::Dacl)?;
+    descriptor
+        .dacl()
+        .map(|dacl| dacl.len() as usize)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "object has no DACL"))
+}
+
+#[cfg(all(test, windows))]
 struct BorrowedMappingHandle(windows_sys::Win32::Foundation::HANDLE);
 
 #[cfg(all(test, windows))]
@@ -821,8 +1005,10 @@ impl Drop for Mapping {
                 },
             )
         };
-        // SAFETY: this Mapping owns handle and CloseHandle retains no reference.
-        let _ = unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
+        // SAFETY: this Mapping owns the section and mutex handles; closing the final handles
+        // retires their names from the Windows object namespace.
+        let _ = unsafe { windows_sys::Win32::Foundation::CloseHandle(self.section) };
+        let _ = unsafe { windows_sys::Win32::Foundation::CloseHandle(self.lock) };
         let _ = self.length;
     }
 }
@@ -830,8 +1016,11 @@ impl Drop for Mapping {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use std::collections::BTreeSet;
+    use std::process::Command;
 
-    use super::{Mapping, validate_section_length};
+    use super::{Mapping, lock_name, validate_section_length};
+
+    const ABANDONED_LOCK_NAME: &str = "SEEED_HAL_ABANDONED_LOCK_NAME";
 
     #[test]
     fn created_mapping_has_a_protected_three_trustee_dacl() {
@@ -841,6 +1030,16 @@ mod windows_tests {
         assert!(sddl.starts_with("D:P"), "DACL must be protected: {sddl}");
         assert_eq!(mapping.dacl_ace_count_for_test().unwrap(), 3);
         assert_eq!(mapping.trustees_for_test().unwrap(), expected_trustees());
+        let lock_sddl = mapping.lock_dacl_sddl_for_test().unwrap();
+        assert!(
+            lock_sddl.starts_with("D:P"),
+            "DACL must be protected: {lock_sddl}"
+        );
+        assert_eq!(mapping.lock_dacl_ace_count_for_test().unwrap(), 3);
+        assert_eq!(
+            mapping.lock_trustees_for_test().unwrap(),
+            expected_trustees()
+        );
         drop(mapping);
         Mapping::unlink(&name).unwrap();
     }
@@ -910,6 +1109,80 @@ mod windows_tests {
         Mapping::unlink(&name).unwrap();
     }
 
+    #[test]
+    fn reader_lock_contention_is_non_blocking_and_unlock_restores_progress() {
+        let name = test_mapping_name("contention");
+        let owner = Mapping::create(&name, 4096).unwrap();
+        let reader = Mapping::open_read_only(&name, 4096).unwrap();
+
+        reader.try_lock_shared().unwrap();
+        let error = owner.try_lock_exclusive().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        reader.unlock().unwrap();
+
+        owner.try_lock_exclusive().unwrap();
+        owner.unlock().unwrap();
+        drop(reader);
+        drop(owner);
+        Mapping::unlink(&name).unwrap();
+    }
+
+    #[test]
+    fn abandoned_mutex_is_rejected_after_child_exit() {
+        if let Ok(name) = std::env::var(ABANDONED_LOCK_NAME) {
+            let mapping = Mapping::open_read_only(&name, 4096).unwrap();
+            mapping.try_lock_exclusive().unwrap();
+            // SAFETY: this subprocess deliberately exits while owning the mutex to exercise
+            // the Win32 abandoned-mutex branch without running Rust destructors.
+            unsafe { windows_sys::Win32::System::Threading::ExitProcess(0) };
+        }
+
+        let name = test_mapping_name("abandoned");
+        let mapping = Mapping::create(&name, 4096).unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("platform::windows_tests::abandoned_mutex_is_rejected_after_child_exit")
+            .arg("--nocapture")
+            .env(ABANDONED_LOCK_NAME, &name)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let error = mapping.try_lock_exclusive().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        drop(mapping);
+        Mapping::unlink(&name).unwrap();
+    }
+
+    #[test]
+    fn names_retire_after_all_handles_drop_and_can_be_created_fresh() {
+        let name = test_mapping_name("retire");
+        let first = Mapping::create(&name, 4096).unwrap();
+        let reader = Mapping::open_read_only(&name, 4096).unwrap();
+        Mapping::unlink(&name).unwrap();
+        drop(reader);
+        drop(first);
+
+        let fresh = Mapping::create(&name, 4096).unwrap();
+        drop(fresh);
+        Mapping::unlink(&name).unwrap();
+    }
+
+    #[test]
+    fn lock_name_is_private_and_mapping_name_validation_rejects_malformed_input() {
+        let lock = lock_name("/seeed-hal-0123456789abcdef12").unwrap();
+        assert_ne!(lock, "/seeed-hal-0123456789abcdef12");
+        for name in [
+            "seeed-hal-0123456789abcdef12",
+            "/seeed-hal-0123456789abcdef1",
+            "/seeed-hal-0123456789abcdef1z",
+            "/seeed-hal-0123456789abcdef12\\nested",
+        ] {
+            assert!(lock_name(name).is_err(), "{name}");
+            assert!(Mapping::unlink(name).is_err(), "{name}");
+        }
+    }
+
     fn expected_trustees() -> BTreeSet<String> {
         [
             windows_permissions::utilities::current_process_sid()
@@ -923,14 +1196,20 @@ mod windows_tests {
     }
 
     fn test_mapping_name(label: &str) -> String {
-        format!(
-            "Local\\seeed-hal-{label}-{}-{}",
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in format!(
+            "{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         )
+        .bytes()
+        {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+        }
+        format!("/seeed-hal-{hash:018x}")
     }
 }
 
