@@ -482,116 +482,74 @@ pub(crate) struct Mapping {
 #[cfg(windows)]
 impl Mapping {
     pub(crate) fn create(name: &str, length: usize) -> io::Result<Self> {
-        let _ = (name, length);
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Windows shared memory is unavailable until DACL and section-size verification is qualified",
-        ))
-        /*
-        use std::ffi::OsStr;
-        use std::mem;
-        use std::os::windows::ffi::OsStrExt;
-
-        use windows_permissions::{LocalBox, SecurityDescriptor};
-        use windows_sys::Win32::Foundation::{
-            ERROR_ALREADY_EXISTS, GetLastError, INVALID_HANDLE_VALUE,
-        };
-        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-        use windows_sys::Win32::System::Memory::{
-            CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, PAGE_READWRITE,
-        };
-
-        let current_user = windows_permissions::utilities::current_process_sid()?;
-        let sddl = format!("D:P(A;;GA;;;{current_user})(A;;GA;;;SY)(A;;GA;;;BA)");
-        let descriptor = sddl
-            .parse::<LocalBox<SecurityDescriptor>>()
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        let mut attributes = SECURITY_ATTRIBUTES {
-            nLength: mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: descriptor.as_ptr().cast(),
-            bInheritHandle: 0,
-        };
-        let wide_name: Vec<u16> = OsStr::new(name).encode_wide().chain(Some(0)).collect();
-        let high = (length >> 32) as u32;
-        let low = length as u32;
-        // SAFETY: the protected, self-relative descriptor and attributes remain alive for this
-        // synchronous API call; `wide_name` is NUL-terminated; mapping size is layout-bounded.
+        let wide_name = wide_name(name)?;
+        let (descriptor, mut attributes) = protected_attributes()?;
+        let (high, low) = split_section_length(length)?;
+        // SAFETY: `attributes` and its LocalAlloc-owned descriptor remain live for this
+        // synchronous call; `wide_name` is NUL-terminated; `length` was checked and split.
         let handle = unsafe {
-            CreateFileMappingW(
-                INVALID_HANDLE_VALUE,
+            windows_sys::Win32::System::Memory::CreateFileMappingW(
+                windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
                 (&raw mut attributes).cast(),
-                PAGE_READWRITE,
+                windows_sys::Win32::System::Memory::PAGE_READWRITE,
                 high,
                 low,
                 wide_name.as_ptr(),
             )
         };
+        let _descriptor = descriptor;
         if handle.is_null() {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: GetLastError reads only the calling thread's last-error value immediately
-        // after CreateFileMappingW, as required by the Windows API collision contract.
-        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-            // SAFETY: the returned handle is owned even when a name collision is reported.
+        // SAFETY: reads this thread's last-error value immediately after CreateFileMappingW.
+        if unsafe { windows_sys::Win32::Foundation::GetLastError() }
+            == windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS
+        {
+            // SAFETY: even on collision CreateFileMappingW returned an owned handle.
             unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "named shared mapping already exists",
             ));
         }
-        // SAFETY: handle is a successful CreateFileMappingW result; length is bounded by the
-        // checked layout and MapViewOfFile returns null on failure without retaining pointers.
-        let address = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, length) };
-        if address.Value.is_null() {
-            let error = io::Error::last_os_error();
-            // SAFETY: handle is owned after successful mapping creation.
-            unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
-            return Err(error);
-        }
-        // SAFETY: a non-null MapViewOfFile result is a valid mapping base for its requested size.
-        let address = unsafe { NonNull::new_unchecked(address.Value.cast()) };
-        Ok(Self {
-            address,
-            length,
+        map_owned(
             handle,
-        })
-        */
+            length,
+            windows_sys::Win32::System::Memory::FILE_MAP_ALL_ACCESS,
+        )
     }
 
     pub(crate) fn open_read_only(name: &str, length: usize) -> io::Result<Self> {
-        let _ = (name, length);
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Windows shared memory is unavailable until DACL and section-size verification is qualified",
-        ))
-        /*
-        use std::ffi::OsStr;
-        use std::os::windows::ffi::OsStrExt;
-
-        use windows_sys::Win32::System::Memory::{FILE_MAP_READ, MapViewOfFile, OpenFileMappingW};
-
-        let wide_name: Vec<u16> = OsStr::new(name).encode_wide().chain(Some(0)).collect();
-        // SAFETY: wide_name is NUL-terminated and the API returns an owned handle on success.
-        let handle = unsafe { OpenFileMappingW(FILE_MAP_READ, 0, wide_name.as_ptr()) };
+        if length == 0 {
+            return Err(invalid_section_length());
+        }
+        let wide_name = wide_name(name)?;
+        // SAFETY: `wide_name` is NUL-terminated and the API returns an owned section handle.
+        let handle = unsafe {
+            windows_sys::Win32::System::Memory::OpenFileMappingW(
+                windows_sys::Win32::System::Memory::FILE_MAP_READ
+                    | windows_sys::Win32::System::Memory::SECTION_QUERY,
+                0,
+                wide_name.as_ptr(),
+            )
+        };
         if handle.is_null() {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: handle is owned and length is descriptor-validated before this call.
-        let address = unsafe { MapViewOfFile(handle, FILE_MAP_READ, 0, 0, length) };
-        if address.Value.is_null() {
-            let error = io::Error::last_os_error();
-            // SAFETY: handle is owned after OpenFileMappingW succeeds.
-            unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
-            return Err(error);
+        let section_length = section_length(handle);
+        match section_length {
+            Ok(actual) if actual >= length => {}
+            Ok(_) | Err(_) => {
+                // SAFETY: OpenFileMappingW returned this owned handle.
+                unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+                return Err(invalid_section_length());
+            }
         }
-        // SAFETY: non-null MapViewOfFile is a valid mapping base for requested length.
-        let address = unsafe { NonNull::new_unchecked(address.Value.cast()) };
-        Ok(Self {
-            address,
-            length,
+        map_owned(
             handle,
-        })
-        */
+            length,
+            windows_sys::Win32::System::Memory::FILE_MAP_READ,
+        )
     }
 
     pub(crate) fn as_ptr(&self) -> *mut u8 {
@@ -613,6 +571,191 @@ impl Mapping {
     pub(crate) fn unlink(_name: &str) -> io::Result<()> {
         Ok(())
     }
+
+    #[cfg(test)]
+    fn dacl_sddl_for_test(&self) -> io::Result<String> {
+        use windows_permissions::constants::SecurityInformation;
+        use windows_permissions::{WindowsSecure, wrappers};
+
+        let descriptor =
+            BorrowedMappingHandle(self.handle).security_descriptor(SecurityInformation::Dacl)?;
+        Ok(
+            wrappers::ConvertSecurityDescriptorToStringSecurityDescriptor(
+                &descriptor,
+                SecurityInformation::Dacl,
+            )?
+            .to_string_lossy()
+            .into_owned(),
+        )
+    }
+
+    #[cfg(test)]
+    fn trustees_for_test(&self) -> io::Result<std::collections::BTreeSet<String>> {
+        use windows_permissions::WindowsSecure;
+        use windows_permissions::constants::SecurityInformation;
+
+        let descriptor =
+            BorrowedMappingHandle(self.handle).security_descriptor(SecurityInformation::Dacl)?;
+        let dacl = descriptor
+            .dacl()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "section has no DACL"))?;
+        (0..dacl.len())
+            .map(|index| {
+                dacl.get_ace(index)
+                    .and_then(|ace| ace.sid())
+                    .map(|sid| sid.to_string())
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid DACL ACE"))
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn dacl_ace_count_for_test(&self) -> io::Result<usize> {
+        use windows_permissions::WindowsSecure;
+        use windows_permissions::constants::SecurityInformation;
+
+        let descriptor =
+            BorrowedMappingHandle(self.handle).security_descriptor(SecurityInformation::Dacl)?;
+        descriptor
+            .dacl()
+            .map(|dacl| dacl.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "section has no DACL"))
+    }
+}
+
+#[cfg(windows)]
+fn protected_attributes() -> io::Result<(
+    windows_permissions::LocalBox<windows_permissions::SecurityDescriptor>,
+    windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+)> {
+    use std::mem::size_of;
+
+    let sid = windows_permissions::utilities::current_process_sid()?;
+    let sddl = format!("D:P(A;;GA;;;{sid})(A;;GA;;;SY)(A;;GA;;;BA)");
+    let descriptor =
+        sddl.parse::<windows_permissions::LocalBox<windows_permissions::SecurityDescriptor>>()?;
+    let attributes = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+        nLength: size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.as_ptr().cast(),
+        bInheritHandle: 0,
+    };
+    Ok((descriptor, attributes))
+}
+
+#[cfg(windows)]
+fn wide_name(name: &str) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    if name.encode_utf16().any(|unit| unit == 0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "shared-memory name contains an interior NUL",
+        ));
+    }
+    Ok(std::ffi::OsStr::new(name)
+        .encode_wide()
+        .chain(Some(0))
+        .collect())
+}
+
+#[cfg(windows)]
+fn split_section_length(length: usize) -> io::Result<(u32, u32)> {
+    let length = u64::try_from(length).map_err(|_| invalid_section_length())?;
+    if length == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "shared-memory section length must be non-zero",
+        ));
+    }
+    Ok(((length >> 32) as u32, length as u32))
+}
+
+#[cfg(windows)]
+fn invalid_section_length() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "shared-memory section length does not match descriptor",
+    )
+}
+
+#[cfg(windows)]
+fn map_owned(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    length: usize,
+    access: windows_sys::Win32::System::Memory::FILE_MAP,
+) -> io::Result<Mapping> {
+    // SAFETY: `handle` is exclusively owned by this function; `length` was checked and is
+    // bounded; the mapping API retains neither Rust pointer and returns null on failure.
+    let address =
+        unsafe { windows_sys::Win32::System::Memory::MapViewOfFile(handle, access, 0, 0, length) };
+    if address.Value.is_null() {
+        let error = io::Error::last_os_error();
+        // SAFETY: this function owns `handle` when view mapping fails.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+        return Err(error);
+    }
+    // SAFETY: a non-null MapViewOfFile result is a valid base for exactly `length` bytes.
+    let address = unsafe { NonNull::new_unchecked(address.Value.cast()) };
+    Ok(Mapping {
+        address,
+        length,
+        handle,
+    })
+}
+
+#[cfg(windows)]
+fn section_length(handle: windows_sys::Win32::Foundation::HANDLE) -> io::Result<usize> {
+    let mut information = SectionBasicInformation {
+        base_address: std::ptr::null_mut(),
+        allocation_attributes: 0,
+        maximum_size: 0,
+    };
+    // SAFETY: `information` is writable storage of the documented SectionBasicInformation
+    // layout; `handle` remains live and requests only its section metadata. See the documented
+    // NtQuerySection SECTION_BASIC_INFORMATION contract.
+    let status = unsafe {
+        NtQuerySection(
+            handle,
+            0,
+            (&raw mut information).cast(),
+            std::mem::size_of::<SectionBasicInformation>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    if status < 0 || information.maximum_size <= 0 {
+        return Err(invalid_section_length());
+    }
+    usize::try_from(information.maximum_size as u64).map_err(|_| invalid_section_length())
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct SectionBasicInformation {
+    base_address: *mut std::ffi::c_void,
+    allocation_attributes: u32,
+    maximum_size: i64,
+}
+
+#[cfg(windows)]
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtQuerySection(
+        section_handle: windows_sys::Win32::Foundation::HANDLE,
+        information_class: u32,
+        information: *mut std::ffi::c_void,
+        information_length: u32,
+        return_length: *mut u32,
+    ) -> i32;
+}
+
+#[cfg(all(test, windows))]
+struct BorrowedMappingHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(all(test, windows))]
+impl std::os::windows::io::AsRawHandle for BorrowedMappingHandle {
+    fn as_raw_handle(&self) -> std::os::windows::io::RawHandle {
+        self.0.cast()
+    }
 }
 
 #[cfg(windows)]
@@ -629,6 +772,83 @@ impl Drop for Mapping {
         // SAFETY: this Mapping owns handle and CloseHandle retains no reference.
         let _ = unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
         let _ = self.length;
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use std::collections::BTreeSet;
+
+    use super::Mapping;
+
+    #[test]
+    fn created_mapping_has_a_protected_three_trustee_dacl() {
+        let name = test_mapping_name("dacl");
+        let mapping = Mapping::create(&name, 4096).unwrap();
+        let sddl = mapping.dacl_sddl_for_test().unwrap();
+        assert!(sddl.starts_with("D:P"), "DACL must be protected: {sddl}");
+        assert_eq!(mapping.dacl_ace_count_for_test().unwrap(), 3);
+        assert_eq!(mapping.trustees_for_test().unwrap(), expected_trustees());
+        drop(mapping);
+        Mapping::unlink(&name).unwrap();
+    }
+
+    #[test]
+    fn create_rejects_an_existing_mapping_name() {
+        let name = test_mapping_name("collision");
+        let first = Mapping::create(&name, 4096).unwrap();
+        let error = match Mapping::create(&name, 4096) {
+            Ok(_) => panic!("existing names must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        drop(first);
+        Mapping::unlink(&name).unwrap();
+    }
+
+    #[test]
+    fn create_rejects_a_zero_length_section() {
+        let error = match Mapping::create(&test_mapping_name("zero"), 0) {
+            Ok(_) => panic!("zero-length section"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn read_only_open_rejects_a_request_larger_than_the_section() {
+        let name = test_mapping_name("short");
+        let mapping = Mapping::create(&name, 4096).unwrap();
+        let error = match Mapping::open_read_only(&name, 8192) {
+            Ok(_) => panic!("larger mapping request is invalid"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        drop(mapping);
+        Mapping::unlink(&name).unwrap();
+    }
+
+    fn expected_trustees() -> BTreeSet<String> {
+        [
+            windows_permissions::utilities::current_process_sid()
+                .unwrap()
+                .to_string(),
+            "S-1-5-18".to_owned(),
+            "S-1-5-32-544".to_owned(),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    fn test_mapping_name(label: &str) -> String {
+        format!(
+            "Local\\seeed-hal-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
     }
 }
 
