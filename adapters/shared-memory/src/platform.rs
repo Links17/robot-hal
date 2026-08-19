@@ -524,6 +524,9 @@ impl Mapping {
             return Err(invalid_section_length());
         }
         let wide_name = wide_name(name)?;
+        // SECTION_QUERY is required only to validate the section length with NtQuerySection before
+        // mapping. The view itself is always FILE_MAP_READ; this path never requests write or
+        // all-access mapping permissions.
         // SAFETY: `wide_name` is NUL-terminated and the API returns an owned section handle.
         let handle = unsafe {
             windows_sys::Win32::System::Memory::OpenFileMappingW(
@@ -537,12 +540,12 @@ impl Mapping {
             return Err(io::Error::last_os_error());
         }
         let section_length = section_length(handle);
-        match section_length {
-            Ok(actual) if actual >= length => {}
-            Ok(_) | Err(_) => {
+        match validate_section_length(section_length, length) {
+            Ok(()) => {}
+            Err(error) => {
                 // SAFETY: OpenFileMappingW returned this owned handle.
                 unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
-                return Err(invalid_section_length());
+                return Err(error);
             }
         }
         map_owned(
@@ -618,8 +621,30 @@ impl Mapping {
             BorrowedMappingHandle(self.handle).security_descriptor(SecurityInformation::Dacl)?;
         descriptor
             .dacl()
-            .map(|dacl| dacl.len())
+            .map(|dacl| dacl.len() as usize)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "section has no DACL"))
+    }
+
+    #[cfg(test)]
+    fn view_protection_for_test(
+        &self,
+    ) -> io::Result<windows_sys::Win32::System::Memory::PAGE_PROTECTION_FLAGS> {
+        let mut information = std::mem::MaybeUninit::<
+            windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION,
+        >::zeroed();
+        // SAFETY: `address` is a live mapped view and `information` is valid writable storage.
+        let queried = unsafe {
+            windows_sys::Win32::System::Memory::VirtualQuery(
+                self.address.as_ptr().cast(),
+                information.as_mut_ptr(),
+                std::mem::size_of::<windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if queried == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a nonzero result from VirtualQuery initialized `information`.
+        Ok(unsafe { information.assume_init() }.Protect)
     }
 }
 
@@ -679,6 +704,15 @@ fn invalid_section_length() -> io::Error {
 }
 
 #[cfg(windows)]
+fn validate_section_length(section_length: io::Result<usize>, requested: usize) -> io::Result<()> {
+    match section_length {
+        Ok(actual) if actual >= requested => Ok(()),
+        Ok(_) => Err(invalid_section_length()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
 fn map_owned(
     handle: windows_sys::Win32::Foundation::HANDLE,
     length: usize,
@@ -722,10 +756,28 @@ fn section_length(handle: windows_sys::Win32::Foundation::HANDLE) -> io::Result<
             std::ptr::null_mut(),
         )
     };
-    if status < 0 || information.maximum_size <= 0 {
+    if status < 0 {
+        return Err(section_query_error(status));
+    }
+    if information.maximum_size <= 0 {
         return Err(invalid_section_length());
     }
     usize::try_from(information.maximum_size as u64).map_err(|_| invalid_section_length())
+}
+
+#[cfg(windows)]
+fn section_query_error(status: i32) -> io::Error {
+    if status == windows_sys::Win32::Foundation::STATUS_ACCESS_DENIED {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "shared-memory section metadata query was denied",
+        )
+    } else {
+        io::Error::new(
+            io::ErrorKind::Other,
+            "shared-memory section metadata query failed",
+        )
+    }
 }
 
 #[cfg(windows)]
@@ -779,7 +831,7 @@ impl Drop for Mapping {
 mod windows_tests {
     use std::collections::BTreeSet;
 
-    use super::Mapping;
+    use super::{Mapping, validate_section_length};
 
     #[test]
     fn created_mapping_has_a_protected_three_trustee_dacl() {
@@ -825,6 +877,36 @@ mod windows_tests {
         };
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         drop(mapping);
+        Mapping::unlink(&name).unwrap();
+    }
+
+    #[test]
+    fn query_failure_is_not_disguised_as_an_invalid_section_length() {
+        let error = validate_section_length(
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "section query denied",
+            )),
+            4096,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn read_only_open_maps_a_read_only_view() {
+        let name = test_mapping_name("read-only-view");
+        let owner = Mapping::create(&name, 4096).unwrap();
+        let reader = Mapping::open_read_only(&name, 4096).unwrap();
+
+        assert_eq!(
+            reader.view_protection_for_test().unwrap(),
+            windows_sys::Win32::System::Memory::PAGE_READONLY
+        );
+
+        drop(reader);
+        drop(owner);
         Mapping::unlink(&name).unwrap();
     }
 
