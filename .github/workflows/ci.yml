@@ -68,6 +68,9 @@ jobs:
         if: ${{ runner.os == 'Linux' }}
         shell: bash
         run: ./scripts/ci/install-linux-native-prerequisites.sh
+      - name: Run Windows shared-memory runtime tests
+        if: ${{ runner.os == 'Windows' }}
+        run: cargo +1.85 test -p seeed-hal-adapter-shared-memory --all-features platform::windows_tests -- --nocapture
       - name: Build production broker
         shell: python
         run: |

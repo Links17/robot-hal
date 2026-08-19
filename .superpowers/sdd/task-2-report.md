@@ -387,3 +387,61 @@ It could not link on this macOS host because `link.exe` is unavailable. The
 Windows target `cargo check` compiles the production and Windows-only test code,
 but Hosted Windows must execute the abandoned shared/exclusive, teardown
 ownership, and close-terminal-state tests to qualify their runtime behavior.
+
+---
+
+## Windows Hosted runtime gate in CI
+
+The prior implementation was committed as `4efcc23` in unrelated `main` history.
+That commit and its history were not cherry-picked or otherwise reused. This
+branch-local change independently added the smallest CI contract and workflow
+step needed to run the existing Windows shared-memory runtime tests on a Hosted
+Windows matrix entry.
+
+### RED
+
+After adding the contract before changing CI, this command failed:
+
+```sh
+uv run --project bindings/python --python 3.11 --frozen pytest -q \
+  tests/release/test_workflow_contract.py
+```
+
+Result: **1 failed, 24 passed**. The new contract failed with `StopIteration`
+because `platform-conformance` had no `Run Windows shared-memory runtime tests`
+step.
+
+### GREEN and verification
+
+`platform-conformance` now runs this Windows-only default-pwsh command before
+`Build production broker`:
+
+```text
+cargo +1.85 test -p seeed-hal-adapter-shared-memory --all-features platform::windows_tests -- --nocapture
+```
+
+The workflow retains its top-level read-only permissions and existing
+SHA-pinned actions. No Unix-specific shell is configured for this Windows step.
+
+Commands:
+
+```sh
+uv run --project bindings/python --python 3.11 --frozen pytest -q \
+  tests/release/test_workflow_contract.py
+uv run --project bindings/python --python 3.11 --frozen pytest -q tests/release
+cargo +1.85 fmt --all --check
+git diff --check
+```
+
+Results:
+
+- Focused workflow contracts: **25 passed**.
+- Complete `tests/release`: **232 passed**.
+- Rust formatting and diff whitespace checks: passed.
+
+No existing release-suite failure occurred, so no unrelated test was modified.
+
+### Branch commit
+
+This branch-local implementation is committed as
+`ci(shared-memory): gate Windows mapping runtime tests`.

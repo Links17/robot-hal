@@ -275,6 +275,29 @@ def test_platform_job_separates_production_manifest_and_virtual_conformance() ->
     )
 
 
+def test_platform_job_runs_windows_shared_memory_runtime_tests_before_production_broker_build() -> None:
+    workflow = load_workflow("ci.yml")
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+    platform_steps = jobs["platform-conformance"]["steps"]
+    runtime_step = next(
+        step
+        for step in platform_steps
+        if step.get("name") == "Run Windows shared-memory runtime tests"
+    )
+
+    assert runtime_step["if"] == "${{ runner.os == 'Windows' }}"
+    assert runtime_step["run"].strip() == (
+        "cargo +1.85 test -p seeed-hal-adapter-shared-memory --all-features "
+        "platform::windows_tests -- --nocapture"
+    )
+    assert platform_steps.index(runtime_step) < next(
+        index
+        for index, step in enumerate(platform_steps)
+        if step.get("name") == "Build production broker"
+    )
+
+
 def test_source_gate_contains_no_native_or_platform_adapter_prerequisites() -> None:
     workflow = load_workflow("ci.yml")
     jobs = workflow["jobs"]
