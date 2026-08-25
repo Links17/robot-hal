@@ -115,9 +115,31 @@ def test_rust_bundle_preserves_path_version_workspace_closure(tmp_path: Path) ->
         "seeed-hal-crates-v0.5.0-rc.1/camera/src/lib.rs",
         "seeed-hal-crates-v0.5.0-rc.1/core/Cargo.toml",
         "seeed-hal-crates-v0.5.0-rc.1/core/src/lib.rs",
-        "seeed-hal-crates-v0.5.0-rc.1/tracked",
     )
     _check_workspace_bundle(bundle)
+
+
+def test_rust_bundle_excludes_unrelated_tracked_repository_files(tmp_path: Path) -> None:
+    repo = tmp_path / "workspace"
+    repo.mkdir()
+    _write_workspace(repo)
+    (repo / ".github").mkdir()
+    (repo / ".github" / "workflow.yml").write_text("internal\n", encoding="utf-8")
+    (repo / "docs").mkdir()
+    (repo / "docs" / "release-notes.md").write_text("internal\n", encoding="utf-8")
+    _git(repo, "add", ".github", "docs")
+    _git(repo, "commit", "-m", "internal files")
+
+    bundle = package_rust(
+        tag="v0.5.0-rc.1",
+        repo_root=repo,
+        output_dir=tmp_path / "artifacts",
+    )
+
+    members = _bundle_members(bundle)
+    assert all("/.github/" not in member for member in members)
+    assert all("/docs/" not in member for member in members)
+    assert all(not member.endswith("/tracked") for member in members)
 
 
 def test_rust_bundle_is_byte_identical_across_independent_output_directories(

@@ -60,12 +60,15 @@ requires hosted evidence before it may be claimed.
 
 ## Rust workspace source bundle
 
-`seeed-hal-crates-v0.5.0-rc.N.tar.gz` is a deterministic, complete Rust
-workspace source bundle. It is not a collection of independently installable
-`.crate` archives and it makes no crates.io availability claim.
+`seeed-hal-crates-v0.5.0-rc.N.tar.gz` is a deterministic Rust workspace source
+closure. It is not a collection of independently installable `.crate` archives
+and it makes no crates.io availability claim. The closure contains the root
+Cargo manifest and lockfile plus tracked files under each Cargo workspace member
+root. Unrelated repository material such as `.github/`, `.superpowers/`, and
+top-level documentation is intentionally excluded.
 
 The archive has one top-level `seeed-hal-crates-v0.5.0-rc.N/` directory and
-contains the tracked, regular repository files needed to retain the workspace
+contains the tracked, regular repository files needed to retain that workspace
 source closure, including the root `Cargo.toml`, `Cargo.lock`, and every
 workspace member manifest and source file. Package construction freezes that
 controlled file set; it rejects symlinks, unsafe or unexpected paths, missing

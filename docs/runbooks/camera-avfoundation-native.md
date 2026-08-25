@@ -11,6 +11,9 @@ not qualify a physical macOS camera.
 
 - Run on macOS with a non-production camera selected in System Settings.
 - If Camera access is `NotDetermined` for the test process, the adapter requests access once and waits for the system prompt. Grant it before continuing. Denied or restricted access fails closed.
+- If the permission prompt is left unanswered, the bounded open deadline may expire while the
+  native worker remains quarantined until macOS delivers the authorization callback. Do not reuse
+  the resource or interpret the timeout as proof that the native claim has already been released.
 - Use the resource ID returned by HAL discovery. Do not record a camera serial number, mapping name,
   capability token, raw frame, or image in source control or the qualification evidence.
 - Ensure no other process is using the fixture. The test user must be permitted to access the

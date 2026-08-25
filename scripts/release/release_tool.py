@@ -2527,7 +2527,10 @@ def _require_clean_repository(repo_root: Path) -> None:
     _package_invalid("unable to verify repository state")
 
 
-def _frozen_workspace_source_files(repo_root: Path) -> tuple[tuple[str, Path, tuple[int, int, int, str]], ...]:
+def _frozen_workspace_source_files(
+    repo_root: Path,
+    packages: tuple[dict[str, object], ...],
+) -> tuple[tuple[str, Path, tuple[int, int, int, str]], ...]:
     try:
         result = subprocess.run(
             ["git", "ls-files", "-z"],
@@ -2544,12 +2547,29 @@ def _frozen_workspace_source_files(repo_root: Path) -> tuple[tuple[str, Path, tu
     entries = result.stdout.split("\0")
     if not entries or entries[-1] != "":
         _package_invalid("repository file list is invalid")
+    member_roots: set[Path] = set()
+    for package in packages:
+        manifest = package.get("manifest_path")
+        if not isinstance(manifest, str):
+            _package_invalid("cargo workspace member manifest is invalid")
+        try:
+            member_roots.add(Path(manifest).resolve().parent.relative_to(repo_root.resolve()))
+        except ValueError as error:
+            raise ReleaseFailure(
+                "release.package.invalid",
+                "cargo workspace member is outside repository root",
+            ) from error
+    allowed_roots = {Path("Cargo.toml"), Path("Cargo.lock")}
     frozen: list[tuple[str, Path, tuple[int, int, int, str]]] = []
     for entry in entries[:-1]:
         try:
             path = _safe_archive_path(entry)
         except ReleaseFailure as error:
             raise ReleaseFailure("release.package.invalid", "repository file path is unsafe") from error
+        if path not in allowed_roots and not any(
+            path == member_root or member_root in path.parents for member_root in member_roots
+        ):
+            continue
         source = repo_root / Path(*path.parts)
         try:
             if source.resolve().parent != source.parent.resolve() or source.is_symlink():
@@ -2644,7 +2664,7 @@ def package_rust(*, tag: str, repo_root: Path, output_dir: Path) -> Path:
         packages = _workspace_source_members(resolved_root)
         if any(package.get("version") != version.cargo for package in packages):
             _package_invalid("cargo workspace version does not match release tag")
-        frozen_sources = _frozen_workspace_source_files(resolved_root)
+        frozen_sources = _frozen_workspace_source_files(resolved_root, packages)
         source_names = {name for name, _, _ in frozen_sources}
         required = {"Cargo.toml", "Cargo.lock"}
         for package in packages:

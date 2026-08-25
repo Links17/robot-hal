@@ -2,11 +2,12 @@ use seeed_hal_core::{ErrorCategory, HalError, HalResult};
 
 use crate::runtime_error;
 
-/// Shared lifecycle phases for exclusive hardware sessions.
+/// Shared lifecycle phases for Serial and USB exclusive sessions.
 ///
 /// Hardware-specific managers retain ownership of their workers and queues.
-/// This module only defines the state transitions that must remain consistent
-/// across Serial, USB, GPIO, and Camera sessions.
+/// This kernel defines the smallest state transitions shared by those managers;
+/// Camera, GPIO, and CAN retain their own terminal, reap, and native-close
+/// bookkeeping because their concurrency semantics are not identical.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SessionLifecycle {
     Opening,
