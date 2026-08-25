@@ -7,21 +7,15 @@ use crate::events::{EventPublisher, RuntimeEventKind};
 use crate::lease_table::LeaseTable;
 use crate::runtime_error;
 use crate::serial_actor::{ActorHandle, ActorMetadata, SerialCommand};
+use crate::session_lifecycle::SessionLifecycle;
 
 const CLOSED_SESSION_CAPACITY: usize = 256;
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum SessionState {
-    Opening,
-    Active,
-    Closing,
-}
 
 struct SessionEntry {
     resource_id: ResourceId,
     owner_id: OwnerId,
     lease: LeaseToken,
-    state: SessionState,
+    state: SessionLifecycle,
     actor: Option<ActorHandle>,
     done: watch::Sender<Option<HalResult<()>>>,
     open_cancel: watch::Sender<bool>,
@@ -75,7 +69,7 @@ impl Registry {
                 resource_id,
                 owner_id,
                 lease: lease.clone(),
-                state: SessionState::Opening,
+                state: SessionLifecycle::Opening,
                 actor: None,
                 done,
                 open_cancel,
@@ -97,7 +91,7 @@ impl Registry {
             return false;
         };
         entry.actor = Some(actor);
-        if entry.state == SessionState::Closing {
+        if entry.state.is_closing() {
             return false;
         }
 
@@ -108,7 +102,10 @@ impl Registry {
             return false;
         }
 
-        entry.state = SessionState::Active;
+        entry.state = match entry.state.commit_open("serial.open") {
+            Ok(state) => state,
+            Err(_) => return false,
+        };
         events.publish(
             RuntimeEventKind::SessionOpened,
             entry.resource_id.clone(),
@@ -143,9 +140,10 @@ impl Registry {
             lease,
             operation,
         )?;
-        if entry.state != SessionState::Active {
-            return Err(session_closed(operation).with_resource_id(entry.resource_id.clone()));
-        }
+        entry
+            .state
+            .admit_io(operation)
+            .map_err(|error| error.with_resource_id(entry.resource_id.clone()))?;
         let actor = entry.actor.as_ref().ok_or_else(|| {
             runtime_error(
                 "runtime.actor.unavailable",
@@ -177,7 +175,7 @@ impl Registry {
             lease,
             "serial.close",
         )?;
-        entry.state = SessionState::Closing;
+        entry.state = entry.state.begin_close("serial.close")?;
         let actor = entry.actor.clone().ok_or_else(|| {
             runtime_error(
                 "runtime.actor.unavailable",
@@ -196,7 +194,10 @@ impl Registry {
             .values_mut()
             .filter(|entry| &entry.owner_id == owner_id)
             .map(|entry| {
-                entry.state = SessionState::Closing;
+                entry.state = entry
+                    .state
+                    .begin_close("runtime.owner.revoke")
+                    .unwrap_or(SessionLifecycle::Closing);
                 if entry.actor.is_none() {
                     entry.open_cancel.send_replace(true);
                 }

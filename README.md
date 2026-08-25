@@ -19,6 +19,7 @@ The implementation is library-first. Rust applications link the library directly
 - [Architecture](docs/architecture/hal-architecture.md)
 - [Responsibility contract](docs/contracts/hal-responsibility.md)
 - [Versioning contract](docs/contracts/versioning.md)
+- [Hardware capability matrix](docs/contracts/capability-matrix.md)
 - [v0.1 implementation plan](docs/superpowers/plans/2026-08-14-v0.1-core-serial.md)
 - [v0.1.0 acceptance evidence](docs/releases/v0.1.0-acceptance.md)
 - [v0.2.0 acceptance evidence](docs/releases/v0.2.0-acceptance.md)

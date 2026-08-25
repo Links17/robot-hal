@@ -54,3 +54,15 @@ HAL cannot prevent unrelated external processes from bypassing it and opening th
 
 An open reservation is provisional until the session is exposed. Failed or cancelled opens roll
 back only their exact current reservation; generations already exposed to callers are never reused.
+
+## Session lifecycle contract
+
+Exclusive session managers use the same transport-level lifecycle phases:
+
+`Opening → Active → Closing`
+
+An open reservation may be cancelled before it becomes active. Once a session is `Closing`, new
+I/O is rejected, while already admitted work follows the hardware-class queue and cancellation
+contract. Completion removes the live session, releases its lease, and records the closed-session
+fence needed to reject stale or invalid lease tokens. Hardware managers may retain different worker
+and queue implementations; they must not weaken these lifecycle admission rules.

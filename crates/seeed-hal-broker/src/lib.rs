@@ -2,6 +2,7 @@
 
 mod camera_dispatch;
 mod can_dispatch;
+mod capability_gate;
 mod connection;
 pub mod listener;
 mod usb_gpio_dispatch;

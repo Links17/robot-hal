@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use crate::capability_gate::require;
 use seeed_hal_core::{
     CapabilityId, CapabilitySet, ErrorCategory, HalError, HalResult, LeaseToken, OwnerId,
     ResourceDescriptor, ResourceId, ResourceSelector, SessionId,
@@ -410,27 +411,6 @@ fn select<'a>(
         ));
     }
     Ok(descriptor)
-}
-
-fn require(
-    capabilities: &CapabilitySet,
-    capability: &CapabilityId,
-    name: &'static str,
-    resource: &ResourceId,
-) -> HalResult<()> {
-    if capabilities.contains(capability) {
-        return Ok(());
-    }
-    Err(session_error(
-        "runtime.protocol.capability_unsupported",
-        "runtime.protocol.dispatch",
-        "selected resource does not advertise the required capability",
-        Some(resource),
-    )
-    .with_context(
-        seeed_hal_core::ErrorContext::new([("capability", name.to_owned())])
-            .expect("static capability context is valid"),
-    ))
 }
 
 fn record(

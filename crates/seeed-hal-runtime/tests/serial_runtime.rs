@@ -897,6 +897,27 @@ async fn session_lifecycle_events_are_ordered_and_describe_the_same_session() {
 }
 
 #[tokio::test]
+async fn serial_typed_facade_delegates_to_the_same_runtime_ownership_root() {
+    let adapter = VirtualSerialAdapter::loopback("serial:virtual:typed-facade");
+    let runtime = HalRuntime::builder().serial_adapter(adapter).build();
+    let serial = runtime.serial();
+    let descriptor = serial.enumerate().await.unwrap().remove(0);
+
+    let handle = serial
+        .open(
+            owner("typed-facade"),
+            descriptor.selector(),
+            SerialConfig::default(),
+        )
+        .await
+        .unwrap();
+
+    handle.write(Bytes::from_static(b"facade")).await.unwrap();
+    assert_eq!(handle.read(6).await.unwrap(), Bytes::from_static(b"facade"));
+    handle.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn invalid_session_and_lease_are_rejected_before_serial_io() {
     let adapter = VirtualSerialAdapter::loopback("serial:virtual:validation");
     let runtime = HalRuntime::builder().serial_adapter(adapter).build();

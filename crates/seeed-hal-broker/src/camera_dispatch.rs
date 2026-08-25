@@ -1,13 +1,14 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use crate::capability_gate::require;
 use seeed_hal_camera::{
     CAMERA_CAPTURE_CAPABILITY, CAMERA_CONTROLS_CAPABILITY, CAMERA_FRAMES_SHM_CAPABILITY,
     camera_capture_capability, camera_controls_capability, camera_frames_shm_capability,
 };
 use seeed_hal_core::{
-    CapabilityId, CapabilitySet, ErrorCategory, HalError, HalResult, LeaseToken, OwnerId,
-    ResourceDescriptor, ResourceId, SessionId,
+    CapabilitySet, ErrorCategory, HalError, HalResult, LeaseToken, OwnerId, ResourceDescriptor,
+    ResourceId, SessionId,
 };
 use seeed_hal_protocol::v1::{self, envelope};
 use seeed_hal_protocol::{
@@ -309,26 +310,6 @@ fn select<'a>(
         ));
     }
     Ok(descriptor)
-}
-
-fn require(
-    capabilities: &CapabilitySet,
-    capability: &CapabilityId,
-    name: &'static str,
-    resource: &ResourceId,
-) -> HalResult<()> {
-    if capabilities.contains(capability) {
-        return Ok(());
-    }
-    Err(session_error(
-        "runtime.protocol.capability_unsupported",
-        "runtime.protocol.dispatch",
-        "selected resource lacks required capability",
-        Some(resource),
-    )
-    .with_context(
-        seeed_hal_core::ErrorContext::new([("capability", name)]).expect("static context"),
-    ))
 }
 
 fn validate(

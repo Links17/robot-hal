@@ -289,9 +289,35 @@ mod tests {
     #[ignore = "requires an authorized physical camera and SEEED_HAL_CAMERA_RESOURCE_ID"]
     async fn physical_camera_captures_requested_verified_frame() {
         use super::{AvFoundationAdapter, CameraAdapter};
-        use seeed_hal_camera::{CameraFormat, CameraPixelFormat, CameraRequest};
-        use seeed_hal_core::{IdentityQuality, ResourceId, ResourceSelector, TransportKind};
-        use std::time::Duration;
+        use seeed_hal_camera::{
+            CameraFormat, CameraFrameMetadata, CameraFrameSink, CameraPixelFormat, CameraRequest,
+        };
+        use seeed_hal_core::{
+            HalResult, IdentityQuality, ResourceId, ResourceSelector, TransportKind,
+        };
+        use std::{
+            sync::{Arc, Mutex},
+            time::Duration,
+        };
+
+        struct CollectingSink {
+            metadata: Mutex<Option<CameraFrameMetadata>>,
+            bytes_written: Mutex<usize>,
+        }
+
+        impl CameraFrameSink for CollectingSink {
+            fn publish(
+                &self,
+                metadata: CameraFrameMetadata,
+                copy_payload: &mut dyn FnMut(&mut [u8]) -> HalResult<usize>,
+            ) -> HalResult<()> {
+                let mut buffer = vec![0_u8; 4 * 1024 * 1024];
+                let written = copy_payload(&mut buffer)?;
+                *self.bytes_written.lock().expect("sink mutex poisoned") = written;
+                *self.metadata.lock().expect("sink mutex poisoned") = Some(metadata);
+                Ok(())
+            }
+        }
 
         let Some(resource_id) = std::env::var("SEEED_HAL_CAMERA_RESOURCE_ID").ok() else {
             return;
@@ -304,30 +330,448 @@ mod tests {
             .into_iter()
             .find(|descriptor| descriptor.id().as_str() == resource_id)
             .expect("SEEED_HAL_CAMERA_RESOURCE_ID must select an enumerated camera");
+        eprintln!(
+            "qualifying camera name={}",
+            descriptor
+                .properties()
+                .get("camera.name")
+                .unwrap_or("missing")
+        );
         let request = CameraRequest::new(
-            CameraFormat::new(CameraPixelFormat::Nv12, 640, 480).unwrap(),
+            CameraFormat::new(CameraPixelFormat::Nv12, 1920, 1080).unwrap(),
             4,
         )
         .unwrap();
+        let selector = ResourceSelector::exact(
+            ResourceId::parse(descriptor.id().as_str()).unwrap(),
+            IdentityQuality::Strong,
+            TransportKind::Camera,
+        );
+        let mjpeg = CameraRequest::new(
+            CameraFormat::new(CameraPixelFormat::Mjpeg, 1920, 1080).unwrap(),
+            4,
+        )
+        .unwrap();
+        let mjpeg_error = adapter
+            .open(&selector, &mjpeg)
+            .await
+            .err()
+            .expect("MJPEG must fail closed");
+        assert_eq!(mjpeg_error.name().as_str(), "camera.format.unsupported");
         let mut session = adapter
-            .open(
-                &ResourceSelector::exact(
-                    ResourceId::parse(descriptor.id().as_str()).unwrap(),
-                    IdentityQuality::Strong,
-                    TransportKind::Camera,
-                ),
-                &request,
-            )
+            .open(&selector, &request)
             .await
             .expect("selected physical camera must open for the requested format");
-        let frame = session
-            .capture(Duration::from_secs(3))
+        let conflict = adapter
+            .open(&selector, &request)
             .await
-            .expect("selected physical camera must provide a frame");
-        assert_eq!(frame.metadata().format(), request.format());
+            .err()
+            .expect("a second open must conflict until the first session closes");
+        assert_eq!(conflict.name().as_str(), "runtime.adapter.conflict");
+        assert_eq!(
+            session
+                .controls()
+                .await
+                .expect_err("AVFoundation must not advertise camera controls")
+                .name()
+                .as_str(),
+            "camera.control.unsupported"
+        );
+        let capture_error = session
+            .capture(Duration::from_secs(1))
+            .await
+            .expect_err("AVFoundation must not return frame bytes from capture()");
+        assert_eq!(
+            capture_error.name().as_str(),
+            "runtime.transport.unavailable"
+        );
+        let sink = Arc::new(CollectingSink {
+            metadata: Mutex::new(None),
+            bytes_written: Mutex::new(0),
+        });
+        session
+            .capture_into(
+                Duration::from_secs(3),
+                Arc::clone(&sink) as Arc<dyn CameraFrameSink>,
+            )
+            .await
+            .expect("selected physical camera must publish a frame into the capture sink");
+        let metadata = sink
+            .metadata
+            .lock()
+            .expect("sink mutex poisoned")
+            .clone()
+            .expect("capture sink must receive frame metadata");
+        assert_eq!(metadata.format(), request.format());
+        assert!(
+            metadata.sequence() > 0,
+            "captured frame sequence must be nonzero"
+        );
+        assert!(
+            *sink.bytes_written.lock().expect("sink mutex poisoned") > 0,
+            "captured frame payload must be nonzero"
+        );
         session
             .close()
             .await
             .expect("physical camera closes cleanly");
+        let mut session = adapter
+            .open(&selector, &request)
+            .await
+            .expect("camera must reopen after close");
+        *sink.metadata.lock().expect("sink mutex poisoned") = None;
+        *sink.bytes_written.lock().expect("sink mutex poisoned") = 0;
+        session
+            .capture_into(
+                Duration::from_secs(3),
+                Arc::clone(&sink) as Arc<dyn CameraFrameSink>,
+            )
+            .await
+            .expect("reopened camera must publish a frame");
+        let reopened = sink
+            .metadata
+            .lock()
+            .expect("sink mutex poisoned")
+            .clone()
+            .expect("reopened capture sink must receive frame metadata");
+        assert_eq!(reopened.format(), request.format());
+        assert!(reopened.sequence() > 0);
+        session
+            .close()
+            .await
+            .expect("reopened physical camera closes cleanly");
+    }
+
+    #[cfg(all(target_os = "macos", feature = "hardware-tests"))]
+    #[tokio::test]
+    #[ignore = "requires operator-controlled unplug of SEEED_HAL_CAMERA_RESOURCE_ID"]
+    async fn physical_camera_hot_unplug_becomes_terminal_then_reopens() {
+        use super::{AvFoundationAdapter, CameraAdapter};
+        use crate::native;
+        use seeed_hal_camera::{
+            CameraFormat, CameraFrameMetadata, CameraFrameSink, CameraPixelFormat, CameraRequest,
+        };
+        use seeed_hal_core::{
+            HalResult, IdentityQuality, ResourceId, ResourceSelector, TransportKind,
+        };
+        use std::{
+            sync::{Arc, Mutex},
+            time::{Duration, Instant},
+        };
+
+        struct CollectingSink {
+            metadata: Mutex<Option<CameraFrameMetadata>>,
+            bytes_written: Mutex<usize>,
+        }
+
+        impl CameraFrameSink for CollectingSink {
+            fn publish(
+                &self,
+                metadata: CameraFrameMetadata,
+                copy_payload: &mut dyn FnMut(&mut [u8]) -> HalResult<usize>,
+            ) -> HalResult<()> {
+                let mut buffer = vec![0_u8; 4 * 1024 * 1024];
+                let written = copy_payload(&mut buffer)?;
+                *self.bytes_written.lock().expect("sink mutex poisoned") = written;
+                *self.metadata.lock().expect("sink mutex poisoned") = Some(metadata);
+                Ok(())
+            }
+        }
+
+        let Some(resource_id) = std::env::var("SEEED_HAL_CAMERA_RESOURCE_ID").ok() else {
+            return;
+        };
+        let adapter = AvFoundationAdapter::new();
+        let descriptor = adapter
+            .enumerate()
+            .await
+            .expect("physical AVFoundation discovery must succeed")
+            .into_iter()
+            .find(|descriptor| descriptor.id().as_str() == resource_id)
+            .expect("SEEED_HAL_CAMERA_RESOURCE_ID must select an enumerated camera");
+        eprintln!(
+            "hot-unplug fixture name={}",
+            descriptor
+                .properties()
+                .get("camera.name")
+                .unwrap_or("missing")
+        );
+        let selector = ResourceSelector::exact(
+            ResourceId::parse(descriptor.id().as_str()).unwrap(),
+            IdentityQuality::Strong,
+            TransportKind::Camera,
+        );
+        let candidates = [
+            (CameraPixelFormat::Nv12, 1920, 1080),
+            (CameraPixelFormat::Nv12, 1280, 720),
+            (CameraPixelFormat::Nv12, 640, 480),
+            (CameraPixelFormat::Yuyv, 1920, 1080),
+            (CameraPixelFormat::Yuyv, 1280, 720),
+            (CameraPixelFormat::Yuyv, 640, 480),
+        ];
+        let mut session = None;
+        let mut request = None;
+        for (pixel_format, width, height) in candidates {
+            let candidate =
+                CameraRequest::new(CameraFormat::new(pixel_format, width, height).unwrap(), 4)
+                    .unwrap();
+            match adapter.open(&selector, &candidate).await {
+                Ok(opened) => {
+                    eprintln!("hot-unplug opened format={pixel_format:?} {width}x{height}");
+                    session = Some(opened);
+                    request = Some(candidate);
+                    break;
+                }
+                Err(error) if error.name().as_str() == "camera.format.unsupported" => continue,
+                Err(error) => panic!("unexpected open error before unplug: {error:?}"),
+            }
+        }
+        let request = request.expect("fixture must support an exact NV12 or YUYV active format");
+        let mut session = session.expect("selected physical camera must open before unplug");
+        let sink = Arc::new(CollectingSink {
+            metadata: Mutex::new(None),
+            bytes_written: Mutex::new(0),
+        });
+        session
+            .capture_into(
+                Duration::from_secs(3),
+                Arc::clone(&sink) as Arc<dyn CameraFrameSink>,
+            )
+            .await
+            .expect("camera must publish a frame before unplug");
+
+        eprintln!(
+            "UNPLUG the selected USB camera now (the camera itself, not the whole hub). Waiting 90s..."
+        );
+        let unplug_deadline = Instant::now() + Duration::from_secs(90);
+        let mut discovery_gone = false;
+        let mut last_status = Instant::now();
+        let unplugged = loop {
+            let discovery_present = adapter
+                .enumerate()
+                .await
+                .expect("enumeration while waiting for unplug must succeed")
+                .iter()
+                .any(|descriptor| descriptor.id().as_str() == resource_id);
+            if !discovery_gone && !discovery_present {
+                discovery_gone = true;
+                eprintln!(
+                    "discovery no longer lists the selected camera; waiting for camera.session.unplugged"
+                );
+            }
+            match session
+                .capture_into(
+                    Duration::from_millis(500),
+                    Arc::clone(&sink) as Arc<dyn CameraFrameSink>,
+                )
+                .await
+            {
+                Ok(()) if Instant::now() < unplug_deadline => {
+                    if last_status.elapsed() >= Duration::from_secs(5) {
+                        eprintln!(
+                            "hot-unplug wait: still receiving frames; discovery_present={discovery_present}"
+                        );
+                        last_status = Instant::now();
+                    }
+                    continue;
+                }
+                Ok(()) => panic!("disconnect was not observed before the operator deadline"),
+                Err(error) if error.name().as_str() == "camera.session.unplugged" => break error,
+                Err(error) if error.name().as_str() == "runtime.transport.timeout" => {
+                    if last_status.elapsed() >= Duration::from_secs(5) {
+                        eprintln!(
+                            "hot-unplug wait: capture timeout; discovery_present={discovery_present}"
+                        );
+                        last_status = Instant::now();
+                    }
+                    if Instant::now() < unplug_deadline {
+                        continue;
+                    }
+                    panic!("disconnect was not observed before the operator deadline");
+                }
+                Err(error) => {
+                    panic!(
+                        "unexpected capture error while waiting for unplug: {} ({})",
+                        error.name().as_str(),
+                        error.debug_message()
+                    )
+                }
+            }
+        };
+        assert_eq!(
+            unplugged.resource_id().map(|id| id.as_str()),
+            Some(resource_id.as_str())
+        );
+        let still_unplugged = session
+            .capture_into(
+                Duration::from_millis(500),
+                Arc::clone(&sink) as Arc<dyn CameraFrameSink>,
+            )
+            .await
+            .expect_err("an unplugged session must stay terminal");
+        assert_eq!(still_unplugged.name().as_str(), "camera.session.unplugged");
+        // macOS UVC often keeps a phantom discovery entry while the capture
+        // stream is already dead; session terminal state is the primary signal.
+        let discovery_after_unplug = adapter
+            .enumerate()
+            .await
+            .expect("enumeration after unplug must succeed");
+        if discovery_after_unplug
+            .iter()
+            .any(|descriptor| descriptor.id().as_str() == resource_id)
+        {
+            eprintln!(
+                "note: selected camera still listed in discovery after unplug (macOS UVC phantom entry)"
+            );
+        }
+        let unique_id = descriptor
+            .properties()
+            .get("camera.unique_id")
+            .expect("fixture descriptor must carry camera.unique_id")
+            .to_owned();
+        session
+            .close()
+            .await
+            .expect("unplugged camera session still closes");
+
+        eprintln!("RECONNECT the selected USB camera now. Waiting 90s...");
+        let reconnect_deadline = Instant::now() + Duration::from_secs(90);
+        let mut last_status = Instant::now();
+        let mut session = None;
+        let reopen_candidates: Vec<_> = std::iter::once((
+            request.format().pixel_format(),
+            request.format().width(),
+            request.format().height(),
+        ))
+        .chain(candidates)
+        .collect();
+        while session.is_none() && Instant::now() < reconnect_deadline {
+            let listed = adapter
+                .enumerate()
+                .await
+                .expect("enumeration during reconnect must succeed")
+                .iter()
+                .any(|descriptor| descriptor.id().as_str() == resource_id);
+            let connectable = tokio::task::spawn_blocking({
+                let unique_id = unique_id.clone();
+                move || native::device_connectable_sync(&unique_id)
+            })
+            .await
+            .expect("reconnect probe task must complete");
+            if last_status.elapsed() >= Duration::from_secs(5) {
+                eprintln!("reconnect wait: listed={listed} connectable={connectable}");
+                last_status = Instant::now();
+            }
+            if listed && connectable {
+                for (pixel_format, width, height) in &reopen_candidates {
+                    let candidate = CameraRequest::new(
+                        CameraFormat::new(*pixel_format, *width, *height).unwrap(),
+                        4,
+                    )
+                    .unwrap();
+                    match adapter.open(&selector, &candidate).await {
+                        Ok(opened) => {
+                            eprintln!(
+                                "hot-unplug reopened format={pixel_format:?} {width}x{height}"
+                            );
+                            session = Some(opened);
+                            break;
+                        }
+                        Err(error) if error.name().as_str() == "camera.format.unsupported" => {
+                            continue;
+                        }
+                        Err(error) if error.retryable() => break,
+                        Err(error) => panic!("unexpected open error after reconnect: {error:?}"),
+                    }
+                }
+            }
+            if session.is_none() {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+        // Phase 2: first-frame recovery.
+        // `open` now includes a 2-second frame-readiness probe, so a session
+        // returned here has already delivered at least one frame internally.
+        // We still allow a bounded retry window in case the probe window is tight
+        // or a subsequent capture stalls. `camera.session.unplugged` during this
+        // phase means the device disconnected again — fall back to the reconnect
+        // wait loop rather than panicking.
+        let first_frame_deadline = Instant::now() + Duration::from_secs(30);
+        let mut session = session.expect("camera must reopen after reconnect");
+        let mut frame_recovered = false;
+        let mut reopen_attempt = 0_u32;
+        while !frame_recovered {
+            if Instant::now() >= first_frame_deadline {
+                panic!("reconnected camera must publish a frame before deadline (30s)");
+            }
+            match session
+                .capture_into(
+                    Duration::from_millis(1000),
+                    Arc::clone(&sink) as Arc<dyn CameraFrameSink>,
+                )
+                .await
+            {
+                Ok(()) => {
+                    frame_recovered = true;
+                }
+                Err(error) if error.name().as_str() == "runtime.transport.timeout" => {
+                    // Session opened but frame delayed — unlikely after probe, but retry.
+                    eprintln!(
+                        "reconnect capture warmup: transport.timeout (attempt={reopen_attempt})"
+                    );
+                    session
+                        .close()
+                        .await
+                        .expect("timed-out reconnect session must close cleanly");
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let mut reopened = None;
+                    for (pixel_format, width, height) in &reopen_candidates {
+                        let candidate = CameraRequest::new(
+                            CameraFormat::new(*pixel_format, *width, *height).unwrap(),
+                            4,
+                        )
+                        .unwrap();
+                        match adapter.open(&selector, &candidate).await {
+                            Ok(opened) => {
+                                reopen_attempt = reopen_attempt.saturating_add(1);
+                                eprintln!(
+                                    "reconnect warmup reopen attempt={reopen_attempt} \
+                                     format={pixel_format:?} {width}x{height}"
+                                );
+                                reopened = Some(opened);
+                                break;
+                            }
+                            Err(error) if error.name().as_str() == "camera.format.unsupported" => {
+                                continue;
+                            }
+                            Err(error) if error.retryable() => break,
+                            Err(error) => {
+                                panic!("unexpected open error during reconnect warmup: {error:?}")
+                            }
+                        }
+                    }
+                    if let Some(opened) = reopened {
+                        session = opened;
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                    }
+                }
+                Err(error) if error.name().as_str() == "camera.session.unplugged" => {
+                    // Device disconnected again during first-frame recovery.
+                    eprintln!(
+                        "reconnect capture: device unplugged again during warmup — \
+                         returning to reconnect wait loop"
+                    );
+                    panic!(
+                        "device unplugged during first-frame recovery after reconnect: {error:?}"
+                    );
+                }
+                Err(error) => panic!("unexpected capture error after reconnect: {error:?}"),
+            }
+        }
+        session
+            .close()
+            .await
+            .expect("reconnected camera closes cleanly");
     }
 }

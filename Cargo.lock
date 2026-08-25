@@ -1308,6 +1308,7 @@ name = "seeed-hal-adapter-avfoundation"
 version = "0.5.0-rc.1"
 dependencies = [
  "async-trait",
+ "block2",
  "bytes",
  "dispatch2",
  "objc2",

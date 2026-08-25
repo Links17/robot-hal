@@ -1,3 +1,4 @@
+use crate::session_lifecycle::SessionLifecycle;
 use crate::{lease_table::LeaseTable, runtime_error};
 use bytes::Bytes;
 use seeed_hal_core::{
@@ -39,6 +40,7 @@ impl UsbQueueObserver {
 struct Entry {
     resource: ResourceId,
     owner: OwnerId,
+    lifecycle: SessionLifecycle,
     worker: UsbWorker,
 }
 #[derive(Default)]
@@ -355,6 +357,9 @@ impl UsbManager {
             Entry {
                 resource: descriptor.id().clone(),
                 owner,
+                lifecycle: SessionLifecycle::Opening
+                    .commit_open("usb.open")
+                    .expect("a committed USB session starts active"),
                 worker,
             },
         );
@@ -397,7 +402,7 @@ impl UsbManager {
                     .insert(id, (entry.resource.clone(), entry.owner));
                 return Err(actor_unavailable("usb.transfer").with_resource_id(entry.resource));
             }
-            if entry.worker.is_closing() {
+            if !entry.lifecycle.is_active() || entry.worker.is_closing() {
                 return Err(session_closed("usb.transfer").with_resource_id(entry.resource.clone()));
             }
             (entry.worker.clone(), entry.resource.clone())
@@ -424,7 +429,7 @@ impl UsbManager {
         .map_err(|error| error.with_resource_id(resource))
     }
     pub(crate) async fn close(&self, id: SessionId, lease: &LeaseToken) -> HalResult<()> {
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
         let entry = state.sessions.get(&id).ok_or_else(|| {
             runtime_error(
                 "runtime.session.closed",
@@ -437,8 +442,14 @@ impl UsbManager {
         state
             .leases
             .validate(&entry.resource, &id, &entry.owner, lease, "usb.close")?;
-        let worker = entry.worker.clone();
         let resource = entry.resource.clone();
+        let worker = entry.worker.clone();
+        let lifecycle = entry.lifecycle.begin_close("usb.close")?;
+        state
+            .sessions
+            .get_mut(&id)
+            .expect("session was looked up")
+            .lifecycle = lifecycle;
         drop(state);
         worker.request_close();
         self.reap_when_finished(id.clone(), worker.clone());

@@ -19,18 +19,24 @@ pub(super) fn open_sync(
 #[cfg(target_os = "macos")]
 mod macos {
     use async_trait::async_trait;
+    use block2::RcBlock;
+    use core::ptr::NonNull;
     use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
     use objc2::{
         AnyThread, DefinedClass, define_class,
         rc::{Retained, autoreleasepool},
-        runtime::{NSObject, NSObjectProtocol, ProtocolObject},
+        runtime::{AnyObject, Bool, NSObject, NSObjectProtocol, ProtocolObject},
     };
     use objc2_av_foundation::{
-        AVAuthorizationStatus, AVCaptureConnection, AVCaptureDevice, AVCaptureDeviceInput,
-        AVCaptureOutput, AVCaptureSession, AVCaptureVideoDataOutput,
-        AVCaptureVideoDataOutputSampleBufferDelegate, AVMediaType, AVMediaTypeVideo,
+        AVAuthorizationStatus, AVCaptureConnection, AVCaptureDevice, AVCaptureDeviceFormat,
+        AVCaptureDeviceInput, AVCaptureDeviceWasDisconnectedNotification, AVCaptureOutput,
+        AVCaptureSession, AVCaptureSessionErrorKey, AVCaptureSessionRuntimeErrorNotification,
+        AVCaptureVideoDataOutput, AVCaptureVideoDataOutputSampleBufferDelegate, AVError,
+        AVMediaType, AVMediaTypeVideo,
     };
-    use objc2_core_media::{CMSampleBuffer, CMVideoFormatDescriptionGetDimensions};
+    use objc2_core_media::{
+        CMSampleBuffer, CMVideoDimensions, CMVideoFormatDescriptionGetDimensions,
+    };
     use objc2_core_video::{
         CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBaseAddressOfPlane,
         CVPixelBufferGetBytesPerRow, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetDataSize,
@@ -40,7 +46,9 @@ mod macos {
         kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
         kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_422YpCbCr8_yuvs,
     };
-    use objc2_foundation::{NSDictionary, NSString};
+    use objc2_foundation::{
+        NSDictionary, NSError, NSNotification, NSNotificationCenter, NSOperationQueue, NSString,
+    };
     use seeed_hal_camera::{
         CameraCaptureSession, CameraControlDescriptor, CameraControlKind, CameraControlValue,
         CameraFormat, CameraFrame, CameraFrameMetadata, CameraFrameSink, CameraPixelFormat,
@@ -160,17 +168,45 @@ mod macos {
         requested: &CameraFormat,
         descriptor: &ResourceDescriptor,
     ) -> HalResult<()> {
-        // SAFETY: The selected retained device is connected and authorized;
-        // its active format description is retained for this comparison.
-        let active_format = unsafe { device.activeFormat() };
-        // SAFETY: See the active-format access rationale above.
-        let description = unsafe { active_format.formatDescription() };
-        // SAFETY: The retained AVFoundation format description is a valid
-        // CMVideoFormatDescription for the selected video capture device.
-        let dimensions = unsafe { CMVideoFormatDescriptionGetDimensions(&description) };
-        // SAFETY: CoreMedia's generated getter reads the immutable format
-        // description returned by the selected device.
-        let subtype = unsafe { description.media_sub_type() };
+        let matching = find_matching_device_format(device, requested, descriptor)?;
+        // SAFETY: The selected retained device is connected and authorized; lock
+        // configuration before changing its active format.
+        unsafe {
+            device
+                .lockForConfiguration()
+                .map_err(|error| platform_error("camera.open", error.to_string()))?;
+            device.setActiveFormat(&matching);
+            device.unlockForConfiguration();
+        }
+        Ok(())
+    }
+
+    fn find_matching_device_format(
+        device: &AVCaptureDevice,
+        requested: &CameraFormat,
+        descriptor: &ResourceDescriptor,
+    ) -> HalResult<Retained<AVCaptureDeviceFormat>> {
+        // SAFETY: Generated getter returns retained formats for this device.
+        let formats = unsafe { device.formats() };
+        for format in formats {
+            // SAFETY: Generated getter reads the retained enumerated format.
+            let description = unsafe { format.formatDescription() };
+            // SAFETY: CoreMedia reads the immutable format description above.
+            let dimensions = unsafe { CMVideoFormatDescriptionGetDimensions(&description) };
+            // SAFETY: CoreMedia reads the immutable format description above.
+            let subtype = unsafe { description.media_sub_type() };
+            if format_description_matches(requested, subtype, dimensions) {
+                return Ok(format);
+            }
+        }
+        Err(format_unsupported("camera.open", descriptor))
+    }
+
+    fn format_description_matches(
+        requested: &CameraFormat,
+        subtype: u32,
+        dimensions: CMVideoDimensions,
+    ) -> bool {
         let matches_pixel_format = match requested.pixel_format() {
             CameraPixelFormat::Nv12 => {
                 subtype == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
@@ -179,13 +215,24 @@ mod macos {
             CameraPixelFormat::Yuyv => subtype == kCVPixelFormatType_422YpCbCr8_yuvs,
             CameraPixelFormat::Mjpeg => false,
         };
-        if !matches_pixel_format
-            || dimensions.width != i32::try_from(requested.width()).unwrap_or_default()
-            || dimensions.height != i32::try_from(requested.height()).unwrap_or_default()
-        {
-            return Err(format_unsupported("camera.open", descriptor));
+        matches_pixel_format
+            && dimensions.width == i32::try_from(requested.width()).unwrap_or_default()
+            && dimensions.height == i32::try_from(requested.height()).unwrap_or_default()
+    }
+
+    fn requested_pixel_format_type(format: &CameraFormat) -> HalResult<u32> {
+        match format.pixel_format() {
+            CameraPixelFormat::Nv12 => Ok(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+            CameraPixelFormat::Yuyv => Ok(kCVPixelFormatType_422YpCbCr8_yuvs),
+            CameraPixelFormat::Mjpeg => Err(HalError::new(
+                "camera.format.unsupported",
+                ErrorCategory::InvalidArgument,
+                "camera.open",
+                false,
+                "AVFoundation did not deliver the requested verified camera format",
+            )
+            .expect("static AVFoundation format error metadata is valid")),
         }
-        Ok(())
     }
 
     fn configure_session(
@@ -233,14 +280,11 @@ mod macos {
         if matches!(format.pixel_format(), CameraPixelFormat::Mjpeg) {
             return Err(format_unsupported("camera.open", descriptor));
         }
-        // AVFoundation accepts an empty dictionary to request device-native
-        // samples. This avoids spelling CoreVideo's CFString keys as
-        // fabricated NSString values; exact requested format and dimensions
-        // are still enforced against every delivered frame below.
+        let _ = requested_pixel_format_type(format)?;
+        // After locking the active format, AVFoundation delivers the negotiated
+        // device-native samples; every frame is still verified below.
         let settings = NSDictionary::<NSString, objc2::runtime::AnyObject>::new();
-        // SAFETY: `settings` contains only AVFoundation's documented
-        // CVPixelBuffer pixel-format, width, and height keys. Later frame
-        // validation fail-closes if the device does not honor it exactly.
+        // SAFETY: Empty settings request the locked active format from the device.
         unsafe { output.setVideoSettings(Some(&settings)) };
         Ok(())
     }
@@ -251,10 +295,15 @@ mod macos {
         next_sequence: u64,
         descriptor: ResourceDescriptor,
         format: CameraFormat,
+        unplugged: bool,
+        /// Consecutive capture deadlines after at least one published frame.
+        /// macOS UVC often keeps phantom discovery entries after unplug while
+        /// the stream is already dead; stall detection fail-closes the session.
+        consecutive_stalls: u32,
     }
 
     struct PendingCapture {
-        id: u64,
+        _id: u64,
         sink: Arc<dyn CameraFrameSink>,
         response: oneshot::Sender<HalResult<()>>,
         deadline: std::time::Instant,
@@ -293,6 +342,7 @@ mod macos {
                             .lock()
                             .expect("AVFoundation capture mutex poisoned");
                         state.next_sequence = state.next_sequence.saturating_add(1);
+                        state.consecutive_stalls = 0;
                     }
                     let _ = pending.response.send(result);
                 }
@@ -469,6 +519,11 @@ mod macos {
         output: Retained<AVCaptureVideoDataOutput>,
         _delegate: Retained<FrameDelegate>,
         _callback_queue: DispatchRetained<DispatchQueue>,
+        /// Private queue so disconnect notifications deliver without a main CFRunLoop
+        /// (Rust tests / broker hosts do not spin NSApplication).
+        _notification_queue: Retained<NSOperationQueue>,
+        _disconnect_observer: Retained<AnyObject>,
+        _runtime_error_observer: Retained<AnyObject>,
     }
 
     fn native_capture_worker(
@@ -493,14 +548,8 @@ mod macos {
                 );
             }
             let media_type = video_media_type("camera.open")?;
-            // SAFETY: The static media-type constant is valid for this generated API.
-            if unsafe { AVCaptureDevice::authorizationStatusForMediaType(media_type) }
-                != AVAuthorizationStatus::Authorized
-            {
-                return Err(
-                    permission_denied("camera.open").with_resource_id(descriptor.id().clone())
-                );
-            }
+            ensure_camera_authorized(media_type)
+                .map_err(|error| error.with_resource_id(descriptor.id().clone()))?;
             ensure_active_format(&device, &format, &descriptor)?;
             // SAFETY: Generated factory accepts the retained selected camera.
             let input = unsafe { AVCaptureDeviceInput::deviceInputWithDevice_error(&device) }
@@ -516,6 +565,8 @@ mod macos {
                 next_sequence: 1,
                 descriptor: descriptor.clone(),
                 format: format.clone(),
+                unplugged: false,
+                consecutive_stalls: 0,
             }));
             let delegate = FrameDelegate::new(Arc::clone(&captures));
             let callback_queue = DispatchQueue::new(
@@ -541,6 +592,19 @@ mod macos {
                 session.commitConfiguration();
                 session.startRunning();
             }
+            let notification_queue = notification_queue()?;
+            let disconnect_observer = register_disconnect_observer(
+                &captures,
+                &descriptor,
+                &unique_id,
+                &notification_queue,
+            )?;
+            let runtime_error_observer = register_session_runtime_error_observer(
+                &session,
+                &captures,
+                &descriptor,
+                &notification_queue,
+            )?;
             Ok((
                 NativeSession {
                     session,
@@ -548,6 +612,9 @@ mod macos {
                     output,
                     _delegate: delegate,
                     _callback_queue: callback_queue,
+                    _notification_queue: notification_queue,
+                    _disconnect_observer: disconnect_observer,
+                    _runtime_error_observer: runtime_error_observer,
                 },
                 captures,
             ))
@@ -556,50 +623,101 @@ mod macos {
             let _ = opened.send(setup.map(|_| ()));
             return;
         };
+        // Frame-readiness probe: wait up to 2 s for the first sample to arrive.
+        // macOS UVC sometimes enumerates phantom post-unplug entries that appear
+        // connected but never produce frames. Detecting this here lets the caller
+        // retry a different resource_id instead of spinning through capture timeouts.
+        {
+            let probe_deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let mut frame_seen = false;
+            while std::time::Instant::now() < probe_deadline {
+                std::thread::sleep(Duration::from_millis(40));
+                let state = captures
+                    .lock()
+                    .expect("AVFoundation capture mutex poisoned");
+                if state.next_sequence > 1 {
+                    frame_seen = true;
+                    break;
+                }
+                if state.unplugged {
+                    break;
+                }
+            }
+            if !frame_seen {
+                let unplugged = captures
+                    .lock()
+                    .expect("AVFoundation capture mutex poisoned")
+                    .unplugged;
+                let err = if unplugged {
+                    unplugged_error("camera.open", &descriptor)
+                } else {
+                    platform_error(
+                        "camera.open",
+                        "device produced no frames within readiness window; \
+                         likely a phantom post-unplug enumeration entry",
+                    )
+                };
+                let _ = teardown_native_session(native);
+                let _ = opened.send(Err(err));
+                return;
+            }
+        }
         let _ = opened.send(Ok(()));
-        while let Ok(command) = commands.recv() {
-            match command {
-                Command::Capture {
-                    id,
-                    timeout,
-                    sink,
-                    response,
-                } => {
-                    {
-                        let mut state = captures
-                            .lock()
-                            .expect("AVFoundation capture mutex poisoned");
-                        if state.pending.is_some() {
-                            let _ = response.send(Err(platform_error(
-                                "camera.capture",
-                                "a capture request is already pending",
-                            )));
+        loop {
+            match commands.recv_timeout(Duration::from_millis(50)) {
+                Ok(command) => match command {
+                    Command::Capture {
+                        id,
+                        timeout,
+                        sink,
+                        response,
+                    } => {
+                        if mark_unplugged_if_disconnected(&captures, &native, &descriptor) {
+                            let _ =
+                                response.send(Err(unplugged_error("camera.capture", &descriptor)));
                             continue;
                         }
-                        state.pending = Some(PendingCapture {
-                            id,
-                            sink,
-                            response,
-                            deadline: std::time::Instant::now() + timeout,
-                        });
+                        {
+                            let mut state = captures
+                                .lock()
+                                .expect("AVFoundation capture mutex poisoned");
+                            if state.pending.is_some() {
+                                let _ = response.send(Err(platform_error(
+                                    "camera.capture",
+                                    "a capture request is already pending",
+                                )));
+                                continue;
+                            }
+                            state.pending = Some(PendingCapture {
+                                _id: id,
+                                sink,
+                                response,
+                                deadline: std::time::Instant::now() + timeout,
+                            });
+                        }
+                        if wait_for_capture_command(&commands, &captures, &native, &descriptor) {
+                            return;
+                        }
                     }
-                    if wait_for_capture_command(&commands, &captures, &native, &descriptor) {
+                    Command::Close { response } => {
+                        cancel_pending_capture(
+                            &captures,
+                            closed_error("camera.capture", &descriptor),
+                        );
+                        let result = teardown_native_session(native);
+                        let _ = response.send(result);
                         return;
                     }
+                },
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if mark_unplugged_if_disconnected(&captures, &native, &descriptor) {
+                        cancel_pending_capture(
+                            &captures,
+                            unplugged_error("camera.capture", &descriptor),
+                        );
+                    }
                 }
-                Command::Close { response } => {
-                    cancel_pending_capture(&captures, closed_error("camera.capture", &descriptor));
-                    let result = teardown_native_session(native);
-                    let _ = response.send(result);
-                    return;
-                }
-                Command::Cancel { id } => {
-                    cancel_capture_by_id(
-                        &captures,
-                        id,
-                        timeout_error("camera.capture", &descriptor),
-                    );
-                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
         cancel_pending_capture(&captures, closed_error("camera.capture", &descriptor));
@@ -614,6 +732,10 @@ mod macos {
         descriptor: &ResourceDescriptor,
     ) -> bool {
         loop {
+            if mark_unplugged_if_disconnected(captures, native, descriptor) {
+                cancel_pending_capture(captures, unplugged_error("camera.capture", descriptor));
+                return false;
+            }
             let deadline = captures
                 .lock()
                 .expect("AVFoundation capture mutex poisoned")
@@ -625,7 +747,7 @@ mod macos {
             };
             let now = std::time::Instant::now();
             if now >= deadline {
-                cancel_pending_capture(captures, timeout_error("camera.capture", descriptor));
+                cancel_pending_capture(captures, stall_or_timeout_error(captures, descriptor));
                 return false;
             }
             match commands.recv_timeout(
@@ -633,26 +755,41 @@ mod macos {
                     .saturating_duration_since(now)
                     .min(Duration::from_millis(10)),
             ) {
-                Ok(Command::Cancel { id }) => {
-                    cancel_capture_by_id(captures, id, timeout_error("camera.capture", descriptor));
-                }
                 Ok(Command::Close { response }) => {
                     cancel_pending_capture(captures, closed_error("camera.capture", descriptor));
                     let result = teardown_native_session_ref(native);
                     let _ = response.send(result);
                     return true;
                 }
-                Ok(Command::Capture { response, .. }) => {
-                    let _ = response.send(Err(platform_error(
-                        "camera.capture",
-                        "a capture request is already pending",
-                    )));
+                Ok(Command::Capture {
+                    id,
+                    timeout,
+                    sink,
+                    response,
+                }) => {
+                    let mut state = captures
+                        .lock()
+                        .expect("AVFoundation capture mutex poisoned");
+                    if state.pending.is_some() {
+                        drop(state);
+                        let _ = response.send(Err(platform_error(
+                            "camera.capture",
+                            "a capture request is already pending",
+                        )));
+                    } else {
+                        state.pending = Some(PendingCapture {
+                            _id: id,
+                            sink,
+                            response,
+                            deadline: std::time::Instant::now() + timeout,
+                        });
+                    }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if std::time::Instant::now() >= deadline {
                         cancel_pending_capture(
                             captures,
-                            timeout_error("camera.capture", descriptor),
+                            stall_or_timeout_error(captures, descriptor),
                         );
                         return false;
                     }
@@ -666,23 +803,179 @@ mod macos {
         }
     }
 
-    fn cancel_capture_by_id(captures: &Arc<Mutex<CaptureState>>, id: u64, error: HalError) {
-        let pending = {
-            let mut captures = captures
-                .lock()
-                .expect("AVFoundation capture mutex poisoned");
-            if captures
-                .pending
-                .as_ref()
-                .is_some_and(|pending| pending.id == id)
-            {
-                captures.pending.take()
-            } else {
-                None
+    fn mark_session_unplugged(
+        captures: &Arc<Mutex<CaptureState>>,
+        descriptor: &ResourceDescriptor,
+    ) {
+        let mut state = captures
+            .lock()
+            .expect("AVFoundation capture mutex poisoned");
+        if state.unplugged {
+            return;
+        }
+        state.unplugged = true;
+        drop(state);
+        cancel_pending_capture(captures, unplugged_error("camera.capture", descriptor));
+    }
+
+    fn notification_queue() -> HalResult<Retained<NSOperationQueue>> {
+        // SAFETY: Generated NSOperationQueue constructor has no caller ABI values.
+        let queue = unsafe { NSOperationQueue::new() };
+        // SAFETY: Name/concurrency setters take owned Foundation values.
+        unsafe {
+            queue.setName(Some(&NSString::from_str(
+                "io.seeed.hal.avfoundation.notifications",
+            )));
+            queue.setMaxConcurrentOperationCount(1);
+        }
+        Ok(queue)
+    }
+
+    fn register_disconnect_observer(
+        captures: &Arc<Mutex<CaptureState>>,
+        descriptor: &ResourceDescriptor,
+        unique_id: &str,
+        queue: &NSOperationQueue,
+    ) -> HalResult<Retained<AnyObject>> {
+        let captures = Arc::clone(captures);
+        let descriptor = descriptor.clone();
+        let unique_id = unique_id.to_owned();
+        let block = RcBlock::new(move |notification: NonNull<NSNotification>| {
+            autoreleasepool(|_| {
+                let notification = unsafe { notification.as_ref() };
+                let Some(object) = (unsafe { notification.object() }) else {
+                    return;
+                };
+                let Some(device) = object.downcast_ref::<AVCaptureDevice>() else {
+                    return;
+                };
+                if unsafe { device.uniqueID() }.to_string() != unique_id {
+                    return;
+                }
+                mark_session_unplugged(&captures, &descriptor);
+            });
+        });
+        // SAFETY: A private NSOperationQueue delivers callbacks without requiring the
+        // process main CFRunLoop / NSApplication that Rust tests do not run.
+        Ok(unsafe {
+            Retained::from(
+                NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
+                    Some(AVCaptureDeviceWasDisconnectedNotification),
+                    None,
+                    Some(queue),
+                    &block,
+                ),
+            )
+        })
+    }
+
+    fn register_session_runtime_error_observer(
+        session: &AVCaptureSession,
+        captures: &Arc<Mutex<CaptureState>>,
+        descriptor: &ResourceDescriptor,
+        queue: &NSOperationQueue,
+    ) -> HalResult<Retained<AnyObject>> {
+        let captures = Arc::clone(captures);
+        let descriptor = descriptor.clone();
+        let block = RcBlock::new(move |notification: NonNull<NSNotification>| {
+            autoreleasepool(|_| {
+                let notification = unsafe { notification.as_ref() };
+                let Some(user_info) = (unsafe { notification.userInfo() }) else {
+                    return;
+                };
+                let Some(error_object) =
+                    user_info.objectForKey(unsafe { &**AVCaptureSessionErrorKey })
+                else {
+                    return;
+                };
+                let Some(error) = error_object.downcast_ref::<NSError>() else {
+                    return;
+                };
+                let code = error.code();
+                if code == AVError::DeviceWasDisconnected.0 || code == AVError::DeviceNotConnected.0
+                {
+                    mark_session_unplugged(&captures, &descriptor);
+                }
+            });
+        });
+        // SAFETY: Runtime errors are scoped to the retained capture session object.
+        Ok(unsafe {
+            Retained::from(
+                NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
+                    Some(AVCaptureSessionRuntimeErrorNotification),
+                    Some(session),
+                    Some(queue),
+                    &block,
+                ),
+            )
+        })
+    }
+
+    fn native_device_connected(native: &NativeSession, unique_id: &str) -> bool {
+        // SAFETY: Capture thread owns the session for the lifetime of this poll.
+        if !unsafe { native.session.isRunning() } {
+            return false;
+        }
+        if !device_still_discoverable(unique_id) {
+            return false;
+        }
+        let native_id = NSString::from_str(unique_id);
+        // SAFETY: Resolve the selected immutable device identity outside the retained input.
+        match unsafe { AVCaptureDevice::deviceWithUniqueID(&native_id) } {
+            Some(device) => unsafe { device.isConnected() },
+            None => false,
+        }
+    }
+
+    fn device_still_discoverable(unique_id: &str) -> bool {
+        autoreleasepool(|_| {
+            let Ok(media_type) = video_media_type("camera.capture") else {
+                return true;
+            };
+            // SAFETY: `devicesWithMediaType:` is AVFoundation's generated discovery API.
+            #[allow(
+                deprecated,
+                reason = "discovery-session bindings are unavailable in objc2 0.3.1"
+            )]
+            let devices = unsafe { AVCaptureDevice::devicesWithMediaType(media_type) };
+            devices.iter().any(|device| {
+                // SAFETY: Getter reads an enumerated retained device identity.
+                unsafe { device.uniqueID() }.to_string() == unique_id
+            })
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn device_connectable_sync(unique_id: &str) -> bool {
+        autoreleasepool(|_| {
+            let native_id = NSString::from_str(unique_id);
+            // SAFETY: Resolve the immutable device identity for a reconnect probe.
+            match unsafe { AVCaptureDevice::deviceWithUniqueID(&native_id) } {
+                Some(device) => unsafe { device.isConnected() },
+                None => false,
             }
-        };
-        if let Some(pending) = pending {
-            let _ = pending.response.send(Err(error));
+        })
+    }
+
+    fn mark_unplugged_if_disconnected(
+        captures: &Arc<Mutex<CaptureState>>,
+        native: &NativeSession,
+        descriptor: &ResourceDescriptor,
+    ) -> bool {
+        let unique_id = descriptor
+            .properties()
+            .get("camera.unique_id")
+            .unwrap_or("");
+        let mut state = captures
+            .lock()
+            .expect("AVFoundation capture mutex poisoned");
+        if camera_capture_wait_status(native_device_connected(native, unique_id), state.unplugged)
+            == CaptureWaitStatus::Unplugged
+        {
+            state.unplugged = true;
+            true
+        } else {
+            false
         }
     }
 
@@ -702,9 +995,11 @@ mod macos {
     }
 
     fn teardown_native_session_ref(native: &NativeSession) -> HalResult<()> {
-        // SAFETY: The native thread owns this graph. Removing the delegate then using a
-        // synchronous barrier drains callbacks queued before graph teardown.
+        // SAFETY: Observers must be removed before graph teardown completes.
         unsafe {
+            let center = NSNotificationCenter::defaultCenter();
+            center.removeObserver(&native._disconnect_observer);
+            center.removeObserver(&native._runtime_error_observer);
             native.output.setSampleBufferDelegate_queue(None, None);
             native.session.stopRunning();
             native.session.removeOutput(&native.output);
@@ -720,9 +1015,6 @@ mod macos {
             timeout: Duration,
             sink: Arc<dyn CameraFrameSink>,
             response: oneshot::Sender<HalResult<()>>,
-        },
-        Cancel {
-            id: u64,
         },
         Close {
             response: oneshot::Sender<HalResult<()>>,
@@ -778,17 +1070,12 @@ mod macos {
                     response: response_sender,
                 })
                 .map_err(|_| closed_error("camera.capture", &self.descriptor))?;
-            match tokio::time::timeout(timeout, response_receiver).await {
-                Ok(result) => {
-                    result.map_err(|_| closed_error("camera.capture", &self.descriptor))?
-                }
-                Err(_) => {
-                    if let Some(commands) = &self.commands {
-                        let _ = commands.try_send(Command::Cancel { id });
-                    }
-                    Err(timeout_error("camera.capture", &self.descriptor))
-                }
-            }
+            // The capture worker owns the deadline and may upgrade a stream stall
+            // into `camera.session.unplugged`. Do not wrap with a racing Tokio
+            // timeout that would drop that terminal error.
+            response_receiver
+                .await
+                .map_err(|_| closed_error("camera.capture", &self.descriptor))?
         }
 
         async fn controls(&mut self) -> HalResult<Vec<CameraControlDescriptor>> {
@@ -903,6 +1190,127 @@ mod macos {
             .ok_or_else(|| platform_error(operation, "AVMediaTypeVideo is absent"))
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CameraAuthorizationAction {
+        Continue,
+        RequestAccess,
+        Deny,
+    }
+
+    fn camera_authorization_action(status: AVAuthorizationStatus) -> CameraAuthorizationAction {
+        match status {
+            AVAuthorizationStatus::Authorized => CameraAuthorizationAction::Continue,
+            AVAuthorizationStatus::NotDetermined => CameraAuthorizationAction::RequestAccess,
+            _ => CameraAuthorizationAction::Deny,
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CaptureWaitStatus {
+        Continue,
+        Unplugged,
+    }
+
+    fn camera_capture_wait_status(connected: bool, already_unplugged: bool) -> CaptureWaitStatus {
+        if already_unplugged || !connected {
+            CaptureWaitStatus::Unplugged
+        } else {
+            CaptureWaitStatus::Continue
+        }
+    }
+
+    /// After at least one published frame, this many consecutive capture
+    /// deadlines without a frame treat the session as physically unplugged.
+    const STREAM_STALL_UNPLUG_THRESHOLD: u32 = 3;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CaptureStallStatus {
+        Timeout,
+        Unplugged,
+    }
+
+    fn camera_capture_stall_status(
+        frames_published: bool,
+        consecutive_stalls_after_increment: u32,
+        already_unplugged: bool,
+        disconnected: bool,
+    ) -> CaptureStallStatus {
+        if already_unplugged || disconnected {
+            return CaptureStallStatus::Unplugged;
+        }
+        if frames_published && consecutive_stalls_after_increment >= STREAM_STALL_UNPLUG_THRESHOLD {
+            CaptureStallStatus::Unplugged
+        } else {
+            CaptureStallStatus::Timeout
+        }
+    }
+
+    fn stall_or_timeout_error(
+        captures: &Arc<Mutex<CaptureState>>,
+        descriptor: &ResourceDescriptor,
+    ) -> HalError {
+        let unique_id = descriptor
+            .properties()
+            .get("camera.unique_id")
+            .unwrap_or("");
+        let disconnected = !device_still_discoverable(unique_id) || {
+            let native_id = NSString::from_str(unique_id);
+            match unsafe { AVCaptureDevice::deviceWithUniqueID(&native_id) } {
+                Some(device) => !unsafe { device.isConnected() },
+                None => true,
+            }
+        };
+        let mut state = captures
+            .lock()
+            .expect("AVFoundation capture mutex poisoned");
+        let frames_published = state.next_sequence > 1;
+        let consecutive = state.consecutive_stalls.saturating_add(1);
+        state.consecutive_stalls = consecutive;
+        match camera_capture_stall_status(
+            frames_published,
+            consecutive,
+            state.unplugged,
+            disconnected,
+        ) {
+            CaptureStallStatus::Unplugged => {
+                state.unplugged = true;
+                drop(state);
+                unplugged_error("camera.capture", descriptor)
+            }
+            CaptureStallStatus::Timeout => {
+                drop(state);
+                timeout_error("camera.capture", descriptor)
+            }
+        }
+    }
+
+    fn ensure_camera_authorized(media_type: &AVMediaType) -> HalResult<()> {
+        // SAFETY: `media_type` is AVFoundation's checked video constant.
+        let status = unsafe { AVCaptureDevice::authorizationStatusForMediaType(media_type) };
+        match camera_authorization_action(status) {
+            CameraAuthorizationAction::Continue => Ok(()),
+            CameraAuthorizationAction::Deny => Err(permission_denied("camera.open")),
+            CameraAuthorizationAction::RequestAccess => request_camera_access(media_type),
+        }
+    }
+
+    fn request_camera_access(media_type: &AVMediaType) -> HalResult<()> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let handler = RcBlock::new(move |granted: Bool| {
+            let _ = tx.send(granted.as_bool());
+        });
+        // SAFETY: `media_type` is AVMediaTypeVideo. The heap block matches the
+        // generated `Fn(Bool)` completion signature and stays alive for this
+        // call; AVFoundation copies the block before returning.
+        unsafe {
+            AVCaptureDevice::requestAccessForMediaType_completionHandler(media_type, &handler);
+        }
+        match rx.recv() {
+            Ok(true) => Ok(()),
+            _ => Err(permission_denied("camera.open")),
+        }
+    }
+
     fn ensure_open(
         closed: bool,
         operation: &'static str,
@@ -955,6 +1363,18 @@ mod macos {
             "timed out waiting for an AVFoundation video frame",
         )
         .expect("static AVFoundation timeout error metadata is valid")
+        .with_resource_id(descriptor.id().clone())
+    }
+
+    fn unplugged_error(operation: &'static str, descriptor: &ResourceDescriptor) -> HalError {
+        HalError::new(
+            "camera.session.unplugged",
+            ErrorCategory::Unavailable,
+            operation,
+            false,
+            "camera was unplugged",
+        )
+        .expect("static AVFoundation unplugged error metadata is valid")
         .with_resource_id(descriptor.id().clone())
     }
 
@@ -1015,7 +1435,114 @@ mod macos {
         )
         .expect("static AVFoundation platform error metadata is valid")
     }
+
+    #[cfg(test)]
+    mod authorization_tests {
+        use super::{
+            AVAuthorizationStatus, CameraAuthorizationAction, camera_authorization_action,
+        };
+
+        #[test]
+        fn authorized_status_continues_without_prompt() {
+            assert_eq!(
+                camera_authorization_action(AVAuthorizationStatus::Authorized),
+                CameraAuthorizationAction::Continue
+            );
+        }
+
+        #[test]
+        fn not_determined_status_requests_access_once() {
+            assert_eq!(
+                camera_authorization_action(AVAuthorizationStatus::NotDetermined),
+                CameraAuthorizationAction::RequestAccess
+            );
+        }
+
+        #[test]
+        fn denied_status_fails_closed_without_prompt() {
+            assert_eq!(
+                camera_authorization_action(AVAuthorizationStatus::Denied),
+                CameraAuthorizationAction::Deny
+            );
+        }
+
+        #[test]
+        fn restricted_status_fails_closed_without_prompt() {
+            assert_eq!(
+                camera_authorization_action(AVAuthorizationStatus::Restricted),
+                CameraAuthorizationAction::Deny
+            );
+        }
+    }
+
+    #[cfg(test)]
+    mod disconnect_tests {
+        use super::{
+            CaptureStallStatus, CaptureWaitStatus, STREAM_STALL_UNPLUG_THRESHOLD,
+            camera_capture_stall_status, camera_capture_wait_status,
+        };
+
+        #[test]
+        fn connected_session_keeps_waiting_for_frames() {
+            assert_eq!(
+                camera_capture_wait_status(true, false),
+                CaptureWaitStatus::Continue
+            );
+        }
+
+        #[test]
+        fn disconnected_device_is_unplugged() {
+            assert_eq!(
+                camera_capture_wait_status(false, false),
+                CaptureWaitStatus::Unplugged
+            );
+        }
+
+        #[test]
+        fn already_unplugged_session_stays_unplugged() {
+            assert_eq!(
+                camera_capture_wait_status(true, true),
+                CaptureWaitStatus::Unplugged
+            );
+        }
+
+        #[test]
+        fn stream_stall_before_first_frame_stays_timeout() {
+            assert_eq!(
+                camera_capture_stall_status(false, STREAM_STALL_UNPLUG_THRESHOLD, false, false),
+                CaptureStallStatus::Timeout
+            );
+        }
+
+        #[test]
+        fn stream_stall_after_frames_becomes_unplugged() {
+            assert_eq!(
+                camera_capture_stall_status(true, STREAM_STALL_UNPLUG_THRESHOLD, false, false),
+                CaptureStallStatus::Unplugged
+            );
+        }
+
+        #[test]
+        fn few_stalls_after_frames_stay_timeout() {
+            assert_eq!(
+                camera_capture_stall_status(
+                    true,
+                    STREAM_STALL_UNPLUG_THRESHOLD.saturating_sub(1),
+                    false,
+                    false
+                ),
+                CaptureStallStatus::Timeout
+            );
+        }
+    }
 }
 
+#[cfg(not(target_os = "macos"))]
+pub(super) fn device_connectable_sync(_unique_id: &str) -> bool {
+    unreachable!("only compiled for macOS")
+}
+
+#[allow(unused_imports)]
+pub(super) use macos::device_connectable_sync;
 #[cfg(target_os = "macos")]
 pub(super) use macos::{enumerate_sync, open_sync};

@@ -9,6 +9,7 @@ mod gpio_manager;
 mod lease_table;
 mod registry;
 mod serial_actor;
+mod session_lifecycle;
 mod usb_manager;
 
 use std::sync::Arc;
@@ -254,6 +255,46 @@ pub struct HalRuntime {
 impl HalRuntime {
     pub fn builder() -> HalRuntimeBuilder {
         HalRuntimeBuilder::default()
+    }
+
+    /// Returns the typed Serial façade while retaining this runtime as the
+    /// single owner of resource lifecycle and cross-class events.
+    pub fn serial(&self) -> SerialRuntime {
+        SerialRuntime {
+            runtime: self.clone(),
+        }
+    }
+
+    /// Returns the typed CAN façade while retaining this runtime as the
+    /// single owner of resource lifecycle and cross-class events.
+    pub fn can(&self) -> CanRuntime {
+        CanRuntime {
+            runtime: self.clone(),
+        }
+    }
+
+    /// Returns the typed USB façade while retaining this runtime as the
+    /// single owner of resource lifecycle and cross-class events.
+    pub fn usb(&self) -> UsbRuntime {
+        UsbRuntime {
+            runtime: self.clone(),
+        }
+    }
+
+    /// Returns the typed GPIO façade while retaining this runtime as the
+    /// single owner of resource lifecycle and cross-class events.
+    pub fn gpio(&self) -> GpioRuntime {
+        GpioRuntime {
+            runtime: self.clone(),
+        }
+    }
+
+    /// Returns the typed Camera façade while retaining this runtime as the
+    /// single owner of resource lifecycle and cross-class events.
+    pub fn camera(&self) -> CameraRuntime {
+        CameraRuntime {
+            runtime: self.clone(),
+        }
     }
 
     pub async fn enumerate_serial(&self) -> HalResult<Vec<ResourceDescriptor>> {
@@ -828,6 +869,111 @@ impl Drop for PendingOpen {
                 registry.lock().await.cancel_open(&session_id);
             });
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct SerialRuntime {
+    runtime: HalRuntime,
+}
+
+impl SerialRuntime {
+    pub async fn enumerate(&self) -> HalResult<Vec<ResourceDescriptor>> {
+        self.runtime.enumerate_serial().await
+    }
+
+    pub async fn open(
+        &self,
+        owner: OwnerId,
+        selector: ResourceSelector,
+        config: SerialConfig,
+    ) -> HalResult<SerialHandle> {
+        self.runtime.open_serial(owner, selector, config).await
+    }
+}
+
+#[derive(Clone)]
+pub struct CanRuntime {
+    runtime: HalRuntime,
+}
+
+impl CanRuntime {
+    pub async fn enumerate(&self) -> HalResult<Vec<ResourceDescriptor>> {
+        self.runtime.enumerate_can().await
+    }
+
+    pub async fn open(
+        &self,
+        owner: OwnerId,
+        selector: ResourceSelector,
+        mode: LeaseMode,
+        config: CanOpenConfig,
+        filters: CanFilterSet,
+    ) -> HalResult<CanHandle> {
+        self.runtime
+            .open_can(owner, selector, mode, config, filters)
+            .await
+    }
+}
+
+#[derive(Clone)]
+pub struct UsbRuntime {
+    runtime: HalRuntime,
+}
+
+impl UsbRuntime {
+    pub async fn enumerate(&self) -> HalResult<Vec<ResourceDescriptor>> {
+        self.runtime.enumerate_usb().await
+    }
+
+    pub async fn open(
+        &self,
+        owner: OwnerId,
+        selector: ResourceSelector,
+        interface: u8,
+    ) -> HalResult<UsbHandle> {
+        self.runtime.open_usb(owner, selector, interface).await
+    }
+}
+
+#[derive(Clone)]
+pub struct GpioRuntime {
+    runtime: HalRuntime,
+}
+
+impl GpioRuntime {
+    pub async fn enumerate(&self) -> HalResult<Vec<ResourceDescriptor>> {
+        self.runtime.enumerate_gpio().await
+    }
+
+    pub async fn open(
+        &self,
+        owner: OwnerId,
+        selector: ResourceSelector,
+        lines: Vec<u32>,
+        config: GpioLineConfig,
+    ) -> HalResult<GpioHandle> {
+        self.runtime.open_gpio(owner, selector, lines, config).await
+    }
+}
+
+#[derive(Clone)]
+pub struct CameraRuntime {
+    runtime: HalRuntime,
+}
+
+impl CameraRuntime {
+    pub async fn enumerate(&self) -> HalResult<Vec<ResourceDescriptor>> {
+        self.runtime.enumerate_camera().await
+    }
+
+    pub async fn open(
+        &self,
+        owner: OwnerId,
+        selector: ResourceSelector,
+        request: CameraRequest,
+    ) -> HalResult<CameraHandle> {
+        self.runtime.open_camera(owner, selector, request).await
     }
 }
 
