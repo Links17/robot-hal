@@ -293,7 +293,7 @@ mod macos {
         pending: Option<PendingCapture>,
         dropped_count: u64,
         next_sequence: u64,
-        first_frame_seen: bool,
+        first_sample_seen: bool,
         descriptor: ResourceDescriptor,
         format: CameraFormat,
         unplugged: bool,
@@ -330,7 +330,7 @@ mod macos {
                         .ivars()
                         .lock()
                         .expect("AVFoundation capture mutex poisoned");
-                    state.first_frame_seen = true;
+                    state.first_sample_seen = true;
                     state.pending.take()
                 };
                 if let Some(pending) = pending {
@@ -566,7 +566,7 @@ mod macos {
                 pending: None,
                 dropped_count: 0,
                 next_sequence: 1,
-                first_frame_seen: false,
+                first_sample_seen: false,
                 descriptor: descriptor.clone(),
                 format: format.clone(),
                 unplugged: false,
@@ -639,7 +639,7 @@ mod macos {
                 let state = captures
                     .lock()
                     .expect("AVFoundation capture mutex poisoned");
-                if state.first_frame_seen {
+                if state.first_sample_seen {
                     frame_seen = true;
                     break;
                 }
@@ -1267,7 +1267,7 @@ mod macos {
         let mut state = captures
             .lock()
             .expect("AVFoundation capture mutex poisoned");
-        let frames_published = state.first_frame_seen;
+        let frames_published = state.next_sequence > 1;
         let consecutive = state.consecutive_stalls.saturating_add(1);
         state.consecutive_stalls = consecutive;
         match camera_capture_stall_status(
