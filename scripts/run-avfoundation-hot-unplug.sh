@@ -61,6 +61,14 @@ for device in AVCaptureDevice.devices(for: .video) {
       result=$(swift -e '
 import AVFoundation
 import Foundation
+final class FrameProbe: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+    let semaphore = DispatchSemaphore(value: 0)
+    func captureOutput(_ output: AVCaptureOutput,
+                       didOutput sampleBuffer: CMSampleBuffer,
+                       from connection: AVCaptureConnection) {
+        semaphore.signal()
+    }
+}
 let uid = CommandLine.arguments[1]
 guard let device = AVCaptureDevice(uniqueID: uid) else {
     print("no-device")
@@ -76,6 +84,8 @@ guard let input = try? AVCaptureDeviceInput(device: device) else {
     exit(0)
 }
 let output = AVCaptureVideoDataOutput()
+let probe = FrameProbe()
+output.setSampleBufferDelegate(probe, queue: DispatchQueue(label: "seeed-hal.avfoundation.probe"))
 guard session.canAddInput(input), session.canAddOutput(output) else {
     print("cannot-add")
     exit(0)
@@ -83,15 +93,13 @@ guard session.canAddInput(input), session.canAddOutput(output) else {
 session.addInput(input)
 session.addOutput(output)
 session.startRunning()
-// wait up to 2s for frames — AVCaptureVideoDataOutput does not expose a quick
-// frame-received signal from swift -e; we use isRunning + sleep as a proxy.
-Thread.sleep(forTimeInterval: 0.5)
-let running = session.isRunning
+let running = session.isRunning &&
+    probe.semaphore.wait(timeout: .now() + 2) == .success
 session.stopRunning()
-print(running ? "running" : "not-running")
+print(running ? "frame-ready" : "not-frame-ready")
 ' "$uid" 2>/dev/null || echo "probe-error")
       echo "  -> ${result}"
-      if [[ "$result" == "running" ]]; then
+      if [[ "$result" == "frame-ready" ]]; then
         selected="$uid"
         break
       fi

@@ -138,7 +138,13 @@ pub(crate) async fn dispatch(
         envelope::Payload::CameraDroppedCountRequest(request) => {
             let (session, lease) =
                 camera_session_lease_from_proto(request.session_id, request.lease)?;
-            validate(&sessions, &session, &lease, "camera.dropped_count", false)?;
+            let record = validate(&sessions, &session, &lease, "camera.dropped_count", false)?;
+            require(
+                &record.capabilities,
+                &camera_frames_shm_capability(),
+                CAMERA_FRAMES_SHM_CAPABILITY,
+                &record.resource_id,
+            )?;
             Ok(envelope::Payload::CameraDroppedCountResponse(
                 v1::CameraDroppedCountResponse {
                     dropped_count: runtime.camera_dropped_count(session, &lease).await?,

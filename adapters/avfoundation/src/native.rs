@@ -293,6 +293,7 @@ mod macos {
         pending: Option<PendingCapture>,
         dropped_count: u64,
         next_sequence: u64,
+        first_frame_seen: bool,
         descriptor: ResourceDescriptor,
         format: CameraFormat,
         unplugged: bool,
@@ -324,12 +325,14 @@ mod macos {
                 sample_buffer: &CMSampleBuffer,
                 _connection: &AVCaptureConnection,
             ) {
-                let pending = self
-                    .ivars()
-                    .lock()
-                    .expect("AVFoundation capture mutex poisoned")
-                    .pending
-                    .take();
+                let pending = {
+                    let mut state = self
+                        .ivars()
+                        .lock()
+                        .expect("AVFoundation capture mutex poisoned");
+                    state.first_frame_seen = true;
+                    state.pending.take()
+                };
                 if let Some(pending) = pending {
                     let result = publish_sample_buffer_into(
                         sample_buffer,
@@ -563,6 +566,7 @@ mod macos {
                 pending: None,
                 dropped_count: 0,
                 next_sequence: 1,
+                first_frame_seen: false,
                 descriptor: descriptor.clone(),
                 format: format.clone(),
                 unplugged: false,
@@ -635,7 +639,7 @@ mod macos {
                 let state = captures
                     .lock()
                     .expect("AVFoundation capture mutex poisoned");
-                if state.next_sequence > 1 {
+                if state.first_frame_seen {
                     frame_seen = true;
                     break;
                 }
@@ -1263,7 +1267,7 @@ mod macos {
         let mut state = captures
             .lock()
             .expect("AVFoundation capture mutex poisoned");
-        let frames_published = state.next_sequence > 1;
+        let frames_published = state.first_frame_seen;
         let consecutive = state.consecutive_stalls.saturating_add(1);
         state.consecutive_stalls = consecutive;
         match camera_capture_stall_status(
