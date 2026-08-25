@@ -2560,14 +2560,19 @@ def _frozen_workspace_source_files(
                 "cargo workspace member is outside repository root",
             ) from error
     allowed_roots = {Path("Cargo.toml"), Path("Cargo.lock")}
+    allowed_directories = {Path("proto")}
     frozen: list[tuple[str, Path, tuple[int, int, int, str]]] = []
     for entry in entries[:-1]:
         try:
             path = _safe_archive_path(entry)
         except ReleaseFailure as error:
             raise ReleaseFailure("release.package.invalid", "repository file path is unsafe") from error
-        if path not in allowed_roots and not any(
-            path == member_root or member_root in path.parents for member_root in member_roots
+        if (
+            path not in allowed_roots
+            and not any(path == root or root in path.parents for root in allowed_directories)
+            and not any(
+                path == member_root or member_root in path.parents for member_root in member_roots
+            )
         ):
             continue
         source = repo_root / Path(*path.parts)

@@ -142,6 +142,30 @@ def test_rust_bundle_excludes_unrelated_tracked_repository_files(tmp_path: Path)
     assert all(not member.endswith("/tracked") for member in members)
 
 
+def test_rust_bundle_includes_root_build_inputs(tmp_path: Path) -> None:
+    repo = tmp_path / "workspace"
+    repo.mkdir()
+    _write_workspace(repo)
+    (repo / "proto" / "seeed" / "hal" / "v1").mkdir(parents=True)
+    (repo / "proto" / "seeed" / "hal" / "v1" / "hal.proto").write_text(
+        'syntax = "proto3";\npackage seeed.hal.v1;\n',
+        encoding="utf-8",
+    )
+    _git(repo, "add", "proto")
+    _git(repo, "commit", "-m", "root build input")
+
+    bundle = package_rust(
+        tag="v0.5.0-rc.1",
+        repo_root=repo,
+        output_dir=tmp_path / "artifacts",
+    )
+
+    assert (
+        "seeed-hal-crates-v0.5.0-rc.1/proto/seeed/hal/v1/hal.proto"
+        in _bundle_members(bundle)
+    )
+
+
 def test_rust_bundle_is_byte_identical_across_independent_output_directories(
     tmp_path: Path,
 ) -> None:

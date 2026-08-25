@@ -63,8 +63,9 @@ requires hosted evidence before it may be claimed.
 `seeed-hal-crates-v0.5.0-rc.N.tar.gz` is a deterministic Rust workspace source
 closure. It is not a collection of independently installable `.crate` archives
 and it makes no crates.io availability claim. The closure contains the root
-Cargo manifest and lockfile plus tracked files under each Cargo workspace member
-root. Unrelated repository material such as `.github/`, `.superpowers/`, and
+Cargo manifest and lockfile, tracked files under each Cargo workspace member
+root, and explicitly declared root-level build inputs such as `proto/`.
+Unrelated repository material such as `.github/`, `.superpowers/`, and
 top-level documentation is intentionally excluded.
 
 The archive has one top-level `seeed-hal-crates-v0.5.0-rc.N/` directory and
