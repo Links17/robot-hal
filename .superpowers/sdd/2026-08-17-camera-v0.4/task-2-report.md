@@ -15,24 +15,24 @@
 
 ## Modified files
 
-- `crates/seeed-hal-broker/src/can_dispatch.rs`
-- `crates/seeed-hal-broker/src/connection.rs`
-- `crates/seeed-hal-broker/src/usb_gpio_dispatch.rs`
-- `crates/seeed-hal-broker/tests/broker_contract.rs`
-- `crates/seeed-hal-camera/src/lib.rs`
-- `crates/seeed-hal-client/src/connection.rs`
-- `crates/seeed-hal-core/src/capability.rs`
-- `crates/seeed-hal-core/tests/core_contract.rs`
-- `crates/seeed-hal-protocol/src/conversion.rs`
-- `crates/seeed-hal-protocol/tests/protocol_contract.rs`
-- `crates/seeed-hal-testkit/src/virtual_camera.rs`
-- `crates/seeed-hal-testkit/tests/camera_conformance.rs`
+- `crates/robot-hal-broker/src/can_dispatch.rs`
+- `crates/robot-hal-broker/src/connection.rs`
+- `crates/robot-hal-broker/src/usb_gpio_dispatch.rs`
+- `crates/robot-hal-broker/tests/broker_contract.rs`
+- `crates/robot-hal-camera/src/lib.rs`
+- `crates/robot-hal-client/src/connection.rs`
+- `crates/robot-hal-core/src/capability.rs`
+- `crates/robot-hal-core/tests/core_contract.rs`
+- `crates/robot-hal-protocol/src/conversion.rs`
+- `crates/robot-hal-protocol/tests/protocol_contract.rs`
+- `crates/robot-hal-testkit/src/virtual_camera.rs`
+- `crates/robot-hal-testkit/tests/camera_conformance.rs`
 
 ## Verification
 
-- RED: `cargo test -p seeed-hal-core --test core_contract && cargo test -p seeed-hal-protocol --test protocol_contract && cargo test -p seeed-hal-testkit --test camera_conformance` — stopped as expected at `capability_accepts_nonempty_multi_segment_contract_names`; `camera..capture/v1` was incorrectly accepted.
-- GREEN: `cargo fmt --all && cargo test -p seeed-hal-core --test core_contract && cargo test -p seeed-hal-camera && cargo test -p seeed-hal-testkit --test camera_conformance && cargo test -p seeed-hal-protocol --test protocol_contract` — passed (22 core contract tests, 6 camera conformance tests, 36 protocol contract tests).
-- `cargo test -p seeed-hal-broker --test broker_contract && cargo test -p seeed-hal-client --test client_contract && cargo test -p seeed-hal-client --test usb_gpio_contract && cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features -- -D warnings` — passed (45 broker, 37 client, and 3 USB/GPIO client tests).
+- RED: `cargo test -p robot-hal-core --test core_contract && cargo test -p robot-hal-protocol --test protocol_contract && cargo test -p robot-hal-testkit --test camera_conformance` — stopped as expected at `capability_accepts_nonempty_multi_segment_contract_names`; `camera..capture/v1` was incorrectly accepted.
+- GREEN: `cargo fmt --all && cargo test -p robot-hal-core --test core_contract && cargo test -p robot-hal-camera && cargo test -p robot-hal-testkit --test camera_conformance && cargo test -p robot-hal-protocol --test protocol_contract` — passed (22 core contract tests, 6 camera conformance tests, 36 protocol contract tests).
+- `cargo test -p robot-hal-broker --test broker_contract && cargo test -p robot-hal-client --test client_contract && cargo test -p robot-hal-client --test usb_gpio_contract && cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features -- -D warnings` — passed (45 broker, 37 client, and 3 USB/GPIO client tests).
 - `git diff --check` — passed.
 
 ## Boundary and concerns

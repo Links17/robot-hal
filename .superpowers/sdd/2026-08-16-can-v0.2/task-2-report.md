@@ -2,10 +2,10 @@
 
 ## Files changed
 
-- `crates/seeed-hal-testkit/Cargo.toml`
-- `crates/seeed-hal-testkit/src/lib.rs`
-- `crates/seeed-hal-testkit/src/virtual_can.rs`
-- `crates/seeed-hal-testkit/tests/can_conformance.rs`
+- `crates/robot-hal-testkit/Cargo.toml`
+- `crates/robot-hal-testkit/src/lib.rs`
+- `crates/robot-hal-testkit/src/virtual_can.rs`
+- `crates/robot-hal-testkit/tests/can_conformance.rs`
 
 ## Behavior implemented
 
@@ -39,7 +39,7 @@ Per the deferred-verification requirement, no tests, builds/checks, Clippy, rust
 
 - Scope is limited to the four Task 2 testkit files.
 - No unsafe code, product/device-protocol concepts, or unbounded channels were introduced.
-- Public APIs use only Seeed HAL-owned types.
+- Public APIs use only Robot HAL-owned types.
 - Queue overflow and finite-time wait behavior are deterministic.
 
 ## Concerns

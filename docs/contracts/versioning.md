@@ -2,7 +2,7 @@
 
 ## Versioned surfaces
 
-Seeed HAL versions three related surfaces:
+Robot HAL versions three related surfaces:
 
 1. Rust crate interfaces;
 2. broker executable releases;

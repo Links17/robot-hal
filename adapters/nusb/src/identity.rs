@@ -1,5 +1,5 @@
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-use seeed_hal_core::{HalResult, IdentityQuality, ResourceId};
+use robot_hal_core::{HalResult, IdentityQuality, ResourceId};
 
 const ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')

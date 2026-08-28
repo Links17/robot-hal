@@ -19,10 +19,10 @@ or a camera driver.
 ## Run
 
 ```powershell
-$env:SEEED_HAL_CAMERA_RESOURCE_ID = 'camera:mediafoundation:<enumerated-id>'
-cargo test -p seeed-hal-adapter-mediafoundation --features hardware-tests -- `
+$env:ROBOT_HAL_CAMERA_RESOURCE_ID = 'camera:mediafoundation:<enumerated-id>'
+cargo test -p robot-hal-adapter-mediafoundation --features hardware-tests -- `
   --ignored --nocapture
-Remove-Item Env:SEEED_HAL_CAMERA_RESOURCE_ID
+Remove-Item Env:ROBOT_HAL_CAMERA_RESOURCE_ID
 ```
 
 Record the Windows release/build, architecture, adapter crate version, redacted HAL resource ID,

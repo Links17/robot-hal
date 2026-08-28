@@ -2,10 +2,10 @@
 
 ## Files
 
-- Added `crates/seeed-hal-broker/src/can_dispatch.rs`.
-- Updated `crates/seeed-hal-broker/src/connection.rs` and `src/lib.rs`.
-- Added the broker's `seeed-hal-can` dependency in `crates/seeed-hal-broker/Cargo.toml`.
-- Extended `crates/seeed-hal-broker/tests/broker_contract.rs` with framed-I/O CAN coverage.
+- Added `crates/robot-hal-broker/src/can_dispatch.rs`.
+- Updated `crates/robot-hal-broker/src/connection.rs` and `src/lib.rs`.
+- Added the broker's `robot-hal-can` dependency in `crates/robot-hal-broker/Cargo.toml`.
+- Extended `crates/robot-hal-broker/tests/broker_contract.rs` with framed-I/O CAN coverage.
 
 ## Behavior
 

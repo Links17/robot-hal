@@ -11,6 +11,6 @@
 ## Verification
 
 - `cargo fmt --all --check`
-- `cargo test -p seeed-hal-adapter-shared-memory`
-- `cargo clippy -p seeed-hal-adapter-shared-memory --all-targets --all-features -- -D warnings`
-- `cargo check -p seeed-hal-adapter-shared-memory --target x86_64-pc-windows-gnu`
+- `cargo test -p robot-hal-adapter-shared-memory`
+- `cargo clippy -p robot-hal-adapter-shared-memory --all-targets --all-features -- -D warnings`
+- `cargo check -p robot-hal-adapter-shared-memory --target x86_64-pc-windows-gnu`

@@ -24,7 +24,7 @@ def virtual_broker_executable() -> Path:
             "cargo",
             "build",
             "--package",
-            "seeed-hal-broker",
+            "robot-hal-broker",
             "--example",
             "virtual_broker",
         ],
@@ -49,8 +49,8 @@ async def broker(virtual_broker_executable: Path):
         if os.name != "nt":
             token_path.chmod(0o600)
         environment = os.environ.copy()
-        environment["SEEED_HAL_TEST_DIRECTORY"] = str(directory)
-        environment["SEEED_HAL_TEST_TOKEN_FILE"] = str(token_path)
+        environment["ROBOT_HAL_TEST_DIRECTORY"] = str(directory)
+        environment["ROBOT_HAL_TEST_TOKEN_FILE"] = str(token_path)
         process = await asyncio.create_subprocess_exec(
             virtual_broker_executable,
             stdout=asyncio.subprocess.PIPE,

@@ -29,8 +29,8 @@ after the minimal implementations, all focused tests passed.
 Passed:
 
 - `cargo fmt --all --check`
-- `cargo clippy -p seeed-hal-runtime --all-targets --all-features -- -D warnings`
-- `cargo test -p seeed-hal-runtime --test camera_runtime`
-- `cargo test -p seeed-hal-adapter-shared-memory`
-- `cargo test -p seeed-hal-camera`
-- `cargo test -p seeed-hal-testkit`
+- `cargo clippy -p robot-hal-runtime --all-targets --all-features -- -D warnings`
+- `cargo test -p robot-hal-runtime --test camera_runtime`
+- `cargo test -p robot-hal-adapter-shared-memory`
+- `cargo test -p robot-hal-camera`
+- `cargo test -p robot-hal-testkit`

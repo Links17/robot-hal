@@ -5,7 +5,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from seeed_hal import (
+from robot_hal import (
     CanBatchSendError,
     CanBitTiming,
     CanBusState,
@@ -32,9 +32,9 @@ from seeed_hal import (
     ResourceSelector,
     TransportKind,
 )
-from seeed_hal.can import _CanSessionProfile
-from seeed_hal.client import _decode_can_frame, _decode_descriptor
-from seeed_hal.proto import hal_pb2
+from robot_hal.can import _CanSessionProfile
+from robot_hal.client import _decode_can_frame, _decode_descriptor
+from robot_hal.proto import hal_pb2
 
 
 MAX_U16 = (1 << 16) - 1

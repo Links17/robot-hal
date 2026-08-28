@@ -9,11 +9,11 @@ use can_hal_pcan::{
     PcanDriver, PcanError, PcanFdTiming, PcanPhaseTiming,
 };
 use libloading::Library;
-use seeed_hal_can::{
+use robot_hal_can::{
     CanActiveConfig, CanBitTiming, CanBusState, CanBusStatus, CanChannel, CanFrame, CanId,
     CanLinkExpectation, CanMode, CanOpenConfig, CanTimestamp, CanTimestampSource, ReceivedCanFrame,
 };
-use seeed_hal_core::{ErrorCategory, HalError, HalResult, ResourceDescriptor, ResourceId};
+use robot_hal_core::{ErrorCategory, HalError, HalResult, ResourceDescriptor, ResourceId};
 
 const PCAN_NONEBUS: u16 = 0;
 const PCAN_ATTACHED_CHANNELS_COUNT: u8 = 0x2A;
@@ -503,7 +503,7 @@ fn active_with_clock_domain(
 }
 
 fn prepare_configure(
-    request: &seeed_hal_can::CanConfigureConfig,
+    request: &robot_hal_can::CanConfigureConfig,
 ) -> Result<PreparedOpen, DriverError> {
     if request.loopback() {
         return Err(DriverError::Unsupported(
@@ -1523,7 +1523,7 @@ mod tests {
 
     #[test]
     fn missing_dynamic_library_is_adapter_unavailable() {
-        let error = match RealDriver::load_from("__seeed_hal_missing_pcan_basic_library__") {
+        let error = match RealDriver::load_from("__robot_hal_missing_pcan_basic_library__") {
             Ok(_) => panic!("an impossible PCAN-Basic path must not load"),
             Err(error) => error,
         };
@@ -1536,7 +1536,7 @@ mod tests {
 
     #[test]
     fn classic_configuration_rejects_non_predefined_bitrate() {
-        let request = seeed_hal_can::CanConfigureConfig::new(
+        let request = robot_hal_can::CanConfigureConfig::new(
             CanMode::Classic,
             CanBitTiming::new(333_333, None, None).unwrap(),
             None,
@@ -1553,7 +1553,7 @@ mod tests {
 
     #[test]
     fn fd_configuration_rejects_rounded_sample_point() {
-        let request = seeed_hal_can::CanConfigureConfig::new(
+        let request = robot_hal_can::CanConfigureConfig::new(
             CanMode::Fd,
             CanBitTiming::new(500_000, Some(873), None).unwrap(),
             Some(CanBitTiming::new(2_000_000, Some(800), None).unwrap()),
@@ -1570,7 +1570,7 @@ mod tests {
 
     #[test]
     fn exact_fd_configuration_preserves_requested_sjw() {
-        let request = seeed_hal_can::CanConfigureConfig::new(
+        let request = robot_hal_can::CanConfigureConfig::new(
             CanMode::Fd,
             CanBitTiming::new(500_000, Some(700), Some(4)).unwrap(),
             Some(CanBitTiming::new(2_000_000, Some(800), Some(2)).unwrap()),

@@ -1,19 +1,19 @@
 #[tokio::test]
-#[ignore = "requires SEEED_HAL_SERIAL_LOOPBACK"]
+#[ignore = "requires ROBOT_HAL_SERIAL_LOOPBACK"]
 async fn physical_loopback_round_trip_preserves_byte_order() {
     #[cfg(not(feature = "hardware-loopback"))]
     {
-        panic!("enable the hardware-tests feature and set SEEED_HAL_SERIAL_LOOPBACK");
+        panic!("enable the hardware-tests feature and set ROBOT_HAL_SERIAL_LOOPBACK");
     }
 
     #[cfg(feature = "hardware-loopback")]
     {
-        use seeed_hal_adapter_serialport::SerialPortAdapter;
-        use seeed_hal_serial::{SerialAdapter, SerialConfig};
+        use robot_hal_adapter_serialport::SerialPortAdapter;
+        use robot_hal_serial::{SerialAdapter, SerialConfig};
         use std::time::{Duration, Instant};
 
-        let endpoint = std::env::var("SEEED_HAL_SERIAL_LOOPBACK")
-            .expect("SEEED_HAL_SERIAL_LOOPBACK must name the loopback serial port");
+        let endpoint = std::env::var("ROBOT_HAL_SERIAL_LOOPBACK")
+            .expect("ROBOT_HAL_SERIAL_LOOPBACK must name the loopback serial port");
         let adapter = SerialPortAdapter::new();
         let descriptor = adapter
             .enumerate()
@@ -27,7 +27,7 @@ async fn physical_loopback_round_trip_preserves_byte_order() {
             ..SerialConfig::default()
         };
         let mut session = adapter.open(&descriptor.selector(), config).await.unwrap();
-        let payload = b"seeed-hal-loopback";
+        let payload = b"robot-hal-loopback";
 
         session.write_all(payload).await.unwrap();
         session.flush().await.unwrap();

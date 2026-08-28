@@ -14,8 +14,8 @@ from unittest.mock import patch
 from google.protobuf.message import Message
 import pytest
 
-import seeed_hal
-from seeed_hal import (
+import robot_hal
+from robot_hal import (
     ControlLines,
     ErrorCategory,
     HalClient,
@@ -25,7 +25,7 @@ from seeed_hal import (
     SerialConfig,
     TransportKind,
 )
-from seeed_hal.proto import hal_pb2
+from robot_hal.proto import hal_pb2
 
 
 TOKEN = bytearray([0x5A] * 32)
@@ -83,7 +83,7 @@ async def fake_broker(
         pytest.skip("Unix socket protocol fault injection is covered on Unix CI")
     import tempfile
 
-    with tempfile.TemporaryDirectory(prefix="seeed-hal-fake-") as directory:
+    with tempfile.TemporaryDirectory(prefix="robot-hal-fake-") as directory:
         endpoint = Path(directory) / "broker.sock"
 
         async def serve(reader_stream: asyncio.StreamReader, writer_stream: asyncio.StreamWriter):
@@ -124,12 +124,12 @@ async def fake_broker(
 
 
 def test_public_api_is_typed_and_does_not_export_protobuf_objects() -> None:
-    assert HalClient.__module__ == "seeed_hal.client"
-    assert SerialConfig.__module__ == "seeed_hal.serial"
-    for name in seeed_hal.__all__:
-        exported = getattr(seeed_hal, name)
+    assert HalClient.__module__ == "robot_hal.client"
+    assert SerialConfig.__module__ == "robot_hal.serial"
+    for name in robot_hal.__all__:
+        exported = getattr(robot_hal, name)
         assert not (inspect.isclass(exported) and issubclass(exported, Message))
-    assert "proto" not in seeed_hal.__all__
+    assert "proto" not in robot_hal.__all__
 
 
 def test_hal_error_structured_details_are_immutable_copies() -> None:
@@ -535,7 +535,7 @@ async def test_request_id_exhaustion_uses_last_nonzero_id() -> None:
 async def test_windows_transport_owns_steady_state_pywin32_calls_on_one_thread(
     monkeypatch,
 ) -> None:
-    from seeed_hal.transport_windows import WindowsFramedTransport
+    from robot_hal.transport_windows import WindowsFramedTransport
 
     win32file = ModuleType("win32file")
     win32pipe = ModuleType("win32pipe")
@@ -586,7 +586,7 @@ async def test_windows_transport_owns_steady_state_pywin32_calls_on_one_thread(
         return await real_to_thread(function, *args)
 
     with patch("asyncio.to_thread", observing_to_thread):
-        transport = await WindowsFramedTransport.connect(r"\\.\pipe\seeed-hal-test")
+        transport = await WindowsFramedTransport.connect(r"\\.\pipe\robot-hal-test")
         assert await transport.receive() == b"ok"
         await transport.send(b"go")
         await transport.close()
@@ -600,6 +600,6 @@ async def test_windows_transport_owns_steady_state_pywin32_calls_on_one_thread(
 
 def test_non_windows_import_does_not_require_pywin32() -> None:
     assert "win32file" not in sys.modules or os.name == "nt"
-    from seeed_hal.transport_windows import WindowsFramedTransport
+    from robot_hal.transport_windows import WindowsFramedTransport
 
     assert WindowsFramedTransport.__name__ == "WindowsFramedTransport"

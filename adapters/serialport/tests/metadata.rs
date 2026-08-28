@@ -1,7 +1,7 @@
-use seeed_hal_adapter_serialport::identity::{
+use robot_hal_adapter_serialport::identity::{
     UsbPortMetadata, identity_from_endpoint, identity_from_usb_metadata,
 };
-use seeed_hal_serial::IdentityQuality;
+use robot_hal_serial::IdentityQuality;
 
 #[test]
 fn usb_serial_number_produces_strong_identity() {

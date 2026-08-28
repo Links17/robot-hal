@@ -4,11 +4,11 @@ pub mod identity;
 mod session;
 
 use async_trait::async_trait;
-use seeed_hal_core::{
+use robot_hal_core::{
     CapabilitySet, Endpoint, ErrorCategory, HalError, HalResult, ResourceDescriptor,
     ResourceProperties, ResourceSelector, TransportKind, resolve_resource,
 };
-use seeed_hal_serial::{SerialAdapter, SerialConfig, SerialSession, serial_bytes_capability};
+use robot_hal_serial::{SerialAdapter, SerialConfig, SerialSession, serial_bytes_capability};
 use serialport::{SerialPortInfo, SerialPortType};
 use std::collections::BTreeMap;
 

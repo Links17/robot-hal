@@ -9,8 +9,8 @@ use std::sync::Condvar;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use seeed_hal_core::{ErrorCategory, HalError, HalResult, ResourceDescriptor};
-use seeed_hal_serial::{
+use robot_hal_core::{ErrorCategory, HalError, HalResult, ResourceDescriptor};
+use robot_hal_serial::{
     ControlLines, DataBits, FlowControl, Parity, SerialConfig, SerialSession, StopBits,
 };
 use tokio::sync::{oneshot, watch};
@@ -476,7 +476,7 @@ fn spawn_session_worker(
 
     let actor_control = control.clone();
     if let Err(error) = thread::Builder::new()
-        .name("seeed-hal-serial-worker".to_owned())
+        .name("robot-hal-serial-worker".to_owned())
         .spawn(move || run_actor_guarded(io, command_rx, actor_control, config.read_timeout))
     {
         control.request_close();
@@ -882,7 +882,7 @@ fn wait_unpoisoned<'a, T>(
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
-    use seeed_hal_core::{
+    use robot_hal_core::{
         Endpoint, IdentityQuality, ResourceId, ResourceProperties, TransportKind,
     };
 
@@ -1307,7 +1307,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn actual_open_missing_endpoint_carries_resource_and_io_raw_os_error() {
         let endpoint = std::env::temp_dir()
-            .join(format!("seeed-hal-missing-serial-{}", std::process::id()))
+            .join(format!("robot-hal-missing-serial-{}", std::process::id()))
             .display()
             .to_string();
         let resource_id = ResourceId::parse("serial:test:missing-open").unwrap();
@@ -1317,7 +1317,7 @@ mod tests {
             IdentityQuality::Weak,
             TransportKind::Serial,
             ResourceProperties::default(),
-            seeed_hal_core::CapabilitySet::new(vec![seeed_hal_serial::serial_bytes_capability()]),
+            robot_hal_core::CapabilitySet::new(vec![robot_hal_serial::serial_bytes_capability()]),
         );
         let expected_raw_os_error = std::fs::OpenOptions::new()
             .read(true)
@@ -1372,7 +1372,7 @@ mod tests {
             IdentityQuality::Weak,
             TransportKind::Serial,
             ResourceProperties::default(),
-            seeed_hal_core::CapabilitySet::new(vec![seeed_hal_serial::serial_bytes_capability()]),
+            robot_hal_core::CapabilitySet::new(vec![robot_hal_serial::serial_bytes_capability()]),
         )
     }
 

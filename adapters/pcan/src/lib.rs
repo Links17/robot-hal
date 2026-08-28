@@ -8,19 +8,19 @@ mod channel;
 pub use identity::{PcanChannelMetadata, PcanIdentity, identity_from_metadata};
 
 use async_trait::async_trait;
-use seeed_hal_can::{CanAdapter, CanChannel, CanOpenConfig};
-use seeed_hal_core::{ErrorCategory, HalError, HalResult, ResourceDescriptor, ResourceSelector};
+use robot_hal_can::{CanAdapter, CanChannel, CanOpenConfig};
+use robot_hal_core::{ErrorCategory, HalError, HalResult, ResourceDescriptor, ResourceSelector};
 
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 use std::sync::Arc;
 
 #[cfg(any(target_os = "windows", target_os = "linux"))]
-use seeed_hal_can::{
+use robot_hal_can::{
     can_classic_capability, can_configure_capability, can_fd_capability,
     can_rx_timestamp_capability,
 };
 #[cfg(any(target_os = "windows", target_os = "linux"))]
-use seeed_hal_core::{
+use robot_hal_core::{
     CapabilitySet, Endpoint, ResourceProperties, TransportKind, resolve_resource,
 };
 
@@ -250,7 +250,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use seeed_hal_can::{
+    use robot_hal_can::{
         CanActiveConfig, CanBitTiming, CanBusState, CanBusStatus, CanConfigureConfig, CanFrame,
         CanId, CanMode, CanTimestamp, CanTimestampSource, ReceivedCanFrame,
         can_error_frames_capability,

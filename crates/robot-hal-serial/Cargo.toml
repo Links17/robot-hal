@@ -1,0 +1,11 @@
+[package]
+name = "robot-hal-serial"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+robot-hal-core = { path = "../robot-hal-core", version = "=0.5.0-rc.1"}

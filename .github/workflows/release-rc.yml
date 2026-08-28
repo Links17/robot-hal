@@ -112,8 +112,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p evidence output
-          cargo +1.85 build -p seeed-hal-broker-app --no-default-features --features "${{ matrix.features }}"
-          broker="target/debug/seeed-hal-broker"
+          cargo +1.85 build -p robot-hal-broker-app --no-default-features --features "${{ matrix.features }}"
+          broker="target/debug/robot-hal-broker"
           if [[ "$RUNNER_OS" == "Windows" ]]; then broker="${broker}.exe"; fi
           "$broker" --manifest > evidence/broker-manifest.json
           python3 scripts/release/release_tool.py verify-broker-manifest --tag "$TAG" --manifest evidence/broker-manifest.json --target "${{ matrix.name }}" --targets release/targets.toml --artifact "$broker"
@@ -122,8 +122,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo +1.85 build -p seeed-hal-broker-app --no-default-features --features virtual-adapters
-          virtual="target/debug/seeed-hal-broker"
+          cargo +1.85 build -p robot-hal-broker-app --no-default-features --features virtual-adapters
+          virtual="target/debug/robot-hal-broker"
           if [[ "$RUNNER_OS" == "Windows" ]]; then virtual="${virtual}.exe"; fi
           cp "$virtual" "output/virtual-${{ matrix.name }}"
           shasum -a 256 output/* > output/SHA256SUMS
@@ -195,7 +195,7 @@ jobs:
           set -euo pipefail
           (cd input && shasum -a 256 --check SHA256SUMS)
           shopt -s nullglob
-          archives=(input/seeed-hal-broker-v"${TAG}"-*.tar.gz input/seeed-hal-broker-v"${TAG}"-*.zip)
+          archives=(input/robot-hal-broker-v"${TAG}"-*.tar.gz input/robot-hal-broker-v"${TAG}"-*.zip)
           if [[ "${#archives[@]}" -ne 1 ]]; then
             echo "expected one production broker archive" >&2
             exit 1
@@ -212,8 +212,8 @@ jobs:
             windows) triple="x86_64-pc-windows-msvc" ;;
             *) exit 1 ;;
           esac
-          package="input/seeed-hal-broker-v${TAG}-${triple}"
-          production_broker="$package/seeed-hal-broker"
+          package="input/robot-hal-broker-v${TAG}-${triple}"
+          production_broker="$package/robot-hal-broker"
           if [[ "$RUNNER_OS" == "Windows" ]]; then production_broker="${production_broker}.exe"; fi
           "$production_broker" --manifest > production-manifest.json
           python3 scripts/release/release_tool.py verify-broker-manifest --tag "$TAG" --manifest production-manifest.json --target "${{ matrix.name }}" --targets release/targets.toml --artifact "$production_broker"
@@ -395,12 +395,12 @@ jobs:
           PYTHON_VERSION="${TAG#v}"
           PYTHON_VERSION="${PYTHON_VERSION/-rc./rc}"
           gh release create "$TAG" \
-            "release/seeed-hal-broker-v${TAG}-aarch64-apple-darwin.tar.gz" \
-            "release/seeed-hal-broker-v${TAG}-x86_64-unknown-linux-gnu.tar.gz" \
-            "release/seeed-hal-broker-v${TAG}-x86_64-pc-windows-msvc.zip" \
-            "release/seeed-hal-crates-v${TAG}.tar.gz" \
-            "release/seeed_hal-${PYTHON_VERSION}-py3-none-any.whl" \
-            "release/seeed_hal-${PYTHON_VERSION}.tar.gz" \
+            "release/robot-hal-broker-v${TAG}-aarch64-apple-darwin.tar.gz" \
+            "release/robot-hal-broker-v${TAG}-x86_64-unknown-linux-gnu.tar.gz" \
+            "release/robot-hal-broker-v${TAG}-x86_64-pc-windows-msvc.zip" \
+            "release/robot-hal-crates-v${TAG}.tar.gz" \
+            "release/robot_hal-${PYTHON_VERSION}-py3-none-any.whl" \
+            "release/robot_hal-${PYTHON_VERSION}.tar.gz" \
             "release/release-manifest.json" \
             "release/SHA256SUMS" \
             "release/conformance-report.json" \

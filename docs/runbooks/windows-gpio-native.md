@@ -12,8 +12,8 @@ wall-clock timestamp.
 ## Run
 
 ```powershell
-$env:SEEED_HAL_GPIO_RESOURCE_ID = "gpio:windows:default"
-cargo test -p seeed-hal-adapter-windows-gpio --features hardware-tests --test hardware -- `
+$env:ROBOT_HAL_GPIO_RESOURCE_ID = "gpio:windows:default"
+cargo test -p robot-hal-adapter-windows-gpio --features hardware-tests --test hardware -- `
   --ignored --nocapture
 ```
 

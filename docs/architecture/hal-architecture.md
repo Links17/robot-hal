@@ -1,4 +1,4 @@
-# Seeed HAL Architecture
+# Robot HAL Architecture
 
 **Status:** v0.4 Camera software implementation landed; v0.5 release-conformance infrastructure has local evidence, while hosted and native hardware qualification remain open
 **Date:** 2026-08-18
@@ -18,7 +18,7 @@ Applications and device-protocol drivers
                     │ HAL interfaces or broker clients
                     ▼
 ┌─────────────────────────────────────────────────┐
-│ Seeed HAL                                       │
+│ Robot HAL                                       │
 │ identity · discovery · sessions · leases        │
 │ async I/O · timeout · cancellation · hotplug    │
 │ errors · events · diagnostics · metrics         │
@@ -112,19 +112,19 @@ best-effort zeroization boundary.
 ## 4. Workspace modules
 
 ```text
-seeed-hal/
+robot-hal/
 ├── crates/
-│   ├── seeed-hal-core/
-│   ├── seeed-hal-runtime/
-│   ├── seeed-hal-protocol/
-│   ├── seeed-hal-broker/
-│   ├── seeed-hal-client/
-│   ├── seeed-hal-serial/
-│   ├── seeed-hal-can/
-│   ├── seeed-hal-usb/
-│   ├── seeed-hal-gpio/
-│   ├── seeed-hal-camera/
-│   └── seeed-hal-testkit/
+│   ├── robot-hal-core/
+│   ├── robot-hal-runtime/
+│   ├── robot-hal-protocol/
+│   ├── robot-hal-broker/
+│   ├── robot-hal-client/
+│   ├── robot-hal-serial/
+│   ├── robot-hal-can/
+│   ├── robot-hal-usb/
+│   ├── robot-hal-gpio/
+│   ├── robot-hal-camera/
+│   └── robot-hal-testkit/
 ├── adapters/
 │   ├── serialport/
 │   ├── socketcan/
@@ -140,7 +140,7 @@ seeed-hal/
 │   ├── python/
 │   └── node/
 └── apps/
-    └── seeed-hal-broker/
+    └── robot-hal-broker/
 ```
 
 Only modules needed by the current vertical slice are created. Empty future crates are prohibited.

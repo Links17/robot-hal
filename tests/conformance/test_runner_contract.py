@@ -9,7 +9,7 @@ from types import ModuleType
 
 import pytest
 
-from seeed_hal.proto import hal_pb2
+from robot_hal.proto import hal_pb2
 
 
 RUNNER = Path(__file__).with_name("run-broker-conformance.py")
@@ -31,13 +31,13 @@ def test_endpoint_name_is_local_and_platform_specific(tmp_path: Path) -> None:
     )
     assert (
         runner.endpoint_for_platform(tmp_path, "fixed", "nt")
-        == r"\\.\pipe\seeed-hal-conformance-fixed"
+        == r"\\.\pipe\robot-hal-conformance-fixed"
     )
 
 
 def test_broker_command_uses_only_production_startup_arguments(tmp_path: Path) -> None:
     runner = load_runner()
-    broker = tmp_path / "seeed-hal-broker"
+    broker = tmp_path / "robot-hal-broker"
     token = tmp_path / "token"
 
     command = runner.broker_command(broker, "endpoint", token)
@@ -388,9 +388,9 @@ def test_readiness_parser_decodes_windows_endpoint_escaping() -> None:
 
     assert (
         runner.parse_readiness_endpoint(
-            br'{"status":"ready","endpoint":"\\\\.\\pipe\\seeed-hal-fixed"}'
+            br'{"status":"ready","endpoint":"\\\\.\\pipe\\robot-hal-fixed"}'
         )
-        == r"\\.\pipe\seeed-hal-fixed"
+        == r"\\.\pipe\robot-hal-fixed"
     )
 
 

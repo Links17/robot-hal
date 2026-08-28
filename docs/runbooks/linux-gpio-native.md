@@ -18,8 +18,8 @@ clock, preserving timestamps without deriving wall-clock time.
 ## Run
 
 ```bash
-export SEEED_HAL_GPIO_RESOURCE_ID=gpio:chip:gpiochipN
-cargo test -p seeed-hal-adapter-linux-gpio --features hardware-tests --test hardware -- \
+export ROBOT_HAL_GPIO_RESOURCE_ID=gpio:chip:gpiochipN
+cargo test -p robot-hal-adapter-linux-gpio --features hardware-tests --test hardware -- \
   --ignored --nocapture
 ```
 

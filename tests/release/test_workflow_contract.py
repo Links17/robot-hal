@@ -138,17 +138,17 @@ def test_source_gate_limits_rust_checks_to_linux_prerequisite_free_runtime_closu
     ).lower()
 
     source_packages = (
-        "seeed-hal-client",
-        "seeed-hal-broker",
-        "seeed-hal-can",
-        "seeed-hal-camera",
-        "seeed-hal-core",
-        "seeed-hal-gpio",
-        "seeed-hal-protocol",
-        "seeed-hal-runtime",
-        "seeed-hal-serial",
-        "seeed-hal-testkit",
-        "seeed-hal-usb",
+        "robot-hal-client",
+        "robot-hal-broker",
+        "robot-hal-can",
+        "robot-hal-camera",
+        "robot-hal-core",
+        "robot-hal-gpio",
+        "robot-hal-protocol",
+        "robot-hal-runtime",
+        "robot-hal-serial",
+        "robot-hal-testkit",
+        "robot-hal-usb",
     )
     for command in ("cargo +1.85 clippy", "cargo +1.85 test"):
         assert command in commands
@@ -160,26 +160,26 @@ def test_source_gate_limits_rust_checks_to_linux_prerequisite_free_runtime_closu
             assert f"-p {package}" in command_line
 
     hardware_adapter_packages = (
-        "seeed-hal-adapter-avfoundation",
-        "seeed-hal-adapter-linux-gpio",
-        "seeed-hal-adapter-mediafoundation",
-        "seeed-hal-adapter-nusb",
-        "seeed-hal-adapter-pcan",
-        "seeed-hal-adapter-serialport",
-        "seeed-hal-adapter-socketcan",
-        "seeed-hal-adapter-v4l2",
-        "seeed-hal-adapter-windows-gpio",
-        "seeed-hal-broker-app",
+        "robot-hal-adapter-avfoundation",
+        "robot-hal-adapter-linux-gpio",
+        "robot-hal-adapter-mediafoundation",
+        "robot-hal-adapter-nusb",
+        "robot-hal-adapter-pcan",
+        "robot-hal-adapter-serialport",
+        "robot-hal-adapter-socketcan",
+        "robot-hal-adapter-v4l2",
+        "robot-hal-adapter-windows-gpio",
+        "robot-hal-broker-app",
     )
     for native_package in hardware_adapter_packages:
         assert native_package not in commands
 
 
 def test_source_gate_runtime_closure_allows_os_backends_without_linux_prerequisites() -> None:
-    runtime = (REPO_ROOT / "crates" / "seeed-hal-runtime" / "Cargo.toml").read_text(
+    runtime = (REPO_ROOT / "crates" / "robot-hal-runtime" / "Cargo.toml").read_text(
         encoding="utf-8"
     )
-    broker = (REPO_ROOT / "crates" / "seeed-hal-broker" / "Cargo.toml").read_text(
+    broker = (REPO_ROOT / "crates" / "robot-hal-broker" / "Cargo.toml").read_text(
         encoding="utf-8"
     )
     shared_memory = (
@@ -189,8 +189,8 @@ def test_source_gate_runtime_closure_allows_os_backends_without_linux_prerequisi
         REPO_ROOT / "adapters" / "windows-security" / "Cargo.toml"
     ).read_text(encoding="utf-8")
 
-    assert 'seeed-hal-adapter-shared-memory = { path = "../../adapters/shared-memory"' in runtime
-    assert 'seeed-hal-windows-security = { path = "../../adapters/windows-security"' in broker
+    assert 'robot-hal-adapter-shared-memory = { path = "../../adapters/shared-memory"' in runtime
+    assert 'robot-hal-windows-security = { path = "../../adapters/windows-security"' in broker
 
     for manifest in (shared_memory, windows_security):
         assert "pkg-config" not in manifest
@@ -264,7 +264,7 @@ def test_platform_job_separates_production_manifest_and_virtual_conformance() ->
     )
 
     assert '"cargo",' in commands
-    assert '"seeed-hal-broker-app",' in commands
+    assert '"robot-hal-broker-app",' in commands
     assert '"--no-default-features",' in commands
     assert '"--features",' in commands
     assert "verify-broker-manifest" in commands
@@ -288,7 +288,7 @@ def test_platform_job_runs_windows_shared_memory_runtime_tests_before_production
 
     assert runtime_step["if"] == "${{ runner.os == 'Windows' }}"
     assert runtime_step["run"].strip() == (
-        "cargo +1.85 test -p seeed-hal-adapter-shared-memory --all-features "
+        "cargo +1.85 test -p robot-hal-adapter-shared-memory --all-features "
         "platform::windows_tests -- --nocapture"
     )
     assert platform_steps.index(runtime_step) < next(
@@ -587,12 +587,12 @@ def test_rc_release_attests_and_publishes_only_exact_final_assets() -> None:
     _, _, text = _release_workflow()
 
     for required in (
-        "seeed-hal-broker-v${TAG}-aarch64-apple-darwin.tar.gz",
-        "seeed-hal-broker-v${TAG}-x86_64-unknown-linux-gnu.tar.gz",
-        "seeed-hal-broker-v${TAG}-x86_64-pc-windows-msvc.zip",
-        "seeed-hal-crates-v${TAG}.tar.gz",
-        "seeed_hal-${PYTHON_VERSION}-py3-none-any.whl",
-        "seeed_hal-${PYTHON_VERSION}.tar.gz",
+        "robot-hal-broker-v${TAG}-aarch64-apple-darwin.tar.gz",
+        "robot-hal-broker-v${TAG}-x86_64-unknown-linux-gnu.tar.gz",
+        "robot-hal-broker-v${TAG}-x86_64-pc-windows-msvc.zip",
+        "robot-hal-crates-v${TAG}.tar.gz",
+        "robot_hal-${PYTHON_VERSION}-py3-none-any.whl",
+        "robot_hal-${PYTHON_VERSION}.tar.gz",
     ):
         assert required in text
     for forbidden in (

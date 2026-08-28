@@ -31,8 +31,8 @@ from scripts.release.release_tool import (
 
 def test_python_artifact_names_use_pep440() -> None:
     assert python_artifact_names(ReleaseVersion.parse("v0.5.0-rc.3")) == (
-        "seeed_hal-0.5.0rc3-py3-none-any.whl",
-        "seeed_hal-0.5.0rc3.tar.gz",
+        "robot_hal-0.5.0rc3-py3-none-any.whl",
+        "robot_hal-0.5.0rc3.tar.gz",
     )
 
 
@@ -175,18 +175,18 @@ def test_python_candidate_rejects_external_directory_replacement(
     assert failure.value.name == "release.artifact.unexpected"
     assert output.is_symlink()
     assert {path.name for path in replacement.iterdir()} == {
-        "seeed_hal-0.5.0rc1-py3-none-any.whl",
-        "seeed_hal-0.5.0rc1.tar.gz",
+        "robot_hal-0.5.0rc1-py3-none-any.whl",
+        "robot_hal-0.5.0rc1.tar.gz",
     }
 
 
 @pytest.mark.parametrize(
     ("artifact_name", "replacement_kind"),
     [
-        ("seeed_hal-0.5.0rc1-py3-none-any.whl", "different-bytes"),
-        ("seeed_hal-0.5.0rc1.tar.gz", "different-bytes"),
-        ("seeed_hal-0.5.0rc1-py3-none-any.whl", "symlink"),
-        ("seeed_hal-0.5.0rc1.tar.gz", "symlink"),
+        ("robot_hal-0.5.0rc1-py3-none-any.whl", "different-bytes"),
+        ("robot_hal-0.5.0rc1.tar.gz", "different-bytes"),
+        ("robot_hal-0.5.0rc1-py3-none-any.whl", "symlink"),
+        ("robot_hal-0.5.0rc1.tar.gz", "symlink"),
     ],
 )
 def test_python_candidate_rejects_artifact_replacement_after_validation(
@@ -265,18 +265,18 @@ def test_python_package_builds_and_validates_complete_candidate_pair(tmp_path: P
 def _wheel(
     tmp_path: Path,
     *,
-    dist_info: str = "seeed_hal-0.5.0rc1.dist-info",
+    dist_info: str = "robot_hal-0.5.0rc1.dist-info",
     wheel_metadata: str = "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
     extra_members: dict[str, bytes] | None = None,
 ) -> Path:
-    wheel = tmp_path / "seeed_hal-0.5.0rc1-py3-none-any.whl"
+    wheel = tmp_path / "robot_hal-0.5.0rc1-py3-none-any.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
-        archive.writestr("seeed_hal/__init__.py", "")
-        archive.writestr("seeed_hal/proto/__init__.py", "")
-        archive.writestr("seeed_hal/proto/hal_pb2.py", "")
+        archive.writestr("robot_hal/__init__.py", "")
+        archive.writestr("robot_hal/proto/__init__.py", "")
+        archive.writestr("robot_hal/proto/hal_pb2.py", "")
         archive.writestr(
             f"{dist_info}/METADATA",
-            "Metadata-Version: 2.4\nName: seeed-hal\nVersion: 0.5.0rc1\n",
+            "Metadata-Version: 2.4\nName: robot-hal\nVersion: 0.5.0rc1\n",
         )
         archive.writestr(f"{dist_info}/WHEEL", wheel_metadata)
         for name, contents in (extra_members or {}).items():
@@ -312,11 +312,11 @@ def _protobuf_wheel(path: Path) -> Path:
             "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
         ),
         (
-            "seeed_hal-0.5.0rc1.dist-info",
+            "robot_hal-0.5.0rc1.dist-info",
             "Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: py3-none-any\n",
         ),
         (
-            "seeed_hal-0.5.0rc1.dist-info",
+            "robot_hal-0.5.0rc1.dist-info",
             "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\nTag: cp311-none-any\n",
         ),
     ],
@@ -339,8 +339,8 @@ def test_wheel_metadata_rejects_noncanonical_internal_identity(
         "google/__init__.py",
         "google/anything.py",
         "google/protobuf/__init__.py",
-        "seeed_hal-0.5.0rc1.data/purelib/google/__init__.py",
-        "seeed_hal-0.5.0rc1.data/platlib/google/protobuf/__init__.py",
+        "robot_hal-0.5.0rc1.data/purelib/google/__init__.py",
+        "robot_hal-0.5.0rc1.data/platlib/google/protobuf/__init__.py",
     ],
 )
 def test_wheel_metadata_rejects_candidate_google_namespace_members(
@@ -722,8 +722,8 @@ def test_isolated_wheel_venv_is_offline_and_uses_current_interpreter(
         "-I",
         "-c",
     ]
-    assert "import seeed_hal;" in commands[2][3]
-    assert "from seeed_hal.proto import hal_pb2;" in commands[2][3]
+    assert "import robot_hal;" in commands[2][3]
+    assert "from robot_hal.proto import hal_pb2;" in commands[2][3]
     assert "hal_pb2.Empty().SerializeToString() == b''" in commands[2][3]
     assert "google.protobuf.__version__ == '6.32.1'" in commands[2][3]
     assert "google.protobuf.__file__" in commands[2][3]

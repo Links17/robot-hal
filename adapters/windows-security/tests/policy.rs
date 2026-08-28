@@ -1,4 +1,4 @@
-use seeed_hal_windows_security::{NamedPipeDaclPolicy, TrustedPrincipal};
+use robot_hal_windows_security::{NamedPipeDaclPolicy, TrustedPrincipal};
 
 #[test]
 fn named_pipe_policy_is_protected_and_has_only_three_trusted_principals() {

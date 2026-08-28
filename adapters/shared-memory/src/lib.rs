@@ -10,7 +10,7 @@ pub use layout::{
 };
 pub use ring::{BrokerMapping, CopiedFrame, FrameLease, FrameView, ReadOnlyMapping, SlotWriter};
 
-use seeed_hal_core::{ErrorCategory, HalError, HalResult};
+use robot_hal_core::{ErrorCategory, HalError, HalResult};
 
 pub(crate) fn invalid(operation: &'static str, message: &'static str) -> HalError {
     HalError::new(
@@ -48,16 +48,16 @@ pub(crate) fn internal(operation: &'static str, message: String) -> HalError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seeed_hal_camera::{CameraFormat, CameraPixelFormat};
+    use robot_hal_camera::{CameraFormat, CameraPixelFormat};
     use std::process::Command;
 
-    const CLOSE_READER_NAME: &str = "SEEED_HAL_CLOSE_READER_NAME";
-    const CLOSE_READER_LENGTH: &str = "SEEED_HAL_CLOSE_READER_LENGTH";
-    const CLOSE_READER_READY: &str = "SEEED_HAL_CLOSE_READER_READY";
+    const CLOSE_READER_NAME: &str = "ROBOT_HAL_CLOSE_READER_NAME";
+    const CLOSE_READER_LENGTH: &str = "ROBOT_HAL_CLOSE_READER_LENGTH";
+    const CLOSE_READER_READY: &str = "ROBOT_HAL_CLOSE_READER_READY";
     #[cfg(windows)]
-    const ABANDONED_CLOSE_NAME: &str = "SEEED_HAL_ABANDONED_CLOSE_NAME";
+    const ABANDONED_CLOSE_NAME: &str = "ROBOT_HAL_ABANDONED_CLOSE_NAME";
     #[cfg(windows)]
-    const ABANDONED_CLOSE_LENGTH: &str = "SEEED_HAL_ABANDONED_CLOSE_LENGTH";
+    const ABANDONED_CLOSE_LENGTH: &str = "ROBOT_HAL_ABANDONED_CLOSE_LENGTH";
 
     fn config() -> RingConfig {
         RingConfig::new(
@@ -254,7 +254,7 @@ mod tests {
 
         let mut reader = ReadOnlyMapping::open(&descriptor).unwrap();
         let ready =
-            std::env::temp_dir().join(format!("seeed-hal-close-reader-{}", std::process::id()));
+            std::env::temp_dir().join(format!("robot-hal-close-reader-{}", std::process::id()));
         let _ = std::fs::remove_file(&ready);
         let mut child = Command::new(std::env::current_exe().unwrap())
             .arg("--exact")

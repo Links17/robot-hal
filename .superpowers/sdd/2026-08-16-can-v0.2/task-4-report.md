@@ -6,12 +6,12 @@ Implemented the Task 4 runtime layer and focused tests. Per the task brief, buil
 
 ## Files
 
-- Created `crates/seeed-hal-runtime/src/can_actor.rs`.
-- Created `crates/seeed-hal-runtime/src/can_manager.rs`.
-- Created `crates/seeed-hal-runtime/tests/can_runtime.rs`.
-- Modified `crates/seeed-hal-runtime/src/lib.rs`.
-- Modified `crates/seeed-hal-runtime/src/events.rs`.
-- Modified `crates/seeed-hal-runtime/Cargo.toml`.
+- Created `crates/robot-hal-runtime/src/can_actor.rs`.
+- Created `crates/robot-hal-runtime/src/can_manager.rs`.
+- Created `crates/robot-hal-runtime/tests/can_runtime.rs`.
+- Modified `crates/robot-hal-runtime/src/lib.rs`.
+- Modified `crates/robot-hal-runtime/src/events.rs`.
+- Modified `crates/robot-hal-runtime/Cargo.toml`.
 
 ## Behavior implemented
 

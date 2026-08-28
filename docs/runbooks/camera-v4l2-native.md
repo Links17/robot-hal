@@ -19,10 +19,10 @@ or the default ignored-test suite, is not Linux camera evidence.
 ## Run
 
 ```bash
-export SEEED_HAL_CAMERA_RESOURCE_ID='camera:v4l2:<enumerated-id>'
-cargo test -p seeed-hal-adapter-v4l2 --features hardware-tests -- \
+export ROBOT_HAL_CAMERA_RESOURCE_ID='camera:v4l2:<enumerated-id>'
+cargo test -p robot-hal-adapter-v4l2 --features hardware-tests -- \
   --ignored --nocapture
-unset SEEED_HAL_CAMERA_RESOURCE_ID
+unset ROBOT_HAL_CAMERA_RESOURCE_ID
 ```
 
 Record the OS/kernel release, architecture, adapter crate version, redacted HAL resource ID,

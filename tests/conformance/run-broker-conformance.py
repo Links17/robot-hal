@@ -21,8 +21,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 PYTHON_BINDINGS = REPO_ROOT / "bindings" / "python"
 sys.path.insert(0, str(PYTHON_BINDINGS))
 
-from seeed_hal.proto import hal_pb2  # noqa: E402
-from seeed_hal.transport_unix import UnixFramedTransport  # noqa: E402
+from robot_hal.proto import hal_pb2  # noqa: E402
+from robot_hal.transport_unix import UnixFramedTransport  # noqa: E402
 
 
 PROTOCOL_MAJOR = 1
@@ -228,7 +228,7 @@ def later_operation_error_for_minor(minor: int) -> str:
 
 def endpoint_for_platform(directory: Path, nonce: str, os_name: str) -> str:
     if os_name == "nt":
-        return rf"\\.\pipe\seeed-hal-conformance-{nonce}"
+        return rf"\\.\pipe\robot-hal-conformance-{nonce}"
     return str(directory / "broker.sock")
 
 
@@ -366,7 +366,7 @@ async def prepare_private_token(
 
 async def connect_transport(endpoint: str):
     if os.name == "nt":
-        from seeed_hal.transport_windows import WindowsFramedTransport
+        from robot_hal.transport_windows import WindowsFramedTransport
 
         return await WindowsFramedTransport.connect(endpoint, FRAME_LIMIT)
     return await UnixFramedTransport.connect(endpoint, FRAME_LIMIT)
@@ -725,7 +725,7 @@ async def _exercise_usb(
     ) -> None:
         if capability not in capabilities:
             return
-        payload = f"seeed-hal-{capability}".encode()
+        payload = f"robot-hal-{capability}".encode()
         common = {
             "session_id": opened.session_id,
             "lease": _lease_copy(opened.lease),
@@ -1130,7 +1130,7 @@ async def _exercise_serial(
     first_lease = _lease_copy(opened.lease)
     _require(first_lease.generation > 0, "lease generation must be nonzero")
 
-    payload = b"seeed-hal-black-box"
+    payload = b"robot-hal-black-box"
     _expect_payload(
         await client.request(
             "serial_write_request",
@@ -1387,7 +1387,7 @@ async def run(
 ) -> None:
     broker = broker.resolve()
     _require(broker.is_file(), f"broker executable not found: {broker}")
-    with tempfile.TemporaryDirectory(prefix="seeed-hal-conformance-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="robot-hal-conformance-") as temporary:
         directory = Path(temporary)
         nonce = uuid.uuid4().hex
         endpoint = endpoint_for_platform(directory, nonce, os.name)

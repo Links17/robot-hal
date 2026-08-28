@@ -52,16 +52,16 @@ claims above because it is not a repository artifact.
 The production macOS candidate was built and packaged with:
 
 ```sh
-cargo build --release -p seeed-hal-broker-app --no-default-features \
+cargo build --release -p robot-hal-broker-app --no-default-features \
   --features serialport,nusb,avfoundation
-target/release/seeed-hal-broker --manifest > target/release/broker-manifest.json
+target/release/robot-hal-broker --manifest > target/release/broker-manifest.json
 scripts/release/package-broker.sh v0.5.0-rc.1 macos \
-  target/release/seeed-hal-broker target/release/broker-manifest.json \
+  target/release/robot-hal-broker target/release/broker-manifest.json \
   target/release-artifacts/macos-production
 ```
 
 This command path succeeded. The actual archive remains at
-`target/release-artifacts/macos-production/seeed-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin.tar.gz`;
+`target/release-artifacts/macos-production/robot-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin.tar.gz`;
 the recorded SHA-256 is:
 
 ```text
@@ -72,12 +72,12 @@ The separately built virtual-adapter broker produced actual local
 hardware-free evidence for protocol minors 0–3:
 
 ```sh
-cargo build --release -p seeed-hal-broker-app --no-default-features \
+cargo build --release -p robot-hal-broker-app --no-default-features \
   --features virtual-adapters
 python3 scripts/release/release_tool.py run-virtual-conformance \
-  --platform macos --broker target/release/seeed-hal-broker --repo-root . \
+  --platform macos --broker target/release/robot-hal-broker --repo-root . \
   --command-identity "local macOS virtual conformance" \
-  --ref "https://github.com/seeed-studio/seeed-hal/commit/8db88edf867abc1dcbef53331bed24c072e74f76"
+  --ref "https://github.com/seeed-studio/robot-hal/commit/8db88edf867abc1dcbef53331bed24c072e74f76"
 ```
 
 The persisted result is
@@ -96,8 +96,8 @@ scripts/release/package-python.sh v0.5.0-rc.1 \
 The actual candidate files and recorded SHA-256 values are:
 
 ```text
-5ede5f9e42189f764648ada35a1745fe42196e98a4f3637a4cbd73adc9a23d74  seeed_hal-0.5.0rc1-py3-none-any.whl
-979f6d1d9c003de36883f4f57daa26b9c66b803403a8c88e48fbbed059a15849  seeed_hal-0.5.0rc1.tar.gz
+5ede5f9e42189f764648ada35a1745fe42196e98a4f3637a4cbd73adc9a23d74  robot_hal-0.5.0rc1-py3-none-any.whl
+979f6d1d9c003de36883f4f57daa26b9c66b803403a8c88e48fbbed059a15849  robot_hal-0.5.0rc1.tar.gz
 ```
 
 The package command validates candidate metadata and an isolated offline wheel
@@ -119,15 +119,15 @@ release.cargo.failed: cargo package failed
 ```
 
 The focused reproduction identified the first blocking package as
-`seeed-hal-adapter-avfoundation`. Cargo reported:
+`robot-hal-adapter-avfoundation`. Cargo reported:
 
 ```text
 error: failed to prepare local package for uploading
 
 Caused by:
-  no matching package named `seeed-hal-camera` found
+  no matching package named `robot-hal-camera` found
   location searched: crates.io index
-  required by package `seeed-hal-adapter-avfoundation v0.5.0-rc.1`
+  required by package `robot-hal-adapter-avfoundation v0.5.0-rc.1`
 ```
 
 No Rust source bundle was produced. The Rust dependency-publication closure is

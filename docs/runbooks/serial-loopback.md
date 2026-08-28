@@ -6,13 +6,13 @@ default workspace test gate never opens physical hardware.
 Set the endpoint path in the environment variable consumed by the test:
 
 ```bash
-export SEEED_HAL_SERIAL_LOOPBACK=/dev/tty.usbserial-example
+export ROBOT_HAL_SERIAL_LOOPBACK=/dev/tty.usbserial-example
 ```
 
-On PowerShell, use `$env:SEEED_HAL_SERIAL_LOOPBACK = "COM7"`. Then run exactly:
+On PowerShell, use `$env:ROBOT_HAL_SERIAL_LOOPBACK = "COM7"`. Then run exactly:
 
 ```bash
-cargo test -p seeed-hal-adapter-serialport --features hardware-tests -- \
+cargo test -p robot-hal-adapter-serialport --features hardware-tests -- \
   --ignored --nocapture
 ```
 
@@ -40,6 +40,6 @@ Environment variable removed after test: yes/no
 Endpoint closed and loopback fixture disconnected: yes/no
 ```
 
-After the run, close any remaining session, unset `SEEED_HAL_SERIAL_LOOPBACK`, disconnect the fixture,
+After the run, close any remaining session, unset `ROBOT_HAL_SERIAL_LOOPBACK`, disconnect the fixture,
 and verify another process can open the endpoint. Physical loopback is not evidence for the broker's
 virtual black-box suite, and the virtual suite is not evidence for a chipset or OS driver.

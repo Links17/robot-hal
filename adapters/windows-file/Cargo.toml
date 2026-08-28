@@ -1,5 +1,5 @@
 [package]
-name = "seeed-hal-windows-file"
+name = "robot-hal-windows-file"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

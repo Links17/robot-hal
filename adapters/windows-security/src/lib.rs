@@ -79,7 +79,7 @@ mod windows_tests {
 
     #[tokio::test]
     async fn created_pipe_has_protected_three_trustee_dacl() {
-        let pipe_name = format!(r"\\.\pipe\seeed-hal-dacl-test-{}", uuid::Uuid::new_v4());
+        let pipe_name = format!(r"\\.\pipe\robot-hal-dacl-test-{}", uuid::Uuid::new_v4());
         let mut options = tokio::net::windows::named_pipe::ServerOptions::new();
         options
             .reject_remote_clients(true)

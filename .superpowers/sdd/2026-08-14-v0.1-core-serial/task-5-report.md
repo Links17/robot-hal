@@ -2,20 +2,20 @@
 
 ## Status
 
-Implemented `seeed-hal-adapter-serialport` under `adapters/serialport` and added it to the workspace.
+Implemented `robot-hal-adapter-serialport` under `adapters/serialport` and added it to the workspace.
 
 ## RED
 
 Command:
 
 ```bash
-cargo test -p seeed-hal-adapter-serialport --test metadata
+cargo test -p robot-hal-adapter-serialport --test metadata
 ```
 
 Observed failure:
 
 ```text
-error: package ID specification `seeed-hal-adapter-serialport` did not match any packages
+error: package ID specification `robot-hal-adapter-serialport` did not match any packages
 ```
 
 This matched the task brief’s expected red state before the adapter package existed.
@@ -30,13 +30,13 @@ Implemented:
 - Native async sessions via `tokio_serial::new(...).open_native_async()`.
 - Explicit mapping for baud, data bits, parity, stop bits, flow control, DTR, and RTS.
 - Stable HAL error names for not found, busy, permission denied, timeout, disconnected, and unsupported configuration, with platform details kept in debug diagnostics.
-- Ignored opt-in physical loopback test gated by `hardware-loopback` and `SEEED_HAL_SERIAL_LOOPBACK`.
+- Ignored opt-in physical loopback test gated by `hardware-loopback` and `ROBOT_HAL_SERIAL_LOOPBACK`.
 
 ## Verification
 
 ```bash
-cargo test -p seeed-hal-adapter-serialport --test metadata
-cargo test -p seeed-hal-adapter-serialport
+cargo test -p robot-hal-adapter-serialport --test metadata
+cargo test -p robot-hal-adapter-serialport
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
@@ -68,13 +68,13 @@ Results:
 ### RED evidence
 
 ```bash
-cargo test -p seeed-hal-adapter-serialport --test metadata
+cargo test -p robot-hal-adapter-serialport --test metadata
 ```
 
 Output summary: failed as expected. New tests showed USB ports without serial numbers were still reported as `Medium` and same-model devices shared `serial:usb:10c4:ea60:meta:...` identities.
 
 ```bash
-cargo test -p seeed-hal-adapter-serialport --lib
+cargo test -p robot-hal-adapter-serialport --lib
 ```
 
 Output summary: failed as expected because `run_blocking_drain` did not exist yet; this covered the new drain-isolation seam before implementation.
@@ -82,10 +82,10 @@ Output summary: failed as expected because `run_blocking_drain` did not exist ye
 ### GREEN evidence
 
 ```bash
-cargo test -p seeed-hal-adapter-serialport --test metadata
-cargo test -p seeed-hal-adapter-serialport --lib
-cargo test -p seeed-hal-adapter-serialport
-for i in {1..20}; do cargo test -q -p seeed-hal-adapter-serialport --lib cancelled_ || exit 1; done
+cargo test -p robot-hal-adapter-serialport --test metadata
+cargo test -p robot-hal-adapter-serialport --lib
+cargo test -p robot-hal-adapter-serialport
+for i in {1..20}; do cargo test -q -p robot-hal-adapter-serialport --lib cancelled_ || exit 1; done
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
@@ -116,7 +116,7 @@ Output summary: metadata tests passed `5/5`; adapter unit tests passed `7/7`; pa
 ### RED evidence
 
 ```bash
-cargo test -p seeed-hal-adapter-serialport --lib
+cargo test -p robot-hal-adapter-serialport --lib
 ```
 
 Output summary: failed as expected before implementation. The focused tests referenced missing round-2 seams and behavior: `SessionState`, `DrainTask`, `DrainStrategy`, `map_serialport_open_error`, and the Unix `libc` raw OS error dependency were not yet present.
@@ -124,9 +124,9 @@ Output summary: failed as expected before implementation. The focused tests refe
 ### GREEN evidence
 
 ```bash
-cargo test -p seeed-hal-adapter-serialport --lib
-cargo test -p seeed-hal-adapter-serialport --test metadata
-cargo test -p seeed-hal-adapter-serialport
+cargo test -p robot-hal-adapter-serialport --lib
+cargo test -p robot-hal-adapter-serialport --test metadata
+cargo test -p robot-hal-adapter-serialport
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
@@ -156,7 +156,7 @@ Output summary: adapter unit tests passed `12/12`; metadata tests passed; packag
 ### RED evidence
 
 ```bash
-cargo test -p seeed-hal-adapter-serialport --lib
+cargo test -p robot-hal-adapter-serialport --lib
 ```
 
 Output summary: failed as expected before implementation. New focused tests required split close/flush worker ownership and failed to compile with `spawn_flush` / `spawn_close` not members of `DrainStrategy` and missing `CloseTask`.
@@ -170,9 +170,9 @@ Focused test names added:
 ### GREEN evidence
 
 ```bash
-cargo test -p seeed-hal-adapter-serialport --lib
-cargo test -p seeed-hal-adapter-serialport --test metadata
-cargo test -p seeed-hal-adapter-serialport
+cargo test -p robot-hal-adapter-serialport --lib
+cargo test -p robot-hal-adapter-serialport --test metadata
+cargo test -p robot-hal-adapter-serialport
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
@@ -202,7 +202,7 @@ Output summary: adapter unit tests passed `13/13`; metadata tests passed `5/5`; 
 The round started by adding deterministic hardware-free tests for the newly reported cancellation paths and running:
 
 ```bash
-cargo test -p seeed-hal-adapter-serialport --lib round4_red_tests
+cargo test -p robot-hal-adapter-serialport --lib round4_red_tests
 ```
 
 The test target failed to compile for the expected missing architecture seams: `SerialIo`, `run_blocking_open`, and `write_all_bounded` did not exist. This proved that the prior per-call `spawn_blocking` implementation could not satisfy the new tests through its existing ownership model.
@@ -210,7 +210,7 @@ The test target failed to compile for the expected missing architecture seams: `
 The partial-write termination case then ran independently:
 
 ```bash
-cargo test -p seeed-hal-adapter-serialport --lib write_all_deadline_terminates_repeated_partial_writes
+cargo test -p robot-hal-adapter-serialport --lib write_all_deadline_terminates_repeated_partial_writes
 ```
 
 It failed to compile with the expected missing `write_all_bounded_with_clock` seam before the deadline-aware partial-write loop was implemented.
@@ -218,7 +218,7 @@ It failed to compile with the expected missing `write_all_bounded_with_clock` se
 Full-diff self-review also restored the round-3 cancelled-flush diagnostic contract. Before the terminal-error slot was added:
 
 ```bash
-cargo test -p seeed-hal-adapter-serialport --lib close_reports_cancelled_flush_error_after_terminal_release
+cargo test -p robot-hal-adapter-serialport --lib close_reports_cancelled_flush_error_after_terminal_release
 ```
 
 The test failed as expected because `close()` returned `Ok(())` instead of the flush `runtime.transport.permission_denied` error after releasing the port.
@@ -250,8 +250,8 @@ The test failed as expected because `close()` returned `Ok(())` instead of the f
 ### GREEN evidence
 
 ```bash
-cargo test -p seeed-hal-adapter-serialport --lib
-cargo test -p seeed-hal-adapter-serialport
+cargo test -p robot-hal-adapter-serialport --lib
+cargo test -p robot-hal-adapter-serialport
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
@@ -288,7 +288,7 @@ Output summary:
 Timeout normalization tests were added first and run with:
 
 ```bash
-cargo test -p seeed-hal-adapter-serialport --lib native_timeout_
+cargo test -p robot-hal-adapter-serialport --lib native_timeout_
 ```
 
 Output summary: compilation failed as expected because `normalize_native_timeout` and `MAX_NATIVE_IO_TIMEOUT` did not exist. The new read/write tests also required the missing deadline-aware read seam and independently derived expected native millisecond values.
@@ -296,7 +296,7 @@ Output summary: compilation failed as expected because `normalize_native_timeout
 The interruption-clone dependency was then exposed with:
 
 ```bash
-cargo test -p seeed-hal-adapter-serialport --lib bounded_flush_session_does_not_require_an_interrupt_clone
+cargo test -p robot-hal-adapter-serialport --lib bounded_flush_session_does_not_require_an_interrupt_clone
 ```
 
 Output summary: the test failed as expected because round 4 called `try_clone_box()` during session construction and propagated the fake clone's `Unsupported` error as `runtime.transport.disconnected`.
@@ -304,7 +304,7 @@ Output summary: the test failed as expected because round 4 called `try_clone_bo
 The bounded drain seam was added to tests and run with:
 
 ```bash
-cargo test -p seeed-hal-adapter-serialport --lib flush_succeeds_only_after_the_native_output_queue_is_empty
+cargo test -p robot-hal-adapter-serialport --lib flush_succeeds_only_after_the_native_output_queue_is_empty
 ```
 
 Output summary: compilation failed as expected because `SerialIo::pending_output_bytes` and `flush_bounded_with_clock_and_wait` did not exist. This established that the round-4 implementation could only enter native `flush()` and could not observe queue progress itself.
@@ -338,10 +338,10 @@ Output summary: compilation failed as expected because `SerialIo::pending_output
 ### GREEN evidence
 
 ```bash
-cargo test -p seeed-hal-adapter-serialport --lib
-cargo test -p seeed-hal-adapter-serialport
-for i in {1..20}; do cargo test -q -p seeed-hal-adapter-serialport --lib cancelled_flush_releases_port_without_later_session_poll || exit 1; cargo test -q -p seeed-hal-adapter-serialport --lib output_queue_poll_panic_releases_port_without_later_session_poll || exit 1; cargo test -q -p seeed-hal-adapter-serialport --lib dropping_polled_close_future_still_releases_port_autonomously || exit 1; done
-cargo check -p seeed-hal-adapter-serialport --target x86_64-pc-windows-msvc
+cargo test -p robot-hal-adapter-serialport --lib
+cargo test -p robot-hal-adapter-serialport
+for i in {1..20}; do cargo test -q -p robot-hal-adapter-serialport --lib cancelled_flush_releases_port_without_later_session_poll || exit 1; cargo test -q -p robot-hal-adapter-serialport --lib output_queue_poll_panic_releases_port_without_later_session_poll || exit 1; cargo test -q -p robot-hal-adapter-serialport --lib dropping_polled_close_future_still_releases_port_autonomously || exit 1; done
+cargo check -p robot-hal-adapter-serialport --target x86_64-pc-windows-msvc
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
@@ -358,4 +358,4 @@ Output summary:
 ### Limitations and platform coverage
 
 - All default tests are deterministic and hardware-free. No physical serial device was opened; physical flush behavior remains covered only by the opt-in ignored loopback test.
-- Production code was built on macOS and cross-checked for Windows. A Linux cross-check was attempted with `cargo check -p seeed-hal-adapter-serialport --target x86_64-unknown-linux-gnu`, but the macOS host lacks a Linux `libudev` sysroot/pkg-config configuration, so the existing `libudev-sys` build script stopped before this crate compiled. The Linux output-queue implementation uses the same `TIOCOUTQ` ABI and pointer shape as `serialport` 4.9's Linux `TTYPort::bytes_to_write`.
+- Production code was built on macOS and cross-checked for Windows. A Linux cross-check was attempted with `cargo check -p robot-hal-adapter-serialport --target x86_64-unknown-linux-gnu`, but the macOS host lacks a Linux `libudev` sysroot/pkg-config configuration, so the existing `libudev-sys` build script stopped before this crate compiled. The Linux output-queue implementation uses the same `TIOCOUTQ` ABI and pointer shape as `serialport` 4.9's Linux `TTYPort::bytes_to_write`.

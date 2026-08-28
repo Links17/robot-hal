@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from seeed_hal import (
+from robot_hal import (
     GpioDirection,
     GpioDrive,
     GpioEdgeRequest,

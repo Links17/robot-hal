@@ -2,7 +2,7 @@
 
 ## Scope and identity
 
-This contract applies only to Seeed HAL `v0.5.0-rc.N` prereleases, where `N`
+This contract applies only to Robot HAL `v0.5.0-rc.N` prereleases, where `N`
 is a non-zero decimal integer without leading zeroes. A release workflow
 checks out the annotated or lightweight tag's resolved commit and rejects a
 dirty checkout, a mismatched ref, a duplicate tag on the resolved commit, or
@@ -20,12 +20,12 @@ The aggregate job creates one new private directory. Its contents must be
 exactly the following six primary artifacts and three sidecars:
 
 ```text
-seeed-hal-broker-v0.5.0-rc.N-aarch64-apple-darwin.tar.gz
-seeed-hal-broker-v0.5.0-rc.N-x86_64-unknown-linux-gnu.tar.gz
-seeed-hal-broker-v0.5.0-rc.N-x86_64-pc-windows-msvc.zip
-seeed-hal-crates-v0.5.0-rc.N.tar.gz
-seeed_hal-0.5.0rcN-py3-none-any.whl
-seeed_hal-0.5.0rcN.tar.gz
+robot-hal-broker-v0.5.0-rc.N-aarch64-apple-darwin.tar.gz
+robot-hal-broker-v0.5.0-rc.N-x86_64-unknown-linux-gnu.tar.gz
+robot-hal-broker-v0.5.0-rc.N-x86_64-pc-windows-msvc.zip
+robot-hal-crates-v0.5.0-rc.N.tar.gz
+robot_hal-0.5.0rcN-py3-none-any.whl
+robot_hal-0.5.0rcN.tar.gz
 release-manifest.json
 SHA256SUMS
 conformance-report.json
@@ -60,7 +60,7 @@ requires hosted evidence before it may be claimed.
 
 ## Rust workspace source bundle
 
-`seeed-hal-crates-v0.5.0-rc.N.tar.gz` is a deterministic Rust workspace source
+`robot-hal-crates-v0.5.0-rc.N.tar.gz` is a deterministic Rust workspace source
 closure. It is not a collection of independently installable `.crate` archives
 and it makes no crates.io availability claim. The closure contains the root
 Cargo manifest and lockfile, tracked files under each Cargo workspace member
@@ -68,7 +68,7 @@ root, and explicitly declared root-level build inputs such as `proto/`.
 Unrelated repository material such as `.github/`, `.superpowers/`, and
 top-level documentation is intentionally excluded.
 
-The archive has one top-level `seeed-hal-crates-v0.5.0-rc.N/` directory and
+The archive has one top-level `robot-hal-crates-v0.5.0-rc.N/` directory and
 contains the tracked, regular repository files needed to retain that workspace
 source closure, including the root `Cargo.toml`, `Cargo.lock`, and every
 workspace member manifest and source file. Package construction freezes that

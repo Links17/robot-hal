@@ -21,8 +21,8 @@ by its finite deadline.
 ## Run
 
 ```bash
-export SEEED_HAL_USB_RESOURCE_ID=usb:device:vvvv:pppp:fixture
-cargo test -p seeed-hal-adapter-nusb --features hardware-tests --test hardware -- \
+export ROBOT_HAL_USB_RESOURCE_ID=usb:device:vvvv:pppp:fixture
+cargo test -p robot-hal-adapter-nusb --features hardware-tests --test hardware -- \
   --ignored --nocapture
 ```
 

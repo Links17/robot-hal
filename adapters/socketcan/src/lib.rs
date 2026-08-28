@@ -10,13 +10,13 @@ mod link;
 pub use identity::{CanIdentity, CanInterfaceMetadata, identity_from_metadata};
 
 use async_trait::async_trait;
-use seeed_hal_can::{CanAdapter, CanChannel, CanOpenConfig};
-use seeed_hal_core::{ErrorCategory, HalError, HalResult, ResourceDescriptor, ResourceSelector};
+use robot_hal_can::{CanAdapter, CanChannel, CanOpenConfig};
+use robot_hal_core::{ErrorCategory, HalError, HalResult, ResourceDescriptor, ResourceSelector};
 
 #[cfg(target_os = "linux")]
-use seeed_hal_can::{can_classic_capability, can_configure_capability, can_fd_capability};
+use robot_hal_can::{can_classic_capability, can_configure_capability, can_fd_capability};
 #[cfg(target_os = "linux")]
-use seeed_hal_core::{CapabilitySet, ResourceProperties, TransportKind, resolve_resource};
+use robot_hal_core::{CapabilitySet, ResourceProperties, TransportKind, resolve_resource};
 
 #[derive(Clone, Debug, Default)]
 pub struct SocketCanAdapter;
@@ -124,7 +124,7 @@ fn descriptor_from_interface(interface: &str) -> HalResult<ResourceDescriptor> {
     );
     Ok(ResourceDescriptor::new(
         identity.id,
-        seeed_hal_core::Endpoint::new(interface.to_owned())?,
+        robot_hal_core::Endpoint::new(interface.to_owned())?,
         identity.quality,
         TransportKind::Can,
         ResourceProperties::new(properties),
@@ -214,7 +214,7 @@ fn join_error(operation: &'static str, error: tokio::task::JoinError) -> HalErro
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::discovery_error;
-    use seeed_hal_core::ErrorCategory;
+    use robot_hal_core::ErrorCategory;
 
     #[test]
     fn discovery_error_accepts_socketcan_error() {

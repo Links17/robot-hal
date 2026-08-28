@@ -4,11 +4,11 @@ pub mod identity;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use seeed_hal_core::{
+use robot_hal_core::{
     CapabilitySet, Endpoint, ErrorCategory, HalError, HalResult, ResourceDescriptor,
     ResourceProperties, ResourceSelector, TransportKind, resolve_resource,
 };
-use seeed_hal_usb::{
+use robot_hal_usb::{
     UsbAdapter, UsbInterfaceClaim, UsbInterfaceSession, UsbTransfer, usb_bulk_capability,
     usb_control_capability, usb_interrupt_capability,
 };

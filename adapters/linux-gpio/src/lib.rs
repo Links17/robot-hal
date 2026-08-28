@@ -4,13 +4,13 @@ pub mod identity;
 
 use async_trait::async_trait;
 #[cfg(target_os = "linux")]
-use seeed_hal_core::{
+use robot_hal_core::{
     CapabilitySet, Endpoint, ResourceProperties, TransportKind, resolve_resource,
 };
-use seeed_hal_core::{ErrorCategory, HalError, HalResult, ResourceDescriptor, ResourceSelector};
-use seeed_hal_gpio::{GpioAdapter, GpioLineConfig, GpioLineSession};
+use robot_hal_core::{ErrorCategory, HalError, HalResult, ResourceDescriptor, ResourceSelector};
+use robot_hal_gpio::{GpioAdapter, GpioLineConfig, GpioLineSession};
 #[cfg(target_os = "linux")]
-use seeed_hal_gpio::{
+use robot_hal_gpio::{
     GpioBias, GpioDirection, GpioDrive, GpioEdge, GpioEdgeEvent, GpioEdgeRequest,
     gpio_edges_capability, gpio_lines_capability,
 };
@@ -195,7 +195,7 @@ fn request_lines(chip: &Chip, lines: &[u32], config: GpioLineConfig) -> HalResul
     let mut request_config =
         RequestConfig::new().map_err(|error| platform_error("gpio.open", error))?;
     request_config
-        .set_consumer("seeed-hal")
+        .set_consumer("robot-hal")
         .map_err(|error| platform_error("gpio.open", error))?;
     chip.request_lines(Some(&request_config), &line_config)
         .map_err(|error| platform_error("gpio.open", error))

@@ -2,14 +2,14 @@
 
 use async_trait::async_trait;
 #[cfg(windows)]
-use seeed_hal_core::{
+use robot_hal_core::{
     CapabilitySet, Endpoint, IdentityQuality, ResourceId, ResourceProperties, TransportKind,
     resolve_resource,
 };
-use seeed_hal_core::{ErrorCategory, HalError, HalResult, ResourceDescriptor, ResourceSelector};
-use seeed_hal_gpio::{GpioAdapter, GpioLineConfig, GpioLineSession};
+use robot_hal_core::{ErrorCategory, HalError, HalResult, ResourceDescriptor, ResourceSelector};
+use robot_hal_gpio::{GpioAdapter, GpioLineConfig, GpioLineSession};
 #[cfg(windows)]
-use seeed_hal_gpio::{GpioDirection, GpioEdgeEvent, GpioEdgeRequest, gpio_lines_capability};
+use robot_hal_gpio::{GpioDirection, GpioEdgeEvent, GpioEdgeRequest, gpio_lines_capability};
 #[cfg(windows)]
 use std::{
     collections::BTreeMap,

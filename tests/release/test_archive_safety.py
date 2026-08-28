@@ -243,26 +243,26 @@ def test_valid_tar_and_zip_are_inspected_without_extraction(tmp_path: Path) -> N
     _tar(
         tar_path,
         [
-            ("seeed-hal-broker-v0.5.0-rc.1/", b"", "directory"),
-            ("seeed-hal-broker-v0.5.0-rc.1/README.txt", b"ok", "file"),
+            ("robot-hal-broker-v0.5.0-rc.1/", b"", "directory"),
+            ("robot-hal-broker-v0.5.0-rc.1/README.txt", b"ok", "file"),
         ],
     )
     _zip(
         zip_path,
         [
-            ("seeed-hal-broker-v0.5.0-rc.1/", b"", False),
-            ("seeed-hal-broker-v0.5.0-rc.1/README.txt", b"ok", False),
+            ("robot-hal-broker-v0.5.0-rc.1/", b"", False),
+            ("robot-hal-broker-v0.5.0-rc.1/README.txt", b"ok", False),
         ],
     )
 
     validate_archive(
         tar_path,
-        expected_root="seeed-hal-broker-v0.5.0-rc.1",
+        expected_root="robot-hal-broker-v0.5.0-rc.1",
         expected_files={"README.txt"},
     )
     validate_archive(
         zip_path,
-        expected_root="seeed-hal-broker-v0.5.0-rc.1",
+        expected_root="robot-hal-broker-v0.5.0-rc.1",
         expected_files={"README.txt"},
     )
 

@@ -1,5 +1,5 @@
-use seeed_hal_adapter_socketcan::identity::{CanInterfaceMetadata, identity_from_metadata};
-use seeed_hal_can::IdentityQuality;
+use robot_hal_adapter_socketcan::identity::{CanInterfaceMetadata, identity_from_metadata};
+use robot_hal_can::IdentityQuality;
 
 #[test]
 fn serial_identity_is_strong_and_percent_encoded() {

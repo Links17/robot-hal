@@ -31,7 +31,7 @@ RELEASE_TOOL = REPO_ROOT / "scripts" / "release" / "release_tool.py"
 
 def _broker_name(target: str) -> str:
     extension = "zip" if target == "x86_64-pc-windows-msvc" else "tar.gz"
-    return f"seeed-hal-broker-v0.5.0-rc.1-{target}.{extension}"
+    return f"robot-hal-broker-v0.5.0-rc.1-{target}.{extension}"
 
 
 def _write_artifacts(directory: Path) -> tuple[Path, ...]:
@@ -39,9 +39,9 @@ def _write_artifacts(directory: Path) -> tuple[Path, ...]:
         _broker_name("x86_64-pc-windows-msvc"),
         _broker_name("aarch64-apple-darwin"),
         _broker_name("x86_64-unknown-linux-gnu"),
-        "seeed-hal-crates-v0.5.0-rc.1.tar.gz",
-        "seeed_hal-0.5.0rc1-py3-none-any.whl",
-        "seeed_hal-0.5.0rc1.tar.gz",
+        "robot-hal-crates-v0.5.0-rc.1.tar.gz",
+        "robot_hal-0.5.0rc1-py3-none-any.whl",
+        "robot_hal-0.5.0rc1.tar.gz",
     )
     paths = tuple(directory / name for name in names)
     for index, path in enumerate(paths):
@@ -345,9 +345,9 @@ def test_generate_manifest_writes_current_pending_conformance_report(
         _broker_name("x86_64-pc-windows-msvc"),
         _broker_name("aarch64-apple-darwin"),
         _broker_name("x86_64-unknown-linux-gnu"),
-        "seeed-hal-crates-v0.5.0-rc.1.tar.gz",
-        "seeed_hal-0.5.0rc1-py3-none-any.whl",
-        "seeed_hal-0.5.0rc1.tar.gz",
+        "robot-hal-crates-v0.5.0-rc.1.tar.gz",
+        "robot_hal-0.5.0rc1-py3-none-any.whl",
+        "robot_hal-0.5.0rc1.tar.gz",
     ],
 )
 def test_manifest_requires_complete_exact_rc_artifact_set(
@@ -363,8 +363,8 @@ def test_manifest_requires_complete_exact_rc_artifact_set(
 
 def test_manifest_rejects_artifact_version_that_does_not_match_tag(tmp_path: Path) -> None:
     inputs = _inputs(tmp_path)
-    artifact = inputs["artifacts_dir"] / "seeed_hal-0.5.0rc1.tar.gz"
-    artifact.rename(inputs["artifacts_dir"] / "seeed_hal-0.5.0rc2.tar.gz")
+    artifact = inputs["artifacts_dir"] / "robot_hal-0.5.0rc1.tar.gz"
+    artifact.rename(inputs["artifacts_dir"] / "robot_hal-0.5.0rc2.tar.gz")
 
     with pytest.raises(ReleaseFailure, match="release.manifest.invalid"):
         generate_manifest(inputs)

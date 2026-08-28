@@ -5,8 +5,8 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-import seeed_hal
-from seeed_hal import (
+import robot_hal
+from robot_hal import (
     ErrorCategory,
     GpioBias,
     GpioDirection,
@@ -22,7 +22,7 @@ from seeed_hal import (
     UsbTransfer,
     UsbTransferKind,
 )
-from seeed_hal.proto import hal_pb2
+from robot_hal.proto import hal_pb2
 
 from test_client_contract import TOKEN, envelope, fake_broker, read_frame, send_frame
 from test_client_hardening import ScriptedTransport
@@ -51,7 +51,7 @@ def test_usb_gpio_models_are_public_immutable_and_validate() -> None:
         "GpioEdgeRequest",
         "GpioLineConfig",
         "GpioSession",
-    }.issubset(seeed_hal.__all__)
+    }.issubset(robot_hal.__all__)
 
     transfer = UsbTransfer(
         UsbTransferKind.BULK_OUT, endpoint=1, data=bytearray(b"out")

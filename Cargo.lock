@@ -1254,6 +1254,362 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "robot-hal-adapter-avfoundation"
+version = "0.5.0-rc.1"
+dependencies = [
+ "async-trait",
+ "block2",
+ "bytes",
+ "dispatch2",
+ "objc2",
+ "objc2-av-foundation",
+ "objc2-core-foundation",
+ "objc2-core-media",
+ "objc2-core-video",
+ "objc2-foundation",
+ "robot-hal-camera",
+ "robot-hal-core",
+ "tokio",
+]
+
+[[package]]
+name = "robot-hal-adapter-linux-gpio"
+version = "0.5.0-rc.1"
+dependencies = [
+ "async-trait",
+ "libgpiod",
+ "percent-encoding",
+ "robot-hal-core",
+ "robot-hal-gpio",
+ "tokio",
+]
+
+[[package]]
+name = "robot-hal-adapter-mediafoundation"
+version = "0.5.0-rc.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "robot-hal-camera",
+ "robot-hal-core",
+ "tokio",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
+name = "robot-hal-adapter-nusb"
+version = "0.5.0-rc.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "nusb",
+ "percent-encoding",
+ "robot-hal-core",
+ "robot-hal-usb",
+ "tokio",
+]
+
+[[package]]
+name = "robot-hal-adapter-pcan"
+version = "0.5.0-rc.1"
+dependencies = [
+ "async-trait",
+ "can-hal-pcan",
+ "can-hal-rs",
+ "libloading",
+ "robot-hal-can",
+ "robot-hal-core",
+ "robot-hal-testkit",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "robot-hal-adapter-serialport"
+version = "0.5.0-rc.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "libc",
+ "percent-encoding",
+ "robot-hal-core",
+ "robot-hal-serial",
+ "robot-hal-testkit",
+ "serial2",
+ "serialport",
+ "tokio",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "robot-hal-adapter-shared-memory"
+version = "0.5.0-rc.1"
+dependencies = [
+ "getrandom 0.3.4",
+ "libc",
+ "robot-hal-camera",
+ "robot-hal-core",
+ "sha2",
+ "subtle",
+ "thiserror",
+ "windows-permissions",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
+
+[[package]]
+name = "robot-hal-adapter-socketcan"
+version = "0.5.0-rc.1"
+dependencies = [
+ "async-trait",
+ "can-hal-rs",
+ "can-hal-socketcan",
+ "libc",
+ "neli",
+ "percent-encoding",
+ "robot-hal-can",
+ "robot-hal-core",
+ "robot-hal-testkit",
+ "socketcan",
+ "tokio",
+]
+
+[[package]]
+name = "robot-hal-adapter-v4l2"
+version = "0.5.0-rc.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "robot-hal-camera",
+ "robot-hal-core",
+ "tokio",
+ "v4l",
+]
+
+[[package]]
+name = "robot-hal-adapter-windows-gpio"
+version = "0.5.0-rc.1"
+dependencies = [
+ "async-trait",
+ "percent-encoding",
+ "robot-hal-core",
+ "robot-hal-gpio",
+ "tokio",
+ "windows",
+]
+
+[[package]]
+name = "robot-hal-broker"
+version = "0.5.0-rc.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures-util",
+ "getrandom 0.3.4",
+ "prost",
+ "robot-hal-camera",
+ "robot-hal-can",
+ "robot-hal-core",
+ "robot-hal-gpio",
+ "robot-hal-protocol",
+ "robot-hal-runtime",
+ "robot-hal-serial",
+ "robot-hal-testkit",
+ "robot-hal-usb",
+ "robot-hal-windows-security",
+ "serde_json",
+ "subtle",
+ "tokio",
+ "tokio-util",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "robot-hal-broker-app"
+version = "0.5.0-rc.1"
+dependencies = [
+ "clap",
+ "robot-hal-adapter-avfoundation",
+ "robot-hal-adapter-linux-gpio",
+ "robot-hal-adapter-mediafoundation",
+ "robot-hal-adapter-nusb",
+ "robot-hal-adapter-pcan",
+ "robot-hal-adapter-serialport",
+ "robot-hal-adapter-socketcan",
+ "robot-hal-adapter-v4l2",
+ "robot-hal-adapter-windows-gpio",
+ "robot-hal-broker",
+ "robot-hal-client",
+ "robot-hal-core",
+ "robot-hal-protocol",
+ "robot-hal-runtime",
+ "robot-hal-serial",
+ "robot-hal-testkit",
+ "robot-hal-windows-file",
+ "robot-hal-windows-security",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "wait-timeout",
+ "winapi-util",
+ "windows-permissions",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
+
+[[package]]
+name = "robot-hal-camera"
+version = "0.5.0-rc.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "robot-hal-core",
+]
+
+[[package]]
+name = "robot-hal-can"
+version = "0.5.0-rc.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "robot-hal-core",
+ "serde_json",
+]
+
+[[package]]
+name = "robot-hal-client"
+version = "0.5.0-rc.1"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "prost",
+ "robot-hal-adapter-shared-memory",
+ "robot-hal-broker",
+ "robot-hal-camera",
+ "robot-hal-can",
+ "robot-hal-core",
+ "robot-hal-gpio",
+ "robot-hal-protocol",
+ "robot-hal-runtime",
+ "robot-hal-serial",
+ "robot-hal-testkit",
+ "robot-hal-usb",
+ "subtle",
+ "tokio",
+ "tokio-util",
+ "zeroize",
+]
+
+[[package]]
+name = "robot-hal-core"
+version = "0.5.0-rc.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "robot-hal-gpio"
+version = "0.5.0-rc.1"
+dependencies = [
+ "async-trait",
+ "robot-hal-core",
+]
+
+[[package]]
+name = "robot-hal-protocol"
+version = "0.5.0-rc.1"
+dependencies = [
+ "bytes",
+ "prost",
+ "prost-build",
+ "protoc-bin-vendored",
+ "robot-hal-adapter-shared-memory",
+ "robot-hal-camera",
+ "robot-hal-can",
+ "robot-hal-core",
+ "robot-hal-gpio",
+ "robot-hal-runtime",
+ "robot-hal-serial",
+ "robot-hal-usb",
+]
+
+[[package]]
+name = "robot-hal-runtime"
+version = "0.5.0-rc.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "robot-hal-adapter-shared-memory",
+ "robot-hal-camera",
+ "robot-hal-can",
+ "robot-hal-core",
+ "robot-hal-gpio",
+ "robot-hal-serial",
+ "robot-hal-testkit",
+ "robot-hal-usb",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "robot-hal-serial"
+version = "0.5.0-rc.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "robot-hal-core",
+]
+
+[[package]]
+name = "robot-hal-testkit"
+version = "0.5.0-rc.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "robot-hal-camera",
+ "robot-hal-can",
+ "robot-hal-core",
+ "robot-hal-gpio",
+ "robot-hal-serial",
+ "robot-hal-usb",
+ "tokio",
+]
+
+[[package]]
+name = "robot-hal-usb"
+version = "0.5.0-rc.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "robot-hal-core",
+]
+
+[[package]]
+name = "robot-hal-windows-file"
+version = "0.5.0-rc.1"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "robot-hal-windows-security"
+version = "0.5.0-rc.1"
+dependencies = [
+ "tokio",
+ "uuid",
+ "windows-permissions",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1302,362 +1658,6 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
-
-[[package]]
-name = "seeed-hal-adapter-avfoundation"
-version = "0.5.0-rc.1"
-dependencies = [
- "async-trait",
- "block2",
- "bytes",
- "dispatch2",
- "objc2",
- "objc2-av-foundation",
- "objc2-core-foundation",
- "objc2-core-media",
- "objc2-core-video",
- "objc2-foundation",
- "seeed-hal-camera",
- "seeed-hal-core",
- "tokio",
-]
-
-[[package]]
-name = "seeed-hal-adapter-linux-gpio"
-version = "0.5.0-rc.1"
-dependencies = [
- "async-trait",
- "libgpiod",
- "percent-encoding",
- "seeed-hal-core",
- "seeed-hal-gpio",
- "tokio",
-]
-
-[[package]]
-name = "seeed-hal-adapter-mediafoundation"
-version = "0.5.0-rc.1"
-dependencies = [
- "async-trait",
- "bytes",
- "seeed-hal-camera",
- "seeed-hal-core",
- "tokio",
- "windows",
- "windows-core",
-]
-
-[[package]]
-name = "seeed-hal-adapter-nusb"
-version = "0.5.0-rc.1"
-dependencies = [
- "async-trait",
- "bytes",
- "nusb",
- "percent-encoding",
- "seeed-hal-core",
- "seeed-hal-usb",
- "tokio",
-]
-
-[[package]]
-name = "seeed-hal-adapter-pcan"
-version = "0.5.0-rc.1"
-dependencies = [
- "async-trait",
- "can-hal-pcan",
- "can-hal-rs",
- "libloading",
- "seeed-hal-can",
- "seeed-hal-core",
- "seeed-hal-testkit",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "seeed-hal-adapter-serialport"
-version = "0.5.0-rc.1"
-dependencies = [
- "async-trait",
- "bytes",
- "libc",
- "percent-encoding",
- "seeed-hal-core",
- "seeed-hal-serial",
- "seeed-hal-testkit",
- "serial2",
- "serialport",
- "tokio",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "seeed-hal-adapter-shared-memory"
-version = "0.5.0-rc.1"
-dependencies = [
- "getrandom 0.3.4",
- "libc",
- "seeed-hal-camera",
- "seeed-hal-core",
- "sha2",
- "subtle",
- "thiserror",
- "windows-permissions",
- "windows-sys 0.61.2",
- "zeroize",
-]
-
-[[package]]
-name = "seeed-hal-adapter-socketcan"
-version = "0.5.0-rc.1"
-dependencies = [
- "async-trait",
- "can-hal-rs",
- "can-hal-socketcan",
- "libc",
- "neli",
- "percent-encoding",
- "seeed-hal-can",
- "seeed-hal-core",
- "seeed-hal-testkit",
- "socketcan",
- "tokio",
-]
-
-[[package]]
-name = "seeed-hal-adapter-v4l2"
-version = "0.5.0-rc.1"
-dependencies = [
- "async-trait",
- "bytes",
- "seeed-hal-camera",
- "seeed-hal-core",
- "tokio",
- "v4l",
-]
-
-[[package]]
-name = "seeed-hal-adapter-windows-gpio"
-version = "0.5.0-rc.1"
-dependencies = [
- "async-trait",
- "percent-encoding",
- "seeed-hal-core",
- "seeed-hal-gpio",
- "tokio",
- "windows",
-]
-
-[[package]]
-name = "seeed-hal-broker"
-version = "0.5.0-rc.1"
-dependencies = [
- "async-trait",
- "bytes",
- "futures-util",
- "getrandom 0.3.4",
- "prost",
- "seeed-hal-camera",
- "seeed-hal-can",
- "seeed-hal-core",
- "seeed-hal-gpio",
- "seeed-hal-protocol",
- "seeed-hal-runtime",
- "seeed-hal-serial",
- "seeed-hal-testkit",
- "seeed-hal-usb",
- "seeed-hal-windows-security",
- "serde_json",
- "subtle",
- "tokio",
- "tokio-util",
- "uuid",
- "zeroize",
-]
-
-[[package]]
-name = "seeed-hal-broker-app"
-version = "0.5.0-rc.1"
-dependencies = [
- "clap",
- "rustix 1.1.4",
- "seeed-hal-adapter-avfoundation",
- "seeed-hal-adapter-linux-gpio",
- "seeed-hal-adapter-mediafoundation",
- "seeed-hal-adapter-nusb",
- "seeed-hal-adapter-pcan",
- "seeed-hal-adapter-serialport",
- "seeed-hal-adapter-socketcan",
- "seeed-hal-adapter-v4l2",
- "seeed-hal-adapter-windows-gpio",
- "seeed-hal-broker",
- "seeed-hal-client",
- "seeed-hal-core",
- "seeed-hal-protocol",
- "seeed-hal-runtime",
- "seeed-hal-serial",
- "seeed-hal-testkit",
- "seeed-hal-windows-file",
- "seeed-hal-windows-security",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "wait-timeout",
- "winapi-util",
- "windows-permissions",
- "windows-sys 0.61.2",
- "zeroize",
-]
-
-[[package]]
-name = "seeed-hal-camera"
-version = "0.5.0-rc.1"
-dependencies = [
- "async-trait",
- "bytes",
- "seeed-hal-core",
-]
-
-[[package]]
-name = "seeed-hal-can"
-version = "0.5.0-rc.1"
-dependencies = [
- "async-trait",
- "bytes",
- "seeed-hal-core",
- "serde_json",
-]
-
-[[package]]
-name = "seeed-hal-client"
-version = "0.5.0-rc.1"
-dependencies = [
- "bytes",
- "futures-util",
- "prost",
- "seeed-hal-adapter-shared-memory",
- "seeed-hal-broker",
- "seeed-hal-camera",
- "seeed-hal-can",
- "seeed-hal-core",
- "seeed-hal-gpio",
- "seeed-hal-protocol",
- "seeed-hal-runtime",
- "seeed-hal-serial",
- "seeed-hal-testkit",
- "seeed-hal-usb",
- "subtle",
- "tokio",
- "tokio-util",
- "zeroize",
-]
-
-[[package]]
-name = "seeed-hal-core"
-version = "0.5.0-rc.1"
-dependencies = [
- "serde",
- "serde_json",
- "uuid",
-]
-
-[[package]]
-name = "seeed-hal-gpio"
-version = "0.5.0-rc.1"
-dependencies = [
- "async-trait",
- "seeed-hal-core",
-]
-
-[[package]]
-name = "seeed-hal-protocol"
-version = "0.5.0-rc.1"
-dependencies = [
- "bytes",
- "prost",
- "prost-build",
- "protoc-bin-vendored",
- "seeed-hal-adapter-shared-memory",
- "seeed-hal-camera",
- "seeed-hal-can",
- "seeed-hal-core",
- "seeed-hal-gpio",
- "seeed-hal-runtime",
- "seeed-hal-serial",
- "seeed-hal-usb",
-]
-
-[[package]]
-name = "seeed-hal-runtime"
-version = "0.5.0-rc.1"
-dependencies = [
- "async-trait",
- "bytes",
- "seeed-hal-adapter-shared-memory",
- "seeed-hal-camera",
- "seeed-hal-can",
- "seeed-hal-core",
- "seeed-hal-gpio",
- "seeed-hal-serial",
- "seeed-hal-testkit",
- "seeed-hal-usb",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "seeed-hal-serial"
-version = "0.5.0-rc.1"
-dependencies = [
- "async-trait",
- "bytes",
- "seeed-hal-core",
-]
-
-[[package]]
-name = "seeed-hal-testkit"
-version = "0.5.0-rc.1"
-dependencies = [
- "async-trait",
- "bytes",
- "seeed-hal-camera",
- "seeed-hal-can",
- "seeed-hal-core",
- "seeed-hal-gpio",
- "seeed-hal-serial",
- "seeed-hal-usb",
- "tokio",
-]
-
-[[package]]
-name = "seeed-hal-usb"
-version = "0.5.0-rc.1"
-dependencies = [
- "async-trait",
- "bytes",
- "seeed-hal-core",
-]
-
-[[package]]
-name = "seeed-hal-windows-file"
-version = "0.5.0-rc.1"
-dependencies = [
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "seeed-hal-windows-security"
-version = "0.5.0-rc.1"
-dependencies = [
- "tokio",
- "uuid",
- "windows-permissions",
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "serde"

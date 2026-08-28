@@ -31,7 +31,7 @@ or CI code changed.
 Command:
 
 ```sh
-cargo test -p seeed-hal-adapter-shared-memory --target x86_64-pc-windows-msvc platform::windows_tests -- --nocapture
+cargo test -p robot-hal-adapter-shared-memory --target x86_64-pc-windows-msvc platform::windows_tests -- --nocapture
 ```
 
 Result: expected failure before the implementation. The Windows-only policy
@@ -46,9 +46,9 @@ Commands:
 
 ```sh
 cargo fmt --all --check
-cargo clippy -p seeed-hal-adapter-shared-memory --all-targets --all-features -- -D warnings
-cargo test -p seeed-hal-adapter-shared-memory
-cargo check -p seeed-hal-adapter-shared-memory --target x86_64-pc-windows-msvc
+cargo clippy -p robot-hal-adapter-shared-memory --all-targets --all-features -- -D warnings
+cargo test -p robot-hal-adapter-shared-memory
+cargo check -p robot-hal-adapter-shared-memory --target x86_64-pc-windows-msvc
 git diff --check
 ```
 
@@ -85,7 +85,7 @@ as Hosted Windows API validation.
 
 ## Outcome
 
-`package-rust` now creates `seeed-hal-crates-v0.5.0-rc.N.tar.gz` as a
+`package-rust` now creates `robot-hal-crates-v0.5.0-rc.N.tar.gz` as a
 deterministic complete workspace source bundle. It is not a `.crate`
 collection and does not imply registry publication readiness.
 
@@ -216,7 +216,7 @@ name, path, SID, or token values.
 Command:
 
 ```sh
-cargo test -p seeed-hal-adapter-shared-memory --target x86_64-pc-windows-msvc platform::windows_tests -- --nocapture
+cargo test -p robot-hal-adapter-shared-memory --target x86_64-pc-windows-msvc platform::windows_tests -- --nocapture
 ```
 
 Result before the production fix: compilation failed because the new
@@ -233,9 +233,9 @@ Commands:
 
 ```sh
 cargo fmt --all --check
-cargo check -p seeed-hal-adapter-shared-memory --target x86_64-pc-windows-msvc
-cargo test -p seeed-hal-adapter-shared-memory
-cargo clippy -p seeed-hal-adapter-shared-memory --all-targets --all-features -- -D warnings
+cargo check -p robot-hal-adapter-shared-memory --target x86_64-pc-windows-msvc
+cargo test -p robot-hal-adapter-shared-memory
+cargo clippy -p robot-hal-adapter-shared-memory --all-targets --all-features -- -D warnings
 git diff --check
 ```
 

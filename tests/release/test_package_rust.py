@@ -105,16 +105,16 @@ def test_rust_bundle_preserves_path_version_workspace_closure(tmp_path: Path) ->
         output_dir=tmp_path / "artifacts",
     )
 
-    assert bundle.name == "seeed-hal-crates-v0.5.0-rc.1.tar.gz"
+    assert bundle.name == "robot-hal-crates-v0.5.0-rc.1.tar.gz"
     assert _bundle_members(bundle) == (
-        "seeed-hal-crates-v0.5.0-rc.1/Cargo.lock",
-        "seeed-hal-crates-v0.5.0-rc.1/Cargo.toml",
-        "seeed-hal-crates-v0.5.0-rc.1/adapter/Cargo.toml",
-        "seeed-hal-crates-v0.5.0-rc.1/adapter/src/lib.rs",
-        "seeed-hal-crates-v0.5.0-rc.1/camera/Cargo.toml",
-        "seeed-hal-crates-v0.5.0-rc.1/camera/src/lib.rs",
-        "seeed-hal-crates-v0.5.0-rc.1/core/Cargo.toml",
-        "seeed-hal-crates-v0.5.0-rc.1/core/src/lib.rs",
+        "robot-hal-crates-v0.5.0-rc.1/Cargo.lock",
+        "robot-hal-crates-v0.5.0-rc.1/Cargo.toml",
+        "robot-hal-crates-v0.5.0-rc.1/adapter/Cargo.toml",
+        "robot-hal-crates-v0.5.0-rc.1/adapter/src/lib.rs",
+        "robot-hal-crates-v0.5.0-rc.1/camera/Cargo.toml",
+        "robot-hal-crates-v0.5.0-rc.1/camera/src/lib.rs",
+        "robot-hal-crates-v0.5.0-rc.1/core/Cargo.toml",
+        "robot-hal-crates-v0.5.0-rc.1/core/src/lib.rs",
     )
     _check_workspace_bundle(bundle)
 
@@ -161,7 +161,7 @@ def test_rust_bundle_includes_root_build_inputs(tmp_path: Path) -> None:
     )
 
     assert (
-        "seeed-hal-crates-v0.5.0-rc.1/proto/seeed/hal/v1/hal.proto"
+        "robot-hal-crates-v0.5.0-rc.1/proto/seeed/hal/v1/hal.proto"
         in _bundle_members(bundle)
     )
 
@@ -244,7 +244,7 @@ def test_rust_bundle_refuses_existing_artifact(tmp_path: Path) -> None:
     _write_workspace(repo)
     output = tmp_path / "artifacts"
     output.mkdir()
-    existing = output / "seeed-hal-crates-v0.5.0-rc.1.tar.gz"
+    existing = output / "robot-hal-crates-v0.5.0-rc.1.tar.gz"
     existing.write_bytes(b"do not overwrite")
 
     try:

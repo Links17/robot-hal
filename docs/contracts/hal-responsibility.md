@@ -2,7 +2,7 @@
 
 ## Promise
 
-Seeed HAL is a cross-platform, business-independent hardware access module. It gives applications consistent interfaces for standard hardware transports and hardware classes without interpreting application or device-protocol meaning.
+Robot HAL is a cross-platform, business-independent hardware access module. It gives applications consistent interfaces for standard hardware transports and hardware classes without interpreting application or device-protocol meaning.
 
 ## Included responsibility
 

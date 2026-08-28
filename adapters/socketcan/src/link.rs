@@ -1,10 +1,10 @@
 #![cfg(target_os = "linux")]
 
-use seeed_hal_can::{
+use robot_hal_can::{
     CanActiveConfig, CanBitTiming, CanBusState, CanBusStatus, CanConfigureConfig,
     CanLinkExpectation, CanMode,
 };
-use seeed_hal_core::{
+use robot_hal_core::{
     ErrorCategory, ErrorContext, HalError, HalResult, ResourceDescriptor, ResourceId,
 };
 use socketcan::nl::{

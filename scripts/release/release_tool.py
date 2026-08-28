@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Seeed HAL release conformance utilities."""
+"""Robot HAL release conformance utilities."""
 
 from __future__ import annotations
 
@@ -127,29 +127,29 @@ SENSITIVE_VALUE = re.compile(
 ARTIFACT_PATTERNS = (
     (
         "rust-crates",
-        re.compile(r"^seeed-hal-crates-v0\.5\.0-rc\.[1-9][0-9]*\.tar\.gz$"),
+        re.compile(r"^robot-hal-crates-v0\.5\.0-rc\.[1-9][0-9]*\.tar\.gz$"),
     ),
     (
         "broker",
         re.compile(
-            r"^seeed-hal-broker-v0\.5\.0-rc\.[1-9][0-9]*-"
+            r"^robot-hal-broker-v0\.5\.0-rc\.[1-9][0-9]*-"
             r"(?:aarch64-apple-darwin|x86_64-unknown-linux-gnu)\.tar\.gz$"
         ),
     ),
     (
         "broker",
         re.compile(
-            r"^seeed-hal-broker-v0\.5\.0-rc\.[1-9][0-9]*-"
+            r"^robot-hal-broker-v0\.5\.0-rc\.[1-9][0-9]*-"
             r"x86_64-pc-windows-msvc\.zip$"
         ),
     ),
     (
         "python-wheel",
-        re.compile(r"^seeed_hal-0\.5\.0rc[1-9][0-9]*-py3-none-any\.whl$"),
+        re.compile(r"^robot_hal-0\.5\.0rc[1-9][0-9]*-py3-none-any\.whl$"),
     ),
     (
         "python-source",
-        re.compile(r"^seeed_hal-0\.5\.0rc[1-9][0-9]*\.tar\.gz$"),
+        re.compile(r"^robot_hal-0\.5\.0rc[1-9][0-9]*\.tar\.gz$"),
     ),
 )
 EXPECTED_BROKER_COMPOSITION = {
@@ -389,11 +389,11 @@ def _python_public_version(repo_root: Path, project_version: str) -> str:
     try:
         with tempfile.TemporaryDirectory() as directory:
             fixture_root = Path(directory)
-            dist_info = fixture_root / "seeed_hal-0.dist-info"
+            dist_info = fixture_root / "robot_hal-0.dist-info"
             dist_info.mkdir()
             (dist_info / "METADATA").write_text(
                 "Metadata-Version: 2.4\n"
-                "Name: seeed-hal\n"
+                "Name: robot-hal\n"
                 f"Version: {project_version}\n",
                 encoding="utf-8",
             )
@@ -415,8 +415,8 @@ def _python_public_version(repo_root: Path, project_version: str) -> str:
                     (
                         "import json, sys;"
                         "sys.path[:0] = json.loads(sys.argv[1]);"
-                        "import seeed_hal;"
-                        "print(seeed_hal.__version__)"
+                        "import robot_hal;"
+                        "print(robot_hal.__version__)"
                     ),
                     json.dumps(import_paths),
                 ],
@@ -490,14 +490,14 @@ def check_version(repo_root: Path, tag: str, cargo: str = "cargo") -> None:
     if actual_project != expected.python:
         raise ReleaseFailure(
             "release.version.mismatch",
-            f"seeed-hal is {actual_project}, expected {expected.python}",
+            f"robot-hal is {actual_project}, expected {expected.python}",
         )
 
     actual_public = _python_public_version(repo_root, str(actual_project))
     if actual_public != expected.python:
         raise ReleaseFailure(
             "release.version.mismatch",
-            f"seeed-hal __version__ is {actual_public}, expected {expected.python}",
+            f"robot-hal __version__ is {actual_public}, expected {expected.python}",
         )
 
 
@@ -587,21 +587,21 @@ def _artifact_metadata(name: str) -> tuple[str, str | None]:
 
 def _expected_artifacts(version: ReleaseVersion) -> dict[str, tuple[str, str | None]]:
     names = {
-        f"seeed-hal-broker-v{version.cargo}-aarch64-apple-darwin.tar.gz": (
+        f"robot-hal-broker-v{version.cargo}-aarch64-apple-darwin.tar.gz": (
             "broker",
             "aarch64-apple-darwin",
         ),
-        f"seeed-hal-broker-v{version.cargo}-x86_64-unknown-linux-gnu.tar.gz": (
+        f"robot-hal-broker-v{version.cargo}-x86_64-unknown-linux-gnu.tar.gz": (
             "broker",
             "x86_64-unknown-linux-gnu",
         ),
-        f"seeed-hal-broker-v{version.cargo}-x86_64-pc-windows-msvc.zip": (
+        f"robot-hal-broker-v{version.cargo}-x86_64-pc-windows-msvc.zip": (
             "broker",
             "x86_64-pc-windows-msvc",
         ),
-        f"seeed-hal-crates-v{version.cargo}.tar.gz": ("rust-crates", None),
-        f"seeed_hal-{version.python}-py3-none-any.whl": ("python-wheel", None),
-        f"seeed_hal-{version.python}.tar.gz": ("python-source", None),
+        f"robot-hal-crates-v{version.cargo}.tar.gz": ("rust-crates", None),
+        f"robot_hal-{version.python}-py3-none-any.whl": ("python-wheel", None),
+        f"robot_hal-{version.python}.tar.gz": ("python-source", None),
     }
     return names
 
@@ -1994,11 +1994,11 @@ def _package_file(path: Path, name: str) -> Path:
 
 
 def _package_binary_name(target: ReleaseTarget) -> str:
-    return "seeed-hal-broker.exe" if target.name == "windows" else "seeed-hal-broker"
+    return "robot-hal-broker.exe" if target.name == "windows" else "robot-hal-broker"
 
 
 def _package_root(version: ReleaseVersion, target: ReleaseTarget) -> str:
-    return f"seeed-hal-broker-v{version.cargo}-{target.triple}"
+    return f"robot-hal-broker-v{version.cargo}-{target.triple}"
 
 
 def _package_archive_name(version: ReleaseVersion, target: ReleaseTarget) -> str:
@@ -2409,8 +2409,8 @@ def _publish_staged_artifact(staged: Path, destination: Path) -> Path:
 
 PYTHON_GENERATED_FILES = frozenset(
     {
-        "seeed_hal/proto/__init__.py",
-        "seeed_hal/proto/hal_pb2.py",
+        "robot_hal/proto/__init__.py",
+        "robot_hal/proto/hal_pb2.py",
     }
 )
 
@@ -2687,10 +2687,10 @@ def package_rust(*, tag: str, repo_root: Path, output_dir: Path) -> Path:
         if not required.issubset(source_names):
             _package_invalid("workspace source bundle is missing required files")
         _package_output_directory(output_dir)
-        archive_name = f"seeed-hal-crates-v{version.cargo}.tar.gz"
+        archive_name = f"robot-hal-crates-v{version.cargo}.tar.gz"
         destination = _published_artifact_path(output_dir, archive_name)
         staging_dir = Path(tempfile.mkdtemp(prefix=".package-rust-", dir=output_dir))
-        root = f"seeed-hal-crates-v{version.cargo}"
+        root = f"robot-hal-crates-v{version.cargo}"
         members = tuple(
             (f"{root}/{name}", path, 0o644)
             for name, path, _ in frozen_sources
@@ -2719,8 +2719,8 @@ def package_rust(*, tag: str, repo_root: Path, output_dir: Path) -> Path:
 
 def python_artifact_names(version: ReleaseVersion) -> tuple[str, str]:
     return (
-        f"seeed_hal-{version.python}-py3-none-any.whl",
-        f"seeed_hal-{version.python}.tar.gz",
+        f"robot_hal-{version.python}-py3-none-any.whl",
+        f"robot_hal-{version.python}.tar.gz",
     )
 
 
@@ -2729,7 +2729,7 @@ def _wheel_metadata(wheel: Path, version: ReleaseVersion) -> None:
         with zipfile.ZipFile(wheel) as archive:
             members = tuple(archive.namelist())
             names = set(members)
-            dist_info = f"seeed_hal-{version.python}.dist-info"
+            dist_info = f"robot_hal-{version.python}.dist-info"
             metadata_name = f"{dist_info}/METADATA"
             wheel_name = f"{dist_info}/WHEEL"
             if metadata_name not in names or wheel_name not in names:
@@ -2761,11 +2761,11 @@ def _wheel_metadata(wheel: Path, version: ReleaseVersion) -> None:
     except (OSError, UnicodeError, zipfile.BadZipFile) as error:
         raise ReleaseFailure("release.package.invalid", "Python wheel metadata is invalid") from error
     if (
-        "Name: seeed-hal\n" not in metadata
+        "Name: robot-hal\n" not in metadata
         or f"Version: {version.python}\n" not in metadata
         or wheel_headers.get_all("Root-Is-Purelib") != ["true"]
         or wheel_headers.get_all("Tag") != ["py3-none-any"]
-        or "seeed_hal/__init__.py" not in names
+        or "robot_hal/__init__.py" not in names
         or not PYTHON_GENERATED_FILES.issubset(names)
     ):
         _package_invalid("Python wheel content is invalid")
@@ -2805,11 +2805,11 @@ def _sdist_metadata(sdist: Path, version: ReleaseVersion) -> None:
             "Python source distribution metadata is invalid",
         ) from error
     if (
-        root != f"seeed_hal-{version.python}"
+        root != f"robot_hal-{version.python}"
         or "pyproject.toml" not in files
-        or "seeed_hal/__init__.py" not in files
+        or "robot_hal/__init__.py" not in files
         or not PYTHON_GENERATED_FILES.issubset(files)
-        or "Name: seeed-hal\n" not in metadata
+        or "Name: robot-hal\n" not in metadata
         or f"Version: {version.python}\n" not in metadata
     ):
         _package_invalid("Python source distribution content is invalid")
@@ -3210,11 +3210,11 @@ def _verify_wheel_install(
                 "-I",
                 "-c",
                 (
-                    "import importlib.metadata;import seeed_hal;"
+                    "import importlib.metadata;import robot_hal;"
                     + f"expected={version.python!r};"
-                    + "assert importlib.metadata.version('seeed-hal') == expected;"
-                    + "assert seeed_hal.__version__ == expected;"
-                    + "from seeed_hal.proto import hal_pb2;"
+                    + "assert importlib.metadata.version('robot-hal') == expected;"
+                    + "assert robot_hal.__version__ == expected;"
+                    + "from robot_hal.proto import hal_pb2;"
                     + "import google.protobuf;"
                     + "assert google.protobuf.__version__ == '6.32.1';"
                     + _installed_protobuf_record_validation_script(

@@ -14,7 +14,7 @@ from types import ModuleType
 
 import pytest
 
-from seeed_hal import (
+from robot_hal import (
     CanMode,
     CanSession,
     ControlLines,
@@ -27,9 +27,9 @@ from seeed_hal import (
     SerialSession,
     TransportKind,
 )
-from seeed_hal.can import _CanSessionProfile
-from seeed_hal.proto import hal_pb2
-from seeed_hal.transport_unix import HARD_FRAME_BYTES, UnixFramedTransport
+from robot_hal.can import _CanSessionProfile
+from robot_hal.proto import hal_pb2
+from robot_hal.transport_unix import HARD_FRAME_BYTES, UnixFramedTransport
 
 
 TOKEN = bytes([0x6B] * 32)
@@ -198,7 +198,7 @@ class FaithfulPyWinTypesError(Exception):
 
 @pytest.mark.asyncio
 async def test_windows_native_no_data_read_retries_then_progresses(monkeypatch) -> None:
-    from seeed_hal.transport_windows import WindowsFramedTransport
+    from robot_hal.transport_windows import WindowsFramedTransport
 
     handle = object()
     wire = bytearray(struct.pack(">I", 2) + b"ok")
@@ -230,7 +230,7 @@ async def test_windows_native_no_data_read_retries_then_progresses(monkeypatch) 
     win32file.CloseHandle = close_handle
     install_win32_modules(monkeypatch, win32file, win32pipe)
 
-    transport = await WindowsFramedTransport.connect(r"\\.\pipe\seeed-hal-no-data")
+    transport = await WindowsFramedTransport.connect(r"\\.\pipe\robot-hal-no-data")
     assert await transport.receive() == b"ok"
     await transport.close()
 
@@ -242,7 +242,7 @@ async def test_windows_native_no_data_read_retries_then_progresses(monkeypatch) 
 async def test_windows_native_no_data_read_deadline_terminates_actor(
     monkeypatch,
 ) -> None:
-    import seeed_hal.transport_windows as transport_windows
+    import robot_hal.transport_windows as transport_windows
 
     handle = object()
     read_times: list[float] = []
@@ -270,7 +270,7 @@ async def test_windows_native_no_data_read_deadline_terminates_actor(
     monkeypatch.setattr(transport_windows, "_POLL_SECONDS", 0.01)
 
     transport = await transport_windows.WindowsFramedTransport.connect(
-        r"\\.\pipe\seeed-hal-no-data-deadline"
+        r"\\.\pipe\robot-hal-no-data-deadline"
     )
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(transport.receive(), 0.025)
@@ -283,7 +283,7 @@ async def test_windows_native_no_data_read_deadline_terminates_actor(
     )
     assert close_calls == 1
     assert not any(
-        thread.name.startswith("seeed-hal-pipe-io") and thread.is_alive()
+        thread.name.startswith("robot-hal-pipe-io") and thread.is_alive()
         for thread in threading.enumerate()
     )
 
@@ -292,7 +292,7 @@ async def test_windows_native_no_data_read_deadline_terminates_actor(
 async def test_windows_native_write_backpressure_error_retries_then_progresses(
     monkeypatch,
 ) -> None:
-    from seeed_hal.transport_windows import WindowsFramedTransport
+    from robot_hal.transport_windows import WindowsFramedTransport
 
     handle = object()
     write_calls = 0
@@ -322,7 +322,7 @@ async def test_windows_native_write_backpressure_error_retries_then_progresses(
     install_win32_modules(monkeypatch, win32file, win32pipe)
 
     transport = await WindowsFramedTransport.connect(
-        r"\\.\pipe\seeed-hal-write-backpressure"
+        r"\\.\pipe\robot-hal-write-backpressure"
     )
     await transport.send(b"ok")
     await transport.close()
@@ -333,7 +333,7 @@ async def test_windows_native_write_backpressure_error_retries_then_progresses(
 
 @pytest.mark.asyncio
 async def test_windows_zero_byte_write_waits_then_progresses(monkeypatch) -> None:
-    import seeed_hal.transport_windows as transport_windows
+    import robot_hal.transport_windows as transport_windows
 
     handle = object()
     write_times: list[float] = []
@@ -363,7 +363,7 @@ async def test_windows_zero_byte_write_waits_then_progresses(monkeypatch) -> Non
     monkeypatch.setattr(transport_windows, "_POLL_SECONDS", 0.01)
 
     transport = await transport_windows.WindowsFramedTransport.connect(
-        r"\\.\pipe\seeed-hal-zero-write"
+        r"\\.\pipe\robot-hal-zero-write"
     )
     await transport.send(b"eventual")
     await transport.close()
@@ -377,7 +377,7 @@ async def test_windows_zero_byte_write_waits_then_progresses(monkeypatch) -> Non
 async def test_windows_zero_byte_write_cancellation_and_repeated_close_terminate_actor(
     monkeypatch,
 ) -> None:
-    import seeed_hal.transport_windows as transport_windows
+    import robot_hal.transport_windows as transport_windows
 
     handle = object()
     write_started = threading.Event()
@@ -408,7 +408,7 @@ async def test_windows_zero_byte_write_cancellation_and_repeated_close_terminate
     monkeypatch.setattr(transport_windows, "_POLL_SECONDS", 0.01)
 
     transport = await transport_windows.WindowsFramedTransport.connect(
-        r"\\.\pipe\seeed-hal-zero-write-cancel"
+        r"\\.\pipe\robot-hal-zero-write-cancel"
     )
     sending = asyncio.create_task(transport.send(b"blocked"))
     assert await asyncio.to_thread(write_started.wait, 1)
@@ -421,7 +421,7 @@ async def test_windows_zero_byte_write_cancellation_and_repeated_close_terminate
     assert write_calls <= 4
     assert close_calls == 1
     assert not any(
-        thread.name.startswith("seeed-hal-pipe-io") and thread.is_alive()
+        thread.name.startswith("robot-hal-pipe-io") and thread.is_alive()
         for thread in threading.enumerate()
     )
 
@@ -432,7 +432,7 @@ async def test_windows_zero_byte_write_cancellation_and_repeated_close_terminate
 async def test_windows_nonretryable_native_error_fails_closed_once(
     monkeypatch, operation: str, code: int
 ) -> None:
-    from seeed_hal.transport_windows import WindowsFramedTransport
+    from robot_hal.transport_windows import WindowsFramedTransport
 
     handle = object()
     close_calls = 0
@@ -455,7 +455,7 @@ async def test_windows_nonretryable_native_error_fails_closed_once(
     win32file.CloseHandle = close_handle
     install_win32_modules(monkeypatch, win32file, win32pipe)
     transport = await WindowsFramedTransport.connect(
-        rf"\\.\pipe\seeed-hal-terminal-{operation}"
+        rf"\\.\pipe\robot-hal-terminal-{operation}"
     )
 
     with pytest.raises(HalError) as caught:
@@ -469,7 +469,7 @@ async def test_windows_nonretryable_native_error_fails_closed_once(
     assert caught.value.operation == f"runtime.protocol.{operation}"
     assert close_calls == 1
     assert not any(
-        thread.name.startswith("seeed-hal-pipe-io") and thread.is_alive()
+        thread.name.startswith("robot-hal-pipe-io") and thread.is_alive()
         for thread in threading.enumerate()
     )
 
@@ -478,7 +478,7 @@ async def test_windows_nonretryable_native_error_fails_closed_once(
 async def test_windows_blocked_read_cancellation_transfers_close_to_owned_worker(
     monkeypatch,
 ) -> None:
-    from seeed_hal.transport_windows import WindowsFramedTransport
+    from robot_hal.transport_windows import WindowsFramedTransport
 
     handle = object()
     read_started = threading.Event()
@@ -513,7 +513,7 @@ async def test_windows_blocked_read_cancellation_transfers_close_to_owned_worker
     win32file.WriteFile = lambda _handle, data: (0, len(data))
     win32file.CloseHandle = close_handle
     install_win32_modules(monkeypatch, win32file, win32pipe)
-    transport = await WindowsFramedTransport.connect(r"\\.\pipe\seeed-hal-blocked-read")
+    transport = await WindowsFramedTransport.connect(r"\\.\pipe\robot-hal-blocked-read")
     receiving = asyncio.create_task(transport.receive())
     assert await asyncio.to_thread(read_started.wait, 1)
 
@@ -534,7 +534,7 @@ async def test_windows_blocked_read_cancellation_transfers_close_to_owned_worker
     assert all(isinstance(result, asyncio.CancelledError) for result in results)
     assert len(close_calls) == 1
     assert not any(
-        thread.name.startswith("seeed-hal-pipe-io") and thread.is_alive()
+        thread.name.startswith("robot-hal-pipe-io") and thread.is_alive()
         for thread in threading.enumerate()
     )
 
@@ -543,7 +543,7 @@ async def test_windows_blocked_read_cancellation_transfers_close_to_owned_worker
 async def test_windows_blocked_write_cancellation_transfers_close_to_owned_worker(
     monkeypatch,
 ) -> None:
-    from seeed_hal.transport_windows import WindowsFramedTransport
+    from robot_hal.transport_windows import WindowsFramedTransport
 
     handle = object()
     write_started = threading.Event()
@@ -578,7 +578,7 @@ async def test_windows_blocked_write_cancellation_transfers_close_to_owned_worke
     win32file.WriteFile = write_file
     win32file.CloseHandle = close_handle
     install_win32_modules(monkeypatch, win32file, win32pipe)
-    transport = await WindowsFramedTransport.connect(r"\\.\pipe\seeed-hal-blocked-write")
+    transport = await WindowsFramedTransport.connect(r"\\.\pipe\robot-hal-blocked-write")
     sending = asyncio.create_task(transport.send(b"blocked"))
     assert await asyncio.to_thread(write_started.wait, 1)
 
@@ -599,14 +599,14 @@ async def test_windows_blocked_write_cancellation_transfers_close_to_owned_worke
     assert all(isinstance(result, asyncio.CancelledError) for result in results)
     assert len(close_calls) == 1
     assert not any(
-        thread.name.startswith("seeed-hal-pipe-io") and thread.is_alive()
+        thread.name.startswith("robot-hal-pipe-io") and thread.is_alive()
         for thread in threading.enumerate()
     )
 
 
 @pytest.mark.asyncio
 async def test_windows_setup_failure_closes_created_handle_once_off_loop(monkeypatch) -> None:
-    from seeed_hal.transport_windows import WindowsFramedTransport
+    from robot_hal.transport_windows import WindowsFramedTransport
 
     main_thread = threading.get_ident()
     handle = object()
@@ -632,7 +632,7 @@ async def test_windows_setup_failure_closes_created_handle_once_off_loop(monkeyp
     install_win32_modules(monkeypatch, win32file, win32pipe)
 
     with pytest.raises(HalError) as caught:
-        await WindowsFramedTransport.connect(r"\\.\pipe\seeed-hal-fail")
+        await WindowsFramedTransport.connect(r"\\.\pipe\robot-hal-fail")
     assert caught.value.name == "runtime.broker.disconnected"
     assert [name for name, _thread in calls] == ["create", "state", "close"]
     assert all(thread != main_thread for _name, thread in calls)
@@ -640,7 +640,7 @@ async def test_windows_setup_failure_closes_created_handle_once_off_loop(monkeyp
 
 @pytest.mark.asyncio
 async def test_windows_cancelled_connect_closes_late_handle_once_off_loop(monkeypatch) -> None:
-    from seeed_hal.transport_windows import WindowsFramedTransport
+    from robot_hal.transport_windows import WindowsFramedTransport
 
     main_thread = threading.get_ident()
     handle = object()
@@ -671,7 +671,7 @@ async def test_windows_cancelled_connect_closes_late_handle_once_off_loop(monkey
     install_win32_modules(monkeypatch, win32file, win32pipe)
 
     connecting = asyncio.create_task(
-        WindowsFramedTransport.connect(r"\\.\pipe\seeed-hal-cancel")
+        WindowsFramedTransport.connect(r"\\.\pipe\robot-hal-cancel")
     )
     assert await asyncio.to_thread(state_started.wait, 1)
     connecting.cancel()
@@ -687,7 +687,7 @@ async def test_windows_cancelled_connect_closes_late_handle_once_off_loop(monkey
 async def test_windows_repeated_cancel_while_worker_pending_cannot_abandon_handle(
     monkeypatch,
 ) -> None:
-    from seeed_hal.transport_windows import WindowsFramedTransport
+    from robot_hal.transport_windows import WindowsFramedTransport
 
     main_thread = threading.get_ident()
     handle = object()
@@ -718,7 +718,7 @@ async def test_windows_repeated_cancel_while_worker_pending_cannot_abandon_handl
     install_win32_modules(monkeypatch, win32file, win32pipe)
 
     connecting = asyncio.create_task(
-        WindowsFramedTransport.connect(r"\\.\pipe\seeed-hal-repeat-worker")
+        WindowsFramedTransport.connect(r"\\.\pipe\robot-hal-repeat-worker")
     )
     assert await asyncio.to_thread(state_started.wait, 1)
     connecting.cancel()
@@ -742,7 +742,7 @@ async def test_windows_repeated_cancel_while_worker_pending_cannot_abandon_handl
 async def test_windows_repeated_cancel_after_worker_completion_closes_once(
     monkeypatch,
 ) -> None:
-    from seeed_hal.transport_windows import WindowsFramedTransport
+    from robot_hal.transport_windows import WindowsFramedTransport
 
     main_thread = threading.get_ident()
     handle = object()
@@ -781,7 +781,7 @@ async def test_windows_repeated_cancel_after_worker_completion_closes_once(
     monkeypatch.setattr(asyncio, "shield", pause_first_claim)
 
     connecting = asyncio.create_task(
-        WindowsFramedTransport.connect(r"\\.\pipe\seeed-hal-repeat-claim")
+        WindowsFramedTransport.connect(r"\\.\pipe\robot-hal-repeat-claim")
     )
     await asyncio.wait_for(worker_completed.wait(), 1)
     connecting.cancel()
@@ -799,7 +799,7 @@ async def test_windows_repeated_cancel_after_worker_completion_closes_once(
 async def test_windows_repeated_cancel_while_close_pending_waits_for_cleanup(
     monkeypatch,
 ) -> None:
-    from seeed_hal.transport_windows import WindowsFramedTransport
+    from robot_hal.transport_windows import WindowsFramedTransport
 
     main_thread = threading.get_ident()
     handle = object()
@@ -832,7 +832,7 @@ async def test_windows_repeated_cancel_while_close_pending_waits_for_cleanup(
     install_win32_modules(monkeypatch, win32file, win32pipe)
 
     connecting = asyncio.create_task(
-        WindowsFramedTransport.connect(r"\\.\pipe\seeed-hal-repeat-close")
+        WindowsFramedTransport.connect(r"\\.\pipe\robot-hal-repeat-close")
     )
     assert await asyncio.to_thread(state_started.wait, 1)
     connecting.cancel()
@@ -856,7 +856,7 @@ async def test_windows_repeated_cancel_while_close_pending_waits_for_cleanup(
 async def test_windows_close_failure_does_not_replace_connect_cancellation(
     monkeypatch,
 ) -> None:
-    from seeed_hal.transport_windows import WindowsFramedTransport
+    from robot_hal.transport_windows import WindowsFramedTransport
 
     handle = object()
     state_started = threading.Event()
@@ -885,7 +885,7 @@ async def test_windows_close_failure_does_not_replace_connect_cancellation(
     install_win32_modules(monkeypatch, win32file, win32pipe)
 
     connecting = asyncio.create_task(
-        WindowsFramedTransport.connect(r"\\.\pipe\seeed-hal-close-error")
+        WindowsFramedTransport.connect(r"\\.\pipe\robot-hal-close-error")
     )
     assert await asyncio.to_thread(state_started.wait, 1)
     connecting.cancel()
@@ -1311,7 +1311,7 @@ async def test_unix_transport_uses_memoryview_nbytes_for_frame_prefix() -> None:
 def test_generation_check_rejects_untracked_stale_outputs() -> None:
     checker = REPO_ROOT / "scripts" / "check-generated-protocol.sh"
     assert checker.is_file(), "repository generation drift checker is required"
-    stale = REPO_ROOT / "bindings/python/seeed_hal/proto/stale_pb2.py"
+    stale = REPO_ROOT / "bindings/python/robot_hal/proto/stale_pb2.py"
     stale.write_text("# stale generated output\n", encoding="utf-8")
     try:
         result = subprocess.run(
@@ -1335,8 +1335,8 @@ def _generation_check_repo(tmp_path: Path) -> Path:
         "scripts/generate-protocol.sh",
         "bindings/python/pyproject.toml",
         "bindings/python/uv.lock",
-        "bindings/python/seeed_hal/proto/__init__.py",
-        "bindings/python/seeed_hal/proto/hal_pb2.py",
+        "bindings/python/robot_hal/proto/__init__.py",
+        "bindings/python/robot_hal/proto/hal_pb2.py",
         "proto/seeed/hal/v1/hal.proto",
     ]
     for relative in files:
@@ -1368,7 +1368,7 @@ def test_generation_check_is_non_mutating_for_clean_and_drifted_trees(
     tmp_path: Path, drift: str
 ) -> None:
     fixture = _generation_check_repo(tmp_path)
-    output = fixture / "bindings/python/seeed_hal/proto"
+    output = fixture / "bindings/python/robot_hal/proto"
     generated = output / "hal_pb2.py"
     if drift == "modified":
         generated.write_text("# locally modified\n", encoding="utf-8")

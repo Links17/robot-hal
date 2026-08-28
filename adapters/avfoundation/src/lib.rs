@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use seeed_hal_camera::{CameraAdapter, CameraCaptureSession, CameraRequest};
-use seeed_hal_core::{
+use robot_hal_camera::{CameraAdapter, CameraCaptureSession, CameraRequest};
+use robot_hal_core::{
     ErrorCategory, HalError, HalResult, ResourceDescriptor, ResourceId, ResourceSelector,
 };
 use std::{
@@ -167,7 +167,7 @@ mod tests {
         claim_conflict, encode_resource_id, quarantine_claim_until_worker_exits,
         release_claim_after_drop,
     };
-    use seeed_hal_core::ResourceId;
+    use robot_hal_core::ResourceId;
     use std::{
         collections::BTreeSet,
         sync::{Arc, Mutex, mpsc},
@@ -253,8 +253,8 @@ mod tests {
     #[tokio::test]
     async fn non_macos_calls_are_stably_unavailable_without_discovery() {
         use super::{AvFoundationAdapter, CameraAdapter};
-        use seeed_hal_camera::{CameraFormat, CameraPixelFormat, CameraRequest};
-        use seeed_hal_core::{IdentityQuality, ResourceId, ResourceSelector, TransportKind};
+        use robot_hal_camera::{CameraFormat, CameraPixelFormat, CameraRequest};
+        use robot_hal_core::{IdentityQuality, ResourceId, ResourceSelector, TransportKind};
 
         let adapter = AvFoundationAdapter::new();
         assert_eq!(
@@ -286,13 +286,13 @@ mod tests {
 
     #[cfg(all(target_os = "macos", feature = "hardware-tests"))]
     #[tokio::test]
-    #[ignore = "requires an authorized physical camera and SEEED_HAL_CAMERA_RESOURCE_ID"]
+    #[ignore = "requires an authorized physical camera and ROBOT_HAL_CAMERA_RESOURCE_ID"]
     async fn physical_camera_captures_requested_verified_frame() {
         use super::{AvFoundationAdapter, CameraAdapter};
-        use seeed_hal_camera::{
+        use robot_hal_camera::{
             CameraFormat, CameraFrameMetadata, CameraFrameSink, CameraPixelFormat, CameraRequest,
         };
-        use seeed_hal_core::{
+        use robot_hal_core::{
             HalResult, IdentityQuality, ResourceId, ResourceSelector, TransportKind,
         };
         use std::{
@@ -319,7 +319,7 @@ mod tests {
             }
         }
 
-        let Some(resource_id) = std::env::var("SEEED_HAL_CAMERA_RESOURCE_ID").ok() else {
+        let Some(resource_id) = std::env::var("ROBOT_HAL_CAMERA_RESOURCE_ID").ok() else {
             return;
         };
         let adapter = AvFoundationAdapter::new();
@@ -329,7 +329,7 @@ mod tests {
             .expect("physical AVFoundation discovery must succeed")
             .into_iter()
             .find(|descriptor| descriptor.id().as_str() == resource_id)
-            .expect("SEEED_HAL_CAMERA_RESOURCE_ID must select an enumerated camera");
+            .expect("ROBOT_HAL_CAMERA_RESOURCE_ID must select an enumerated camera");
         eprintln!(
             "qualifying camera name={}",
             descriptor
@@ -444,14 +444,14 @@ mod tests {
 
     #[cfg(all(target_os = "macos", feature = "hardware-tests"))]
     #[tokio::test]
-    #[ignore = "requires operator-controlled unplug of SEEED_HAL_CAMERA_RESOURCE_ID"]
+    #[ignore = "requires operator-controlled unplug of ROBOT_HAL_CAMERA_RESOURCE_ID"]
     async fn physical_camera_hot_unplug_becomes_terminal_then_reopens() {
         use super::{AvFoundationAdapter, CameraAdapter};
         use crate::native;
-        use seeed_hal_camera::{
+        use robot_hal_camera::{
             CameraFormat, CameraFrameMetadata, CameraFrameSink, CameraPixelFormat, CameraRequest,
         };
-        use seeed_hal_core::{
+        use robot_hal_core::{
             HalResult, IdentityQuality, ResourceId, ResourceSelector, TransportKind,
         };
         use std::{
@@ -478,7 +478,7 @@ mod tests {
             }
         }
 
-        let Some(resource_id) = std::env::var("SEEED_HAL_CAMERA_RESOURCE_ID").ok() else {
+        let Some(resource_id) = std::env::var("ROBOT_HAL_CAMERA_RESOURCE_ID").ok() else {
             return;
         };
         let adapter = AvFoundationAdapter::new();
@@ -488,7 +488,7 @@ mod tests {
             .expect("physical AVFoundation discovery must succeed")
             .into_iter()
             .find(|descriptor| descriptor.id().as_str() == resource_id)
-            .expect("SEEED_HAL_CAMERA_RESOURCE_ID must select an enumerated camera");
+            .expect("ROBOT_HAL_CAMERA_RESOURCE_ID must select an enumerated camera");
         eprintln!(
             "hot-unplug fixture name={}",
             descriptor

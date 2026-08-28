@@ -1,6 +1,8 @@
-# Seeed HAL
+# Robot HAL
 
-Seeed HAL is a reusable, cross-platform Rust hardware abstraction runtime for desktop and edge applications.
+Robot HAL is a reusable, cross-platform Rust hardware abstraction runtime for
+desktop and edge applications. It is an alpha reference implementation, not a
+certified safety system.
 
 It presents application-facing interfaces for hardware transports and standard hardware classes while keeping product and device-protocol semantics outside the HAL.
 
@@ -12,7 +14,20 @@ Target families:
 - GPIO
 - Camera
 
-The implementation is library-first. Rust applications link the library directly; Python, Node, Electron, and multi-process applications use the same implementation through a local broker.
+Robot HAL deliberately contains no robot kinematics, device-protocol business
+logic, workflow topology or product semantics. The companion
+[`dora-lerobot`](https://github.com/Links17/dora-lerobot) project composes this
+resource/runtime layer with robot adapters, local safety gates and LeRobot
+bridges.
+
+The implementation is library-first. Rust applications link the library
+directly; Python, Node, Electron, and multi-process applications use the same
+implementation through a local broker.
+
+## Architecture
+
+Resource identity, exclusive leases and cancellation remain below robot
+semantics. This separation lets non-Dora applications reuse the same runtime.
 
 ## Documentation
 
@@ -88,6 +103,19 @@ macOS/Linux/Windows broker conformance. The hosted platform matrix is derived fr
 [`release/targets.toml`](release/targets.toml); each job verifies a production broker manifest
 and separately qualifies a `virtual-adapters` broker for protocol minors 0 through 3. Hosted
 conformance JSON is retained only as test evidence and is not a release artifact.
+
+## Development
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+cd bindings/python && uv run --frozen pytest -q
+```
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for contribution boundaries and the
+release checklist. Native hardware qualification remains an explicit external
+gate documented under `docs/runbooks/`.
 
 Run the Camera v0.4 hardware-free release gate with:
 

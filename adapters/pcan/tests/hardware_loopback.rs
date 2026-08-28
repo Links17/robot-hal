@@ -3,16 +3,16 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use seeed_hal_adapter_pcan::PcanAdapter;
-use seeed_hal_can::{
+use robot_hal_adapter_pcan::PcanAdapter;
+use robot_hal_can::{
     CanAdapter, CanBitTiming, CanChannel, CanConfigureConfig, CanFrame, CanId, CanMode,
     CanOpenConfig, ResourceDescriptor, ResourceSelector,
 };
-use seeed_hal_core::HalResult;
+use robot_hal_core::HalResult;
 
 async fn selected_descriptor(adapter: &PcanAdapter) -> ResourceDescriptor {
-    let resource_id = std::env::var("SEEED_HAL_PCAN_RESOURCE_ID")
-        .expect("set SEEED_HAL_PCAN_RESOURCE_ID to the provisioned PCAN resource");
+    let resource_id = std::env::var("ROBOT_HAL_PCAN_RESOURCE_ID")
+        .expect("set ROBOT_HAL_PCAN_RESOURCE_ID to the provisioned PCAN resource");
     adapter
         .enumerate()
         .await
@@ -23,11 +23,11 @@ async fn selected_descriptor(adapter: &PcanAdapter) -> ResourceDescriptor {
 }
 
 fn configured(mode: CanMode) -> CanOpenConfig {
-    let nominal = std::env::var("SEEED_HAL_PCAN_NOMINAL_BITRATE")
+    let nominal = std::env::var("ROBOT_HAL_PCAN_NOMINAL_BITRATE")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(500_000);
-    let data = std::env::var("SEEED_HAL_PCAN_DATA_BITRATE")
+    let data = std::env::var("ROBOT_HAL_PCAN_DATA_BITRATE")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(2_000_000);
@@ -96,7 +96,7 @@ async fn selected_fd_channel_preserves_brs_esi_and_payload() {
 }
 
 #[tokio::test]
-#[ignore = "requires an operator-controlled PCAN disconnect selected by SEEED_HAL_PCAN_RESOURCE_ID"]
+#[ignore = "requires an operator-controlled PCAN disconnect selected by ROBOT_HAL_PCAN_RESOURCE_ID"]
 async fn selected_channel_reports_disconnect_with_canonical_identity() {
     let adapter = PcanAdapter::load().expect("load PCAN-Basic");
     let descriptor = selected_descriptor(&adapter).await;
@@ -182,12 +182,12 @@ impl CanAdapter for SelectedPcanAdapter {
 #[ignore = "requires a preconfigured selected PCAN channel and an external loopback peer"]
 async fn selected_preconfigured_channel_passes_shared_conformance() {
     let adapter = SelectedPcanAdapter {
-        resource_id: std::env::var("SEEED_HAL_PCAN_RESOURCE_ID")
-            .expect("set SEEED_HAL_PCAN_RESOURCE_ID"),
+        resource_id: std::env::var("ROBOT_HAL_PCAN_RESOURCE_ID")
+            .expect("set ROBOT_HAL_PCAN_RESOURCE_ID"),
         inner: PcanAdapter::load().expect("load PCAN-Basic"),
     };
 
-    seeed_hal_testkit::run_can_adapter_conformance(&adapter)
+    robot_hal_testkit::run_can_adapter_conformance(&adapter)
         .await
         .expect("selected PCAN channel passes capability-gated conformance");
 }

@@ -1,11 +1,11 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use seeed_hal_camera::{
+use robot_hal_camera::{
     CameraCaptureSession, CameraControlDescriptor, CameraControlKind, CameraControlValue,
     CameraFormat, CameraFrame, CameraFrameMetadata, CameraPixelFormat, CameraPlaneLayout,
     CameraRequest, MAX_CAMERA_FRAME_BYTES, camera_capture_capability, camera_frames_shm_capability,
 };
-use seeed_hal_core::{
+use robot_hal_core::{
     CapabilitySet, Endpoint, ErrorCategory, HalError, HalResult, IdentityQuality,
     ResourceDescriptor, ResourceProperties, ResourceSelector, TransportKind, resolve_resource,
 };
@@ -225,7 +225,7 @@ fn start_worker(
     let shutdown = Arc::new(AtomicBool::new(false));
     let worker_shutdown = Arc::clone(&shutdown);
     let worker = thread::Builder::new()
-        .name("seeed-hal-mediafoundation-capture".to_owned())
+        .name("robot-hal-mediafoundation-capture".to_owned())
         .spawn(move || {
             worker(
                 symbolic_link,

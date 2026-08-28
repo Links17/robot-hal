@@ -1,7 +1,7 @@
 use std::fmt;
 
 use getrandom::fill;
-use seeed_hal_camera::{
+use robot_hal_camera::{
     CameraFormat, CameraPixelFormat, MAX_CAMERA_FRAME_BYTES, MAX_CAMERA_HEIGHT,
     MAX_CAMERA_SLOT_COUNT, MAX_CAMERA_WIDTH, MIN_CAMERA_SLOT_COUNT,
 };
@@ -28,7 +28,7 @@ pub enum PixelFormat {
 }
 
 impl TryFrom<u32> for PixelFormat {
-    type Error = seeed_hal_core::HalError;
+    type Error = robot_hal_core::HalError;
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         match value {

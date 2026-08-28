@@ -129,7 +129,7 @@ deferred to the owning integration gate.
   `vcan` fixtures covering sysfs-only virtual classification, Weak identity,
   conservative capabilities, missing-timing Attach errors, and deletion errors.
   Shared conformance now filters to the explicitly selected real interface from
-  `SEEED_HAL_SOCKETCAN_CONFORMANCE_INTERFACE`. Added focused static unit coverage
+  `ROBOT_HAL_SOCKETCAN_CONFORMANCE_INTERFACE`. Added focused static unit coverage
   for Classic data-timing absence, sample point/SJW/restart verification, full
   control-mode/termination fingerprints, and evidence-gated capabilities.
 

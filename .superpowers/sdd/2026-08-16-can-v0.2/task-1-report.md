@@ -3,7 +3,7 @@
 ## Status
 
 Implemented the v0.2 public CAN/CAN FD contract in the core and new
-`seeed-hal-can` crate.
+`robot-hal-can` crate.
 
 ## Implementation
 
@@ -31,11 +31,11 @@ final implementation gate after the remaining v0.2 tasks are complete.
 
 ## Files
 
-Changed: `Cargo.toml`, `crates/seeed-hal-core/src/identity.rs`,
-`crates/seeed-hal-core/src/lease.rs`, and
-`crates/seeed-hal-core/tests/core_contract.rs`.
+Changed: `Cargo.toml`, `crates/robot-hal-core/src/identity.rs`,
+`crates/robot-hal-core/src/lease.rs`, and
+`crates/robot-hal-core/tests/core_contract.rs`.
 
-Created: `crates/seeed-hal-can/Cargo.toml`, `src/lib.rs`, `src/frame.rs`,
+Created: `crates/robot-hal-can/Cargo.toml`, `src/lib.rs`, `src/frame.rs`,
 `src/config.rs`, `src/filter.rs`, `src/adapter.rs`, and
 `tests/can_contract.rs`.
 

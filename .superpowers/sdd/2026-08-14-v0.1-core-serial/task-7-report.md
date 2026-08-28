@@ -2,22 +2,22 @@
 
 ## Status
 
-Implemented the v0.1 Rust broker client and the `seeed-hal-broker` executable without adding product or device-protocol concepts. The implementation is Serial-only, library-first, Rust 2024/MSRV 1.85, and forbids unsafe code in the client and executable.
+Implemented the v0.1 Rust broker client and the `robot-hal-broker` executable without adding product or device-protocol concepts. The implementation is Serial-only, library-first, Rust 2024/MSRV 1.85, and forbids unsafe code in the client and executable.
 
 ## Files
 
 - Modified `Cargo.toml` to add the client and executable workspace members.
 - Modified `Cargo.lock` for the existing workspace dependencies newly activated by the executable.
-- Added `crates/seeed-hal-client/Cargo.toml`.
-- Added `crates/seeed-hal-client/src/lib.rs`.
-- Added `crates/seeed-hal-client/src/connection.rs`.
-- Added `crates/seeed-hal-client/src/serial.rs`.
-- Added `crates/seeed-hal-client/tests/client_contract.rs`.
-- Added `apps/seeed-hal-broker/Cargo.toml`.
-- Added `apps/seeed-hal-broker/build.rs` to capture Cargo's actual target triple.
-- Added `apps/seeed-hal-broker/src/main.rs`.
-- Added `apps/seeed-hal-broker/src/manifest.rs`.
-- Added `apps/seeed-hal-broker/tests/manifest.rs`.
+- Added `crates/robot-hal-client/Cargo.toml`.
+- Added `crates/robot-hal-client/src/lib.rs`.
+- Added `crates/robot-hal-client/src/connection.rs`.
+- Added `crates/robot-hal-client/src/serial.rs`.
+- Added `crates/robot-hal-client/tests/client_contract.rs`.
+- Added `apps/robot-hal-broker/Cargo.toml`.
+- Added `apps/robot-hal-broker/build.rs` to capture Cargo's actual target triple.
+- Added `apps/robot-hal-broker/src/main.rs`.
+- Added `apps/robot-hal-broker/src/manifest.rs`.
+- Added `apps/robot-hal-broker/tests/manifest.rs`.
 - Added this report.
 
 ## RED evidence
@@ -25,14 +25,14 @@ Implemented the v0.1 Rust broker client and the `seeed-hal-broker` executable wi
 1. Initial client contract:
 
    ```text
-   cargo test -p seeed-hal-client --test client_contract
-   error: package ID specification `seeed-hal-client` did not match any packages
+   cargo test -p robot-hal-client --test client_contract
+   error: package ID specification `robot-hal-client` did not match any packages
    ```
 
 2. Cancellation/backpressure contract after the initial client implementation:
 
    ```text
-   cargo test -p seeed-hal-client --test client_contract
+   cargo test -p robot-hal-client --test client_contract
    cancelling_a_caller_releases_pending_capacity_and_discards_its_response ... FAILED
    runtime.queue.full
    ```
@@ -42,14 +42,14 @@ Implemented the v0.1 Rust broker client and the `seeed-hal-broker` executable wi
 3. Initial executable manifest contract:
 
    ```text
-   cargo test -p seeed-hal-broker-app --test manifest
-   error: package ID specification `seeed-hal-broker-app` did not match any packages
+   cargo test -p robot-hal-broker-app --test manifest
+   error: package ID specification `robot-hal-broker-app` did not match any packages
    ```
 
 ## GREEN evidence
 
-- `cargo test -p seeed-hal-client --test client_contract`: 10 passed.
-- `cargo test -p seeed-hal-broker-app`: 3 passed.
+- `cargo test -p robot-hal-client --test client_contract`: 10 passed.
+- `cargo test -p robot-hal-broker-app`: 3 passed.
 - `cargo fmt --all --check`: passed.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`: passed.
 - `cargo test --workspace --all-features`: passed; the pre-existing physical loopback test remained explicitly ignored.
@@ -181,9 +181,9 @@ hardware-free default verification.
 
 ### GREEN evidence
 
-- `cargo test -p seeed-hal-client`: 21 passed, including 19 client contract tests.
-- `cargo test -p seeed-hal-broker`: 24 passed, including 23 broker contract tests.
-- `cargo test -p seeed-hal-broker-app`: 10 passed, including manifest, token trust, cooperative
+- `cargo test -p robot-hal-client`: 21 passed, including 19 client contract tests.
+- `cargo test -p robot-hal-broker`: 24 passed, including 23 broker contract tests.
+- `cargo test -p robot-hal-broker-app`: 10 passed, including manifest, token trust, cooperative
   shutdown/resource reuse, and connection-retention-bound coverage.
 - `cargo fmt --all --check`: passed.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`: passed.
@@ -195,12 +195,12 @@ hardware-free default verification.
 ### Files
 
 - Workspace/dependencies: `Cargo.toml`, `Cargo.lock`, broker/client/app Cargo manifests.
-- Broker library: `crates/seeed-hal-broker/src/lib.rs`,
-  `crates/seeed-hal-broker/src/connection.rs`.
-- Rust client: `crates/seeed-hal-client/src/connection.rs`,
-  `crates/seeed-hal-client/src/serial.rs`, `crates/seeed-hal-client/tests/client_contract.rs`.
-- Executable: `apps/seeed-hal-broker/src/main.rs`, `apps/seeed-hal-broker/src/manifest.rs`,
-  `apps/seeed-hal-broker/src/token.rs`, `apps/seeed-hal-broker/tests/manifest.rs`.
+- Broker library: `crates/robot-hal-broker/src/lib.rs`,
+  `crates/robot-hal-broker/src/connection.rs`.
+- Rust client: `crates/robot-hal-client/src/connection.rs`,
+  `crates/robot-hal-client/src/serial.rs`, `crates/robot-hal-client/tests/client_contract.rs`.
+- Executable: `apps/robot-hal-broker/src/main.rs`, `apps/robot-hal-broker/src/manifest.rs`,
+  `apps/robot-hal-broker/src/token.rs`, `apps/robot-hal-broker/tests/manifest.rs`.
 - Architecture: `docs/architecture/hal-architecture.md`.
 
 ### Target coverage and residual concerns
@@ -272,9 +272,9 @@ MSRV 1.85. Default verification remains hardware-free.
 
 ### GREEN evidence
 
-- `cargo test -p seeed-hal-client`: 24 passed, including 20 client contract tests.
-- `cargo test -p seeed-hal-broker`: 26 passed, including 24 broker contract tests.
-- `cargo test -p seeed-hal-broker-app`: 13 passed, including Unix token trust, cooperative shutdown,
+- `cargo test -p robot-hal-client`: 24 passed, including 20 client contract tests.
+- `cargo test -p robot-hal-broker`: 26 passed, including 24 broker contract tests.
+- `cargo test -p robot-hal-broker-app`: 13 passed, including Unix token trust, cooperative shutdown,
   connection retention, and manifest coverage.
 - `cargo fmt --all --check`: passed.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`: passed.
@@ -287,12 +287,12 @@ MSRV 1.85. Default verification remains hardware-free.
 ### Files
 
 - Workspace/dependencies: `Cargo.toml`, `Cargo.lock`, broker app and broker crate Cargo manifests.
-- Broker lifecycle/security: `crates/seeed-hal-broker/src/connection.rs`,
-  `crates/seeed-hal-broker/tests/broker_contract.rs`.
-- Client cancellation/scanner/tests: `crates/seeed-hal-client/src/connection.rs`,
-  `crates/seeed-hal-client/src/serial.rs`, `crates/seeed-hal-client/tests/client_contract.rs`.
-- Executable token/readiness: `apps/seeed-hal-broker/src/token.rs`,
-  `apps/seeed-hal-broker/src/main.rs`.
+- Broker lifecycle/security: `crates/robot-hal-broker/src/connection.rs`,
+  `crates/robot-hal-broker/tests/broker_contract.rs`.
+- Client cancellation/scanner/tests: `crates/robot-hal-client/src/connection.rs`,
+  `crates/robot-hal-client/src/serial.rs`, `crates/robot-hal-client/tests/client_contract.rs`.
+- Executable token/readiness: `apps/robot-hal-broker/src/token.rs`,
+  `apps/robot-hal-broker/src/main.rs`.
 - Architecture: `docs/architecture/hal-architecture.md`.
 
 ### Target coverage and residual concerns
@@ -361,11 +361,11 @@ MSRV 1.85. Default verification remains deterministic and hardware-free.
 
 ### GREEN evidence
 
-- `cargo test -p seeed-hal-client`: 26 passed, including 7 unit and 19 client contract tests.
-- `cargo test -p seeed-hal-broker`: 26 passed, including 24 broker contract tests.
-- `cargo test -p seeed-hal-broker-app`: 13 passed, including token, shutdown, retention, and manifest
+- `cargo test -p robot-hal-client`: 26 passed, including 7 unit and 19 client contract tests.
+- `cargo test -p robot-hal-broker`: 26 passed, including 24 broker contract tests.
+- `cargo test -p robot-hal-broker-app`: 13 passed, including token, shutdown, retention, and manifest
   coverage.
-- `cargo test -p seeed-hal-windows-file`: passed on the native host; its Windows-only test was
+- `cargo test -p robot-hal-windows-file`: passed on the native host; its Windows-only test was
   compile-checked by the cross-target gate.
 - `cargo fmt --all --check`: passed.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`: passed.
@@ -380,11 +380,11 @@ MSRV 1.85. Default verification remains deterministic and hardware-free.
 - Workspace/dependencies: `Cargo.toml`, `Cargo.lock`, broker app Cargo manifest.
 - Windows handle adapter: `adapters/windows-file/Cargo.toml`,
   `adapters/windows-file/src/lib.rs`.
-- Client terminal/read/write tests: `crates/seeed-hal-client/src/connection.rs`,
-  `crates/seeed-hal-client/tests/client_contract.rs`.
-- Broker lifecycle tests: `crates/seeed-hal-broker/tests/broker_contract.rs`.
-- Executable token and shutdown tests: `apps/seeed-hal-broker/src/token.rs`,
-  `apps/seeed-hal-broker/src/main.rs`.
+- Client terminal/read/write tests: `crates/robot-hal-client/src/connection.rs`,
+  `crates/robot-hal-client/tests/client_contract.rs`.
+- Broker lifecycle tests: `crates/robot-hal-broker/tests/broker_contract.rs`.
+- Executable token and shutdown tests: `apps/robot-hal-broker/src/token.rs`,
+  `apps/robot-hal-broker/src/main.rs`.
 - Architecture: `docs/architecture/hal-architecture.md`.
 
 ### Target coverage and residual concerns
@@ -427,7 +427,7 @@ existing adapter-local `SetFileInformationByHandle` wrapper remains the only nar
 - Command:
 
   ```text
-  cargo test -p seeed-hal-broker-app identity_reopen_shares_delete_without_weakening_the_primary_handle
+  cargo test -p robot-hal-broker-app identity_reopen_shares_delete_without_weakening_the_primary_handle
   ```
 
   Result: failed to compile with `E0432` because `windows_token_share_modes` did not exist. This was
@@ -436,9 +436,9 @@ existing adapter-local `SetFileInformationByHandle` wrapper remains the only nar
 
 ### GREEN evidence
 
-- `cargo test -p seeed-hal-broker-app identity_reopen_shares_delete_without_weakening_the_primary_handle`:
+- `cargo test -p robot-hal-broker-app identity_reopen_shares_delete_without_weakening_the_primary_handle`:
   1 passed.
-- `cargo test -p seeed-hal-broker-app -p seeed-hal-windows-file`: broker app 13 unit tests and 1
+- `cargo test -p robot-hal-broker-app -p robot-hal-windows-file`: broker app 13 unit tests and 1
   manifest integration test passed; the adapter has no native-host tests because its runtime test is
   Windows-only.
 - `cargo fmt --all --check`: passed.
@@ -452,7 +452,7 @@ existing adapter-local `SetFileInformationByHandle` wrapper remains the only nar
 
 ### Files
 
-- Windows token open/re-open policy and tests: `apps/seeed-hal-broker/src/token.rs`.
+- Windows token open/re-open policy and tests: `apps/robot-hal-broker/src/token.rs`.
 - Fix evidence: `.superpowers/sdd/2026-08-14-v0.1-core-serial/task-7-report.md`.
 
 ### Target coverage and residual concerns

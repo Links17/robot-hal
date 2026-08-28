@@ -1,5 +1,5 @@
-use seeed_hal_adapter_linux_gpio::identity::{GpioChipMetadata, identity_from_metadata};
-use seeed_hal_gpio::IdentityQuality;
+use robot_hal_adapter_linux_gpio::identity::{GpioChipMetadata, identity_from_metadata};
+use robot_hal_gpio::IdentityQuality;
 
 #[test]
 fn chip_kernel_name_is_a_strong_gpio_identity() {

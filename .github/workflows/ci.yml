@@ -31,9 +31,9 @@ jobs:
       # security backends. Each host builds its own OS implementation; neither
       # needs Linux pkg-config packages or a hardware device adapter build.
       - name: Run Linux-prerequisite-free Rust clippy (only the runtime closure that needs no Linux external native prerequisites)
-        run: cargo +1.85 clippy --all-targets -p seeed-hal-client -p seeed-hal-broker -p seeed-hal-can -p seeed-hal-camera -p seeed-hal-core -p seeed-hal-gpio -p seeed-hal-protocol -p seeed-hal-runtime -p seeed-hal-serial -p seeed-hal-testkit -p seeed-hal-usb -- -D warnings
+        run: cargo +1.85 clippy --all-targets -p robot-hal-client -p robot-hal-broker -p robot-hal-can -p robot-hal-camera -p robot-hal-core -p robot-hal-gpio -p robot-hal-protocol -p robot-hal-runtime -p robot-hal-serial -p robot-hal-testkit -p robot-hal-usb -- -D warnings
       - name: Run Linux-prerequisite-free Rust tests (only the runtime closure that needs no Linux external native prerequisites)
-        run: cargo +1.85 test -p seeed-hal-client -p seeed-hal-broker -p seeed-hal-can -p seeed-hal-camera -p seeed-hal-core -p seeed-hal-gpio -p seeed-hal-protocol -p seeed-hal-runtime -p seeed-hal-serial -p seeed-hal-testkit -p seeed-hal-usb
+        run: cargo +1.85 test -p robot-hal-client -p robot-hal-broker -p robot-hal-can -p robot-hal-camera -p robot-hal-core -p robot-hal-gpio -p robot-hal-protocol -p robot-hal-runtime -p robot-hal-serial -p robot-hal-testkit -p robot-hal-usb
       - name: Run frozen Python and release tests
         run: |
           uv run --project bindings/python --python 3.11 --frozen pytest -q
@@ -70,7 +70,7 @@ jobs:
         run: ./scripts/ci/install-linux-native-prerequisites.sh
       - name: Run Windows shared-memory runtime tests
         if: ${{ runner.os == 'Windows' }}
-        run: cargo +1.85 test -p seeed-hal-adapter-shared-memory --all-features platform::windows_tests -- --nocapture
+        run: cargo +1.85 test -p robot-hal-adapter-shared-memory --all-features platform::windows_tests -- --nocapture
       - name: Build production broker
         shell: python
         run: |
@@ -78,7 +78,7 @@ jobs:
           import sys
           from pathlib import Path
 
-          broker = Path("target/debug/seeed-hal-broker")
+          broker = Path("target/debug/robot-hal-broker")
           if sys.platform == "win32":
               broker = broker.with_suffix(".exe")
           manifest = Path("ci-evidence/production/broker-manifest.json")
@@ -89,7 +89,7 @@ jobs:
                   "+1.85",
                   "build",
                   "-p",
-                  "seeed-hal-broker-app",
+                  "robot-hal-broker-app",
                   "--no-default-features",
                   "--features",
                   "${{ matrix.features }}",
@@ -124,7 +124,7 @@ jobs:
           import sys
           from pathlib import Path
 
-          broker = Path("target/debug/seeed-hal-broker")
+          broker = Path("target/debug/robot-hal-broker")
           if sys.platform == "win32":
               broker = broker.with_suffix(".exe")
           report = Path("ci-evidence/virtual-conformance.json")
@@ -135,7 +135,7 @@ jobs:
                   "+1.85",
                   "build",
                   "-p",
-                  "seeed-hal-broker-app",
+                  "robot-hal-broker-app",
                   "--no-default-features",
                   "--features",
                   "virtual-adapters",

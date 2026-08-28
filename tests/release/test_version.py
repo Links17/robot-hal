@@ -25,11 +25,11 @@ def _write_version_repo(
     cargo_version: str = "0.5.0-rc.1",
 ) -> Path:
     package_root = root / "bindings" / "python"
-    package = package_root / "seeed_hal"
+    package = package_root / "robot_hal"
     package.mkdir(parents=True)
     (package_root / "pyproject.toml").write_text(
         "[project]\n"
-        'name = "seeed-hal"\n'
+        'name = "robot-hal"\n'
         f'version = "{project_version}"\n',
         encoding="utf-8",
     )
@@ -38,7 +38,7 @@ def _write_version_repo(
         if init_body is not None
         else (
             "from importlib.metadata import version as _distribution_version\n"
-            '__version__ = _distribution_version("seeed-hal")\n'
+            '__version__ = _distribution_version("robot-hal")\n'
             f"__version__ = {public_version!r}\n"
         ),
         encoding="utf-8",
@@ -46,7 +46,7 @@ def _write_version_repo(
     cargo = root / "cargo"
     cargo.write_text(
         "#!/bin/sh\n"
-        f"printf '%s\\n' {json.dumps(json.dumps({'packages': [{'name': 'seeed-hal-runtime', 'version': cargo_version}]}))}\n",
+        f"printf '%s\\n' {json.dumps(json.dumps({'packages': [{'name': 'robot-hal-runtime', 'version': cargo_version}]}))}\n",
         encoding="utf-8",
     )
     cargo.chmod(0o755)
@@ -97,7 +97,7 @@ def test_check_version_reports_a_stable_package_mismatch(tmp_path: Path) -> None
 
     assert result.returncode == 1
     assert result.stderr == (
-        "release.version.mismatch: seeed-hal-runtime is 0.4.0, "
+        "release.version.mismatch: robot-hal-runtime is 0.4.0, "
         "expected 0.5.0-rc.1\n"
     )
 
@@ -109,7 +109,7 @@ def test_check_version_rejects_public_python_version_drift(tmp_path: Path) -> No
 
     assert result.returncode == 1
     assert result.stderr == (
-        "release.version.mismatch: seeed-hal __version__ is 0.5.0rc2, "
+        "release.version.mismatch: robot-hal __version__ is 0.5.0rc2, "
         "expected 0.5.0rc1\n"
     )
 

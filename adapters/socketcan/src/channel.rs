@@ -8,10 +8,10 @@ use can_hal::{
     Transmit, TransmitFd,
 };
 use can_hal_socketcan::{SocketCanChannel as BackendChannel, SocketCanDriver, SocketCanError};
-use seeed_hal_can::{
+use robot_hal_can::{
     CanActiveConfig, CanBusStatus, CanChannel, CanFrame, CanId, CanMode, ReceivedCanFrame,
 };
-use seeed_hal_core::{ErrorCategory, HalError, HalResult, ResourceDescriptor};
+use robot_hal_core::{ErrorCategory, HalError, HalResult, ResourceDescriptor};
 use socketcan::{
     CanAnyFrame, CanFdSocket, CanRemoteFrame, EmbeddedFrame, ExtendedId, Id, Socket, StandardId,
 };
@@ -287,22 +287,22 @@ fn from_socketcan_frame(frame: CanAnyFrame) -> HalResult<CanFrame> {
             let bits = frame.error_bits();
             let mut classes = Vec::new();
             for (mask, class) in [
-                (0x0001, seeed_hal_can::CanErrorClass::TxTimeout),
-                (0x0002, seeed_hal_can::CanErrorClass::LostArbitration),
-                (0x0004, seeed_hal_can::CanErrorClass::Controller),
-                (0x0008, seeed_hal_can::CanErrorClass::Protocol),
-                (0x0010, seeed_hal_can::CanErrorClass::Transceiver),
-                (0x0020, seeed_hal_can::CanErrorClass::NoAcknowledgement),
-                (0x0040, seeed_hal_can::CanErrorClass::BusOff),
-                (0x0080, seeed_hal_can::CanErrorClass::BusError),
-                (0x0100, seeed_hal_can::CanErrorClass::Restarted),
+                (0x0001, robot_hal_can::CanErrorClass::TxTimeout),
+                (0x0002, robot_hal_can::CanErrorClass::LostArbitration),
+                (0x0004, robot_hal_can::CanErrorClass::Controller),
+                (0x0008, robot_hal_can::CanErrorClass::Protocol),
+                (0x0010, robot_hal_can::CanErrorClass::Transceiver),
+                (0x0020, robot_hal_can::CanErrorClass::NoAcknowledgement),
+                (0x0040, robot_hal_can::CanErrorClass::BusOff),
+                (0x0080, robot_hal_can::CanErrorClass::BusError),
+                (0x0100, robot_hal_can::CanErrorClass::Restarted),
             ] {
                 if bits & mask != 0 {
                     classes.push(class);
                 }
             }
             if classes.is_empty() {
-                classes.push(seeed_hal_can::CanErrorClass::Other);
+                classes.push(robot_hal_can::CanErrorClass::Other);
             }
             CanFrame::error(classes, frame.data().to_vec())
         }
@@ -502,11 +502,11 @@ fn closed(operation: &'static str, descriptor: &ResourceDescriptor) -> HalError 
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use seeed_hal_can::{
+    use robot_hal_can::{
         CanBusState, CanFilter, CanFilterSet, CanFrameClasses, CanIdFormat, IdentityQuality,
         can_classic_capability, can_fd_capability,
     };
-    use seeed_hal_core::{CapabilitySet, Endpoint, ResourceId, ResourceProperties, TransportKind};
+    use robot_hal_core::{CapabilitySet, Endpoint, ResourceId, ResourceProperties, TransportKind};
     use socketcan::nl::{CanInterface, Mtu};
 
     use super::*;

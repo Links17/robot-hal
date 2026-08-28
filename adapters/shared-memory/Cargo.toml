@@ -1,5 +1,5 @@
 [package]
-name = "seeed-hal-adapter-shared-memory"
+name = "robot-hal-adapter-shared-memory"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,8 +12,8 @@ sha2 = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
 zeroize = { workspace = true }
-seeed-hal-camera = { path = "../../crates/seeed-hal-camera", version = "=0.5.0-rc.1"}
-seeed-hal-core = { path = "../../crates/seeed-hal-core", version = "=0.5.0-rc.1"}
+robot-hal-camera = { path = "../../crates/robot-hal-camera", version = "=0.5.0-rc.1"}
+robot-hal-core = { path = "../../crates/robot-hal-core", version = "=0.5.0-rc.1"}
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

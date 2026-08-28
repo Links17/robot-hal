@@ -1,5 +1,5 @@
-use seeed_hal_adapter_pcan::identity::{PcanChannelMetadata, identity_from_metadata};
-use seeed_hal_can::IdentityQuality;
+use robot_hal_adapter_pcan::identity::{PcanChannelMetadata, identity_from_metadata};
+use robot_hal_can::IdentityQuality;
 
 #[test]
 fn vendor_device_identity_is_strong_and_channel_specific() {
@@ -68,7 +68,7 @@ fn zero_vendor_device_id_is_not_treated_as_stable_evidence() {
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
 #[test]
 fn unsupported_platform_load_is_structured() {
-    let error = seeed_hal_adapter_pcan::PcanAdapter::load()
+    let error = robot_hal_adapter_pcan::PcanAdapter::load()
         .expect_err("PCAN must be unavailable on unsupported platforms");
 
     assert_eq!(error.name().as_str(), "can.adapter.unavailable");

@@ -72,7 +72,7 @@ Attestations, existing protobuf broker conformance runner.
 - Modify: `Cargo.toml`
 - Modify: every workspace member `Cargo.toml`
 - Modify: `bindings/python/pyproject.toml`
-- Modify: `bindings/python/seeed_hal/__init__.py`
+- Modify: `bindings/python/robot_hal/__init__.py`
 - Modify: `Cargo.lock`
 
 **Interfaces:**
@@ -184,7 +184,7 @@ required_adapters = ["mediafoundation", "nusb", "serialport", "windows-gpio"]
 - [ ] **Step 4: Unify package versions**
 
 Add `version = "0.5.0-rc.1"` under `[workspace.package]`; replace each Rust member's literal
-`version` with `version.workspace = true`. Keep `apps/seeed-hal-broker` as an executable artifact,
+`version` with `version.workspace = true`. Keep `apps/robot-hal-broker` as an executable artifact,
 not a crates.io package, with `publish = false`. All library and adapter crates remain packageable.
 Every path dependency between packageable crates receives `version = "=0.5.0-rc.1"` in addition to
 `path`. Set Python project version to `0.5.0rc1` and expose:
@@ -192,7 +192,7 @@ Every path dependency between packageable crates receives `version = "=0.5.0-rc.
 ```python
 from importlib.metadata import version as _distribution_version
 
-__version__ = _distribution_version("seeed-hal")
+__version__ = _distribution_version("robot-hal")
 ```
 
 Add `"__version__"` to `__all__`. Regenerate `Cargo.lock`.
@@ -203,7 +203,7 @@ Add `"__version__"` to `__all__`. Regenerate `Cargo.lock`.
 distribution metadata fixture. It rejects a package mismatch as:
 
 ```text
-release.version.mismatch: seeed-hal-runtime is 0.4.0, expected 0.5.0-rc.1
+release.version.mismatch: robot-hal-runtime is 0.4.0, expected 0.5.0-rc.1
 ```
 
 Wrappers must only locate the repository and call:
@@ -221,7 +221,7 @@ uv run --project bindings/python --python 3.11 --frozen \
 python3 scripts/release/release_tool.py check-version \
   --tag v0.5.0-rc.1 --repo-root .
 cargo metadata --no-deps --format-version 1 >/dev/null
-cargo test -p seeed-hal-broker-app --test manifest
+cargo test -p robot-hal-broker-app --test manifest
 uv run --project bindings/python --python 3.11 --frozen \
   pytest -q bindings/python/tests
 ```
@@ -238,9 +238,9 @@ git commit -m "build(release): unify v0.5 release candidate versions"
 ### Task 2: Validate production broker composition against the matrix
 
 **Files:**
-- Modify: `apps/seeed-hal-broker/src/manifest.rs`
-- Modify: `apps/seeed-hal-broker/tests/manifest.rs`
-- Modify: `apps/seeed-hal-broker/Cargo.toml`
+- Modify: `apps/robot-hal-broker/src/manifest.rs`
+- Modify: `apps/robot-hal-broker/tests/manifest.rs`
+- Modify: `apps/robot-hal-broker/Cargo.toml`
 - Modify: `scripts/release/release_tool.py`
 - Create: `tests/release/test_broker_manifest.py`
 
@@ -294,12 +294,12 @@ require every current field and compare exact lists. Never infer a missing adapt
 On macOS:
 
 ```bash
-cargo build -p seeed-hal-broker-app --no-default-features \
+cargo build -p robot-hal-broker-app --no-default-features \
   --features serialport,nusb,avfoundation
-target/debug/seeed-hal-broker --manifest > target/macos-manifest.json
+target/debug/robot-hal-broker --manifest > target/macos-manifest.json
 python3 scripts/release/release_tool.py verify-broker-manifest \
   --manifest target/macos-manifest.json --target macos \
-  --targets release/targets.toml --artifact target/debug/seeed-hal-broker
+  --targets release/targets.toml --artifact target/debug/robot-hal-broker
 ```
 
 In hosted Linux/Windows jobs, run the equivalent matrix-derived commands. Locally, run the Rust
@@ -308,7 +308,7 @@ manifest tests for non-host branches.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add apps/seeed-hal-broker scripts/release/release_tool.py tests/release
+git add apps/robot-hal-broker scripts/release/release_tool.py tests/release
 git commit -m "test(release): verify broker composition manifests"
 ```
 
@@ -377,11 +377,11 @@ the connection must remain well-defined according to the broker contract.
 - [ ] **Step 4: Run all four black-box profiles**
 
 ```bash
-cargo build -p seeed-hal-broker-app --features virtual-adapters
+cargo build -p robot-hal-broker-app --features virtual-adapters
 for minor in 0 1 2 3; do
   uv run --project bindings/python --python 3.11 --frozen python \
     tests/conformance/run-broker-conformance.py \
-    --broker target/debug/seeed-hal-broker --protocol-minor "$minor"
+    --broker target/debug/robot-hal-broker --protocol-minor "$minor"
 done
 ```
 
@@ -479,7 +479,7 @@ git commit -m "feat(release): generate and validate artifact manifests"
 **Interfaces:**
 - Produces CLI:
   `package-broker --tag --target --targets --binary --output-dir --manifest`.
-- Archive contains only `seeed-hal-broker[.exe]`, `broker-manifest.json`, `LICENSE`, and
+- Archive contains only `robot-hal-broker[.exe]`, `broker-manifest.json`, `LICENSE`, and
   `README.md` below one versioned root directory.
 
 - [ ] **Step 1: Write failing package-content tests**
@@ -488,10 +488,10 @@ git commit -m "feat(release): generate and validate artifact manifests"
 def test_broker_archive_has_exact_files(tmp_path: Path) -> None:
     archive = package_fixture_broker(tmp_path, target="linux")
     assert archive_members(archive) == (
-        "seeed-hal-broker-v0.5.0-rc.1-x86_64-unknown-linux-gnu/LICENSE",
-        "seeed-hal-broker-v0.5.0-rc.1-x86_64-unknown-linux-gnu/README.md",
-        "seeed-hal-broker-v0.5.0-rc.1-x86_64-unknown-linux-gnu/broker-manifest.json",
-        "seeed-hal-broker-v0.5.0-rc.1-x86_64-unknown-linux-gnu/seeed-hal-broker",
+        "robot-hal-broker-v0.5.0-rc.1-x86_64-unknown-linux-gnu/LICENSE",
+        "robot-hal-broker-v0.5.0-rc.1-x86_64-unknown-linux-gnu/README.md",
+        "robot-hal-broker-v0.5.0-rc.1-x86_64-unknown-linux-gnu/broker-manifest.json",
+        "robot-hal-broker-v0.5.0-rc.1-x86_64-unknown-linux-gnu/robot-hal-broker",
     )
 ```
 
@@ -510,11 +510,11 @@ attributes. Before packaging, run `verify-broker-manifest` against the binary an
 - [ ] **Step 4: Package the local macOS broker and verify it**
 
 ```bash
-cargo build --release -p seeed-hal-broker-app --no-default-features \
+cargo build --release -p robot-hal-broker-app --no-default-features \
   --features serialport,nusb,avfoundation
-target/release/seeed-hal-broker --manifest > target/release/broker-manifest.json
+target/release/robot-hal-broker --manifest > target/release/broker-manifest.json
 scripts/release/package-broker.sh v0.5.0-rc.1 macos \
-  target/release/seeed-hal-broker target/release/broker-manifest.json target/release-artifacts
+  target/release/robot-hal-broker target/release/broker-manifest.json target/release-artifacts
 python3 scripts/release/release_tool.py verify-static \
   --artifacts-dir target/release-artifacts
 ```
@@ -558,7 +558,7 @@ def test_rust_bundle_contains_every_publishable_package(metadata: dict) -> None:
 
 def test_python_artifact_names_use_pep440() -> None:
     assert wheel_name(ReleaseVersion.parse("v0.5.0-rc.3")) == (
-        "seeed_hal-0.5.0rc3-py3-none-any.whl"
+        "robot_hal-0.5.0rc3-py3-none-any.whl"
     )
 ```
 
@@ -601,10 +601,10 @@ manifest with a bounded subprocess timeout. Install the wheel into a temporary v
 
 ```python
 import importlib.metadata
-import seeed_hal
+import robot_hal
 
-assert importlib.metadata.version("seeed-hal") == "0.5.0rc1"
-assert seeed_hal.__version__ == "0.5.0rc1"
+assert importlib.metadata.version("robot-hal") == "0.5.0rc1"
+assert robot_hal.__version__ == "0.5.0rc1"
 ```
 
 - [ ] **Step 6: Run focused tests and package dry-run**
@@ -900,7 +900,7 @@ uv run --project bindings/python --python 3.11 --frozen pytest -q
 ```bash
 rm -rf target/release-artifacts
 scripts/release/package-broker.sh v0.5.0-rc.1 macos \
-  target/release/seeed-hal-broker target/release/broker-manifest.json \
+  target/release/robot-hal-broker target/release/broker-manifest.json \
   target/release-artifacts
 scripts/release/package-rust.sh v0.5.0-rc.1 target/release-artifacts
 scripts/release/package-python.sh v0.5.0-rc.1 target/release-artifacts

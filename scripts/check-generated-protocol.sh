@@ -2,13 +2,13 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-output_dir="$repo_root/bindings/python/seeed_hal/proto"
-output_path="bindings/python/seeed_hal/proto"
-temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/seeed-hal-proto.XXXXXX")"
+output_dir="$repo_root/bindings/python/robot_hal/proto"
+output_path="bindings/python/robot_hal/proto"
+temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/robot-hal-proto.XXXXXX")"
 generated_dir="$temporary_root/proto"
 trap 'rm -rf "$temporary_root"' EXIT
 
-SEEED_HAL_PROTO_OUTPUT_DIR="$generated_dir" \
+ROBOT_HAL_PROTO_OUTPUT_DIR="$generated_dir" \
   "$repo_root/scripts/generate-protocol.sh"
 
 failed=0

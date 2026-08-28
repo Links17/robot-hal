@@ -63,11 +63,11 @@
 
 ### TDD commands
 
-- Red: `cargo test -p seeed-hal-protocol camera_next_frame_lease_decoder_rejects_zero_sequence_and_preserves_validated_wire_fields`
+- Red: `cargo test -p robot-hal-protocol camera_next_frame_lease_decoder_rejects_zero_sequence_and_preserves_validated_wire_fields`
   failed because zero sequence returned `Ok(None)`.
-- Red: `cargo test -p seeed-hal-client camera_response_validation_rejects_invalid_associated_payloads`
+- Red: `cargo test -p robot-hal-client camera_response_validation_rejects_invalid_associated_payloads`
   failed because malformed Camera responses returned `Ok(())`.
-- Red: `cargo test -p seeed-hal-adapter-shared-memory independently_reopened_mapping_only_returns_an_owned_copy`
+- Red: `cargo test -p robot-hal-adapter-shared-memory independently_reopened_mapping_only_returns_an_owned_copy`
   failed to compile because validated mapping layout exposed no `slot_count`.
 - Green: reran those focused commands successfully after the minimum fixes.
 
@@ -86,7 +86,7 @@
 ### Defect TDD commands
 
 - Rust red:
-  `cargo test -p seeed-hal-client --test client_contract camera_rejects_another_session_mapping_before_frame_lease_admission`
+  `cargo test -p robot-hal-client --test client_contract camera_rejects_another_session_mapping_before_frame_lease_admission`
   failed because the fake broker observed `CameraNextFrameLeaseRequest`.
 - Rust green: reran the same command successfully after binding the accepted
   mapping identity to each `RemoteCameraHandle`.
@@ -97,10 +97,10 @@
   reader precondition.
 - Coverage:
   `cargo fmt --all --check`;
-  `cargo clippy -p seeed-hal-client --tests -- -D warnings`;
-  `cargo test -p seeed-hal-client --test client_contract`;
-  `cargo test -p seeed-hal-protocol`;
-  `cargo test -p seeed-hal-adapter-shared-memory`; and
+  `cargo clippy -p robot-hal-client --tests -- -D warnings`;
+  `cargo test -p robot-hal-client --test client_contract`;
+  `cargo test -p robot-hal-protocol`;
+  `cargo test -p robot-hal-adapter-shared-memory`; and
   `uv run pytest tests/test_camera_contract.py`.
 
 ## Python controls discovery follow-up
@@ -108,7 +108,7 @@
 ### API decision
 
 - Python now exposes immutable `CameraControlDescriptor`, `ControlRange`, and
-  `ControlEnumValues` values from `seeed_hal`. A descriptor keeps the
+  `ControlEnumValues` values from `robot_hal`. A descriptor keeps the
   standardized `ControlKind`, access and auto flags, one validated range or
   enum domain, current-value availability, and an optional adapter diagnostic.
 - `CameraSession.controls()` is the public discovery API. It delegates only to
@@ -127,7 +127,7 @@
 - Red:
   `uv run pytest tests/test_camera_contract.py -k 'control_discovery or fake_broker_wires_capture_mapping_lease_controls_and_close or malformed_camera_controls_response'`
   failed at collection because `CameraControlDescriptor` was absent from the
-  public `seeed_hal` API.
+  public `robot_hal` API.
 - Green: reran that command successfully after the minimum public models,
   controls RPC, and strict response conversion were added: 3 passed.
 - Focused Camera coverage:

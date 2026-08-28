@@ -1,7 +1,7 @@
 use std::{fmt::Write, string::String};
 
 use getrandom::fill;
-use seeed_hal_camera::CameraFormat;
+use robot_hal_camera::CameraFormat;
 
 use crate::layout::{
     FrameMetadata, HEADER_BYTES, LAYOUT_MAJOR, LAYOUT_MINOR, MAGIC, MAX_PLANES, MappingDescriptor,
@@ -62,7 +62,7 @@ impl BrokerMapping {
         let mut name_bytes = [0_u8; 9];
         fill(&mut name_bytes)
             .map_err(|error| internal("shared_memory.create", error.to_string()))?;
-        let mut name = String::from("/seeed-hal-");
+        let mut name = String::from("/robot-hal-");
         for byte in name_bytes {
             write!(&mut name, "{byte:02x}")
                 .expect("writing hexadecimal data to a String cannot fail");
@@ -935,9 +935,9 @@ fn validate_header(
     let format = PixelFormat::try_from(format)?;
     let camera_format = CameraFormat::new(
         match format {
-            PixelFormat::Nv12 => seeed_hal_camera::CameraPixelFormat::Nv12,
-            PixelFormat::Yuyv => seeed_hal_camera::CameraPixelFormat::Yuyv,
-            PixelFormat::Mjpeg => seeed_hal_camera::CameraPixelFormat::Mjpeg,
+            PixelFormat::Nv12 => robot_hal_camera::CameraPixelFormat::Nv12,
+            PixelFormat::Yuyv => robot_hal_camera::CameraPixelFormat::Yuyv,
+            PixelFormat::Mjpeg => robot_hal_camera::CameraPixelFormat::Mjpeg,
         },
         width,
         height,

@@ -2,7 +2,7 @@
 
 ## Scope
 
-v0.5 makes Seeed HAL software releases repeatable and independently verifiable across macOS,
+v0.5 makes Robot HAL software releases repeatable and independently verifiable across macOS,
 Linux, and Windows. It adds no hardware class and does not freeze the v1.0 API. Its deliverable is
 a layered GitHub Actions pipeline that runs source and platform conformance, builds release
 candidate artifacts for the broker, Rust crates, and Python client, verifies those artifacts in
@@ -84,12 +84,12 @@ not a reason to wait indefinitely.
 
 After all platform conformance jobs pass, the pipeline builds:
 
-- `seeed-hal-broker-v0.5.0-rc.N-<target>.tar.gz` on macOS/Linux;
-- `seeed-hal-broker-v0.5.0-rc.N-<target>.zip` on Windows;
-- `seeed-hal-crates-v0.5.0-rc.N.tar.gz`, a complete Rust workspace source
+- `robot-hal-broker-v0.5.0-rc.N-<target>.tar.gz` on macOS/Linux;
+- `robot-hal-broker-v0.5.0-rc.N-<target>.zip` on Windows;
+- `robot-hal-crates-v0.5.0-rc.N.tar.gz`, a complete Rust workspace source
   bundle;
-- `seeed_hal-0.5.0rcN-py3-none-any.whl`;
-- `seeed_hal-0.5.0rcN.tar.gz`;
+- `robot_hal-0.5.0rcN-py3-none-any.whl`;
+- `robot_hal-0.5.0rcN.tar.gz`;
 - `SHA256SUMS`;
 - `release-manifest.json`;
 - `conformance-report.json`.
@@ -99,7 +99,7 @@ required adapters, and archive format. Build scripts consume this file rather th
 platform lists.
 
 Rust packaging freezes the controlled, tracked workspace source set and creates
-`seeed-hal-crates-v0.5.0-rc.N.tar.gz`. The archive retains the root
+`robot-hal-crates-v0.5.0-rc.N.tar.gz`. The archive retains the root
 `Cargo.toml`, `Cargo.lock`, every workspace member, and necessary release
 files so internal `path + version` dependencies resolve without registry
 availability. It rejects symlinks, unsafe or unexpected paths, missing

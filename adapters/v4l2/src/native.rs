@@ -1,11 +1,11 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use seeed_hal_camera::{
+use robot_hal_camera::{
     CameraCaptureSession, CameraControlDescriptor, CameraControlKind, CameraControlValue,
     CameraFormat, CameraFrame, CameraFrameMetadata, CameraPixelFormat, CameraPlaneLayout,
     CameraRequest, MAX_CAMERA_FRAME_BYTES, camera_capture_capability, camera_frames_shm_capability,
 };
-use seeed_hal_core::{
+use robot_hal_core::{
     CapabilitySet, Endpoint, ErrorCategory, HalError, HalResult, IdentityQuality,
     ResourceDescriptor, ResourceProperties, ResourceSelector, TransportKind, resolve_resource,
 };
@@ -63,7 +63,7 @@ pub(super) fn enumerate_sync() -> HalResult<Vec<ResourceDescriptor>> {
 pub(super) fn open_sync(
     selector: &ResourceSelector,
     request: &CameraRequest,
-    claims: Arc<Mutex<BTreeSet<seeed_hal_core::ResourceId>>>,
+    claims: Arc<Mutex<BTreeSet<robot_hal_core::ResourceId>>>,
 ) -> HalResult<Box<dyn CameraCaptureSession>> {
     request.format().validate()?;
     let descriptor = resolve_resource(
@@ -234,7 +234,7 @@ fn start_worker(
     let shutdown = Arc::new(AtomicBool::new(false));
     let worker_shutdown = Arc::clone(&shutdown);
     let worker = thread::Builder::new()
-        .name("seeed-hal-v4l2-capture".to_owned())
+        .name("robot-hal-v4l2-capture".to_owned())
         .spawn(move || {
             capture_worker(
                 requested,
@@ -531,7 +531,7 @@ struct V4l2Session {
     sender: Option<mpsc::SyncSender<Command>>,
     worker: Option<thread::JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
-    claims: Arc<Mutex<BTreeSet<seeed_hal_core::ResourceId>>>,
+    claims: Arc<Mutex<BTreeSet<robot_hal_core::ResourceId>>>,
     claim_quarantined: bool,
     closed: bool,
 }
@@ -763,7 +763,7 @@ fn worker_failed(operation: &'static str, error: tokio::task::JoinError) -> HalE
 #[cfg(test)]
 mod tests {
     use super::identity_from_serial_or_sysfs_path;
-    use seeed_hal_core::IdentityQuality;
+    use robot_hal_core::IdentityQuality;
 
     #[test]
     fn serial_identity_is_strong_and_distinct_from_transient_endpoint() {

@@ -3,12 +3,12 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
-use seeed_hal_adapter_socketcan::SocketCanAdapter;
-use seeed_hal_can::{
+use robot_hal_adapter_socketcan::SocketCanAdapter;
+use robot_hal_can::{
     CanAdapter, CanBitTiming, CanChannel, CanConfigureConfig, CanLinkExpectation, CanMode,
     CanOpenConfig, IdentityQuality, ResourceDescriptor, ResourceSelector, can_configure_capability,
 };
-use seeed_hal_core::{ErrorCategory, HalResult};
+use robot_hal_core::{ErrorCategory, HalResult};
 use socketcan::nl::{CanCtrlMode, CanInterface, InterfaceDetails, Mtu};
 
 static NEXT_INTERFACE: AtomicU32 = AtomicU32::new(0);
@@ -169,10 +169,10 @@ impl CanAdapter for SelectedSocketCanAdapter {
 }
 
 #[tokio::test]
-#[ignore = "requires a provisioned real CAN interface selected by SEEED_HAL_SOCKETCAN_CONFORMANCE_INTERFACE"]
+#[ignore = "requires a provisioned real CAN interface selected by ROBOT_HAL_SOCKETCAN_CONFORMANCE_INTERFACE"]
 async fn selected_real_interface_passes_shared_can_conformance() {
-    let interface = std::env::var("SEEED_HAL_SOCKETCAN_CONFORMANCE_INTERFACE")
-        .expect("set SEEED_HAL_SOCKETCAN_CONFORMANCE_INTERFACE to a provisioned real CAN link");
+    let interface = std::env::var("ROBOT_HAL_SOCKETCAN_CONFORMANCE_INTERFACE")
+        .expect("set ROBOT_HAL_SOCKETCAN_CONFORMANCE_INTERFACE to a provisioned real CAN link");
     let adapter = SelectedSocketCanAdapter {
         interface,
         inner: SocketCanAdapter::new(),
@@ -187,7 +187,7 @@ async fn selected_real_interface_passes_shared_can_conformance() {
         .expect("selected SocketCAN interface is present");
     assert_eq!(descriptor.properties().get("virtual"), Some("false"));
 
-    seeed_hal_testkit::run_can_adapter_conformance(&adapter)
+    robot_hal_testkit::run_can_adapter_conformance(&adapter)
         .await
         .expect("selected SocketCAN interface passes shared conformance");
 }
@@ -326,10 +326,10 @@ impl Drop for UpStateRestore<'_> {
 }
 
 #[tokio::test]
-#[ignore = "requires a provisioned real CAN interface selected by SEEED_HAL_SOCKETCAN_CONFORMANCE_INTERFACE and optional CAP_NET_ADMIN"]
+#[ignore = "requires a provisioned real CAN interface selected by ROBOT_HAL_SOCKETCAN_CONFORMANCE_INTERFACE and optional CAP_NET_ADMIN"]
 async fn selected_real_configure_reports_permission_or_close_retries_after_conflict() {
-    let interface_name = std::env::var("SEEED_HAL_SOCKETCAN_CONFORMANCE_INTERFACE")
-        .expect("set SEEED_HAL_SOCKETCAN_CONFORMANCE_INTERFACE to a provisioned real CAN link");
+    let interface_name = std::env::var("ROBOT_HAL_SOCKETCAN_CONFORMANCE_INTERFACE")
+        .expect("set ROBOT_HAL_SOCKETCAN_CONFORMANCE_INTERFACE to a provisioned real CAN link");
     let adapter = SocketCanAdapter::new();
     let descriptor = descriptor_for(&adapter, &interface_name).await;
     assert!(

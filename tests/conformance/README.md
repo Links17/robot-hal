@@ -5,17 +5,17 @@ compiled with the test-only `virtual-adapters` feature; there is no runtime swit
 production adapters.
 
 ```bash
-cargo build -p seeed-hal-broker-app --features virtual-adapters
+cargo build -p robot-hal-broker-app --features virtual-adapters
 uv run --project bindings/python --python 3.11 --frozen pytest -q \
   tests/conformance/test_runner_contract.py \
   tests/conformance/test_minor_matrix.py
 uv run --project bindings/python --frozen python \
   tests/conformance/run-broker-conformance.py \
-  --broker target/debug/seeed-hal-broker \
+  --broker target/debug/robot-hal-broker \
   --protocol-minor 3
 ```
 
-On Windows, pass `target/debug/seeed-hal-broker.exe`. The Python 3.11 runner creates a unique local
+On Windows, pass `target/debug/robot-hal-broker.exe`. The Python 3.11 runner creates a unique local
 endpoint and startup token, waits with bounded deadlines, exchanges length-prefixed protobuf
 frames, and removes its token, endpoint, temporary directory, and child process. `--protocol-minor`
 is an exact offer and must be one of 0, 1, 2, or 3. Profiles are additive: minor 0 exercises Serial;

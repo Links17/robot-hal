@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Repository-level instructions for Seeed HAL. Keep changes small, factual, testable, and reusable outside any one product.
+Repository-level instructions for Robot HAL. Keep changes small, factual, testable, and reusable outside any one product.
 
 ## Priority
 
@@ -11,7 +11,7 @@ Repository-level instructions for Seeed HAL. Keep changes small, factual, testab
 
 ## Non-negotiable responsibility seam
 
-Seeed HAL abstracts hardware access, transport behavior, and resource lifecycle. It must not contain product or device-protocol business logic.
+Robot HAL abstracts hardware access, transport behavior, and resource lifecycle. It must not contain product or device-protocol business logic.
 
 Allowed concepts include:
 
@@ -34,7 +34,7 @@ If a proposed change requires a forbidden concept, place it in the consuming app
 
 ## Architecture rules
 
-- The project is **library-first**. `seeed-hal-broker` is an adapter that exposes the same library semantics over local IPC; it is not a second HAL implementation.
+- The project is **library-first**. `robot-hal-broker` is an adapter that exposes the same library semantics over local IPC; it is not a second HAL implementation.
 - Core types and behavior must be platform-neutral.
 - Platform-specific code lives in an adapter crate.
 - One adapter is hypothetical; require either two real adapters or one real adapter plus the conformance adapter before stabilizing a seam.

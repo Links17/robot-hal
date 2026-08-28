@@ -86,7 +86,7 @@ def _fixture_repo(tmp_path: Path) -> tuple[Path, Path]:
 
 def package_fixture_broker(tmp_path: Path, target: str) -> Path:
     repo, targets = _fixture_repo(tmp_path)
-    binary = tmp_path / ("seeed-hal-broker.exe" if target == "windows" else "seeed-hal-broker")
+    binary = tmp_path / ("robot-hal-broker.exe" if target == "windows" else "robot-hal-broker")
     binary.write_bytes(b"broker fixture\n")
     manifest = tmp_path / "broker-manifest.json"
     _write_fixture_manifest(target, binary, manifest)
@@ -114,11 +114,11 @@ def test_broker_archive_has_exact_files(tmp_path: Path) -> None:
     archive = package_fixture_broker(tmp_path, target="linux")
 
     assert archive_members(archive) == (
-        "seeed-hal-broker-v0.5.0-rc.1-x86_64-unknown-linux-gnu",
-        "seeed-hal-broker-v0.5.0-rc.1-x86_64-unknown-linux-gnu/LICENSE",
-        "seeed-hal-broker-v0.5.0-rc.1-x86_64-unknown-linux-gnu/README.md",
-        "seeed-hal-broker-v0.5.0-rc.1-x86_64-unknown-linux-gnu/broker-manifest.json",
-        "seeed-hal-broker-v0.5.0-rc.1-x86_64-unknown-linux-gnu/seeed-hal-broker",
+        "robot-hal-broker-v0.5.0-rc.1-x86_64-unknown-linux-gnu",
+        "robot-hal-broker-v0.5.0-rc.1-x86_64-unknown-linux-gnu/LICENSE",
+        "robot-hal-broker-v0.5.0-rc.1-x86_64-unknown-linux-gnu/README.md",
+        "robot-hal-broker-v0.5.0-rc.1-x86_64-unknown-linux-gnu/broker-manifest.json",
+        "robot-hal-broker-v0.5.0-rc.1-x86_64-unknown-linux-gnu/robot-hal-broker",
     )
 
 
@@ -130,9 +130,9 @@ def test_broker_archive_uses_target_matrix_format(
     archive = package_fixture_broker(tmp_path, target)
 
     assert archive.suffix == (".zip" if target == "windows" else ".gz")
-    expected_binary = "seeed-hal-broker.exe" if target == "windows" else "seeed-hal-broker"
+    expected_binary = "robot-hal-broker.exe" if target == "windows" else "robot-hal-broker"
     assert archive_members(archive)[-1] == (
-        f"seeed-hal-broker-v0.5.0-rc.1-{_target(target)[0]}/{expected_binary}"
+        f"robot-hal-broker-v0.5.0-rc.1-{_target(target)[0]}/{expected_binary}"
     )
 
 
@@ -146,7 +146,7 @@ def test_broker_archive_is_byte_deterministic(tmp_path: Path, target: str) -> No
 
 def test_broker_package_rejects_manifest_target_mismatch(tmp_path: Path) -> None:
     repo, targets = _fixture_repo(tmp_path)
-    binary = tmp_path / "seeed-hal-broker"
+    binary = tmp_path / "robot-hal-broker"
     binary.write_bytes(b"broker fixture\n")
     manifest = tmp_path / "broker-manifest.json"
     _write_fixture_manifest("macos", binary, manifest)
@@ -167,7 +167,7 @@ def test_broker_package_rejects_manifest_target_mismatch(tmp_path: Path) -> None
 
 def test_broker_package_diagnostic_does_not_echo_manifest_path(tmp_path: Path) -> None:
     repo, targets = _fixture_repo(tmp_path)
-    binary = tmp_path / "seeed-hal-broker"
+    binary = tmp_path / "robot-hal-broker"
     binary.write_bytes(b"broker fixture\n")
     missing_manifest = tmp_path / "secret-endpoint-manifest.json"
 
@@ -191,7 +191,7 @@ def test_validation_failure_leaves_no_final_archive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo, targets = _fixture_repo(tmp_path)
-    binary = tmp_path / "seeed-hal-broker"
+    binary = tmp_path / "robot-hal-broker"
     binary.write_bytes(b"broker fixture\n")
     manifest = tmp_path / "broker-manifest.json"
     _write_fixture_manifest("macos", binary, manifest)
@@ -219,13 +219,13 @@ def test_validation_failure_leaves_no_final_archive(
 
 def test_existing_final_archive_is_never_overwritten(tmp_path: Path) -> None:
     repo, targets = _fixture_repo(tmp_path)
-    binary = tmp_path / "seeed-hal-broker"
+    binary = tmp_path / "robot-hal-broker"
     binary.write_bytes(b"broker fixture\n")
     manifest = tmp_path / "broker-manifest.json"
     _write_fixture_manifest("macos", binary, manifest)
     output = tmp_path / "output"
     output.mkdir()
-    archive = output / "seeed-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin.tar.gz"
+    archive = output / "robot-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin.tar.gz"
     archive.write_bytes(b"pre-existing archive")
 
     with pytest.raises(ReleaseFailure) as failure:
@@ -249,7 +249,7 @@ def test_packaging_uses_frozen_staged_input_copies(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo, targets = _fixture_repo(tmp_path)
-    binary = tmp_path / "seeed-hal-broker"
+    binary = tmp_path / "robot-hal-broker"
     binary.write_bytes(b"broker fixture\n")
     manifest = tmp_path / "broker-manifest.json"
     _write_fixture_manifest("macos", binary, manifest)
@@ -284,10 +284,10 @@ def test_packaging_uses_frozen_staged_input_copies(
     assert all(path.parent.name == "inputs" for path in observed)
     with tarfile.open(archive, "r:gz") as contents:
         assert contents.extractfile(
-            "seeed-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin/seeed-hal-broker"
+            "robot-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin/robot-hal-broker"
         ).read() == b"broker fixture\n"
         assert contents.extractfile(
-            "seeed-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin/broker-manifest.json"
+            "robot-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin/broker-manifest.json"
         ).read() == original_manifest
     assert not any(path.name.startswith(".package-broker-") for path in archive.parent.iterdir())
 
@@ -302,7 +302,7 @@ def test_concurrent_publish_reserves_final_archive_without_overwrite(
     def publish(label: str) -> None:
         source = tmp_path / label
         source.mkdir()
-        binary = source / "seeed-hal-broker"
+        binary = source / "robot-hal-broker"
         binary.write_bytes(f"broker fixture {label}\n".encode())
         manifest = source / "broker-manifest.json"
         _write_fixture_manifest("macos", binary, manifest)
@@ -335,8 +335,8 @@ def test_concurrent_publish_reserves_final_archive_without_overwrite(
     archive = successes[0]
     validate_archive(
         archive,
-        expected_root="seeed-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin",
-        expected_files={"LICENSE", "README.md", "broker-manifest.json", "seeed-hal-broker"},
+        expected_root="robot-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin",
+        expected_files={"LICENSE", "README.md", "broker-manifest.json", "robot-hal-broker"},
     )
     assert not any(path.name.startswith(".package-broker-") for path in output.iterdir())
     assert not any(path.name.startswith(".reserve-broker-") for path in output.iterdir())
@@ -344,14 +344,14 @@ def test_concurrent_publish_reserves_final_archive_without_overwrite(
 
 def test_existing_reservation_fails_closed_without_removal(tmp_path: Path) -> None:
     repo, targets = _fixture_repo(tmp_path)
-    binary = tmp_path / "seeed-hal-broker"
+    binary = tmp_path / "robot-hal-broker"
     binary.write_bytes(b"broker fixture\n")
     manifest = tmp_path / "broker-manifest.json"
     _write_fixture_manifest("macos", binary, manifest)
     output = tmp_path / "output"
     output.mkdir()
     reservation = output / (
-        ".reserve-broker-seeed-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin.tar.gz"
+        ".reserve-broker-robot-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin.tar.gz"
     )
     reservation.write_bytes(b"unknown publisher reservation")
 
@@ -375,7 +375,7 @@ def test_external_final_after_reservation_is_not_overwritten(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo, targets = _fixture_repo(tmp_path)
-    binary = tmp_path / "seeed-hal-broker"
+    binary = tmp_path / "robot-hal-broker"
     binary.write_bytes(b"broker fixture\n")
     manifest = tmp_path / "broker-manifest.json"
     _write_fixture_manifest("macos", binary, manifest)
@@ -385,7 +385,7 @@ def test_external_final_after_reservation_is_not_overwritten(
 
     def stage_then_publish_external_final(*args, **kwargs) -> str:
         staging = original_mkdtemp(*args, **kwargs)
-        (output / "seeed-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin.tar.gz").write_bytes(
+        (output / "robot-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin.tar.gz").write_bytes(
             external_bytes
         )
         return staging
@@ -404,7 +404,7 @@ def test_external_final_after_reservation_is_not_overwritten(
         )
 
     assert failure.value.name == "release.artifact.unexpected"
-    archive = output / "seeed-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin.tar.gz"
+    archive = output / "robot-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin.tar.gz"
     assert archive.read_bytes() == external_bytes
 
 
@@ -413,7 +413,7 @@ def test_link_publish_rejects_external_final_without_overwrite(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo, targets = _fixture_repo(tmp_path)
-    binary = tmp_path / "seeed-hal-broker"
+    binary = tmp_path / "robot-hal-broker"
     binary.write_bytes(b"broker fixture\n")
     manifest = tmp_path / "broker-manifest.json"
     _write_fixture_manifest("macos", binary, manifest)
@@ -438,7 +438,7 @@ def test_link_publish_rejects_external_final_without_overwrite(
         )
 
     assert failure.value.name == "release.artifact.unexpected"
-    archive = output / "seeed-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin.tar.gz"
+    archive = output / "robot-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin.tar.gz"
     assert archive.read_bytes() == external_bytes
 
 
@@ -449,7 +449,7 @@ def test_link_publish_fails_closed_when_unsupported(
     error_number: int,
 ) -> None:
     repo, targets = _fixture_repo(tmp_path)
-    binary = tmp_path / "seeed-hal-broker"
+    binary = tmp_path / "robot-hal-broker"
     binary.write_bytes(b"broker fixture\n")
     manifest = tmp_path / "broker-manifest.json"
     _write_fixture_manifest("macos", binary, manifest)
@@ -480,7 +480,7 @@ def test_published_archive_succeeds_when_staged_unlink_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo, targets = _fixture_repo(tmp_path)
-    binary = tmp_path / "seeed-hal-broker"
+    binary = tmp_path / "robot-hal-broker"
     binary.write_bytes(b"broker fixture\n")
     manifest = tmp_path / "broker-manifest.json"
     _write_fixture_manifest("macos", binary, manifest)
@@ -513,8 +513,8 @@ def test_published_archive_succeeds_when_staged_unlink_fails(
 
     validate_archive(
         archive,
-        expected_root="seeed-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin",
-        expected_files={"LICENSE", "README.md", "broker-manifest.json", "seeed-hal-broker"},
+        expected_root="robot-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin",
+        expected_files={"LICENSE", "README.md", "broker-manifest.json", "robot-hal-broker"},
     )
 
 

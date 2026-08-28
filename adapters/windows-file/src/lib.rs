@@ -46,7 +46,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let directory = std::env::temp_dir().join(format!(
-            "seeed-hal-handle-delete-{}-{nonce}",
+            "robot-hal-handle-delete-{}-{nonce}",
             std::process::id()
         ));
         std::fs::create_dir(&directory).unwrap();

@@ -2,9 +2,9 @@
 
 ## Files changed
 
-- `crates/seeed-hal-runtime/src/can_lease_table.rs`
-- `crates/seeed-hal-runtime/src/lib.rs`
-- `crates/seeed-hal-runtime/tests/can_leases.rs`
+- `crates/robot-hal-runtime/src/can_lease_table.rs`
+- `crates/robot-hal-runtime/src/lib.rs`
+- `crates/robot-hal-runtime/tests/can_leases.rs`
 
 ## Behavior implemented
 

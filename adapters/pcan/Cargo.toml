@@ -1,5 +1,5 @@
 [package]
-name = "seeed-hal-adapter-pcan"
+name = "robot-hal-adapter-pcan"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,8 +10,8 @@ license.workspace = true
 # libpcanbasic.so with libloading instead of linking PCAN-Basic at build time.
 [dependencies]
 async-trait = { workspace = true }
-seeed-hal-can = { path = "../../crates/seeed-hal-can", version = "=0.5.0-rc.1"}
-seeed-hal-core = { path = "../../crates/seeed-hal-core", version = "=0.5.0-rc.1"}
+robot-hal-can = { path = "../../crates/robot-hal-can", version = "=0.5.0-rc.1"}
+robot-hal-core = { path = "../../crates/robot-hal-core", version = "=0.5.0-rc.1"}
 
 [target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
 can-hal-rs = { workspace = true }
@@ -21,5 +21,5 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-seeed-hal-testkit = { path = "../../crates/seeed-hal-testkit", version = "=0.5.0-rc.1"}
+robot-hal-testkit = { path = "../../crates/robot-hal-testkit", version = "=0.5.0-rc.1"}
 tokio = { workspace = true }

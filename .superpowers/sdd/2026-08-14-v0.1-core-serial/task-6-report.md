@@ -9,8 +9,8 @@ semantics, and has no physical-hardware dependency in its default tests.
 ## Files
 
 - Added `proto/seeed/hal/v1/hal.proto` with the v1 envelope and typed Serial/domain messages.
-- Added `crates/seeed-hal-protocol/` for generated protobuf types and validated domain conversion.
-- Added `crates/seeed-hal-broker/` for handshake, framed connections, bounded dispatch, event
+- Added `crates/robot-hal-protocol/` for generated protobuf types and validated domain conversion.
+- Added `crates/robot-hal-broker/` for handshake, framed connections, bounded dispatch, event
   forwarding, Unix sockets, Windows Named Pipes, and broker contract tests.
 - Updated the workspace manifest and lockfile for the new crates and IPC dependencies.
 - Added `ResourceProperties::iter` for lossless descriptor serialization.
@@ -21,15 +21,15 @@ semantics, and has no physical-hardware dependency in its default tests.
 
 ## RED evidence
 
-1. Command: `cargo test -p seeed-hal-protocol`
+1. Command: `cargo test -p robot-hal-protocol`
    - Exit 101.
-   - Meaningful failure: `package ID specification 'seeed-hal-protocol' did not match any packages`.
+   - Meaningful failure: `package ID specification 'robot-hal-protocol' did not match any packages`.
 2. After adding the protocol tracer bullet, command:
-   `cargo test -p seeed-hal-broker --test broker_contract`
+   `cargo test -p robot-hal-broker --test broker_contract`
    - Exit 101.
-   - Meaningful failure: unresolved public imports `seeed_hal_broker::Broker` and
-     `seeed_hal_broker::StartupToken`.
-3. During the listener slice, command: `cargo test -p seeed-hal-protocol -p seeed-hal-broker`
+   - Meaningful failure: unresolved public imports `robot_hal_broker::Broker` and
+     `robot_hal_broker::StartupToken`.
+3. During the listener slice, command: `cargo test -p robot-hal-protocol -p robot-hal-broker`
    - Exit 101 with 8 broker tests passing and the Unix permission test failing because the macOS
      Unix-socket path exceeded `SUN_LEN`.
    - The test was corrected to use an explicit short, caller-private `/tmp` directory; no broker
@@ -37,7 +37,7 @@ semantics, and has no physical-hardware dependency in its default tests.
 
 ## GREEN evidence
 
-1. Focused command: `cargo test -p seeed-hal-protocol -p seeed-hal-broker`
+1. Focused command: `cargo test -p robot-hal-protocol -p robot-hal-broker`
    - Exit 0.
    - 13 contract tests passed: 11 broker and 2 protocol; doc tests also passed.
 2. Lint command: `cargo clippy --workspace --all-targets --all-features -- -D warnings`
@@ -45,7 +45,7 @@ semantics, and has no physical-hardware dependency in its default tests.
 3. Workspace command: `cargo test --workspace --all-features`
    - Exit 0.
    - All default unit, integration, and doc tests passed; the existing physical Serial loopback test
-     remained ignored because `SEEED_HAL_SERIAL_LOOPBACK` was not supplied.
+     remained ignored because `ROBOT_HAL_SERIAL_LOOPBACK` was not supplied.
 4. Formatting is verified with `cargo fmt --all --check` at handoff.
 
 ## Design notes
@@ -103,33 +103,33 @@ The resulting SHA is recorded in the task handoff because a commit cannot contai
 
 Resolved all critical and important round-1 findings in:
 
-- `crates/seeed-hal-broker/src/connection.rs`
-- `crates/seeed-hal-broker/tests/broker_contract.rs`
+- `crates/robot-hal-broker/src/connection.rs`
+- `crates/robot-hal-broker/tests/broker_contract.rs`
 - `docs/architecture/hal-architecture.md`
 
 The protobuf schema and its field numbers were unchanged.
 
 ### RED evidence
 
-1. `cargo test -p seeed-hal-broker --test broker_contract
+1. `cargo test -p robot-hal-broker --test broker_contract
    stalled_writer_cannot_delay_owner_revoke_or_resource_reuse -- --nocapture`
    - Exit 101 after 1.02 seconds.
    - Failed with `stalled output must not block connection teardown: Elapsed(())`, reproducing the
      writer-before-revoke deadlock.
-2. `cargo test -p seeed-hal-broker --test broker_contract
+2. `cargo test -p robot-hal-broker --test broker_contract
    handshake_version_capability_and_byte_limits_fail_closed -- --nocapture`
    - Exit 101.
    - A 128-byte frame with a 128-byte read payload was incorrectly accepted, so the test observed a
      handshake response where it required `runtime.protocol.invalid_message`.
-3. `cargo test -p seeed-hal-broker --test broker_contract
+3. `cargo test -p robot-hal-broker --test broker_contract
    negotiated_frame_limit_rejects_oversized_raw_inbound_frame -- --nocapture`
    - Exit 101.
    - The oversized post-handshake frame was dispatched instead of causing broker-initiated EOF.
-4. `cargo test -p seeed-hal-broker --test broker_contract
+4. `cargo test -p robot-hal-broker --test broker_contract
    negotiated_frame_limit_rejects_oversized_outbound_before_encoding -- --nocapture`
    - Exit 101.
    - The broker wrote an enumerate envelope larger than the negotiated limit.
-5. `cargo test -p seeed-hal-broker --test broker_contract
+5. `cargo test -p robot-hal-broker --test broker_contract
    runtime_events_are_filtered_to_the_connection_owner -- --nocapture`
    - Exit 101.
    - A second authenticated connection received the first connection's session event.
@@ -176,12 +176,12 @@ manufacture a red state for those characterization cases.
 ### Verification evidence
 
 - `cargo fmt --all --check`: exit 0, no output.
-- `cargo test -p seeed-hal-protocol -p seeed-hal-broker`: exit 0; 17 broker tests and 2 protocol
+- `cargo test -p robot-hal-protocol -p robot-hal-broker`: exit 0; 17 broker tests and 2 protocol
   tests passed, plus doc tests.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`: exit 0, no warnings.
 - `cargo test --workspace --all-features`: exit 0; all default tests and doc tests passed; the
   existing physical loopback test remained intentionally ignored without
-  `SEEED_HAL_SERIAL_LOOPBACK`.
+  `ROBOT_HAL_SERIAL_LOOPBACK`.
 - `cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-msvc`: exit 0;
   the installed Windows target compiled the workspace, including the Named Pipe module.
 
@@ -199,8 +199,8 @@ the macOS host. Physical Serial hardware remains outside default tests.
 
 Resolved the round-2 handshake admission race and isolated response-queue overflow reporting in:
 
-- `crates/seeed-hal-broker/src/connection.rs`
-- `crates/seeed-hal-broker/tests/broker_contract.rs`
+- `crates/robot-hal-broker/src/connection.rs`
+- `crates/robot-hal-broker/tests/broker_contract.rs`
 - `docs/architecture/hal-architecture.md`
 
 The protobuf schema, field numbers, exact 1 MiB hard cap, and Serial-only runtime dispatch remain
@@ -208,12 +208,12 @@ unchanged.
 
 ### RED evidence
 
-1. `cargo test -p seeed-hal-broker --test broker_contract
+1. `cargo test -p robot-hal-broker --test broker_contract
    response_queue_overflow_is_isolated_structured_and_cleans_up_owner -- --nocapture`
    - Exit 101.
    - The isolated response-only overflow returned generic `runtime.queue.full` instead of the
      required response-specific `runtime.queue.response_full` outcome.
-2. `cargo test -p seeed-hal-broker --test broker_contract
+2. `cargo test -p robot-hal-broker --test broker_contract
    pipelined_handshake_then_oversized_frame_uses_negotiated_limit -- --nocapture`
    - Exit 101 after the one-second bound.
    - A post-handshake frame already buffered by the peer raced dispatch's publication of the
@@ -260,16 +260,16 @@ introduced to manufacture extra failures.
 ### Verification evidence
 
 - `cargo fmt --all --check`: exit 0, no output.
-- `cargo test -p seeed-hal-protocol -p seeed-hal-broker`: exit 0; 23 broker contract tests and 2
+- `cargo test -p robot-hal-protocol -p robot-hal-broker`: exit 0; 23 broker contract tests and 2
   protocol contract tests passed, plus doc tests.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`: exit 0, no warnings.
 - `cargo test --workspace --all-features`: exit 0; 87 tests passed and the existing physical Serial
-  loopback test remained intentionally ignored without `SEEED_HAL_SERIAL_LOOPBACK`; all doc tests
+  loopback test remained intentionally ignored without `ROBOT_HAL_SERIAL_LOOPBACK`; all doc tests
   passed.
 - `cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-msvc`: exit 0;
   the workspace and Windows Named Pipe module compiled for the installed Windows target.
 - `make docs-guard` was attempted because the parent repository guidance requested it, but this
-  standalone `seeed-hal` repository has no Makefile, make target, or alternate docs-check script.
+  standalone `robot-hal` repository has no Makefile, make target, or alternate docs-check script.
 
 ### Commit and remaining concerns
 
@@ -285,7 +285,7 @@ host. No repository-owned docs guard exists beyond the Rust checks listed above.
 
 Made the isolated response-queue overflow contract test scheduler-independent in:
 
-- `crates/seeed-hal-broker/tests/broker_contract.rs`
+- `crates/robot-hal-broker/tests/broker_contract.rs`
 
 No production code, public API, protobuf contract, queue behavior, or cleanup ordering changed.
 
@@ -293,7 +293,7 @@ No production code, public API, protobuf contract, queue behavior, or cleanup or
 
 Command:
 
-`cargo test -p seeed-hal-broker --test broker_contract
+`cargo test -p robot-hal-broker --test broker_contract
 response_queue_overflow_is_isolated_structured_and_cleans_up_owner -- --nocapture`
 
 - Exit 101 after 1.01 seconds.
@@ -319,7 +319,7 @@ response_queue_overflow_is_isolated_structured_and_cleans_up_owner -- --nocaptur
 
 Focused GREEN command:
 
-`cargo test -p seeed-hal-broker --test broker_contract
+`cargo test -p robot-hal-broker --test broker_contract
 response_queue_overflow_is_isolated_structured_and_cleans_up_owner -- --nocapture`
 
 - Exit 0; 1 passed, 0 failed.
@@ -335,11 +335,11 @@ done`
 ### Verification evidence
 
 - `cargo fmt --all --check`: exit 0, no output.
-- `cargo test -p seeed-hal-protocol -p seeed-hal-broker`: exit 0; 23 broker contract tests and 2
+- `cargo test -p robot-hal-protocol -p robot-hal-broker`: exit 0; 23 broker contract tests and 2
   protocol contract tests passed, plus doc tests.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`: exit 0, no warnings.
 - `cargo test --workspace --all-features`: exit 0; 87 tests passed and the existing physical Serial
-  loopback test remained intentionally ignored without `SEEED_HAL_SERIAL_LOOPBACK`; all doc tests
+  loopback test remained intentionally ignored without `ROBOT_HAL_SERIAL_LOOPBACK`; all doc tests
   passed.
 
 ### Commit and remaining concerns

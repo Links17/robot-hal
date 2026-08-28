@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use seeed_hal_camera::{CameraAdapter, CameraCaptureSession, CameraRequest};
-use seeed_hal_core::{
+use robot_hal_camera::{CameraAdapter, CameraCaptureSession, CameraRequest};
+use robot_hal_core::{
     ErrorCategory, HalError, HalResult, ResourceDescriptor, ResourceId, ResourceSelector,
 };
 use std::{
@@ -165,8 +165,8 @@ mod tests {
         CameraAdapter, MediaFoundationAdapter, claim_conflict, encode_resource_id,
         quarantine_claim_until_worker_exits,
     };
-    use seeed_hal_camera::{CameraFormat, CameraPixelFormat, CameraRequest};
-    use seeed_hal_core::{IdentityQuality, ResourceId, ResourceSelector, TransportKind};
+    use robot_hal_camera::{CameraFormat, CameraPixelFormat, CameraRequest};
+    use robot_hal_core::{IdentityQuality, ResourceId, ResourceSelector, TransportKind};
     use std::{
         collections::BTreeSet,
         sync::{Arc, Mutex, mpsc},
@@ -282,13 +282,13 @@ mod tests {
 
     #[cfg(all(windows, feature = "hardware-tests"))]
     #[tokio::test]
-    #[ignore = "requires an accessible physical camera and SEEED_HAL_CAMERA_RESOURCE_ID"]
+    #[ignore = "requires an accessible physical camera and ROBOT_HAL_CAMERA_RESOURCE_ID"]
     async fn physical_camera_captures_requested_verified_frame() {
-        use seeed_hal_camera::CameraCaptureSession;
+        use robot_hal_camera::CameraCaptureSession;
         use std::time::Duration;
 
-        let resource_id = std::env::var("SEEED_HAL_CAMERA_RESOURCE_ID")
-            .expect("set SEEED_HAL_CAMERA_RESOURCE_ID to an enumerated Media Foundation camera");
+        let resource_id = std::env::var("ROBOT_HAL_CAMERA_RESOURCE_ID")
+            .expect("set ROBOT_HAL_CAMERA_RESOURCE_ID to an enumerated Media Foundation camera");
         let adapter = MediaFoundationAdapter::new();
         let descriptor = adapter
             .enumerate()
@@ -296,7 +296,7 @@ mod tests {
             .expect("physical Media Foundation discovery must succeed")
             .into_iter()
             .find(|descriptor| descriptor.id().as_str() == resource_id)
-            .expect("SEEED_HAL_CAMERA_RESOURCE_ID must select an enumerated camera");
+            .expect("ROBOT_HAL_CAMERA_RESOURCE_ID must select an enumerated camera");
         let request = CameraRequest::new(
             CameraFormat::new(CameraPixelFormat::Nv12, 640, 480).expect("valid format"),
             4,

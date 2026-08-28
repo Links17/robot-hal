@@ -1,4 +1,4 @@
-use seeed_hal_core::{Endpoint, HalResult, IdentityQuality, ResourceId};
+use robot_hal_core::{Endpoint, HalResult, IdentityQuality, ResourceId};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PcanChannelMetadata {

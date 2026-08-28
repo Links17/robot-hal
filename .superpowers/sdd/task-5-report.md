@@ -69,18 +69,18 @@ IDE diagnostics reported no errors for edited Python files.
 The following command ran successfully on this macOS arm64 host:
 
 ```bash
-cargo build --release -p seeed-hal-broker-app --no-default-features \
+cargo build --release -p robot-hal-broker-app --no-default-features \
   --features serialport,nusb,avfoundation
-target/release/seeed-hal-broker --manifest > target/release/broker-manifest.json
+target/release/robot-hal-broker --manifest > target/release/broker-manifest.json
 scripts/release/package-broker.sh v0.5.0-rc.1 macos \
-  target/release/seeed-hal-broker target/release/broker-manifest.json \
+  target/release/robot-hal-broker target/release/broker-manifest.json \
   target/release-artifacts
 python3 scripts/release/release_tool.py verify-broker-manifest \
   --tag v0.5.0-rc.1 \
   --manifest target/release/broker-manifest.json \
   --target macos \
   --targets release/targets.toml \
-  --artifact target/release/seeed-hal-broker
+  --artifact target/release/robot-hal-broker
 ```
 
 The release build, manifest generation, matrix/manifest verification, and

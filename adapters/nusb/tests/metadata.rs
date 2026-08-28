@@ -1,5 +1,5 @@
-use seeed_hal_adapter_nusb::identity::{UsbDeviceMetadata, identity_from_metadata};
-use seeed_hal_usb::IdentityQuality;
+use robot_hal_adapter_nusb::identity::{UsbDeviceMetadata, identity_from_metadata};
+use robot_hal_usb::IdentityQuality;
 
 #[test]
 fn serial_number_produces_strong_usb_identity() {

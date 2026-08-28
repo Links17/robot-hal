@@ -5,8 +5,8 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-import seeed_hal
-from seeed_hal import (
+import robot_hal
+from robot_hal import (
     CameraControlDescriptor,
     CameraFormat,
     CameraSession,
@@ -16,8 +16,8 @@ from seeed_hal import (
     PixelFormat,
     ControlRange,
 )
-from seeed_hal.errors import HalError
-from seeed_hal.proto import hal_pb2
+from robot_hal.errors import HalError
+from robot_hal.proto import hal_pb2
 from test_client_contract import TOKEN, envelope, fake_broker, read_frame, send_frame
 
 
@@ -102,7 +102,7 @@ async def test_frame_acquisition_without_a_local_mapping_reader_fails_before_lea
         maximum_minor=3,
         capabilities=["serial.bytes/v1", *capabilities],
     ) as endpoint:
-        from seeed_hal import HalClient
+        from robot_hal import HalClient
 
         client = await HalClient.connect(endpoint, TOKEN)
         resource = (await client.enumerate_camera())[0]
@@ -125,7 +125,7 @@ def test_camera_public_values_redact_tokens_and_expose_no_callback_constructed_b
         "MappingDescriptor",
         "PixelFormat",
         "ControlRange",
-    }.issubset(seeed_hal.__all__)
+    }.issubset(robot_hal.__all__)
 
     descriptor = MappingDescriptor(
         mapping_name="seeed-camera-test",
@@ -138,18 +138,18 @@ def test_camera_public_values_redact_tokens_and_expose_no_callback_constructed_b
     with pytest.raises(FrozenInstanceError):
         descriptor.total_length = 1  # type: ignore[misc]
 
-    assert "BorrowedFrame" not in seeed_hal.__all__
-    assert not hasattr(seeed_hal, "BorrowedFrame")
+    assert "BorrowedFrame" not in robot_hal.__all__
+    assert not hasattr(robot_hal, "BorrowedFrame")
     assert not hasattr(CameraSession, "borrowed_frame")
 
 
 def test_camera_control_discovery_values_are_public_immutable_and_validated() -> None:
     range_values = ControlRange(minimum=1, maximum=9, step=2)
     enum_values = ControlEnumValues(
-        values=(seeed_hal.ControlValue(enum="manual"), seeed_hal.ControlValue(enum="auto"))
+        values=(robot_hal.ControlValue(enum="manual"), robot_hal.ControlValue(enum="auto"))
     )
     descriptor = CameraControlDescriptor(
-        kind=seeed_hal.ControlKind.EXPOSURE,
+        kind=robot_hal.ControlKind.EXPOSURE,
         readable=True,
         writable=True,
         auto_supported=True,
@@ -168,7 +168,7 @@ def test_camera_control_discovery_values_are_public_immutable_and_validated() ->
         ControlEnumValues(values=())
     with pytest.raises(HalError, match="camera control descriptor is invalid"):
         CameraControlDescriptor(
-            kind=seeed_hal.ControlKind.GAIN,
+            kind=robot_hal.ControlKind.GAIN,
             readable=False,
             writable=True,
             auto_supported=False,
@@ -259,7 +259,7 @@ async def test_next_frame_invalidates_prior_copy_borrow_and_returns_owned_bytes(
         maximum_minor=3,
         capabilities=["serial.bytes/v1", *capabilities],
     ) as endpoint:
-        from seeed_hal import HalClient
+        from robot_hal import HalClient
 
         client = await HalClient.connect(endpoint, TOKEN)
         resource = (await client.enumerate_camera())[0]
@@ -342,7 +342,7 @@ async def test_malformed_camera_frame_lease_terminates_the_python_client() -> No
         maximum_minor=3,
         capabilities=["serial.bytes/v1", *capabilities],
     ) as endpoint:
-        from seeed_hal import HalClient
+        from robot_hal import HalClient
 
         client = await HalClient.connect(endpoint, TOKEN)
         resource = (await client.enumerate_camera())[0]
@@ -540,7 +540,7 @@ async def test_camera_fake_broker_wires_capture_mapping_lease_controls_and_close
         maximum_minor=3,
         capabilities=["serial.bytes/v1", *capabilities],
     ) as endpoint:
-        from seeed_hal import HalClient
+        from robot_hal import HalClient
 
         client = await HalClient.connect(endpoint, TOKEN)
         resources = await client.enumerate_camera()
@@ -559,7 +559,7 @@ async def test_camera_fake_broker_wires_capture_mapping_lease_controls_and_close
         controls = await session.controls()
         assert controls == [
             CameraControlDescriptor(
-                kind=seeed_hal.ControlKind.EXPOSURE,
+                kind=robot_hal.ControlKind.EXPOSURE,
                 readable=True,
                 writable=True,
                 auto_supported=True,
@@ -568,14 +568,14 @@ async def test_camera_fake_broker_wires_capture_mapping_lease_controls_and_close
                 diagnostic="virtual camera",
             ),
             CameraControlDescriptor(
-                kind=seeed_hal.ControlKind.WHITE_BALANCE,
+                kind=robot_hal.ControlKind.WHITE_BALANCE,
                 readable=True,
                 writable=True,
                 auto_supported=False,
                 values=ControlEnumValues(
                     values=(
-                        seeed_hal.ControlValue(enum="daylight"),
-                        seeed_hal.ControlValue(enum="tungsten"),
+                        robot_hal.ControlValue(enum="daylight"),
+                        robot_hal.ControlValue(enum="tungsten"),
                     )
                 ),
                 current_value_available=False,
@@ -583,9 +583,9 @@ async def test_camera_fake_broker_wires_capture_mapping_lease_controls_and_close
         ]
         assert isinstance(controls[0].values, ControlRange)
         assert isinstance(controls[1].values, ControlEnumValues)
-        assert (await session.get_control(seeed_hal.ControlKind.EXPOSURE)).integer == 42
-        await session.set_control(seeed_hal.ControlKind.EXPOSURE, seeed_hal.ControlValue(integer=43))
-        await session.set_auto(seeed_hal.ControlKind.EXPOSURE, True)
+        assert (await session.get_control(robot_hal.ControlKind.EXPOSURE)).integer == 42
+        await session.set_control(robot_hal.ControlKind.EXPOSURE, robot_hal.ControlValue(integer=43))
+        await session.set_auto(robot_hal.ControlKind.EXPOSURE, True)
         await session.close()
         await client.close()
 
@@ -663,7 +663,7 @@ async def test_malformed_camera_controls_response_terminates_the_python_client()
         maximum_minor=3,
         capabilities=["serial.bytes/v1", *capabilities],
     ) as endpoint:
-        from seeed_hal import HalClient
+        from robot_hal import HalClient
 
         client = await HalClient.connect(endpoint, TOKEN)
         resource = (await client.enumerate_camera())[0]

@@ -3,19 +3,19 @@
 Status: done.
 
 RED:
-`cargo test -p seeed-hal-core --test core_contract`
-Output: `error: package ID specification 'seeed-hal-core' did not match any packages`
-Why expected: the workspace initially had no `seeed-hal-core` member.
+`cargo test -p robot-hal-core --test core_contract`
+Output: `error: package ID specification 'robot-hal-core' did not match any packages`
+Why expected: the workspace initially had no `robot-hal-core` member.
 
 GREEN:
-`cargo test -p seeed-hal-core --test core_contract`
+`cargo test -p robot-hal-core --test core_contract`
 `cargo test`
 Output: 5 contract tests passed; workspace test run passed; doc-tests passed.
 
 Files changed:
-`Cargo.toml`, `Cargo.lock`, `crates/seeed-hal-core/Cargo.toml`,
-`crates/seeed-hal-core/src/{lib.rs,capability.rs,error.rs,identity.rs,lease.rs}`,
-`crates/seeed-hal-core/tests/core_contract.rs`
+`Cargo.toml`, `Cargo.lock`, `crates/robot-hal-core/Cargo.toml`,
+`crates/robot-hal-core/src/{lib.rs,capability.rs,error.rs,identity.rs,lease.rs}`,
+`crates/robot-hal-core/tests/core_contract.rs`
 
 Self-review:
 core identifiers are validated; `ResourceDescriptor::selector()` preserves id, transport, and minimum identity quality; `HalError` serializes only decision fields.
@@ -32,11 +32,11 @@ Finding 2: the public error helper could panic on caller input.
 Fix: replaced the public panic path with crate-private `HalError::invalid_argument_error(...)`; public `HalError::new(...)` remains fallible.
 
 RED:
-`cargo test -p seeed-hal-core --test core_contract`
+`cargo test -p robot-hal-core --test core_contract`
 Output: `malformed_serialized_values_are_rejected` failed because empty serialized strings still constructed `ResourceId`; `public_error_construction_returns_result_instead_of_panicking` initially used a valid ASCII operation string.
 
 GREEN:
-`cargo test -p seeed-hal-core --test core_contract`
+`cargo test -p robot-hal-core --test core_contract`
 `cargo test`
 Output: 7 contract tests passed; workspace test run passed; doc-tests passed.
 

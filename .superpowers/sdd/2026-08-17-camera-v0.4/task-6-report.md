@@ -2,7 +2,7 @@
 
 ## Linux V4L2 adapter slice
 
-- Added `seeed-hal-adapter-v4l2` to the root workspace. The crate uses the
+- Added `robot-hal-adapter-v4l2` to the root workspace. The crate uses the
   current `v4l` 0.14 safe wrapper, whose `Stream::with_buffers` implements
   kernel V4L2 mmap buffer allocation, queue/dequeue, streaming start/stop, and
   unmapping. The crate's dependency graph resolved with Rust 1.85-compatible
@@ -24,12 +24,12 @@
   advertised and every control operation fails closed.
 - Non-Linux calls return `runtime.adapter.unavailable` without native
   discovery. A feature-gated ignored hardware test requires
-  `SEEED_HAL_CAMERA_RESOURCE_ID`.
+  `ROBOT_HAL_CAMERA_RESOURCE_ID`.
 
 ## TDD evidence
 
 - Red:
-  `cargo test -p seeed-hal-adapter-v4l2 --all-features` initially failed because
+  `cargo test -p robot-hal-adapter-v4l2 --all-features` initially failed because
   `V4l2Adapter::enumerate` was intentionally unimplemented and panicked instead
   of returning the stable non-Linux unavailable error.
 - Green:
@@ -44,11 +44,11 @@
 - Passed:
   `cargo fmt --all --check`
 - Passed:
-  `cargo clippy -p seeed-hal-adapter-v4l2 --all-targets --all-features -- -D warnings`
+  `cargo clippy -p robot-hal-adapter-v4l2 --all-targets --all-features -- -D warnings`
 - Passed:
-  `cargo test -p seeed-hal-adapter-v4l2 --all-features`
+  `cargo test -p robot-hal-adapter-v4l2 --all-features`
 - Attempted Linux target check:
-  `cargo check -p seeed-hal-adapter-v4l2 --target x86_64-unknown-linux-gnu`
+  `cargo check -p robot-hal-adapter-v4l2 --target x86_64-unknown-linux-gnu`
   could not build in this macOS environment because the `v4l2-sys-mit` build
   script requires the Linux kernel header `linux/videodev2.h`, which is absent.
 
@@ -88,7 +88,7 @@
 ## Teardown TDD evidence
 
 - Red:
-  `cargo test -p seeed-hal-adapter-v4l2 --all-features` failed two new
+  `cargo test -p robot-hal-adapter-v4l2 --all-features` failed two new
   portable wait-helper tests before the implementation: one observed an
   unbounded native wait exceeding the capture deadline; the other observed a
   stalled capture returning timeout instead of yielding to shutdown.
@@ -102,9 +102,9 @@
 - Passed:
   `cargo fmt --all --check`
 - Passed:
-  `cargo clippy -p seeed-hal-adapter-v4l2 --all-targets --all-features -- -D warnings`
+  `cargo clippy -p robot-hal-adapter-v4l2 --all-targets --all-features -- -D warnings`
 - Passed on this non-Linux macOS host:
-  `cargo test -p seeed-hal-adapter-v4l2 --all-features`
+  `cargo test -p robot-hal-adapter-v4l2 --all-features`
 - Linux target checking remains unavailable here. The macOS toolchain reaches
   `v4l2-sys-mit` but cannot generate bindings because the Linux kernel header
   `linux/videodev2.h` is absent. No Linux kernel sysroot or physical V4L2
@@ -131,21 +131,21 @@ close behavior, and hot-unplug coverage were not relaxed.
 ## TDD evidence
 
 - Red:
-  `cargo test -p seeed-hal-testkit --test camera_conformance capture_only_camera_passes_public_adapter_conformance`
+  `cargo test -p robot-hal-testkit --test camera_conformance capture_only_camera_passes_public_adapter_conformance`
   first failed because the capture-only fixture did not exist; after adding
   only that fixture, it failed at the old runner's unconditional assertion
   that all four control descriptors were present.
 - Green:
-  `cargo test -p seeed-hal-testkit --test camera_conformance capture_only_camera_passes_public_adapter_conformance`
+  `cargo test -p robot-hal-testkit --test camera_conformance capture_only_camera_passes_public_adapter_conformance`
   passed after capability-gating the runner and enforcing unsupported control
   operations for the capture-only fixture.
 - Regression:
-  `cargo test -p seeed-hal-testkit --test camera_conformance virtual_camera_passes_public_adapter_conformance`
+  `cargo test -p robot-hal-testkit --test camera_conformance virtual_camera_passes_public_adapter_conformance`
   passed, retaining the full-controls branch.
 
 ## macOS AVFoundation adapter slice
 
-- Added the workspace package `seeed-hal-adapter-avfoundation`, with
+- Added the workspace package `robot-hal-adapter-avfoundation`, with
   target-specific official `objc2` AVFoundation, CoreMedia, CoreVideo,
   Foundation, and dispatch bindings pinned to the Rust 1.85-compatible
   `0.3.1` binding line.
@@ -170,12 +170,12 @@ close behavior, and hot-unplug coverage were not relaxed.
 ## Verification
 
 - `cargo fmt --all --check`
-- `cargo clippy -p seeed-hal-adapter-avfoundation --all-targets --all-features -- -D warnings`
-- `cargo test -p seeed-hal-adapter-avfoundation --all-features`
+- `cargo clippy -p robot-hal-adapter-avfoundation --all-targets --all-features -- -D warnings`
+- `cargo test -p robot-hal-adapter-avfoundation --all-features`
   - deterministic identity tests passed;
   - hardware test is feature-gated and ignored, requiring an authorized camera
-    plus `SEEED_HAL_CAMERA_RESOURCE_ID`.
-- `cargo test -p seeed-hal-testkit --test camera_conformance capture_only_camera_passes_public_adapter_conformance -- --exact`
+    plus `ROBOT_HAL_CAMERA_RESOURCE_ID`.
+- `cargo test -p robot-hal-testkit --test camera_conformance capture_only_camera_passes_public_adapter_conformance -- --exact`
 - `cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace --all-features`
 
 ## Limitations
@@ -198,7 +198,7 @@ close behavior, and hot-unplug coverage were not relaxed.
 
 ## Windows Media Foundation adapter slice
 
-- Added the workspace package `seeed-hal-adapter-mediafoundation`. It uses the
+- Added the workspace package `robot-hal-adapter-mediafoundation`. It uses the
   existing target-scoped `windows` 0.58 bindings, with the adapter-local
   `windows-core` dependency required by the binding's COM implementation macro.
 - On Windows, discovery initializes COM/MF on the calling blocking worker and
@@ -226,19 +226,19 @@ close behavior, and hot-unplug coverage were not relaxed.
 - On non-Windows platforms, `enumerate` and `open` return stable
   `runtime.adapter.unavailable` before any native discovery or probing.
   The `hardware-tests` feature provides an ignored test selected by
-  `SEEED_HAL_CAMERA_RESOURCE_ID`; it is not hardware qualification evidence.
+  `ROBOT_HAL_CAMERA_RESOURCE_ID`; it is not hardware qualification evidence.
 
 ## Media Foundation TDD evidence
 
 - Red:
-  `cargo test -p seeed-hal-adapter-mediafoundation --all-features` initially
+  `cargo test -p robot-hal-adapter-mediafoundation --all-features` initially
   failed while compiling the test-first crate because `expect_err` required
   `Debug` on `Box<dyn CameraCaptureSession>`. The test was changed to an
   explicit `match`, then failed before the platform-gated adapter behavior was
   wired in.
 - Green:
   after implementing the platform gate and symbolic-link identity helper,
-  `cargo test -p seeed-hal-adapter-mediafoundation --all-features` passed the
+  `cargo test -p robot-hal-adapter-mediafoundation --all-features` passed the
   empty-identity, percent-encoding, and no-probe non-Windows tests.
 - Windows compilation then exposed three binding-boundary defects (the
   `MFEnumDeviceSources` borrow, non-`Send` activation object crossing a
@@ -251,11 +251,11 @@ close behavior, and hot-unplug coverage were not relaxed.
 - Passed:
   `cargo fmt --all --check`
 - Passed:
-  `cargo test -p seeed-hal-adapter-mediafoundation --all-features`
+  `cargo test -p robot-hal-adapter-mediafoundation --all-features`
 - Passed:
-  `cargo clippy -p seeed-hal-adapter-mediafoundation --all-targets --all-features -- -D warnings`
+  `cargo clippy -p robot-hal-adapter-mediafoundation --all-targets --all-features -- -D warnings`
 - Passed:
-  `cargo check -p seeed-hal-adapter-mediafoundation --target x86_64-pc-windows-gnu`
+  `cargo check -p robot-hal-adapter-mediafoundation --target x86_64-pc-windows-gnu`
 
 ## Media Foundation limitations
 
@@ -292,7 +292,7 @@ close behavior, and hot-unplug coverage were not relaxed.
 ## Media Foundation teardown TDD evidence
 
 - Red:
-  `cargo test -p seeed-hal-adapter-mediafoundation --all-features
+  `cargo test -p robot-hal-adapter-mediafoundation --all-features
   quarantine_retains_claim_until_the_old_worker_exits -- --exact` failed before
   implementation because the portable quarantine/reaper API did not exist.
 - Green:
@@ -306,11 +306,11 @@ close behavior, and hot-unplug coverage were not relaxed.
 - Passed:
   `cargo fmt --all --check`
 - Passed:
-  `cargo test -p seeed-hal-adapter-mediafoundation --all-features`
+  `cargo test -p robot-hal-adapter-mediafoundation --all-features`
 - Passed:
-  `cargo clippy -p seeed-hal-adapter-mediafoundation --all-targets --all-features -- -D warnings`
+  `cargo clippy -p robot-hal-adapter-mediafoundation --all-targets --all-features -- -D warnings`
 - Passed:
-  `cargo check -p seeed-hal-adapter-mediafoundation --target x86_64-pc-windows-gnu`
+  `cargo check -p robot-hal-adapter-mediafoundation --target x86_64-pc-windows-gnu`
 - The cross-target check validates the Windows binding type path, but no
   Windows runtime, camera device, or hardware test was available on this macOS
   host to force a real Media Foundation worker join timeout.
@@ -343,7 +343,7 @@ close behavior, and hot-unplug coverage were not relaxed.
   the manifest emitted maximum minor `3` while the stale assertion expected
   `2`.
 - Composition red:
-  `cargo test -p seeed-hal-broker-app --all-features camera_composition_tests::virtual_adapter_feature_registers_the_broker_camera -- --exact`
+  `cargo test -p robot-hal-broker-app --all-features camera_composition_tests::virtual_adapter_feature_registers_the_broker_camera -- --exact`
   failed before registration with `runtime.adapter.not_configured` for
   `camera.enumerate`.
 - Green:
@@ -355,9 +355,9 @@ close behavior, and hot-unplug coverage were not relaxed.
 ## Broker composition verification and limitation
 
 - Passed:
-  `cargo test -p seeed-hal-broker-app --all-features camera_composition_tests::virtual_adapter_feature_registers_the_broker_camera -- --exact`
+  `cargo test -p robot-hal-broker-app --all-features camera_composition_tests::virtual_adapter_feature_registers_the_broker_camera -- --exact`
 - Passed:
-  `cargo test -p seeed-hal-broker-app --test manifest --all-features`
+  `cargo test -p robot-hal-broker-app --test manifest --all-features`
 - No physical camera qualification was performed. Native camera execution
   remains limited to its target OS and requires a separate hardware-enabled
   environment.

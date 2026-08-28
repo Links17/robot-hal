@@ -160,7 +160,7 @@ Implemented Windows mapping coordination and named-object lifecycle in
 `adapters/shared-memory/src/platform.rs`:
 
 - `Mapping` now owns both the section and a separately derived named mutex.
-  The mutex name is a SHA-256-derived `Local\seeed-hal-lock-…` name; it is
+  The mutex name is a SHA-256-derived `Local\robot-hal-lock-…` name; it is
   distinct from the mapping name and never included in errors.
 - The same protected DACL (`current user`, `SY`, and `BA`, protected with
   `D:P`) is passed to both `CreateFileMappingW` and `CreateMutexW`. A
@@ -201,7 +201,7 @@ Added Windows-only policy and process tests before production implementation:
 Command:
 
 ```sh
-cargo test -p seeed-hal-adapter-shared-memory --target x86_64-pc-windows-msvc platform::windows_tests -- --nocapture
+cargo test -p robot-hal-adapter-shared-memory --target x86_64-pc-windows-msvc platform::windows_tests -- --nocapture
 ```
 
 Result before production implementation: the test crate failed to compile
@@ -216,9 +216,9 @@ Commands:
 ```sh
 cargo fmt --all
 cargo fmt --all --check
-cargo check -p seeed-hal-adapter-shared-memory --target x86_64-pc-windows-msvc
-cargo test -p seeed-hal-adapter-shared-memory
-cargo clippy -p seeed-hal-adapter-shared-memory --all-targets --all-features -- -D warnings
+cargo check -p robot-hal-adapter-shared-memory --target x86_64-pc-windows-msvc
+cargo test -p robot-hal-adapter-shared-memory
+cargo clippy -p robot-hal-adapter-shared-memory --all-targets --all-features -- -D warnings
 git diff --check
 ```
 
@@ -235,7 +235,7 @@ Results:
 The requested runtime command was attempted after implementation:
 
 ```sh
-cargo test -p seeed-hal-adapter-shared-memory --target x86_64-pc-windows-msvc platform::windows_tests -- --nocapture
+cargo test -p robot-hal-adapter-shared-memory --target x86_64-pc-windows-msvc platform::windows_tests -- --nocapture
 ```
 
 It compiled the crate but failed during final linking because this macOS host
@@ -291,7 +291,7 @@ Windows-only tests were written before the production correction:
 Attempted RED command:
 
 ```sh
-cargo test -p seeed-hal-adapter-shared-memory --target x86_64-pc-windows-msvc \
+cargo test -p robot-hal-adapter-shared-memory --target x86_64-pc-windows-msvc \
   platform::windows_tests -- --nocapture
 ```
 
@@ -308,7 +308,7 @@ only `last_os_error`, which does not disclose either private object name.
 The Windows target compile check passed:
 
 ```sh
-cargo check -p seeed-hal-adapter-shared-memory --target x86_64-pc-windows-msvc
+cargo check -p robot-hal-adapter-shared-memory --target x86_64-pc-windows-msvc
 ```
 
 Hosted Windows still needs to run the two tests above: this machine cannot
@@ -341,7 +341,7 @@ Windows-only tests were added before the implementation:
 The first RED check was:
 
 ```sh
-cargo test -p seeed-hal-adapter-shared-memory --target x86_64-pc-windows-msvc \
+cargo test -p robot-hal-adapter-shared-memory --target x86_64-pc-windows-msvc \
   platform::windows_tests::teardown_lock_keeps_abandoned_ownership_until_unlocked --no-run
 ```
 
@@ -363,9 +363,9 @@ Commands:
 
 ```sh
 cargo fmt --all --check
-cargo test -p seeed-hal-adapter-shared-memory
-cargo clippy -p seeed-hal-adapter-shared-memory --all-targets --all-features -- -D warnings
-cargo check -p seeed-hal-adapter-shared-memory --target x86_64-pc-windows-msvc
+cargo test -p robot-hal-adapter-shared-memory
+cargo clippy -p robot-hal-adapter-shared-memory --all-targets --all-features -- -D warnings
+cargo check -p robot-hal-adapter-shared-memory --target x86_64-pc-windows-msvc
 git diff --check
 ```
 
@@ -379,7 +379,7 @@ all frame, pin, lease, reader, and writer paths retain ordinary lock calls.
 The Windows test-binary build was attempted with:
 
 ```sh
-cargo test -p seeed-hal-adapter-shared-memory --target x86_64-pc-windows-msvc \
+cargo test -p robot-hal-adapter-shared-memory --target x86_64-pc-windows-msvc \
   platform::windows_tests --no-run
 ```
 
@@ -417,7 +417,7 @@ step.
 `Build production broker`:
 
 ```text
-cargo +1.85 test -p seeed-hal-adapter-shared-memory --all-features platform::windows_tests -- --nocapture
+cargo +1.85 test -p robot-hal-adapter-shared-memory --all-features platform::windows_tests -- --nocapture
 ```
 
 The workflow retains its top-level read-only permissions and existing
@@ -451,7 +451,7 @@ This branch-local implementation is committed as
 ## Hosted Windows CI #32207788187 test-infrastructure correction
 
 Hosted run:
-<https://github.com/Seeed-Studio/seeed-hal/actions/runs/32207788187>
+<https://github.com/Seeed-Studio/robot-hal/actions/runs/32207788187>
 
 ### Observed failures and root causes
 
@@ -496,10 +496,10 @@ has exactly one matching unlock.
 Commands:
 
 ```sh
-cargo +1.85 test -p seeed-hal-adapter-shared-memory
-cargo +1.85 check -p seeed-hal-adapter-shared-memory --target x86_64-pc-windows-msvc
+cargo +1.85 test -p robot-hal-adapter-shared-memory
+cargo +1.85 check -p robot-hal-adapter-shared-memory --target x86_64-pc-windows-msvc
 cargo +1.85 fmt --all --check
-cargo +1.85 clippy -p seeed-hal-adapter-shared-memory --all-targets --all-features -- -D warnings
+cargo +1.85 clippy -p robot-hal-adapter-shared-memory --all-targets --all-features -- -D warnings
 git diff --check
 ```
 
@@ -509,7 +509,7 @@ formatting, focused clippy, and whitespace verification passed.
 The Windows runtime test build was also attempted:
 
 ```sh
-cargo +1.85 test -p seeed-hal-adapter-shared-memory --target x86_64-pc-windows-msvc \
+cargo +1.85 test -p robot-hal-adapter-shared-memory --target x86_64-pc-windows-msvc \
   platform::windows_tests --no-run
 ```
 

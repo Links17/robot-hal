@@ -1,7 +1,7 @@
 #[cfg(not(target_os = "macos"))]
-use seeed_hal_camera::{CameraCaptureSession, CameraRequest};
+use robot_hal_camera::{CameraCaptureSession, CameraRequest};
 #[cfg(not(target_os = "macos"))]
-use seeed_hal_core::{HalResult, ResourceDescriptor, ResourceSelector};
+use robot_hal_core::{HalResult, ResourceDescriptor, ResourceSelector};
 
 #[cfg(not(target_os = "macos"))]
 pub(super) fn enumerate_sync() -> HalResult<Vec<ResourceDescriptor>> {
@@ -49,12 +49,12 @@ mod macos {
     use objc2_foundation::{
         NSDictionary, NSError, NSNotification, NSNotificationCenter, NSOperationQueue, NSString,
     };
-    use seeed_hal_camera::{
+    use robot_hal_camera::{
         CameraCaptureSession, CameraControlDescriptor, CameraControlKind, CameraControlValue,
         CameraFormat, CameraFrame, CameraFrameMetadata, CameraFrameSink, CameraPixelFormat,
         CameraPlaneLayout, CameraRequest, camera_capture_capability, camera_frames_shm_capability,
     };
-    use seeed_hal_core::{
+    use robot_hal_core::{
         CapabilitySet, Endpoint, ErrorCategory, HalError, HalResult, IdentityQuality,
         ResourceDescriptor, ResourceProperties, ResourceSelector, TransportKind, resolve_resource,
     };
@@ -125,7 +125,7 @@ mod macos {
     pub fn open_sync(
         selector: &ResourceSelector,
         request: &CameraRequest,
-        claims: Arc<Mutex<std::collections::BTreeSet<seeed_hal_core::ResourceId>>>,
+        claims: Arc<Mutex<std::collections::BTreeSet<robot_hal_core::ResourceId>>>,
     ) -> HalResult<Box<dyn CameraCaptureSession>> {
         request.format().validate()?;
         autoreleasepool(|_| {
@@ -239,14 +239,14 @@ mod macos {
         descriptor: ResourceDescriptor,
         format: CameraFormat,
         unique_id: String,
-        claims: Arc<Mutex<std::collections::BTreeSet<seeed_hal_core::ResourceId>>>,
+        claims: Arc<Mutex<std::collections::BTreeSet<robot_hal_core::ResourceId>>>,
     ) -> HalResult<Box<dyn CameraCaptureSession>> {
         let (commands, command_rx) = mpsc::sync_channel(8);
         let (opened_tx, opened_rx) = mpsc::sync_channel(1);
         let thread_descriptor = descriptor.clone();
         let thread_format = format.clone();
         let worker = std::thread::Builder::new()
-            .name("seeed-hal-avfoundation-capture".to_owned())
+            .name("robot-hal-avfoundation-capture".to_owned())
             .spawn(move || {
                 native_capture_worker(
                     thread_descriptor,
@@ -1030,7 +1030,7 @@ mod macos {
         format: CameraFormat,
         commands: Option<mpsc::SyncSender<Command>>,
         worker: Option<std::thread::JoinHandle<()>>,
-        claims: Arc<Mutex<std::collections::BTreeSet<seeed_hal_core::ResourceId>>>,
+        claims: Arc<Mutex<std::collections::BTreeSet<robot_hal_core::ResourceId>>>,
         claim_quarantined: bool,
         next_capture_id: u64,
         closed: bool,
@@ -1150,8 +1150,8 @@ mod macos {
     async fn close_session(
         commands: &mut Option<mpsc::SyncSender<Command>>,
         worker: &mut Option<std::thread::JoinHandle<()>>,
-        claims: Arc<Mutex<std::collections::BTreeSet<seeed_hal_core::ResourceId>>>,
-        resource_id: seeed_hal_core::ResourceId,
+        claims: Arc<Mutex<std::collections::BTreeSet<robot_hal_core::ResourceId>>>,
+        resource_id: robot_hal_core::ResourceId,
         already_closed: bool,
         claim_quarantined: &mut bool,
     ) -> HalResult<()> {
@@ -1394,7 +1394,7 @@ mod macos {
         .with_resource_id(descriptor.id().clone())
     }
 
-    fn close_timeout_error(descriptor: &seeed_hal_core::ResourceId) -> HalError {
+    fn close_timeout_error(descriptor: &robot_hal_core::ResourceId) -> HalError {
         HalError::new(
             "runtime.adapter.close_timeout",
             ErrorCategory::Unavailable,

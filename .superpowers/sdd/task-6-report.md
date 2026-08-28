@@ -28,7 +28,7 @@ Commit sequence:
 - Added locked `build==1.3.0` to the Python development group and lockfile.
   Python packaging validates exact PEP 440 artifact names, wheel metadata/tag
   (`py3-none-any`), sdist metadata/content, and a temporary offline wheel
-  installation asserting both distribution and `seeed_hal.__version__`.
+  installation asserting both distribution and `robot_hal.__version__`.
 
 ## TDD
 
@@ -66,7 +66,7 @@ cargo test --workspace --all-features
 # completed successfully; hardware tests remained appropriately ignored
 
 scripts/release/package-python.sh v0.5.0-rc.1 target/task6-python-artifacts
-# emitted seeed_hal-0.5.0rc1-py3-none-any.whl and seeed_hal-0.5.0rc1.tar.gz
+# emitted robot_hal-0.5.0rc1-py3-none-any.whl and robot_hal-0.5.0rc1.tar.gz
 # wheel was installed offline in a temporary venv and version assertions passed
 
 python3 -m compileall -q scripts/release/release_tool.py \
@@ -78,13 +78,13 @@ git diff --check
 
 The public v0.5 crates are not yet published to crates.io.  Running the
 release workspace's real package command reached Cargo's normal upload
-preparation check and failed because `seeed-hal-camera` was not available in
+preparation check and failed because `robot-hal-camera` was not available in
 the crates.io index:
 
 ```text
-cargo package --package seeed-hal-adapter-avfoundation --locked --allow-dirty --no-verify
+cargo package --package robot-hal-adapter-avfoundation --locked --allow-dirty --no-verify
 # failed to prepare local package for uploading:
-# no matching package named `seeed-hal-camera` found; location searched: crates.io index
+# no matching package named `robot-hal-camera` found; location searched: crates.io index
 ```
 
 This is expected for the current release state.  The implementation neither
@@ -124,7 +124,7 @@ Addressed the four Important findings from the Task 6 review:
   failed reservation, build, validation, or second link removes only artifacts
   hard-linked by this invocation and leaves external final files untouched.
 - The exact generated files
-  `seeed_hal/proto/__init__.py` and `seeed_hal/proto/hal_pb2.py` are required
+  `robot_hal/proto/__init__.py` and `robot_hal/proto/hal_pb2.py` are required
   in both distributions.  The isolated install imports the generated module,
   asserts its descriptor name, and serializes `Empty`.
 
@@ -161,7 +161,7 @@ no publication was attempted.
 Addressed the next two Important and two Minor findings:
 
 - Wheel validation now parses its internal `WHEEL` metadata and requires the
-  exact `seeed_hal-<PEP 440 version>.dist-info` directory,
+  exact `robot_hal-<PEP 440 version>.dist-info` directory,
   `Root-Is-Purelib: true`, and exactly one `Tag: py3-none-any`.
 - Temporary wheel validation invokes `uv venv --offline --no-project --python
   sys.executable`, removes proxy variables from all validator subprocesses, and

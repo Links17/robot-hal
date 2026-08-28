@@ -33,7 +33,7 @@ TARGET_PLATFORM = {
 
 @pytest.fixture
 def artifact(tmp_path: Path) -> Path:
-    path = tmp_path / "seeed-hal-broker"
+    path = tmp_path / "robot-hal-broker"
     path.write_bytes(b"broker artifact fixture\n")
     return path
 

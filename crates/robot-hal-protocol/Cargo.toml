@@ -1,0 +1,23 @@
+[package]
+name = "robot-hal-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+bytes = { workspace = true }
+prost = { workspace = true }
+robot-hal-can = { path = "../robot-hal-can", version = "=0.5.0-rc.1"}
+robot-hal-camera = { path = "../robot-hal-camera", version = "=0.5.0-rc.1"}
+robot-hal-core = { path = "../robot-hal-core", version = "=0.5.0-rc.1"}
+robot-hal-runtime = { path = "../robot-hal-runtime", version = "=0.5.0-rc.1"}
+robot-hal-serial = { path = "../robot-hal-serial", version = "=0.5.0-rc.1"}
+robot-hal-usb = { path = "../robot-hal-usb", version = "=0.5.0-rc.1"}
+robot-hal-gpio = { path = "../robot-hal-gpio", version = "=0.5.0-rc.1"}
+robot-hal-adapter-shared-memory = { path = "../../adapters/shared-memory", version = "=0.5.0-rc.1"}
+
+[build-dependencies]
+prost-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }

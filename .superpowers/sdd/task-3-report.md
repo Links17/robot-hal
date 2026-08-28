@@ -54,7 +54,7 @@ GREEN:
 Built the production broker entry point with virtual adapters:
 
 ```text
-cargo build -p seeed-hal-broker-app --features virtual-adapters
+cargo build -p robot-hal-broker-app --features virtual-adapters
 Finished `dev` profile
 ```
 
@@ -373,17 +373,17 @@ closure. This matches the architecture: the runtime owns the bounded
 shared-memory camera data plane, and the broker uses Windows local-IPC security
 when compiled for Windows.
 
-`seeed-hal-adapter-shared-memory` is therefore allowed through
-`seeed-hal-runtime`; its Windows implementation uses Windows memory/security
+`robot-hal-adapter-shared-memory` is therefore allowed through
+`robot-hal-runtime`; its Windows implementation uses Windows memory/security
 APIs, but its manifest has no Linux-target dependency and no `pkg-config`,
-`libgpiod`, or `libudev` prerequisite. `seeed-hal-windows-security` is likewise
+`libgpiod`, or `libudev` prerequisite. `robot-hal-windows-security` is likewise
 allowed through the broker's `cfg(windows)` dependency, because it provides
 Windows named-pipe/file security rather than a hardware adapter and has no
 Linux native prerequisite.
 
 The excluded closure remains the hardware adapter and production application
 set: AVFoundation, Linux GPIO/libgpiod, Media Foundation, nusb, PCAN,
-serialport, SocketCAN, V4L2, Windows GPIO, and `seeed-hal-broker-app`. Those
+serialport, SocketCAN, V4L2, Windows GPIO, and `robot-hal-broker-app`. Those
 build only in `platform-conformance`; Linux package provisioning stays there
 with the libgpiod/libudev `pkg-config` preflight.
 

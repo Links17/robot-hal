@@ -24,10 +24,10 @@ not qualify a physical macOS camera.
 For non-hot-unplug checks:
 
 ```bash
-export SEEED_HAL_CAMERA_RESOURCE_ID='camera:avfoundation:<enumerated-id>'
-cargo test -p seeed-hal-adapter-avfoundation --features hardware-tests -- \
+export ROBOT_HAL_CAMERA_RESOURCE_ID='camera:avfoundation:<enumerated-id>'
+cargo test -p robot-hal-adapter-avfoundation --features hardware-tests -- \
   --ignored --nocapture
-unset SEEED_HAL_CAMERA_RESOURCE_ID
+unset ROBOT_HAL_CAMERA_RESOURCE_ID
 ```
 
 For the supervised hot-unplug test (requires physical unplug/replug during the run):
@@ -37,7 +37,7 @@ For the supervised hot-unplug test (requires physical unplug/replug during the r
 ./scripts/run-avfoundation-hot-unplug.sh
 
 # Or specify a specific resource ID explicitly:
-SEEED_HAL_CAMERA_RESOURCE_ID='camera:avfoundation:<id>' \
+ROBOT_HAL_CAMERA_RESOURCE_ID='camera:avfoundation:<id>' \
   ./scripts/run-avfoundation-hot-unplug.sh
 ```
 

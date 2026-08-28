@@ -2,19 +2,19 @@
 
 ## Status
 
-Implemented the additive Seeed HAL protocol-major-1, wire-minor-1 CAN contract,
+Implemented the additive Robot HAL protocol-major-1, wire-minor-1 CAN contract,
 generated the Python protobuf binding, and added the fail-closed Rust conversion
 surface and protocol contract tests required by the brief.
 
 ## Files
 
 - Modified `proto/seeed/hal/v1/hal.proto`.
-- Modified `crates/seeed-hal-protocol/Cargo.toml`.
-- Modified `crates/seeed-hal-protocol/src/lib.rs`.
-- Modified `crates/seeed-hal-protocol/src/conversion.rs`.
-- Created `crates/seeed-hal-protocol/src/can_conversion.rs`.
-- Modified `crates/seeed-hal-protocol/tests/protocol_contract.rs`.
-- Regenerated `bindings/python/seeed_hal/proto/hal_pb2.py`.
+- Modified `crates/robot-hal-protocol/Cargo.toml`.
+- Modified `crates/robot-hal-protocol/src/lib.rs`.
+- Modified `crates/robot-hal-protocol/src/conversion.rs`.
+- Created `crates/robot-hal-protocol/src/can_conversion.rs`.
+- Modified `crates/robot-hal-protocol/tests/protocol_contract.rs`.
+- Regenerated `bindings/python/robot_hal/proto/hal_pb2.py`.
 - Created this report.
 
 ## Wire contract
@@ -37,7 +37,7 @@ surface and protocol contract tests required by the brief.
 ## Conversion and validation
 
 - Added symmetric conversions for every Task 1 CAN value type using only core
-  Seeed HAL types and generated wire types.
+  Robot HAL types and generated wire types.
 - Centralized operation decoding for enumeration, open, send, receive, filter
   replacement, and bus status.
 - Rejects unknown/unspecified required enums, invalid/missing nested values,
@@ -83,8 +83,8 @@ The first successful run exited 0 and reported:
 ```text
 Using CPython 3.13.2 interpreter at: /Users/links/miniconda/bin/python3
 Creating virtual environment at: bindings/python/.venv
-   Building seeed-hal @ file:///Users/links/Documents/Project/Seeed/robot/links/seeed-robotic/seeed-hal/.worktrees/v0.2-can/bindings/python
-      Built seeed-hal @ file:///Users/links/Documents/Project/Seeed/robot/links/seeed-robotic/seeed-hal/.worktrees/v0.2-can/bindings/python
+   Building robot-hal @ file:///Users/links/Documents/Project/Seeed/robot/links/seeed-robotic/robot-hal/.worktrees/v0.2-can/bindings/python
+      Built robot-hal @ file:///Users/links/Documents/Project/Seeed/robot/links/seeed-robotic/robot-hal/.worktrees/v0.2-can/bindings/python
 Installed 12 packages in 51ms
 ```
 
@@ -130,7 +130,7 @@ completed successfully.
   unverified until the owning integration gate runs the deferred commands.
 - `Cargo.lock` was not changed because the permitted generator did not update
   it and the brief excludes it; the later Cargo verification gate may add the
-  already-present `seeed-hal-can` package to the protocol package's dependency
+  already-present `robot-hal-can` package to the protocol package's dependency
   list in the lockfile.
 
 ## Fix round 1
@@ -149,9 +149,9 @@ completed successfully.
   values (including RuntimeEventKind 4..7 and CanErrorClass 2..9), and both
   Attach=1 and Configure=2 oneof tags.
 - Fix-round changes additionally touch
-  `crates/seeed-hal-client/src/serial.rs`,
-  `crates/seeed-hal-client/src/connection.rs`, and
-  `crates/seeed-hal-broker/src/connection.rs` to migrate the existing Serial
+  `crates/robot-hal-client/src/serial.rs`,
+  `crates/robot-hal-client/src/connection.rs`, and
+  `crates/robot-hal-broker/src/connection.rs` to migrate the existing Serial
   call sites. No protobuf generator was needed because the schema is unchanged.
 - Tests, builds, lint, formatting, generated-code checks, and Python tests
   remain intentionally unexecuted; only static inspection and

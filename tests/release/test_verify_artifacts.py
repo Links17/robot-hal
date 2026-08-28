@@ -93,9 +93,9 @@ def _write_broker_candidate(
         "windows": "x86_64-pc-windows-msvc",
     }[target]
     extension = "zip" if target == "windows" else "tar.gz"
-    archive = directory / f"seeed-hal-broker-v0.5.0-rc.1-{triple}.{extension}"
-    root = f"seeed-hal-broker-v0.5.0-rc.1-{triple}"
-    binary_name = "seeed-hal-broker.exe" if target == "windows" else "seeed-hal-broker"
+    archive = directory / f"robot-hal-broker-v0.5.0-rc.1-{triple}.{extension}"
+    root = f"robot-hal-broker-v0.5.0-rc.1-{triple}"
+    binary_name = "robot-hal-broker.exe" if target == "windows" else "robot-hal-broker"
     binary = _broker_binary()
     manifest = _broker_manifest(target, binary)
     entries = {
@@ -124,15 +124,15 @@ def _write_broker_candidate(
 
 def _write_source_candidate(directory: Path) -> Path:
     directory.mkdir()
-    artifact = directory / "seeed-hal-crates-v0.5.0-rc.1.tar.gz"
+    artifact = directory / "robot-hal-crates-v0.5.0-rc.1.tar.gz"
     artifact.write_bytes(b"rust bundle fixture\n")
     return directory
 
 
 def _write_python_candidate(directory: Path) -> Path:
     directory.mkdir()
-    (directory / "seeed_hal-0.5.0rc1-py3-none-any.whl").write_bytes(b"wheel\n")
-    (directory / "seeed_hal-0.5.0rc1.tar.gz").write_bytes(b"sdist\n")
+    (directory / "robot_hal-0.5.0rc1-py3-none-any.whl").write_bytes(b"wheel\n")
+    (directory / "robot_hal-0.5.0rc1.tar.gz").write_bytes(b"sdist\n")
     return directory
 
 
@@ -376,7 +376,7 @@ def test_broker_extraction_restores_execution_only_from_validated_tar_metadata(
         tmp_path / "extracted",
     )
 
-    binary = extracted / "seeed-hal-broker"
+    binary = extracted / "robot-hal-broker"
     assert stat.S_IMODE(binary.stat().st_mode) == 0o700
     assert stat.S_IMODE(archive.stat().st_mode) == 0o644
 
@@ -399,7 +399,7 @@ def test_broker_extraction_rejects_tar_without_owner_execute_metadata(
 def test_verify_rejects_partial_platform_set(tmp_path: Path) -> None:
     release = _complete_release(tmp_path)
     (
-        release / "seeed-hal-broker-v0.5.0-rc.1-x86_64-pc-windows-msvc.zip"
+        release / "robot-hal-broker-v0.5.0-rc.1-x86_64-pc-windows-msvc.zip"
     ).unlink()
 
     with pytest.raises(ReleaseFailure, match="release.artifact.unexpected"):
@@ -447,10 +447,10 @@ def test_aggregate_rejects_external_candidate_mutation_before_publish(
 @pytest.mark.parametrize(
     "candidate",
     [
-        "seeed_hal-0.5.0rc1-py3-none-any.whl",
-        "seeed_hal-0.5.0rc1.tar.gz",
-        "seeed-hal-crates-v0.5.0-rc.1.tar.gz",
-        "seeed-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin.tar.gz",
+        "robot_hal-0.5.0rc1-py3-none-any.whl",
+        "robot_hal-0.5.0rc1.tar.gz",
+        "robot-hal-crates-v0.5.0-rc.1.tar.gz",
+        "robot-hal-broker-v0.5.0-rc.1-aarch64-apple-darwin.tar.gz",
     ],
 )
 def test_aggregate_rechecks_every_candidate_before_return(
@@ -469,9 +469,9 @@ def test_aggregate_rechecks_every_candidate_before_return(
     report = _write_report_inputs(inputs / "report")
     source = (
         python / candidate
-        if candidate.startswith("seeed_hal")
+        if candidate.startswith("robot_hal")
         else rust / candidate
-        if candidate.startswith("seeed-hal-crates")
+        if candidate.startswith("robot-hal-crates")
         else brokers / candidate
     )
     original_verify = __import__(

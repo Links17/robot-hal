@@ -268,7 +268,7 @@ impl Mapping {
 #[cfg(unix)]
 fn lock_path(name: &std::ffi::CStr) -> io::Result<CString> {
     let name = name.to_bytes();
-    const PREFIX: &[u8] = b"/seeed-hal-";
+    const PREFIX: &[u8] = b"/robot-hal-";
     if !name.starts_with(PREFIX)
         || name.len() != PREFIX.len() + 18
         || !name[PREFIX.len()..].iter().all(u8::is_ascii_hexdigit)
@@ -363,7 +363,7 @@ mod tests {
 
     use super::Mapping;
 
-    const CHILD_MAPPING_NAME: &str = "SEEED_HAL_FLOCK_TEST_MAPPING_NAME";
+    const CHILD_MAPPING_NAME: &str = "ROBOT_HAL_FLOCK_TEST_MAPPING_NAME";
 
     #[test]
     fn exclusive_lock_is_released_when_child_exits() {
@@ -402,9 +402,9 @@ mod tests {
     #[test]
     fn rejects_non_basename_shared_memory_names() {
         for name in [
-            "seeed-hal-invalid",
-            "/seeed-hal/nested",
-            "/seeed-hal-../escape",
+            "robot-hal-invalid",
+            "/robot-hal/nested",
+            "/robot-hal-../escape",
         ] {
             assert!(super::lock_path(CString::new(name).unwrap().as_c_str()).is_err());
         }
@@ -470,7 +470,7 @@ mod tests {
             bytes[index % bytes.len()] ^= byte;
         }
         format!(
-            "/seeed-hal-{}",
+            "/robot-hal-{}",
             bytes.map(|byte| format!("{byte:02x}")).concat()
         )
     }
@@ -797,7 +797,7 @@ fn wide_name(name: &str) -> io::Result<Vec<u16>> {
 
 #[cfg(windows)]
 fn validate_mapping_name(name: &str) -> io::Result<()> {
-    const PREFIX: &str = "/seeed-hal-";
+    const PREFIX: &str = "/robot-hal-";
     let suffix = name.strip_prefix(PREFIX).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -820,7 +820,7 @@ fn lock_name(name: &str) -> io::Result<String> {
     validate_mapping_name(name)?;
     let digest = sha2::Sha256::digest(name.as_bytes());
     Ok(format!(
-        "Local\\seeed-hal-lock-{}",
+        "Local\\robot-hal-lock-{}",
         digest[..16]
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -1047,8 +1047,8 @@ mod windows_tests {
 
     use super::{Mapping, lock_name, validate_section_length};
 
-    const ABANDONED_LOCK_NAME: &str = "SEEED_HAL_ABANDONED_LOCK_NAME";
-    const ABANDONED_LOCK_PHASE: &str = "SEEED_HAL_ABANDONED_LOCK_PHASE";
+    const ABANDONED_LOCK_NAME: &str = "ROBOT_HAL_ABANDONED_LOCK_NAME";
+    const ABANDONED_LOCK_PHASE: &str = "ROBOT_HAL_ABANDONED_LOCK_PHASE";
 
     #[test]
     fn created_mapping_has_a_protected_three_trustee_dacl() {
@@ -1171,7 +1171,7 @@ mod windows_tests {
     fn abandoned_mutex_is_released_while_still_failing_closed() {
         if let Ok(name) = std::env::var(ABANDONED_LOCK_NAME) {
             let mapping = Mapping::open_read_only(&name, 4096).unwrap();
-            match std::env::var("SEEED_HAL_ABANDONED_LOCK_PHASE").as_deref() {
+            match std::env::var("ROBOT_HAL_ABANDONED_LOCK_PHASE").as_deref() {
                 Ok("abandon") => mapping.try_lock_exclusive().unwrap(),
                 Ok("verify-released") => {
                     mapping.try_lock_exclusive().unwrap();
@@ -1192,7 +1192,7 @@ mod windows_tests {
             .arg("platform::windows_tests::abandoned_mutex_is_released_while_still_failing_closed")
             .arg("--nocapture")
             .env(ABANDONED_LOCK_NAME, &name)
-            .env("SEEED_HAL_ABANDONED_LOCK_PHASE", "abandon")
+            .env("ROBOT_HAL_ABANDONED_LOCK_PHASE", "abandon")
             .status()
             .unwrap();
         assert!(status.success());
@@ -1205,7 +1205,7 @@ mod windows_tests {
             .arg("platform::windows_tests::abandoned_mutex_is_released_while_still_failing_closed")
             .arg("--nocapture")
             .env(ABANDONED_LOCK_NAME, &name)
-            .env("SEEED_HAL_ABANDONED_LOCK_PHASE", "verify-released")
+            .env("ROBOT_HAL_ABANDONED_LOCK_PHASE", "verify-released")
             .status()
             .unwrap();
         assert!(
@@ -1324,13 +1324,13 @@ mod windows_tests {
 
     #[test]
     fn lock_name_is_private_and_mapping_name_validation_rejects_malformed_input() {
-        let lock = lock_name("/seeed-hal-0123456789abcdef12").unwrap();
-        assert_ne!(lock, "/seeed-hal-0123456789abcdef12");
+        let lock = lock_name("/robot-hal-0123456789abcdef12").unwrap();
+        assert_ne!(lock, "/robot-hal-0123456789abcdef12");
         for name in [
-            "seeed-hal-0123456789abcdef12",
-            "/seeed-hal-0123456789abcdef1",
-            "/seeed-hal-0123456789abcdef1z",
-            "/seeed-hal-0123456789abcdef12\\nested",
+            "robot-hal-0123456789abcdef12",
+            "/robot-hal-0123456789abcdef1",
+            "/robot-hal-0123456789abcdef1z",
+            "/robot-hal-0123456789abcdef12\\nested",
         ] {
             assert!(lock_name(name).is_err(), "{name}");
             assert!(Mapping::unlink(name).is_err(), "{name}");
@@ -1363,7 +1363,7 @@ mod windows_tests {
         {
             hash = (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
         }
-        format!("/seeed-hal-{hash:018x}")
+        format!("/robot-hal-{hash:018x}")
     }
 }
 

@@ -1,5 +1,5 @@
 [package]
-name = "seeed-hal-adapter-linux-gpio"
+name = "robot-hal-adapter-linux-gpio"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,8 +14,8 @@ hardware-tests = []
 [dependencies]
 async-trait = { workspace = true }
 percent-encoding = { workspace = true }
-seeed-hal-core = { path = "../../crates/seeed-hal-core", version = "=0.5.0-rc.1"}
-seeed-hal-gpio = { path = "../../crates/seeed-hal-gpio", version = "=0.5.0-rc.1"}
+robot-hal-core = { path = "../../crates/robot-hal-core", version = "=0.5.0-rc.1"}
+robot-hal-gpio = { path = "../../crates/robot-hal-gpio", version = "=0.5.0-rc.1"}
 tokio = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

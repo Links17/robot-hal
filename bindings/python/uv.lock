@@ -292,7 +292,7 @@ wheels = [
 ]
 
 [[package]]
-name = "seeed-hal"
+name = "robot-hal"
 version = "0.5.0rc1"
 source = { editable = "." }
 dependencies = [

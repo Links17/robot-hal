@@ -9,16 +9,16 @@ checked-in protobuf generation, and CI drift verification.
 
 - `bindings/python/pyproject.toml`, `bindings/python/uv.lock`: Python >=3.11 package metadata,
   platform-conditional pywin32 dependency, pinned direct dependencies, and locked dev toolchain.
-- `bindings/python/seeed_hal/{__init__,client,serial,errors}.py`: protobuf-independent public API,
+- `bindings/python/robot_hal/{__init__,client,serial,errors}.py`: protobuf-independent public API,
   typed values, bounded async client, structured errors, events, and broker-owned Serial sessions.
-- `bindings/python/seeed_hal/transport_{unix,windows}.py`: bounded Unix socket and local Named Pipe
+- `bindings/python/robot_hal/transport_{unix,windows}.py`: bounded Unix socket and local Named Pipe
   transports using the broker's big-endian 32-bit frame prefix.
-- `bindings/python/seeed_hal/proto/{__init__,hal_pb2}.py`: private checked-in generated protobuf.
+- `bindings/python/robot_hal/proto/{__init__,hal_pb2}.py`: private checked-in generated protobuf.
 - `bindings/python/tests/{conftest,test_client_contract}.py`: protocol fault injection, mocked Windows
   delegation, and real subprocess broker/virtual-adapter integration coverage.
-- `crates/seeed-hal-broker/examples/virtual_broker.rs`: test-only language-client broker process seam;
+- `crates/robot-hal-broker/examples/virtual_broker.rs`: test-only language-client broker process seam;
   no production CLI adapter-switch flag was added.
-- `crates/seeed-hal-broker/Cargo.toml`, `Cargo.lock`: example-only test dependencies.
+- `crates/robot-hal-broker/Cargo.toml`, `Cargo.lock`: example-only test dependencies.
 - `scripts/generate-protocol.sh`: executable uv/grpc_tools generator.
 - `.github/workflows/ci.yml`: regeneration drift gate on every CI OS and frozen Python test execution.
 - `docs/architecture/hal-architecture.md`: implemented Python client concurrency, framing, transport,
@@ -30,7 +30,7 @@ checked-in protobuf generation, and CI drift verification.
 RED commands and observed results:
 
 1. `cd bindings/python && uv run pytest tests/test_client_contract.py -q`
-   - Collection failed with `ModuleNotFoundError: No module named 'seeed_hal'`.
+   - Collection failed with `ModuleNotFoundError: No module named 'robot_hal'`.
 2. `cd bindings/python && uv run pytest tests/test_client_contract.py::test_reversed_responses_remain_correlated -q`
    - Initially failed on the missing typed public API, then exposed a handshake bytes conversion bug
      before the correlation test could connect.
@@ -60,7 +60,7 @@ GREEN commands and observed results:
 `scripts/generate-protocol.sh` runs frozen `uv` dependencies from `bindings/python/uv.lock`, invokes
 `python -m grpc_tools.protoc` from grpcio-tools 1.75.1, uses
 `proto/seeed/hal/v1/hal.proto` as `hal.proto`, and writes
-`bindings/python/seeed_hal/proto/hal_pb2.py`. The generated header contains no absolute path or host
+`bindings/python/robot_hal/proto/hal_pb2.py`. The generated header contains no absolute path or host
 identity. Two consecutive generations produced the same SHA-256:
 `0d17a1312ff3f0b9e797d44c94d6b19d72e5c0e7bfd78647d64b18a91428e3e7`.
 
@@ -99,7 +99,7 @@ Final verification commands:
 - `cargo test --workspace --all-features` — passed; all default hardware-free tests passed and the
   physical loopback test remained ignored as intended.
 - `cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-msvc` — passed.
-- `uv run --project bindings/python --frozen python -m compileall -q bindings/python/seeed_hal bindings/python/tests`
+- `uv run --project bindings/python --frozen python -m compileall -q bindings/python/robot_hal bindings/python/tests`
   — passed.
 
 ## Concerns and limitations
@@ -159,7 +159,7 @@ GREEN:
   - `68 passed`.
 - `uv run --project bindings/python --python 3.11 --frozen pytest -q`
   - `83 passed`.
-- `uv run --project bindings/python --python 3.11 --frozen python -m compileall -q bindings/python/seeed_hal bindings/python/tests`
+- `uv run --project bindings/python --python 3.11 --frozen python -m compileall -q bindings/python/robot_hal bindings/python/tests`
   - passed.
 - `./scripts/check-generated-protocol.sh` twice
   - passed twice with Python 3.11.13; the scoped generated tree remained clean.
@@ -225,7 +225,7 @@ GREEN:
     close-pending double/triple cancellation boundaries plus the existing setup-failure case.
 - `uv run --project bindings/python --python 3.11 --frozen pytest -q`
   - `95 passed`.
-- `uv run --project bindings/python --python 3.11 --frozen python -m compileall -q bindings/python/seeed_hal bindings/python/tests`
+- `uv run --project bindings/python --python 3.11 --frozen python -m compileall -q bindings/python/robot_hal bindings/python/tests`
   - passed.
 - `./scripts/check-generated-protocol.sh` twice
   - passed twice; before/after SHA-256 remained

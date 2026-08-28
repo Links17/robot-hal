@@ -63,7 +63,7 @@ When adding a hardware-class capability, update this matrix together with:
 The matrix is a contract index, not a claim that every native row is qualified. Use the following
 evidence paths:
 
-- **Virtual evidence**: run the applicable `seeed-hal-testkit` conformance test and the broker
+- **Virtual evidence**: run the applicable `robot-hal-testkit` conformance test and the broker
   virtual-adapter conformance command for the advertised protocol minors.
 - **Hosted evidence**: run the release target's production broker build, manifest verification,
   and virtual conformance on the target host.

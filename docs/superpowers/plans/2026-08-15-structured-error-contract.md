@@ -4,7 +4,7 @@
 
 **Goal:** Preserve the complete v0.1 structured-error contract across in-process Rust, protobuf wire v1, the Rust broker client, and the Python broker client.
 
-**Architecture:** Extend the existing `HalError` rather than adding an error framework. Add bounded Google-`ErrorInfo`-style diagnostic metadata to the core interface, append fields 6–9 to the existing protobuf `Error`, centralize Rust wire conversion in `seeed-hal-protocol`, and validate the same contract in Python.
+**Architecture:** Extend the existing `HalError` rather than adding an error framework. Add bounded Google-`ErrorInfo`-style diagnostic metadata to the core interface, append fields 6–9 to the existing protobuf `Error`, centralize Rust wire conversion in `robot-hal-protocol`, and validate the same contract in Python.
 
 **Tech Stack:** Rust 2024/MSRV 1.85, `std::collections::BTreeMap`, serde, prost/protobuf, Tokio, Python 3.11, `MappingProxyType`, pytest.
 
@@ -24,17 +24,17 @@
 
 ## File Structure
 
-- `crates/seeed-hal-core/src/error.rs` owns validated diagnostic details and the complete Rust error interface.
-- `crates/seeed-hal-core/src/lib.rs` exports `ErrorContext`.
+- `crates/robot-hal-core/src/error.rs` owns validated diagnostic details and the complete Rust error interface.
+- `crates/robot-hal-core/src/lib.rs` exports `ErrorContext`.
 - `proto/seeed/hal/v1/hal.proto` owns the additive wire fields.
-- `crates/seeed-hal-protocol/src/conversion.rs` owns both Rust error conversion directions.
-- `crates/seeed-hal-protocol/src/lib.rs` exports `error_from_proto`.
-- `crates/seeed-hal-runtime/src/lease_table.rs` enriches active resource-scoped lease errors.
-- `crates/seeed-hal-core/src/identity.rs` enriches canonical resolver failures.
+- `crates/robot-hal-protocol/src/conversion.rs` owns both Rust error conversion directions.
+- `crates/robot-hal-protocol/src/lib.rs` exports `error_from_proto`.
+- `crates/robot-hal-runtime/src/lease_table.rs` enriches active resource-scoped lease errors.
+- `crates/robot-hal-core/src/identity.rs` enriches canonical resolver failures.
 - `adapters/serialport/src/lib.rs` preserves native platform codes.
-- `crates/seeed-hal-client/src/connection.rs` delegates wire-error decoding to the protocol module.
-- `bindings/python/seeed_hal/errors.py` owns immutable Python diagnostic details.
-- `bindings/python/seeed_hal/client.py` validates wire details.
+- `crates/robot-hal-client/src/connection.rs` delegates wire-error decoding to the protocol module.
+- `bindings/python/robot_hal/errors.py` owns immutable Python diagnostic details.
+- `bindings/python/robot_hal/client.py` validates wire details.
 - Contract tests remain next to their owning interface; generated Python protobuf remains generated.
 
 ---
@@ -42,9 +42,9 @@
 ### Task 1: Add bounded diagnostic details to `HalError`
 
 **Files:**
-- Modify: `crates/seeed-hal-core/src/error.rs`
-- Modify: `crates/seeed-hal-core/src/lib.rs`
-- Modify: `crates/seeed-hal-core/tests/core_contract.rs`
+- Modify: `crates/robot-hal-core/src/error.rs`
+- Modify: `crates/robot-hal-core/src/lib.rs`
+- Modify: `crates/robot-hal-core/tests/core_contract.rs`
 
 **Interfaces:**
 - Consumes: existing `ResourceId`, `HalError::new`, decision-only serde contract.
@@ -62,9 +62,9 @@ fn structured_error_details_are_validated_and_preserved() {
         ("limit_bytes".to_owned(), "1024".to_owned()),
     ])
     .unwrap();
-    let error = seeed_hal_core::HalError::new(
+    let error = robot_hal_core::HalError::new(
         "runtime.queue.full",
-        seeed_hal_core::ErrorCategory::Unavailable,
+        robot_hal_core::ErrorCategory::Unavailable,
         "serial.write",
         true,
         "queue is full",
@@ -88,9 +88,9 @@ fn structured_error_details_are_validated_and_preserved() {
 
 #[test]
 fn legacy_error_constructor_has_empty_details() {
-    let error = seeed_hal_core::HalError::new(
+    let error = robot_hal_core::HalError::new(
         "runtime.session.closed",
-        seeed_hal_core::ErrorCategory::Conflict,
+        robot_hal_core::ErrorCategory::Conflict,
         "serial.read",
         false,
         "closed",
@@ -136,7 +136,7 @@ Validate before insertion, reject duplicates with `error.context.duplicate_key`,
 
 Replace the tuple `HalError` implementation with named private fields while keeping `HalError::new` source-compatible. Initialize details to `None`/default in both constructors and decision-only deserialization. Add the enrichment methods and accessors specified by the design. Reuse `validate_identifier` for platform/vendor codes.
 
-Export `ErrorContext` from `crates/seeed-hal-core/src/lib.rs`.
+Export `ErrorContext` from `crates/robot-hal-core/src/lib.rs`.
 
 - [ ] **Step 3: Refactor and statically self-review without executing tools**
 
@@ -145,7 +145,7 @@ Keep validation helpers private, remove repeated error construction, and inspect
 - [ ] **Step 4: Commit the core contract**
 
 ```bash
-git add crates/seeed-hal-core/src/error.rs crates/seeed-hal-core/src/lib.rs crates/seeed-hal-core/tests/core_contract.rs
+git add crates/robot-hal-core/src/error.rs crates/robot-hal-core/src/lib.rs crates/robot-hal-core/tests/core_contract.rs
 git commit -m "feat(core): add structured error details"
 ```
 
@@ -153,10 +153,10 @@ git commit -m "feat(core): add structured error details"
 
 **Files:**
 - Modify: `proto/seeed/hal/v1/hal.proto`
-- Modify: `crates/seeed-hal-protocol/src/conversion.rs`
-- Modify: `crates/seeed-hal-protocol/src/lib.rs`
-- Modify: `crates/seeed-hal-protocol/tests/protocol_contract.rs`
-- Regenerate: `bindings/python/seeed_hal/proto/hal_pb2.py`
+- Modify: `crates/robot-hal-protocol/src/conversion.rs`
+- Modify: `crates/robot-hal-protocol/src/lib.rs`
+- Modify: `crates/robot-hal-protocol/tests/protocol_contract.rs`
+- Regenerate: `bindings/python/robot_hal/proto/hal_pb2.py`
 
 **Interfaces:**
 - Consumes: `ErrorContext` and enriched `HalError` from Task 1.
@@ -213,17 +213,17 @@ Map the category first, build the legacy error with `HalError::new`, then condit
 Inspect the schema tags, both conversion directions, generated binding diff, and tests. Do not run formatting, lint, build, or test commands.
 
 ```bash
-git add proto/seeed/hal/v1/hal.proto crates/seeed-hal-protocol/src/conversion.rs crates/seeed-hal-protocol/src/lib.rs crates/seeed-hal-protocol/tests/protocol_contract.rs bindings/python/seeed_hal/proto/hal_pb2.py
+git add proto/seeed/hal/v1/hal.proto crates/robot-hal-protocol/src/conversion.rs crates/robot-hal-protocol/src/lib.rs crates/robot-hal-protocol/tests/protocol_contract.rs bindings/python/robot_hal/proto/hal_pb2.py
 git commit -m "feat(protocol): preserve structured error details"
 ```
 
 ### Task 3: Attach canonical resource identity to resolver and active lease errors
 
 **Files:**
-- Modify: `crates/seeed-hal-core/src/identity.rs`
-- Modify: `crates/seeed-hal-core/tests/core_contract.rs`
-- Modify: `crates/seeed-hal-runtime/src/lease_table.rs`
-- Modify: `crates/seeed-hal-runtime/tests/serial_runtime.rs`
+- Modify: `crates/robot-hal-core/src/identity.rs`
+- Modify: `crates/robot-hal-core/tests/core_contract.rs`
+- Modify: `crates/robot-hal-runtime/src/lease_table.rs`
+- Modify: `crates/robot-hal-runtime/tests/serial_runtime.rs`
 
 **Interfaces:**
 - Consumes: `HalError::with_resource_id` from Task 1.
@@ -250,7 +250,7 @@ Do not add a resource ID to closed-session replay errors because `Registry::Clos
 Inspect every changed error path and its assertions. Do not run formatting, lint, build, or test commands.
 
 ```bash
-git add crates/seeed-hal-core/src/identity.rs crates/seeed-hal-core/tests/core_contract.rs crates/seeed-hal-runtime/src/lease_table.rs crates/seeed-hal-runtime/tests/serial_runtime.rs
+git add crates/robot-hal-core/src/identity.rs crates/robot-hal-core/tests/core_contract.rs crates/robot-hal-runtime/src/lease_table.rs crates/robot-hal-runtime/tests/serial_runtime.rs
 git commit -m "fix(runtime): attach canonical resource error identity"
 ```
 
@@ -297,11 +297,11 @@ git commit -m "fix(serial): preserve native platform error codes"
 ### Task 5: Make the Rust client use the shared wire conversion
 
 **Files:**
-- Modify: `crates/seeed-hal-client/src/connection.rs`
-- Modify: `crates/seeed-hal-client/tests/client_contract.rs`
+- Modify: `crates/robot-hal-client/src/connection.rs`
+- Modify: `crates/robot-hal-client/tests/client_contract.rs`
 
 **Interfaces:**
-- Consumes: `seeed_hal_protocol::error_from_proto` from Task 2.
+- Consumes: `robot_hal_protocol::error_from_proto` from Task 2.
 - Produces: rich and legacy broker errors through every Rust-client response path.
 
 - [ ] **Step 1: Write Rust-client tests without running them**
@@ -310,7 +310,7 @@ Add a fake-server request error containing all four details and assert the retur
 
 Add one real broker round-trip using `Broker` with `VirtualSerialAdapter`: connect `HalClient`, construct a valid `ResourceSelector::exact` for the absent ID `serial:virtual:missing`, call `open_serial`, and assert the returned `runtime.resource.not_found` error carries that exact resource ID. This proves core resolver → adapter → runtime → broker → protocol → Rust client preservation without test-only production hooks.
 
-- [ ] **Step 2: Delegate decoding to `seeed-hal-protocol`**
+- [ ] **Step 2: Delegate decoding to `robot-hal-protocol`**
 
 Import `error_from_proto`, replace all local `decode_error` calls, and delete the duplicate category/error constructor in `connection.rs`. Preserve existing termination behavior: `error_from_proto` already normalizes malformed peer details to `runtime.protocol.invalid_message`, which closes the connection.
 
@@ -319,15 +319,15 @@ Import `error_from_proto`, replace all local `decode_error` calls, and delete th
 Inspect all normal and unsolicited error paths and their tests. Do not run formatting, lint, build, or test commands.
 
 ```bash
-git add crates/seeed-hal-client/src/connection.rs crates/seeed-hal-client/tests/client_contract.rs
+git add crates/robot-hal-client/src/connection.rs crates/robot-hal-client/tests/client_contract.rs
 git commit -m "fix(client): retain structured broker errors"
 ```
 
 ### Task 6: Add immutable structured errors to the Python client
 
 **Files:**
-- Modify: `bindings/python/seeed_hal/errors.py`
-- Modify: `bindings/python/seeed_hal/client.py`
+- Modify: `bindings/python/robot_hal/errors.py`
+- Modify: `bindings/python/robot_hal/client.py`
 - Modify: `bindings/python/tests/test_client_contract.py`
 - Modify: `bindings/python/tests/test_client_hardening.py`
 
@@ -395,7 +395,7 @@ Extend `_decode_error` to pass all details to `HalError`. Do not parse `debug_me
 Inspect immutability, fresh fan-out, validation parity, and their tests. Do not run formatting, lint, build, or test commands.
 
 ```bash
-git add bindings/python/seeed_hal/errors.py bindings/python/seeed_hal/client.py bindings/python/tests/test_client_contract.py bindings/python/tests/test_client_hardening.py
+git add bindings/python/robot_hal/errors.py bindings/python/robot_hal/client.py bindings/python/tests/test_client_contract.py bindings/python/tests/test_client_hardening.py
 git commit -m "fix(python): retain immutable structured errors"
 ```
 
@@ -456,8 +456,8 @@ Record the exact count from fresh output.
 Run:
 
 ```bash
-cargo build -p seeed-hal-broker-app --features virtual-adapter
-uv run --project bindings/python --frozen python tests/conformance/run-broker-conformance.py --broker target/debug/seeed-hal-broker
+cargo build -p robot-hal-broker-app --features virtual-adapter
+uv run --project bindings/python --frozen python tests/conformance/run-broker-conformance.py --broker target/debug/robot-hal-broker
 ```
 
 Record the exact checks passed. Do not claim native Linux, native Windows, remote CI, or physical-loopback qualification without fresh evidence.

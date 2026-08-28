@@ -1,5 +1,5 @@
 [package]
-name = "seeed-hal-adapter-v4l2"
+name = "robot-hal-adapter-v4l2"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,8 +10,8 @@ hardware-tests = []
 
 [dependencies]
 async-trait = { workspace = true }
-seeed-hal-camera = { path = "../../crates/seeed-hal-camera", version = "=0.5.0-rc.1"}
-seeed-hal-core = { path = "../../crates/seeed-hal-core", version = "=0.5.0-rc.1"}
+robot-hal-camera = { path = "../../crates/robot-hal-camera", version = "=0.5.0-rc.1"}
+robot-hal-core = { path = "../../crates/robot-hal-core", version = "=0.5.0-rc.1"}
 tokio = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

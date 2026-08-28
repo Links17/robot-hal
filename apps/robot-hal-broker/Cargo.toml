@@ -1,0 +1,70 @@
+[package]
+name = "robot-hal-broker-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+build = "build.rs"
+
+[features]
+default = ["serialport"]
+avfoundation = ["dep:robot-hal-adapter-avfoundation"]
+mediafoundation = ["dep:robot-hal-adapter-mediafoundation"]
+pcan = ["dep:robot-hal-adapter-pcan"]
+serialport = ["dep:robot-hal-adapter-serialport"]
+socketcan = ["dep:robot-hal-adapter-socketcan"]
+v4l2 = ["dep:robot-hal-adapter-v4l2"]
+nusb = ["dep:robot-hal-adapter-nusb"]
+linux-gpio = ["dep:robot-hal-adapter-linux-gpio"]
+windows-gpio = ["dep:robot-hal-adapter-windows-gpio"]
+virtual-adapters = ["dep:robot-hal-testkit"]
+
+[[bin]]
+name = "robot-hal-broker"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+robot-hal-adapter-serialport = { path = "../../adapters/serialport", optional = true, version = "=0.5.0-rc.1"}
+robot-hal-adapter-pcan = { path = "../../adapters/pcan", optional = true, version = "=0.5.0-rc.1"}
+robot-hal-adapter-socketcan = { path = "../../adapters/socketcan", optional = true, version = "=0.5.0-rc.1"}
+robot-hal-adapter-nusb = { path = "../../adapters/nusb", optional = true, version = "=0.5.0-rc.1"}
+robot-hal-adapter-linux-gpio = { path = "../../adapters/linux-gpio", optional = true, version = "=0.5.0-rc.1"}
+robot-hal-adapter-windows-gpio = { path = "../../adapters/windows-gpio", optional = true, version = "=0.5.0-rc.1"}
+robot-hal-broker = { path = "../../crates/robot-hal-broker", version = "=0.5.0-rc.1"}
+robot-hal-core = { path = "../../crates/robot-hal-core", version = "=0.5.0-rc.1"}
+robot-hal-protocol = { path = "../../crates/robot-hal-protocol", version = "=0.5.0-rc.1"}
+robot-hal-runtime = { path = "../../crates/robot-hal-runtime", version = "=0.5.0-rc.1"}
+robot-hal-testkit = { path = "../../crates/robot-hal-testkit", optional = true, version = "=0.5.0-rc.1"}
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+zeroize = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+robot-hal-adapter-avfoundation = { path = "../../adapters/avfoundation", optional = true, version = "=0.5.0-rc.1"}
+
+[target.'cfg(target_os = "linux")'.dependencies]
+robot-hal-adapter-v4l2 = { path = "../../adapters/v4l2", optional = true, version = "=0.5.0-rc.1"}
+
+[target.'cfg(windows)'.dependencies]
+robot-hal-adapter-mediafoundation = { path = "../../adapters/mediafoundation", optional = true, version = "=0.5.0-rc.1"}
+robot-hal-windows-file = { path = "../../adapters/windows-file", version = "=0.5.0-rc.1"}
+robot-hal-windows-security = { path = "../../adapters/windows-security", version = "=0.5.0-rc.1"}
+windows-permissions = { workspace = true }
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
+winapi-util = { workspace = true }
+
+[dev-dependencies]
+robot-hal-client = { path = "../../crates/robot-hal-client", version = "=0.5.0-rc.1"}
+robot-hal-serial = { path = "../../crates/robot-hal-serial", version = "=0.5.0-rc.1"}
+robot-hal-testkit = { path = "../../crates/robot-hal-testkit", version = "=0.5.0-rc.1"}
+serde_json = { workspace = true }
+wait-timeout = "0.2.1"
